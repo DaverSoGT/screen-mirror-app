@@ -4,8 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.screenmirror.app",
   "build": {
-    "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420"
+    "frontendDist": "../dist"
   },
   "bundle": {
     "active": true,

@@ -2,6 +2,7 @@
 name = "sm-infra"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 sm-domain = { path = "../sm-domain" }

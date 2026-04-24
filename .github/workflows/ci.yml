@@ -49,7 +49,9 @@ jobs:
         with:
           tool: nextest
       - name: cargo nextest run
-        run: cargo nextest run --workspace
+        # --no-tests=warn: treat "no tests found" as a warning rather than an
+        # error. The scaffold ships with zero tests; later changes will add them.
+        run: cargo nextest run --workspace --no-tests=warn
 
   # ---------------------------------------------------------------------------
   # clippy — lint the workspace. Runs on ubuntu only; clippy output is

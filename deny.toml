@@ -2,7 +2,14 @@
 # Requires cargo-deny >= 0.14 (v2 config schema).
 
 [licenses]
-# Allow common permissive licences used by the Rust ecosystem.
+# cargo-deny 0.19.x simplified [licenses] to an allow-list-only model
+# (migration ref: https://github.com/EmbarkStudios/cargo-deny/pull/611).
+# Any licence NOT in this allow list is automatically rejected — this
+# replaces the removed `deny`, `unlicensed`, and `copyleft` keys.
+#
+# GPL-2.0, GPL-3.0, and AGPL-3.0 are rejected by absence from this list
+# (intent from the original spec preserved). Crates with unparseable
+# licence metadata are also rejected automatically.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -14,27 +21,19 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    "Unicode-3.0",
 ]
-# Deny copyleft licences that would affect our proprietary distribution.
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-]
-# Treat unlicensed or ambiguous crates as errors.
-unlicensed = "deny"
-# Warn on crates where licence could not be determined from metadata.
-copyleft = "warn"
 # Confidence threshold for licence text detection (0.0 – 1.0).
 confidence-threshold = 0.8
 
 [advisories]
 # Deny crates that have been yanked from crates.io.
 yanked = "deny"
-# Warn on crates that are unmaintained (but do not block the build).
-unmaintained = "warn"
-# Warn on crates with unsound code notices.
-unsound = "warn"
+# Only flag unmaintained advisories on DIRECT workspace dependencies,
+# not transitive ones we cannot control (e.g. unic-* crates pulled in
+# by tauri -> tauri-utils -> urlpattern are unmaintained but unavoidable).
+# cargo-deny 0.19.x scope values: "all" | "workspace" | "transitive" | "none".
+unmaintained = "workspace"
 
 [bans]
 # Warn (rather than error) when multiple versions of the same crate are pulled in.
@@ -42,6 +41,11 @@ unsound = "warn"
 multiple-versions = "warn"
 # Deny wildcard dependencies (version = "*") — forces explicit pinning.
 wildcards = "deny"
+# Path-based workspace deps (e.g. `sm-domain = { path = "../sm-domain" }`) are
+# inherently wildcards because they have no version constraint. They are NOT
+# the "wildcard published to crates.io" that wildcards=deny aims to catch.
+# Exempt them explicitly — this is the idiomatic setting for Cargo workspaces.
+allow-wildcard-paths = true
 
 [sources]
 # Only allow crates from the official registry and local workspace paths.
