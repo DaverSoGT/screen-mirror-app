@@ -1,0 +1,5 @@
+# To use the `cargo cov` alias below, install cargo-llvm-cov first:
+#   cargo install cargo-llvm-cov
+# (The alias references it; cargo does not install tools automatically.)
+[alias]
+cov = "llvm-cov --workspace --lcov --output-path target/lcov.info"

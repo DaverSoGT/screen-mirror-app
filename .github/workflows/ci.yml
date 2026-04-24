@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # check — compile-check the workspace on all three target platforms.
+  # Platform-gated cfg(target_os = ...) code only type-checks on the matching
+  # host, so we must run on all three.
+  # ---------------------------------------------------------------------------
+  check:
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace
+
+  # ---------------------------------------------------------------------------
+  # test — run the full test suite via cargo-nextest on all three platforms.
+  # nextest is installed from pre-built binaries (not compiled from source)
+  # via taiki-e/install-action, which reduces CI time by ~5 minutes per run.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: cargo nextest run
+        run: cargo nextest run --workspace
+
+  # ---------------------------------------------------------------------------
+  # clippy — lint the workspace. Runs on ubuntu only; clippy output is
+  # platform-independent for this codebase (no OS-specific lint triggers).
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # fmt — verify all source files conform to rustfmt.toml.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt check
+        run: cargo fmt --check --all
+
+  # ---------------------------------------------------------------------------
+  # msrv — verify the workspace compiles with the declared minimum Rust version
+  # (1.85.0). Catches accidental use of features stabilised after the MSRV.
+  # Runs only on ubuntu — the compiler's acceptance of a language feature is
+  # not OS-dependent.
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: MSRV (1.85.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (MSRV)
+        run: cargo check --workspace

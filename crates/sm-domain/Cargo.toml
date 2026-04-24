@@ -1,0 +1,11 @@
+[package]
+name = "sm-domain"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

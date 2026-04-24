@@ -1,0 +1,15 @@
+# lefthook — git hook manager configuration.
+# Install hooks once after cloning: `lefthook install`
+# Docs: https://github.com/evilmartians/lefthook
+
+pre-commit:
+  # Run fmt before clippy. fmt --check fails fast on style violations and
+  # does not modify files, but must pass before clippy wastes time on
+  # code that would be reformatted anyway.
+  # parallel: false ensures sequential execution: fmt -> clippy.
+  parallel: false
+  commands:
+    fmt:
+      run: cargo fmt --check --all
+    clippy:
+      run: cargo clippy --workspace --all-targets -- -D warnings

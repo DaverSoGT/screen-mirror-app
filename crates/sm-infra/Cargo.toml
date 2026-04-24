@@ -1,0 +1,13 @@
+[package]
+name = "sm-infra"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sm-domain = { path = "../sm-domain" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]

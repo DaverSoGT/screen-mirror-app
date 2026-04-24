@@ -1,0 +1,63 @@
+name: Security
+
+# Runs on every push to main to catch newly-introduced vulnerabilities, and on a
+# weekly cron to surface advisories published against an unchanged Cargo.lock.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Every Monday at 06:00 UTC — catches advisories published mid-week against
+    # a dependency graph that has not changed since the last push.
+    - cron: '0 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # -----------------------------------------------------------------------------
+  # security — run cargo-deny (licence / banned crates / advisories) and
+  # cargo-audit (RustSec vulnerability database query) against Cargo.lock.
+  #
+  # Both tools are installed from pre-built binaries, not compiled from source.
+  # This matches the pattern used in ci.yml (nextest via taiki-e/install-action)
+  # and avoids ~5-minute compile times per run.
+  #
+  # Note: rustsec/audit-check@v2 reads Cargo.lock. Until the first `cargo check`
+  # or `cargo build` generates and commits Cargo.lock, this step will produce a
+  # warning but will NOT fail the workflow (the action handles a missing lock file
+  # gracefully). Cargo.lock will be committed as part of Batch 5 verification
+  # (task 9.2 / 9.7).
+  # -----------------------------------------------------------------------------
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    permissions:
+      # Required by rustsec/audit-check@v2 to post check-run annotations.
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # -------------------------------------------------------------------------
+      # cargo deny — checks licences, banned crates, and the RustSec advisory DB.
+      # Uses EmbarkStudios/cargo-deny-action (pre-built binary) per Adjustment 2.
+      # Reads deny.toml at the repository root (created in Batch 3, task 5.3).
+      # -------------------------------------------------------------------------
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      # -------------------------------------------------------------------------
+      # cargo audit — dedicated RustSec vulnerability scanner.
+      # Uses rustsec/audit-check@v2 (official RustSec action, pre-built binary).
+      # The token is required to post findings as GitHub check-run annotations.
+      # -------------------------------------------------------------------------
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
