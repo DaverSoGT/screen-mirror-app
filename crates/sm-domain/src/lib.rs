@@ -1,3 +1,21 @@
+//! Domain core for the screen-mirror application.
+//!
+//! `sm-domain` is the innermost crate of the hexagonal architecture. It defines the
+//! port boundaries (traits) and shared value types that cross-cut every platform
+//! adapter and application layer. It MUST remain free of any platform-specific,
+//! async-runtime, or GUI-framework dependency.
+//!
+//! # Crate policy
+//!
+//! - No `tokio`, `windows`, `tauri`, or OS-specific crate in `[dependencies]`.
+//! - All platform adapters live in `sm-infra`, gated by `cfg(target_os = ...)`.
+//! - Compile correctness on Ubuntu, macOS, and Windows is a CI requirement.
+//!
+//! # Modules
+//!
+//! - [`capture`] — port boundary for screen capture sources: trait, frame model,
+//!   error taxonomy, configuration, and monitor enumeration types.
+
 pub mod capture;
 
 pub use capture::BorderPolicy;

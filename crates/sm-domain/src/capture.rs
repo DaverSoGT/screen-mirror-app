@@ -1,4 +1,34 @@
 //! Port boundary for screen capture sources.
+//!
+//! This module defines the domain-level contract for acquiring frames from a display.
+//! No platform type, async runtime, or OS-specific import is permitted here — all
+//! platform adaptation lives in `sm-infra`.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`CaptureSource`] | Port trait implemented by each platform adapter. |
+//! | [`CaptureFrame`] | A single captured frame with shared-ownership pixel buffer. |
+//! | [`CaptureConfig`] | Configuration for a capture session (monitor, FPS cap, border). |
+//! | [`CaptureError`] | Unified error enum for all capture operations. |
+//! | [`MonitorInfo`] | Descriptor for an enumerated display. |
+//! | [`MonitorId`] | Stable, opaque identifier for a display. |
+//! | [`PixelFormat`] | Pixel format of a frame buffer. |
+//! | [`BorderPolicy`] | Controls the WGC system border overlay. |
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use sm_domain::{CaptureConfig, CaptureSource};
+//! // (construct a concrete adapter in sm-infra, then call through the trait)
+//! let monitors = MyAdapter::enumerate_monitors()?;
+//! let mut source = MyAdapter::new(CaptureConfig::default())?;
+//! let (tx, rx) = std::sync::mpsc::sync_channel(4);
+//! source.start(tx)?;
+//! // receive frames from rx on a consumer thread
+//! source.stop()?;
+//! ```
 
 use std::sync::Arc;
 
