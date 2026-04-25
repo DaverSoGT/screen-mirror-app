@@ -8,6 +8,7 @@ license.workspace = true
 sm-domain = { path = "../sm-domain" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 

@@ -9,4 +9,5 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+cargo_metadata = "0.18"
 insta = { workspace = true }
