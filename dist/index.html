@@ -3,9 +3,47 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Screen Mirror</title>
+    <title>Screen Mirror — R10.2 smoke</title>
+    <style>
+      body { font-family: system-ui, sans-serif; padding: 2rem; max-width: 720px; }
+      h1 { margin-bottom: 0.5rem; }
+      .status { margin-top: 1rem; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+      .status.pending { background: #fff7cc; }
+      .status.pass    { background: #d4f7d4; }
+      .status.fail    { background: #f7d4d4; }
+      button { margin-top: 1rem; padding: 0.5rem 1rem; font-size: 1rem; }
+    </style>
   </head>
   <body>
-    <h1>Screen Mirror</h1>
+    <h1>Screen Mirror — R10.2 smoke</h1>
+    <p>Validates that <code>WindowsCaptureSource</code> starts cleanly under the Tauri 2 main-thread COM apartment. Auto-runs when the WebView loads.</p>
+    <div id="status" class="status pending">running...</div>
+    <button id="rerun" type="button">Re-run smoke</button>
+    <script type="module">
+      // Tauri 2 exposes invoke on window.__TAURI__.core.invoke
+      const invoke = window.__TAURI__?.core?.invoke;
+      const status = document.getElementById("status");
+
+      async function runSmoke() {
+        if (!invoke) {
+          status.className = "status fail";
+          status.textContent = "ERROR — window.__TAURI__.core.invoke not available (not running inside Tauri).";
+          return;
+        }
+        status.className = "status pending";
+        status.textContent = "running smoke_com_apartment (up to 10s)...";
+        try {
+          const msg = await invoke("smoke_com_apartment");
+          status.className = "status pass";
+          status.textContent = msg;
+        } catch (err) {
+          status.className = "status fail";
+          status.textContent = String(err);
+        }
+      }
+
+      document.getElementById("rerun").addEventListener("click", runSmoke);
+      runSmoke();
+    </script>
   </body>
 </html>
