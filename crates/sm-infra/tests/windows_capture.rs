@@ -99,3 +99,150 @@ fn windows_capture_new_primary_returns_ok() {
         "WindowsCaptureSource::new with primary monitor must succeed: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 5.5 — frame delivery: start → receive ≥3 frames → stop
+// ---------------------------------------------------------------------------
+
+/// End-to-end frame delivery test (R11, R5, R13.4).
+///
+/// Starts capture on the primary monitor using a channel of capacity
+/// `CAPTURE_CHANNEL_CAPACITY` (R11.1). Waits up to 10 seconds to receive
+/// at least 3 frames. Validates each frame has non-zero dimensions and the
+/// correct pixel format. Then calls `stop()` and asserts `Ok(())`.
+#[test]
+#[ignore = "requires interactive desktop with WGC support"]
+fn windows_capture_delivers_at_least_3_frames() {
+    use sm_infra::capture::CAPTURE_CHANNEL_CAPACITY;
+    use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+
+    if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+        eprintln!("SKIP: Windows Graphics Capture not supported on this host");
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(CAPTURE_CHANNEL_CAPACITY);
+
+    let mut source = WindowsCaptureSource::new(CaptureConfig::default())
+        .expect("WindowsCaptureSource::new must succeed");
+
+    source.start(tx).expect("start must succeed");
+
+    let timeout = std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut frames = Vec::new();
+
+    while frames.len() < 3 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(frame) => frames.push(frame),
+            Err(_) => break,
+        }
+    }
+
+    source.stop().expect("stop must return Ok(())");
+
+    assert!(
+        frames.len() >= 3,
+        "expected at least 3 frames within 10 s, got {}",
+        frames.len()
+    );
+
+    use sm_domain::PixelFormat;
+    for (i, frame) in frames.iter().enumerate() {
+        assert!(frame.width > 0, "frame {i} width must be > 0");
+        assert!(frame.height > 0, "frame {i} height must be > 0");
+        assert_eq!(
+            frame.format,
+            PixelFormat::Bgra8,
+            "frame {i} format must be Bgra8"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.7 — stop() idempotency: calling stop twice must not panic and
+//            must return Ok(()) both times (AC #13)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Task 7.1 / Phase 7 — dropped_frames counter: drop-newest backpressure
+// ---------------------------------------------------------------------------
+
+/// Backpressure test: start capture with a tiny channel (capacity 1) and a
+/// consumer that pauses 500 ms before draining. After the pause, `dropped_frames()`
+/// must be > 0 (R11.2, R11.3).
+///
+/// This test is `#[ignore]` and requires an interactive desktop with WGC support.
+#[test]
+#[ignore = "requires interactive desktop with WGC support"]
+fn windows_capture_drops_frames_when_consumer_slow() {
+    use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+
+    if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+        eprintln!("SKIP: Windows Graphics Capture not supported on this host");
+        return;
+    }
+
+    // Capacity 1 means the second frame will cause a drop.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<sm_domain::CaptureFrame>(1);
+
+    let mut source = WindowsCaptureSource::new(CaptureConfig::default()).expect("new must succeed");
+
+    source.start(tx).expect("start must succeed");
+
+    // Give the WGC thread time to produce several frames (at 60 fps → ~10 frames in 200 ms).
+    // The consumer does NOT read from rx during this window — so frames pile up and drop.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let drops = source.dropped_frames();
+    source.stop().expect("stop must succeed");
+
+    // Drain the remaining buffered frame(s).
+    while rx.try_recv().is_ok() {}
+
+    assert!(
+        drops > 0,
+        "expected at least 1 dropped frame with capacity-1 channel and slow consumer, \
+         got 0 — did WGC not produce any frames?"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 5.7 — stop() idempotency: calling stop twice must not panic and
+//            must return Ok(()) both times (AC #13)
+// ---------------------------------------------------------------------------
+
+/// Calling `stop()` on an already-stopped capture source must be idempotent:
+/// both calls must return `Ok(())` and neither must panic.
+#[test]
+#[ignore = "requires interactive desktop with WGC support"]
+fn windows_capture_stop_is_idempotent() {
+    use windows_capture::graphics_capture_api::GraphicsCaptureApi;
+
+    if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
+        eprintln!("SKIP: Windows Graphics Capture not supported on this host");
+        return;
+    }
+
+    let (tx, _rx) = std::sync::mpsc::sync_channel::<sm_domain::CaptureFrame>(4);
+
+    let mut source = WindowsCaptureSource::new(CaptureConfig::default()).expect("new must succeed");
+
+    source.start(tx).expect("start must succeed");
+
+    let first = source.stop();
+    assert!(
+        first.is_ok(),
+        "first stop() must return Ok(()), got: {first:?}"
+    );
+
+    let second = source.stop();
+    assert!(
+        second.is_ok(),
+        "second stop() must return Ok(()), got: {second:?}"
+    );
+}

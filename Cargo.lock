@@ -3172,6 +3172,7 @@ version = "0.0.0"
 dependencies = [
  "sm-domain",
  "windows-capture",
+ "windows-version",
 ]
 
 [[package]]
