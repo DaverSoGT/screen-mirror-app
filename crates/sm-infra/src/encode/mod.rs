@@ -6,4 +6,4 @@ pub mod bgra_to_i420;
 pub mod windows;
 
 #[cfg(target_os = "windows")]
-pub use windows::{WindowsOpenH264Encoder, ENCODE_CHANNEL_CAPACITY};
+pub use windows::{ENCODE_CHANNEL_CAPACITY, WindowsOpenH264Encoder};
