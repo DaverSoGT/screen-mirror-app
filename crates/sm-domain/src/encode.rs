@@ -562,4 +562,22 @@ mod tests {
         drop(frame_tx);
         enc.stop().unwrap();
     }
+
+    // ─── S15.1: VideoEncoder dyn trait object is Sync ─────────────────────────
+    //
+    // This test is RED when `VideoEncoder: Send` only (the trait does not declare
+    // `Sync`). `dyn VideoEncoder` is only `Sync` if the trait requires `Sync`.
+    // After the one-line change to `pub trait VideoEncoder: Send + Sync`, this
+    // test compiles and passes.
+    //
+    // [S15.1] Given this assertion, when `cargo nextest run -p sm-domain` runs,
+    // then it compiles and passes on all platforms.
+
+    #[test]
+    fn video_encoder_dyn_trait_object_is_sync_s15_1() {
+        // Verify dyn VideoEncoder (the trait object, not a concrete type) is Sync.
+        // This requires the trait to declare: pub trait VideoEncoder: Send + Sync
+        fn check_dyn_sync<T: ?Sized + Sync>() {}
+        check_dyn_sync::<dyn VideoEncoder>();
+    }
 }
