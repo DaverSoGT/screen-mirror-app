@@ -9,38 +9,69 @@ Platform adapters for screen-mirror. Implements the domain ports defined in
   `windows-capture` v2. Delivers BGRA8 frames over a bounded `std::sync::mpsc`
   channel with drop-newest backpressure.
 
+- `encode` — Windows OpenH264 software encoder (`WindowsOpenH264Encoder`) and the
+  bounded packet channel constant (`ENCODE_CHANNEL_CAPACITY`). Accepts
+  `CaptureFrame`s on its input channel, performs stride-aware BGRA→I420 conversion
+  internally using BT.601 limited-range coefficients, and emits Annex-B H.264
+  packets via OpenH264 (Cisco, BSD-2). On non-Windows targets this module compiles
+  to an empty stub.
+
 All platform-specific code is gated by `cfg(target_os = "...")` so that only the
-relevant adapter compiles per target. Non-Windows targets see an empty `capture`
-module and the crate compiles cleanly on all three CI platforms.
+relevant adapter compiles per target. Non-Windows targets see empty `capture` and
+`encode` modules and the crate compiles cleanly on all three CI platforms.
 
 ## Running unit tests
 
-Non-ignored tests (pure logic, no live WGC session required):
+Non-ignored tests (pure logic, no live capture or encoder session required):
 
 ```sh
 cargo nextest run -p sm-infra
 ```
 
-Expected output on Windows: 4+ tests pass, 6 skipped (the `#[ignore]` integration
-tests). On non-Windows: 0 tests collected (the Windows-gated code is excluded by
-`cfg`).
+Expected output on Windows: 20+ tests pass, 9 skipped (the `#[ignore]` integration
+tests). On non-Windows: only the platform-agnostic `bgra_to_i420` tests run (the
+Windows-gated code is excluded by `cfg`).
 
 ## Running Windows integration tests
 
-Integration tests require an interactive desktop session with Windows Graphics
-Capture support (Windows 10 1903+ or Windows 11). They are annotated `#[ignore]`
-and guarded by a runtime `GraphicsCaptureApi::is_supported()` check so they exit
-cleanly on headless hosts without failing.
-
-Run them on a Windows machine with an active display:
+Integration tests require an interactive desktop session and are annotated
+`#[ignore]`. Run all ignored tests on a Windows machine:
 
 ```sh
 cargo nextest run -p sm-infra --run-ignored only
 ```
 
-### Which tests are `#[ignore]`
+To run only the encoder integration tests:
 
-All tests in `crates/sm-infra/tests/windows_capture.rs` are ignored. Current list:
+```sh
+cargo nextest run -p sm-infra --run-ignored only --tests windows_encode
+```
+
+To run only the capture integration tests:
+
+```sh
+cargo nextest run -p sm-infra --run-ignored only --tests windows_capture
+```
+
+### Encoder integration tests (`crates/sm-infra/tests/windows_encode.rs`)
+
+These tests run the full encoder stack (BGRA→I420 + OpenH264 SW encode). They
+require a Windows host but no live capture session — all frames are synthetic.
+
+NASM in PATH gives OpenH264 a 2–3× SIMD speedup on the encode hot loop. NASM is
+OPTIONAL — without it, OpenH264 falls back to portable C.
+
+| Test name | What it verifies |
+|-----------|------------------|
+| `synthetic_bgra_30_frames_yields_idr_and_p_frames` | 30 synthetic 1920×1080 frames → ≥1 IDR + ≥10 P-frames within 3 s; Annex-B start code at offset 0. |
+| `request_keyframe_midstream_produces_idr_on_next_packet` | `request_keyframe()` forces IDR on the next encoded packet. |
+| `slow_consumer_increments_dropped_frames` | Deliberate slow consumer with capacity-2 channel → `dropped_frames() > 0`. |
+
+### Capture integration tests (`crates/sm-infra/tests/windows_capture.rs`)
+
+These tests require an interactive desktop session with Windows Graphics Capture
+support (Windows 10 1903+ or Windows 11). They are guarded by a runtime
+`GraphicsCaptureApi::is_supported()` check so they exit cleanly on headless hosts.
 
 | Test name | What it verifies |
 |-----------|------------------|

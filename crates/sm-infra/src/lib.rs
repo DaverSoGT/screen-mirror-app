@@ -18,6 +18,11 @@
 //! - [`capture`] — Windows Graphics Capture adapter (`WindowsCaptureSource`) and
 //!   the bounded frame channel constant (`CAPTURE_CHANNEL_CAPACITY`).
 //!   On non-Windows targets this module compiles to an empty stub.
+//! - [`encode`] — Windows OpenH264 software encoder (`WindowsOpenH264Encoder`)
+//!   and the bounded packet channel constant (`ENCODE_CHANNEL_CAPACITY`).
+//!   On non-Windows targets this module compiles to an empty stub. The
+//!   adapter accepts `CaptureFrame`s on its input channel, performs BGRA→I420
+//!   conversion internally, and emits Annex-B H.264 packets via OpenH264 (BSD-2).
 
 pub mod capture;
 pub mod encode;

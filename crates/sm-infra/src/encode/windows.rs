@@ -334,7 +334,9 @@ impl Drop for WindowsOpenH264Encoder {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use sm_domain::capture::PixelFormat;
     use sm_domain::encode::{EncoderConfig, EncoderError, VideoEncoder};
+    use std::time::Duration;
 
     // ─── Static assertion: WindowsOpenH264Encoder is Send ─────────────────────
 
@@ -342,6 +344,24 @@ mod tests {
     fn _assert_send() {
         fn check<T: Send>() {}
         check::<WindowsOpenH264Encoder>();
+    }
+
+    // ─── Helper: build a minimal CaptureFrame ─────────────────────────────────
+
+    /// Build a synthetic BGRA8 `CaptureFrame` at the given resolution.
+    /// All pixels are black (0,0,0,255). Width and height are rounded to even
+    /// values so the encoder can produce I420 without dimension issues.
+    fn make_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::CaptureFrame {
+        let stride = width * 4;
+        let data = vec![0u8; (stride * height) as usize];
+        sm_domain::CaptureFrame {
+            data: Arc::from(data.as_slice()),
+            width,
+            height,
+            stride,
+            format: PixelFormat::Bgra8,
+            timestamp: Duration::from_millis(ts_ms),
+        }
     }
 
     // ─── A1: new with default config returns Ok ────────────────────────────────
@@ -392,5 +412,199 @@ mod tests {
         let enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
         let s = format!("{enc:?}");
         assert!(!s.is_empty(), "Debug output should be non-empty");
+    }
+
+    // ─── A5: start then stop — no panic, Ok returned ──────────────────────────
+    //
+    // Verifies the encoder thread starts and can be joined cleanly.
+    // We drop frame_tx before calling stop() so the thread's rx.recv() unblocks.
+
+    #[test]
+    fn windows_openh264_start_then_stop_ok() {
+        let mut enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(4);
+        let (pkt_tx, _pkt_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(4);
+        enc.start(frame_rx, pkt_tx).unwrap();
+
+        // Drop the input sender so the encoder thread's rx.recv() returns Err and exits.
+        drop(frame_tx);
+
+        let result = enc.stop();
+        assert!(result.is_ok(), "stop() should return Ok, got: {result:?}");
+    }
+
+    // ─── A6: stop is idempotent ────────────────────────────────────────────────
+    //
+    // Scenario S2.2: second stop() on an already-stopped encoder returns Ok without panic.
+
+    #[test]
+    fn windows_openh264_stop_is_idempotent() {
+        let mut enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+
+        // Stop on a never-started encoder is idempotent.
+        enc.stop().unwrap();
+        enc.stop().unwrap();
+
+        // Start + stop + stop again.
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(4);
+        let (pkt_tx, _pkt_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(4);
+        enc.start(frame_rx, pkt_tx).unwrap();
+        drop(frame_tx);
+        enc.stop().unwrap();
+        enc.stop().unwrap(); // second stop must not panic
+    }
+
+    // ─── A7: drop without stop — no thread leak ────────────────────────────────
+    //
+    // Construct + start + drop without calling stop().
+    // The Drop impl calls stop() internally, so the thread must be joined.
+    // If the thread is leaked this test hangs or valgrind would show an error.
+
+    #[test]
+    fn windows_openh264_drop_without_stop_joins_thread() {
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(4);
+        let (pkt_tx, _pkt_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(4);
+
+        {
+            let mut enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            enc.start(frame_rx, pkt_tx).unwrap();
+
+            // Drop frame_tx first so the encoder thread's recv() unblocks when enc drops.
+            drop(frame_tx);
+            // enc drops here — Drop calls stop() which sets stop=true and joins the handle.
+        }
+        // If we reach here without hanging, the thread was successfully joined.
+    }
+
+    // ─── A8: dropped_frames counter increments under backpressure ─────────────
+    //
+    // Scenario S8.1: output channel capacity = 1; consumer never reads;
+    // after encoding several frames, dropped_frames() > 0.
+    //
+    // Note: this test sends real BGRA frames through the full encoder stack
+    // (BGRA→I420 + OpenH264). It is a unit test (no #[ignore]) because OpenH264
+    // is available on Windows and the encode is fast for small frames.
+
+    #[test]
+    fn windows_openh264_backpressure_increments_dropped_frames() {
+        let mut enc = WindowsOpenH264Encoder::new(EncoderConfig {
+            framerate: 60,
+            ..EncoderConfig::default()
+        })
+        .unwrap();
+
+        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(32);
+        // Capacity = 1 so the channel fills after the first packet.
+        let (pkt_tx, _pkt_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(1);
+
+        enc.start(frame_rx, pkt_tx).unwrap();
+
+        // Flood the encoder with 30 frames. At 60×60 pixels, each encode is fast.
+        // With output capacity=1, most packets will be dropped.
+        for i in 0..30u64 {
+            // Use a 60×60 frame — even dimensions, small, fast to encode.
+            let frame = make_frame(60, 60, i * 16);
+            let _ = frame_tx.send(frame);
+        }
+
+        // Give the encoder thread time to process all frames.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let dropped = enc.dropped_frames();
+
+        // Drop frame_tx before stop so the thread's recv() unblocks.
+        drop(frame_tx);
+        enc.stop().unwrap();
+
+        assert!(
+            dropped > 0,
+            "expected dropped_frames > 0 with capacity-1 channel, got {dropped}"
+        );
+    }
+
+    // ─── A9: dropped_frames monotonically non-decreasing ─────────────────────
+    //
+    // Scenario S8.4: read dropped_frames at time T, read again at T+1, assert T+1 >= T.
+
+    #[test]
+    fn windows_openh264_dropped_frames_is_monotonic() {
+        let enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        let d0 = enc.dropped_frames();
+        let d1 = enc.dropped_frames();
+        assert!(
+            d1 >= d0,
+            "dropped_frames must be monotonically non-decreasing"
+        );
+    }
+
+    // ─── A10: ENCODE_CHANNEL_CAPACITY is in range [4, 8] ─────────────────────
+
+    #[test]
+    fn windows_openh264_channel_capacity_in_valid_range() {
+        assert!(
+            ENCODE_CHANNEL_CAPACITY >= 4 && ENCODE_CHANNEL_CAPACITY <= 8,
+            "ENCODE_CHANNEL_CAPACITY must be in [4, 8], got {ENCODE_CHANNEL_CAPACITY}"
+        );
+    }
+
+    // ─── A11: request_keyframe — does not panic when called before start ───────
+    //
+    // Scenario S6.3: calling request_keyframe() on a stopped encoder must not panic.
+
+    #[test]
+    fn windows_openh264_request_keyframe_before_start_no_panic() {
+        let enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        // Not started — just calling request_keyframe should not panic.
+        enc.request_keyframe();
+        // The flag is set but no thread reads it — that's fine.
+        assert!(enc.state.keyframe_pending.load(Ordering::Relaxed));
+    }
+
+    // ─── A12: set_bitrate — valid bps is stored, zero is rejected ─────────────
+    //
+    // Scenario S7.2/S7.3: set_bitrate records new bps; set_bitrate(0) returns InvalidConfig.
+
+    #[test]
+    fn windows_openh264_set_bitrate_valid_stores_value() {
+        let enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        enc.set_bitrate(8_000_000).unwrap();
+        let stored = enc.state.pending_bitrate.load(Ordering::Relaxed);
+        assert_eq!(stored, 8_000_000);
+    }
+
+    #[test]
+    fn windows_openh264_set_bitrate_zero_rejected() {
+        let enc = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        let err = enc.set_bitrate(0).unwrap_err();
+        assert!(
+            matches!(err, EncoderError::InvalidConfig(_)),
+            "expected InvalidConfig for bitrate=0, got {err:?}"
+        );
+    }
+
+    // ─── A13: set_bitrate and request_keyframe are callable from any thread ───
+
+    #[test]
+    fn windows_openh264_runtime_controls_callable_from_another_thread() {
+        use std::sync::Arc as StdArc;
+
+        let enc = StdArc::new(WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap());
+        let enc_clone = StdArc::clone(&enc);
+
+        let handle = std::thread::spawn(move || {
+            enc_clone.request_keyframe();
+            enc_clone.set_bitrate(2_000_000).unwrap();
+            enc_clone.dropped_frames() // returns 0, confirms thread-safe read
+        });
+
+        let dropped = handle.join().expect("thread should not panic");
+        assert_eq!(dropped, 0);
+
+        // Verify the keyframe flag was set by the other thread.
+        assert!(enc.state.keyframe_pending.load(Ordering::Relaxed));
     }
 }
