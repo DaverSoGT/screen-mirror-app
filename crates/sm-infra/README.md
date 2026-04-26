@@ -67,6 +67,20 @@ OPTIONAL — without it, OpenH264 falls back to portable C.
 | `request_keyframe_midstream_produces_idr_on_next_packet` | `request_keyframe()` forces IDR on the next encoded packet. |
 | `slow_consumer_increments_dropped_frames` | Deliberate slow consumer with capacity-2 channel → `dropped_frames() > 0`. |
 
+### Composability smoke example (`crates/sm-infra/examples/encode_smoke.rs`)
+
+End-to-end smoke that wires `WindowsCaptureSource` → `WindowsOpenH264Encoder` and
+writes an Annex-B `.h264` file. Captures the primary monitor for ~10 s, calls
+`request_keyframe()` at +5 s, and prints a summary on exit (frame counts,
+dropped-frame counters on both stages, output file size).
+
+```sh
+cargo run -p sm-infra --example encode_smoke
+cargo run -p sm-infra --example encode_smoke -- my_capture.h264
+```
+
+Verify the output with `ffplay -i encode_smoke.h264` or `ffprobe -i encode_smoke.h264`.
+
 ### Capture integration tests (`crates/sm-infra/tests/windows_capture.rs`)
 
 These tests require an interactive desktop session with Windows Graphics Capture
