@@ -259,6 +259,7 @@ mod tests {
     /// In-memory `VideoSender` for domain-level unit tests.
     /// No network — records calls via atomics.
     struct FakeVideoSender {
+        #[allow(dead_code)]
         config: TransportConfig,
         started: Arc<AtomicBool>,
         stopped: Arc<AtomicBool>,

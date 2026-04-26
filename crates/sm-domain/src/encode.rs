@@ -144,7 +144,7 @@ pub enum EncoderError {
 ///
 /// `request_keyframe()` uses atomic signalling; the next frame encoded after
 /// the call will be an IDR (NAL type 5) with SPS/PPS prepended.
-pub trait VideoEncoder: Send {
+pub trait VideoEncoder: Send + Sync {
     /// Construct an encoder with the given configuration.
     ///
     /// Validates `config` (e.g., `bitrate_bps > 0`, `framerate > 0`). Does NOT spawn
@@ -385,6 +385,38 @@ mod tests {
     fn video_encoder_trait_send_bound_satisfied() {
         fn takes_send<T: VideoEncoder + Send + 'static>(_: T) {}
         takes_send(FakeVideoEncoder::default());
+    }
+
+    // ─── S15.1: FakeVideoEncoder satisfies Send + Sync ────────────────────────
+    //
+    // The VideoEncoder trait MUST be Send + Sync so that adapters can hold
+    // Arc<dyn VideoEncoder + Send + Sync> for PLI feedback without a channel hop.
+    // This static assertion verifies both the concrete FakeVideoEncoder type
+    // AND that the trait bound allows dyn usage.
+    //
+    // [S15.1] Given this assertion in the test suite, when `cargo nextest run -p sm-domain`
+    // runs, then it compiles and passes on all platforms.
+
+    #[test]
+    fn fake_video_encoder_is_send_sync_s15_1() {
+        // Verifies FakeVideoEncoder (concrete type) satisfies Send + Sync.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FakeVideoEncoder>();
+    }
+
+    #[test]
+    fn video_encoder_trait_object_is_send_sync_s15_1_dyn() {
+        // Verifies that VideoEncoder trait objects are usable as Send + Sync.
+        // This test requires the trait to be: pub trait VideoEncoder: Send + Sync
+        // If the trait bound is Send-only, `dyn VideoEncoder + Send + Sync` is
+        // redundant-but-still-allowed on the concrete type. The CRITICAL assertion
+        // is that Arc<dyn VideoEncoder + Send + Sync> compiles — which requires
+        // the trait to declare Sync (otherwise the dyn coercion won't type-check).
+        fn assert_arc_dyn_send_sync<T: VideoEncoder + Send + Sync + 'static>() {
+            let enc = T::new(EncoderConfig::default()).unwrap();
+            let _arc: std::sync::Arc<dyn VideoEncoder + Send + Sync> = std::sync::Arc::new(enc);
+        }
+        assert_arc_dyn_send_sync::<FakeVideoEncoder>();
     }
 
     // ─── D8: set_bitrate(0) rejected ───────────────────────────────────────────

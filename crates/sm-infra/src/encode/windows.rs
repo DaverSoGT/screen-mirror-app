@@ -346,6 +346,20 @@ mod tests {
         check::<WindowsOpenH264Encoder>();
     }
 
+    // ─── Static assertion: WindowsOpenH264Encoder is Send + Sync ──────────────
+    //
+    // Guards R-DELTA-encoder-h264-windows-1 (VideoEncoder: Send + Sync).
+    // WindowsOpenH264Encoder is already Sync: all shared state is via
+    // Arc<EncoderShared> with AtomicBool/AtomicU32/AtomicU64 fields.
+    // The openh264::Encoder lives exclusively inside the spawned thread stack
+    // — it never escapes — so its non-Sync-ness is irrelevant. [R15.2, S15.2]
+
+    #[allow(dead_code)]
+    fn _assert_send_sync() {
+        fn check<T: Send + Sync>() {}
+        check::<WindowsOpenH264Encoder>();
+    }
+
     // ─── Helper: build a minimal CaptureFrame ─────────────────────────────────
 
     /// Build a synthetic BGRA8 `CaptureFrame` at the given resolution.
