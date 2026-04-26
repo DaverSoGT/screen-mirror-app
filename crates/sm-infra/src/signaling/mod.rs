@@ -1,6 +1,7 @@
 //! Signaling adapters.
 //!
-//! This module will contain `MdnsSignaling` (mDNS auto-discovery + TCP control
-//! channel) and `LoopbackSignaling` (in-memory fixture for tests and CI).
-//!
-//! Both implement the `sm_domain::signaling::Signaling` port.
+//! - [`loopback::LoopbackSignaling`] — In-memory fixture for tests and CI.
+//!   No network, no mDNS. Implements [`sm_domain::signaling::Signaling`].
+//! - `MdnsSignaling` (future batch) — mDNS auto-discovery + TCP control channel.
+
+pub mod loopback;
