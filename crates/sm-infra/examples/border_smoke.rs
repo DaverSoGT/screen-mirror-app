@@ -28,7 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use sm_domain::{BorderPolicy, CaptureConfig, CaptureSource};
     use sm_infra::capture::{CAPTURE_CHANNEL_CAPACITY, WindowsCaptureSource};
 
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "auto".to_string());
+    let arg = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "auto".to_string());
     let border = match arg.as_str() {
         "auto" => BorderPolicy::Auto,
         "on" => BorderPolicy::AlwaysOn,
