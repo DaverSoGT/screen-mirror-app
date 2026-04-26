@@ -3224,6 +3224,7 @@ name = "sm-infra"
 version = "0.0.0"
 dependencies = [
  "openh264",
+ "openh264-sys2",
  "sm-domain",
  "windows-capture",
  "windows-version",
