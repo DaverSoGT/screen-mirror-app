@@ -9,6 +9,8 @@
 //! - Platform-specific dependencies (`windows-capture`, `windows-version`, etc.) MUST
 //!   appear only under `[target.'cfg(target_os = "...")'.dependencies]` in `Cargo.toml`.
 //! - The `sm-domain` crate is the only cross-platform dependency.
+//! - Cross-platform adapters (transport, signaling) use unconditional top-level
+//!   dependencies — no `cfg` gate required for pure-Rust crates.
 //! - Integration tests requiring a live desktop session MUST be annotated `#[ignore]`
 //!   and guarded by a runtime `IsSupported()` check. Run them with:
 //!   `cargo nextest run -p sm-infra --run-ignored only`.
@@ -23,8 +25,12 @@
 //!   On non-Windows targets this module compiles to an empty stub. The
 //!   adapter accepts `CaptureFrame`s on its input channel, performs BGRA→I420
 //!   conversion internally, and emits Annex-B H.264 packets via OpenH264 (BSD-2).
+//! - [`transport`] — Media transport adapters (`Str0mVideoSender`, `Str0mVideoReceiver`)
+//!   backed by the str0m SansIO WebRTC stack. Cross-platform, no OS gate.
+//! - [`signaling`] — Signaling adapters: `MdnsSignaling` (mDNS auto-discovery) and
+//!   `LoopbackSignaling` (in-memory fixture for tests/CI). Cross-platform.
 
 pub mod capture;
 pub mod encode;
-mod signaling;
-mod transport;
+pub mod signaling;
+pub mod transport;

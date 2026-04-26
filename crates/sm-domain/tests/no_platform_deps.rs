@@ -14,6 +14,9 @@ const BANNED: &[&str] = &[
     "tauri",
     "wasm-bindgen",
     "openh264", // encoder backend must stay in sm-infra (R10.2)
+    "str0m",    // WebRTC stack must stay in sm-infra (transport adapter)
+    "mdns-sd",  // mDNS discovery must stay in sm-infra (signaling adapter)
+    "if-addrs", // multi-NIC enumeration must stay in sm-infra
 ];
 
 #[test]

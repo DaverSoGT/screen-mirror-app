@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 sm-domain = { path = "../sm-domain" }
+str0m = { version = "0.18", default-features = false, features = ["rust-crypto"] }
+mdns-sd = "0.19"
+if-addrs = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = "2"
