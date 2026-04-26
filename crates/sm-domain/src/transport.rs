@@ -251,7 +251,7 @@ pub trait VideoReceiver: Send {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::time::Duration;
 
     // ─── FakeVideoSender ────────────────────────────────────────────────────────
