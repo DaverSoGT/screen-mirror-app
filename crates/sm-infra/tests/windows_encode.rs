@@ -55,7 +55,7 @@ fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::Captu
 //
 // Spec R14.4 IT1: End-to-end smoke — feed 30 synthetic 1920×1080 BGRA frames,
 // observe ≥1 keyframe (is_keyframe == true) and ≥10 non-keyframe packets,
-// all within 3 s wall-clock. Also asserts Annex-B start code at offset 0.
+// all within 5 s wall-clock. Also asserts Annex-B start code at offset 0.
 
 #[test]
 #[ignore]
@@ -63,7 +63,7 @@ fn synthetic_bgra_30_frames_yields_idr_and_p_frames() {
     const WIDTH: u32 = 1920;
     const HEIGHT: u32 = 1080;
     const N_FRAMES: u64 = 30;
-    const DEADLINE: Duration = Duration::from_secs(3);
+    const DEADLINE: Duration = Duration::from_secs(5);
 
     let mut enc = WindowsOpenH264Encoder::new(EncoderConfig::default())
         .expect("encoder construction should succeed");

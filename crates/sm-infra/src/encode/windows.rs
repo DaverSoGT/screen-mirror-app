@@ -29,8 +29,10 @@
 //! - `start(rx, tx)`: spawns one OS thread that owns `openh264::Encoder`. OpenH264 is
 //!   lazily initialised inside the thread on the first call to `encode()` — the encoder
 //!   auto-reinitialises when frame dimensions change.
-//! - `stop()`: idempotent. Sets `stop` flag, drops the receiver (unblocking `rx.recv()`
-//!   in the thread if it is blocking), then joins the handle.
+//! - `stop()`: idempotent. Sets the `stop` flag and joins the handle. NOTE: callers MUST
+//!   drop their `frame_tx` (the `SyncSender` paired with `rx`) BEFORE calling `stop()` —
+//!   otherwise the encoder thread can remain blocked on `rx.recv()` and `stop().join()`
+//!   will deadlock. The `stop` flag is only consulted between recv calls.
 //! - `Drop`: calls `stop()` if handle is still `Some` — no leaked thread on panic or
 //!   forgotten call.
 //!
@@ -94,12 +96,10 @@ pub struct WindowsOpenH264Encoder {
     state: Arc<EncoderShared>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
-    /// The input-channel receiver. Taken at `start`; stored as `None` afterwards.
-    /// Stored here so `stop` can drop it (closing the channel, unblocking `recv` in the thread).
-    ///
-    /// Note: this field is `None` before `start` and after `start` (it is moved into the thread).
-    /// The `Option` exists only to allow the type to compile — `start` moves `rx` directly into
-    /// the thread closure; we don't need to store it. See `start` implementation.
+    /// Reserved placeholder. `start()` moves `rx` directly into the thread closure;
+    /// the `Receiver` is never owned by the struct. To unblock the thread on shutdown,
+    /// callers MUST drop their `frame_tx` (the paired `SyncSender`) before calling
+    /// `stop()` — the stop flag is only consulted between recv calls.
     #[allow(dead_code)]
     _rx_placeholder: (),
 }
@@ -545,10 +545,7 @@ mod tests {
 
     #[test]
     fn windows_openh264_channel_capacity_in_valid_range() {
-        assert!(
-            ENCODE_CHANNEL_CAPACITY >= 4 && ENCODE_CHANNEL_CAPACITY <= 8,
-            "ENCODE_CHANNEL_CAPACITY must be in [4, 8], got {ENCODE_CHANNEL_CAPACITY}"
-        );
+        const { assert!(ENCODE_CHANNEL_CAPACITY >= 4 && ENCODE_CHANNEL_CAPACITY <= 8) }
     }
 
     // ─── A11: request_keyframe — does not panic when called before start ───────
