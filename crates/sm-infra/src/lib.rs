@@ -20,6 +20,6 @@
 //!   On non-Windows targets this module compiles to an empty stub.
 
 pub mod capture;
-mod encode;
+pub mod encode;
 mod signaling;
 mod transport;
