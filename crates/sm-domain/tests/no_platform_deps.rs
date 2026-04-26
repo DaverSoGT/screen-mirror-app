@@ -13,6 +13,7 @@ const BANNED: &[&str] = &[
     "windows-targets",
     "tauri",
     "wasm-bindgen",
+    "openh264", // encoder backend must stay in sm-infra (R10.2)
 ];
 
 #[test]
