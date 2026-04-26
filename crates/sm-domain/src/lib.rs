@@ -15,6 +15,8 @@
 //!
 //! - [`capture`] — port boundary for screen capture sources: trait, frame model,
 //!   error taxonomy, configuration, and monitor enumeration types.
+//! - [`encode`] — port boundary for video encoding: `VideoEncoder` trait,
+//!   `EncoderConfig`, `EncodedPacket`, `EncoderError`, and `RateControlMode`.
 
 pub mod capture;
 
@@ -28,6 +30,11 @@ pub use capture::MonitorInfo;
 pub use capture::MonitorSelector;
 pub use capture::PixelFormat;
 pub mod encode;
+pub use encode::EncodedPacket;
+pub use encode::EncoderConfig;
+pub use encode::EncoderError;
+pub use encode::RateControlMode;
+pub use encode::VideoEncoder;
 pub mod error;
 pub mod session;
 pub mod signaling;
