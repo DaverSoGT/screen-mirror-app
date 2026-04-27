@@ -155,4 +155,57 @@ mod tests {
         assert_eq!(c.dropped_segments.load(Ordering::Relaxed), 0);
         assert_eq!(c.keyframe_requests_fired.load(Ordering::Relaxed), 0);
     }
+
+    // ─── Capability B: init-segment timing guard (R9.3) ─────────────────────
+
+    /// Build an Annex-B byte stream from raw NAL slices (prepends 4-byte start codes).
+    fn make_annex_b(nals: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
+    /// B.1 — extract_sps_pps_from_idr finds SPS (NAL type 7) and PPS (NAL type 8).
+    ///
+    /// RED: extract_sps_pps_from_idr does not exist in sm-infra yet.
+    #[test]
+    fn extract_sps_pps_finds_sps_and_pps() {
+        let sps_nal = &[0x67u8, 0x42, 0xE0, 0x1E]; // nal_type = 7
+        let pps_nal = &[0x68u8, 0xCE, 0x38]; // nal_type = 8
+        let annex_b = make_annex_b(&[sps_nal, pps_nal]);
+        let result = sm_infra::render::fmp4_muxer::extract_sps_pps_from_idr(&annex_b);
+        assert!(result.is_some(), "should find SPS and PPS");
+        let (sps, pps) = result.unwrap();
+        assert_eq!(sps, sps_nal);
+        assert_eq!(pps, pps_nal);
+    }
+
+    /// B.2 — extract_sps_pps_from_idr returns None when SPS is missing.
+    #[test]
+    fn extract_sps_pps_returns_none_when_sps_missing() {
+        let pps_nal = &[0x68u8, 0xCE, 0x38];
+        let idr_nal = &[0x65u8, 0x00]; // nal_type = 5 (IDR)
+        let annex_b = make_annex_b(&[pps_nal, idr_nal]);
+        let result = sm_infra::render::fmp4_muxer::extract_sps_pps_from_idr(&annex_b);
+        assert!(result.is_none());
+    }
+
+    /// B.3 — extract_sps_pps_from_idr returns None when PPS is missing.
+    #[test]
+    fn extract_sps_pps_returns_none_when_pps_missing() {
+        let sps_nal = &[0x67u8, 0x42, 0xE0, 0x1E];
+        let annex_b = make_annex_b(&[sps_nal]);
+        let result = sm_infra::render::fmp4_muxer::extract_sps_pps_from_idr(&annex_b);
+        assert!(result.is_none());
+    }
+
+    /// B.4 — extract_sps_pps_from_idr on empty input returns None.
+    #[test]
+    fn extract_sps_pps_empty_returns_none() {
+        let result = sm_infra::render::fmp4_muxer::extract_sps_pps_from_idr(&[]);
+        assert!(result.is_none());
+    }
 }
