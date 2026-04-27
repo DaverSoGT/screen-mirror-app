@@ -147,6 +147,10 @@ pub(crate) type BuilderFn =
 /// `0..=65535`; no out-of-range case exists after `Zero` and `Privileged` are
 /// handled. If a future change adds an upper-bound forbidden range (e.g. forbid
 /// 65535), add `OutOfRange { min: u16, max: u16 }` at that time.
+///
+/// `#[allow(dead_code)]`: variants first constructed by `validate_udp_port`
+/// which lands in B3. Remove this attribute when B3 lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PortRejectReason {
     /// `value == 0` — would silently corrupt the ICE candidate (Risk #1 from
@@ -154,6 +158,63 @@ pub enum PortRejectReason {
     Zero,
     /// `1..=1023` — privileged port range; cross-platform UX guard (PQ-C).
     Privileged,
+}
+
+// ─── StartStreamError — typed error enum for start_stream (C3) ───────────────
+
+/// Typed error returned by `start_stream` (and `start_stream_inner` in B5+).
+///
+/// Tauri 2 serializes `Result<T, E>` where `E: serde::Serialize` to the JS layer.
+/// `#[serde(tag = "kind", content = "data")]` produces JSON of the form:
+///   `{"kind":"InvalidPort","data":{"value":80,"reason":"Privileged"}}`
+/// which the frontend can branch on without parsing strings (OQ-D6 resolved).
+///
+/// Design #288 §1.2; spec #287 R3.1–R3.4.
+///
+/// `#[allow(dead_code)]`: most variants are first constructed by `validate_udp_port`
+/// (B3), `validate_service_name` (B4), and `start_stream_inner` (B5). Only
+/// `BundleBuildFailed` is constructed in B2 (the return-type migration).
+/// Remove this attribute when B5 lands.
+#[allow(dead_code)]
+#[derive(Debug, thiserror::Error, serde::Serialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum StartStreamError {
+    /// A session is already active.
+    ///
+    /// Carries the args of the active session so the frontend can show
+    /// "running with port=X service=Y". Both same-args and diff-args double-start
+    /// return this variant (PQ-E: no silent ignore).
+    #[error("a stream session is already running on port {current_port} ({current_service_name})")]
+    AlreadyRunning {
+        current_port: u16,
+        current_service_name: String,
+    },
+
+    /// `udp_port` failed validation. See `PortRejectReason` for the cause.
+    #[error("invalid udp_port {value}: {reason:?}")]
+    InvalidPort {
+        value: u16,
+        reason: PortRejectReason,
+    },
+
+    /// `service_name` failed RFC 6763 validation.
+    ///
+    /// `reason` is a human-readable explanation (e.g. `"must end with '.local.'"`).
+    #[error("invalid service_name {value:?}: {reason}")]
+    InvalidServiceName { value: String, reason: String },
+
+    /// The OS-level socket bind failed (e.g. `AddrInUse` after a recent stop).
+    ///
+    /// Distinguished from `BundleBuildFailed` so the frontend can suggest
+    /// "try a different port" instead of a generic failure message.
+    #[error("UDP port {port} is already in use")]
+    PortInUse { port: u16 },
+
+    /// Catch-all for failures inside `BuilderFn` (signaling start, str0m receiver
+    /// init, drain spawn, etc.). Wraps the legacy `String` error from
+    /// `build_production_bundle`. Translated at the command boundary.
+    #[error("bundle build failed: {0}")]
+    BundleBuildFailed(String),
 }
 
 // ─── StreamBridge — Capability A ─────────────────────────────────────────────
@@ -643,11 +704,14 @@ fn build_production_bundle(stop_flag: Arc<AtomicBool>) -> Result<ReceiverBundle,
 ///
 /// Idempotent: if a session is already running, returns `Ok(())` immediately.
 /// Returns immediately — SDP/ICE handshake completes asynchronously via drain threads.
+///
+/// Return type migrated from `Result<(), String>` to `Result<(), StartStreamError>`
+/// in B2 (mechanical migration — full orchestration wiring lands in B5). (Spec R3.5)
 #[tauri::command]
 pub fn start_stream(
     bridge: tauri::State<StreamBridge>,
     channel: tauri::ipc::Channel<InvokeResponseBody>,
-) -> Result<(), String> {
+) -> Result<(), StartStreamError> {
     if bridge.is_running() {
         return Ok(()); // idempotent
     }
@@ -660,9 +724,16 @@ pub fn start_stream(
     // build_production_bundle) and the mux thread (built inside
     // build_stream_session) all share the exact same Arc.
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let bundle = build_production_bundle(stop_flag.clone())?;
+    // B2 mechanical migration: map String errors to BundleBuildFailed.
+    // B5 will replace this with the full orchestration: validate → resolve →
+    // check double-start → invoke BuilderFn → wire session.
+    let bundle =
+        build_production_bundle(stop_flag.clone()).map_err(StartStreamError::BundleBuildFailed)?;
 
-    *guard = Some(build_stream_session(channel_arc, bundle, stop_flag)?);
+    *guard = Some(
+        build_stream_session(channel_arc, bundle, stop_flag)
+            .map_err(StartStreamError::BundleBuildFailed)?,
+    );
 
     Ok(())
 }
@@ -1863,10 +1934,7 @@ mod tests {
         ];
         for err in &variants {
             let display = format!("{err}");
-            assert!(
-                !display.is_empty(),
-                "Display must be non-empty for {err:?}"
-            );
+            assert!(!display.is_empty(), "Display must be non-empty for {err:?}");
         }
     }
 
