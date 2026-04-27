@@ -4,6 +4,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Reserved for V2 Media Foundation MFT hardware decoder adapter.
+# Empty in V1 — no code is gated behind it yet.
+hw-decoder = []
+
 [dependencies]
 sm-domain = { path = "../sm-domain" }
 str0m = { version = "0.18", default-features = false, features = ["rust-crypto"] }

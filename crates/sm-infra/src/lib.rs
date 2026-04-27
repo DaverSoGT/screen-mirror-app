@@ -29,8 +29,14 @@
 //!   backed by the str0m SansIO WebRTC stack. Cross-platform, no OS gate.
 //! - [`signaling`] — Signaling adapters: `MdnsSignaling` (mDNS auto-discovery) and
 //!   `LoopbackSignaling` (in-memory fixture for tests/CI). Cross-platform.
+//! - [`decode`] — Decoder adapters (capability tier). V1: `WindowsOpenH264Decoder`
+//!   (Windows-gated). Cross-platform module root for future adapters.
+//! - [`render`] — Render-side helpers. V1: `fmp4_muxer` (fMP4 init + media segments for
+//!   the MSE hot path) and `avcc` (SPS parser + avcC box builder). Cross-platform.
 
 pub mod capture;
+pub mod decode;
 pub mod encode;
+pub mod render;
 pub mod signaling;
 pub mod transport;
