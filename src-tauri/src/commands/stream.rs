@@ -1093,6 +1093,181 @@ mod tests {
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
     }
 
+    // ─── W2-fix-B RED: signaling drain bridges offer → apply_remote_offer → publish_local_answer ──
+
+    /// B.SIG.1 — On `SignalingEvent::OfferReceived`, `run_signaling_drain` calls
+    ///            `receiver.apply_remote_offer(offer)` and then
+    ///            `signaling.publish_local_answer(answer)`.
+    ///
+    /// RED: `run_signaling_drain` does not exist yet.
+    #[test]
+    fn signaling_drain_offer_received_calls_apply_and_publish() {
+        use std::sync::mpsc::sync_channel;
+        use sm_domain::signaling::{SdpAnswer, SdpOffer, SignalingEvent};
+
+        // FakeReceiverForSig: records the offer it received and returns a canned answer.
+        struct FakeReceiverForSig {
+            last_offer: Mutex<Option<SdpOffer>>,
+        }
+        impl FakeReceiverForSig {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    last_offer: Mutex::new(None),
+                })
+            }
+        }
+        impl SignalingReceiverOps for FakeReceiverForSig {
+            fn apply_remote_offer(
+                &self,
+                offer: SdpOffer,
+            ) -> Result<SdpAnswer, TransportError> {
+                *self.last_offer.lock().unwrap() = Some(offer);
+                Ok(SdpAnswer("v=0\r\nanswer".to_string()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        // FakeSignalingForDrain: records the answer it received.
+        struct FakeSignalingForDrain {
+            last_answer: Mutex<Option<SdpAnswer>>,
+        }
+        impl FakeSignalingForDrain {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    last_answer: Mutex::new(None),
+                })
+            }
+        }
+        impl SignalingPublishOps for FakeSignalingForDrain {
+            fn publish_local_answer(
+                &self,
+                answer: SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                *self.last_answer.lock().unwrap() = Some(answer);
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+        }
+
+        let recv = FakeReceiverForSig::new();
+        let sig = FakeSignalingForDrain::new();
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Spawn the drain.
+        let recv_clone = recv.clone();
+        let sig_clone = sig.clone();
+        let stop_clone = stop_flag.clone();
+        let drain = thread::spawn(move || {
+            run_signaling_drain(ev_rx, recv_clone, sig_clone, stop_clone);
+        });
+
+        // Send an OfferReceived event.
+        let test_offer = SdpOffer("v=0\r\noffer".to_string());
+        ev_tx.send(SignalingEvent::OfferReceived(test_offer.clone())).unwrap();
+
+        // Give the drain a moment to process.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Signal drain to stop.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        drain.join().unwrap();
+
+        // Assert: receiver.apply_remote_offer was called with the correct offer.
+        let received_offer = recv.last_offer.lock().unwrap().clone();
+        assert_eq!(
+            received_offer.as_ref(),
+            Some(&test_offer),
+            "apply_remote_offer must be called with the OfferReceived offer"
+        );
+
+        // Assert: signaling.publish_local_answer was called with the canned answer.
+        let published_answer = sig.last_answer.lock().unwrap().clone();
+        assert_eq!(
+            published_answer.as_ref().map(|a| a.0.as_str()),
+            Some("v=0\r\nanswer"),
+            "publish_local_answer must be called with the answer from apply_remote_offer"
+        );
+    }
+
+    /// B.SIG.2 — On `SignalingEvent::CandidateReceived`, `run_signaling_drain`
+    ///            calls `receiver.add_remote_candidate(cand)`.
+    #[test]
+    fn signaling_drain_candidate_received_calls_add_remote_candidate() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::mpsc::sync_channel;
+        use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
+
+        struct FakeReceiverForCand {
+            cand_count: AtomicU32,
+        }
+        impl FakeReceiverForCand {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    cand_count: AtomicU32::new(0),
+                })
+            }
+        }
+        impl SignalingReceiverOps for FakeReceiverForCand {
+            fn apply_remote_offer(&self, _: SdpOffer) -> Result<SdpAnswer, TransportError> {
+                Ok(SdpAnswer("v=0".to_string()))
+            }
+            fn add_remote_candidate(&self, _: IceCandidate) -> Result<(), TransportError> {
+                self.cand_count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        struct NoopSignalingPublish;
+        impl SignalingPublishOps for NoopSignalingPublish {
+            fn publish_local_answer(&self, _: SdpAnswer) -> Result<(), sm_domain::signaling::SignalingError> { Ok(()) }
+            fn publish_local_candidate(&self, _: IceCandidate) -> Result<(), sm_domain::signaling::SignalingError> { Ok(()) }
+        }
+
+        let recv = FakeReceiverForCand::new();
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let recv_clone = recv.clone();
+        let stop_clone = stop_flag.clone();
+
+        let drain = thread::spawn(move || {
+            run_signaling_drain(ev_rx, recv_clone, Arc::new(NoopSignalingPublish), stop_clone);
+        });
+
+        ev_tx
+            .send(SignalingEvent::CandidateReceived(IceCandidate(
+                "candidate:1".to_string(),
+            )))
+            .unwrap();
+        ev_tx
+            .send(SignalingEvent::CandidateReceived(IceCandidate(
+                "candidate:2".to_string(),
+            )))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        drain.join().unwrap();
+
+        assert_eq!(
+            recv.cand_count.load(Ordering::Relaxed),
+            2,
+            "add_remote_candidate must be called once per CandidateReceived event"
+        );
+    }
+
     // ─── W2-fix-A RED: start_stream wires a real receiver (Some, not None) ─────
 
     /// Helper: build a test `ReceiverBundle` with a `FakeReceiver` and a
