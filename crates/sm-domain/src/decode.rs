@@ -184,10 +184,7 @@ pub trait VideoDecoder: Send + Sync {
     /// as `Arc<dyn VideoReceiver + Send + Sync>` so the decode thread can call
     /// `request_keyframe()` directly without a channel hop. Mirrors
     /// [`VideoSender::set_encoder`](crate::transport::VideoSender::set_encoder).
-    fn set_receiver(
-        &mut self,
-        receiver: Arc<dyn crate::transport::VideoReceiver + Send + Sync>,
-    );
+    fn set_receiver(&mut self, receiver: Arc<dyn crate::transport::VideoReceiver + Send + Sync>);
 
     /// Begin decoding. Spawns one OS thread that owns the codec backend.
     ///
@@ -365,10 +362,7 @@ mod tests {
         if let (PixelData::I420 { y: y1, .. }, PixelData::I420 { y: y2, .. }) =
             (&frame.data, &cloned.data)
         {
-            assert!(
-                Arc::ptr_eq(y1, y2),
-                "clone must not copy the y-plane bytes"
-            );
+            assert!(Arc::ptr_eq(y1, y2), "clone must not copy the y-plane bytes");
         } else {
             panic!("both frames must have I420 variant");
         }
@@ -390,10 +384,7 @@ mod tests {
         if let (PixelData::Bgra8 { data: d1, .. }, PixelData::Bgra8 { data: d2, .. }) =
             (&frame.data, &cloned.data)
         {
-            assert!(
-                Arc::ptr_eq(d1, d2),
-                "clone must not copy bgra8 data bytes"
-            );
+            assert!(Arc::ptr_eq(d1, d2), "clone must not copy bgra8 data bytes");
         } else {
             panic!("both frames must have Bgra8 variant");
         }
@@ -422,7 +413,14 @@ mod tests {
             width: 2,
             height: 2,
         };
-        if let PixelData::I420 { y, u, v, width, height } = pd {
+        if let PixelData::I420 {
+            y,
+            u,
+            v,
+            width,
+            height,
+        } = pd
+        {
             assert_eq!(y.len(), (width * height) as usize);
             assert_eq!(u.len(), ((width / 2) * (height / 2)) as usize);
             assert_eq!(v.len(), ((width / 2) * (height / 2)) as usize);
@@ -438,7 +436,12 @@ mod tests {
             width: 2,
             height: 2,
         };
-        if let PixelData::Bgra8 { data, width, height } = pd {
+        if let PixelData::Bgra8 {
+            data,
+            width,
+            height,
+        } = pd
+        {
             assert_eq!(data.len(), (width * height * 4) as usize);
         }
     }
@@ -473,7 +476,9 @@ mod tests {
     }
 
     impl crate::transport::VideoReceiver for CountingReceiver {
-        fn new(_config: crate::transport::TransportConfig) -> Result<Self, crate::transport::TransportError>
+        fn new(
+            _config: crate::transport::TransportConfig,
+        ) -> Result<Self, crate::transport::TransportError>
         where
             Self: Sized,
         {
