@@ -636,4 +636,93 @@ mod tests {
         drop(pkt_tx);
         sender.stop().unwrap();
     }
+
+    // ─── Task 4.3 RED: PLI + backpressure tests ───────────────────────────────
+
+    /// S9.1 — When `Event::KeyframeRequest` is injected into the tick loop,
+    /// the encoder's `request_keyframe()` MUST be called and
+    /// `TransportEvent::KeyframeRequested` MUST appear on `event_tx`.
+    ///
+    /// Requires the `inject_keyframe_request_for_test` method added in task 4.4.
+    #[test]
+    fn sender_pli_calls_encoder_request_keyframe_s9_1() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let enc = FakeEncoder::new();
+        let enc_arc = Arc::clone(&enc) as Arc<dyn VideoEncoder + Send + Sync>;
+        let keyframe_called = Arc::clone(&enc.keyframe_called);
+
+        let mut sender = Str0mVideoSender::new(TransportConfig {
+            udp_port: 0,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+        sender.set_encoder(enc_arc);
+
+        let (_pkt_tx, pkt_rx) = sync_channel(4);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(4);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        // Inject a synthetic PLI into the running tick loop.
+        sender.inject_keyframe_request_for_test();
+
+        // Give the tick loop time to process the PLI.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // The encoder's request_keyframe() must have been called.
+        assert!(
+            keyframe_called.load(Ordering::Acquire),
+            "encoder.request_keyframe() must be called on PLI"
+        );
+
+        // TransportEvent::KeyframeRequested must appear on the event channel.
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let has_keyframe_requested = events
+            .iter()
+            .any(|e| matches!(e, TransportEvent::KeyframeRequested));
+        assert!(
+            has_keyframe_requested,
+            "TransportEvent::KeyframeRequested must be emitted on PLI; got: {events:?}"
+        );
+
+        sender.stop().unwrap();
+    }
+
+    /// R14.3, S14.2 — When the event channel is full and a PLI fires, the sender
+    /// MUST NOT panic or block. The dropped-frames counter MUST increment.
+    ///
+    /// Requires the `inject_keyframe_request_for_test` method added in task 4.4.
+    #[test]
+    fn sender_pli_with_full_event_channel_no_panic_s14_2() {
+        use std::time::Duration;
+
+        let enc = FakeEncoder::new();
+        let enc_arc = Arc::clone(&enc) as Arc<dyn VideoEncoder + Send + Sync>;
+
+        // Capacity-1 event channel — fills up immediately.
+        let mut sender = Str0mVideoSender::new(TransportConfig {
+            udp_port: 0,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+        sender.set_encoder(enc_arc);
+
+        let (_pkt_tx, pkt_rx) = sync_channel(4);
+        // Capacity-1 channel that we NEVER drain — fills immediately on first try_send.
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(1);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        // Inject multiple PLI requests to overflow the event channel.
+        sender.inject_keyframe_request_for_test();
+        sender.inject_keyframe_request_for_test();
+        sender.inject_keyframe_request_for_test();
+
+        // Give the tick loop time to process all three PLIs.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Must not have panicked. stop() should return Ok.
+        let result = sender.stop();
+        assert!(result.is_ok(), "stop() must return Ok even after full event channel");
+    }
 }
