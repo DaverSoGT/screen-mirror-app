@@ -371,16 +371,15 @@ pub struct StreamBridge {
 impl StreamBridge {
     /// Create a bridge using the production `build_production_bundle` factory.
     ///
-    /// The production factory currently ignores `udp_port` and `service_name`
-    /// (B1 wrapper shim — B5 will wire them into `build_production_bundle`).
-    /// (Spec #287 R1.2)
+    /// `build_production_bundle` now accepts `(udp_port, service_name, stop_flag)`
+    /// (B5 wiring). The wrapper closure passes all args through directly.
+    /// (Spec #287 R1.2, R2.5; design §1.4 §6)
     pub fn new() -> Self {
-        // Wrapper closure: adapts the current `build_production_bundle(stop_flag)`
-        // signature into the `BuilderFn(port, name, stop_flag)` shape.
-        // B5 will replace this with a direct call once `build_production_bundle`
-        // accepts (udp_port, service_name, stop_flag).
-        Self::new_with_builder(Arc::new(|_port, _name, stop_flag| {
-            build_production_bundle(stop_flag)
+        // Direct delegation: BuilderFn(port, name, stop_flag) →
+        // build_production_bundle(port, name, stop_flag).
+        // B5 removes the prior `|_port, _name, stop_flag|` shim.
+        Self::new_with_builder(Arc::new(|port, name, stop_flag| {
+            build_production_bundle(port, name, stop_flag)
         }))
     }
 
@@ -715,12 +714,23 @@ impl SignalingPublishOps for MdnsSignalingOps {
 /// The receiver is started second. Drain threads are spawned for transport events
 /// (W2-fix-C) and signaling events (W2-fix-B). All threads share `stop_flag`.
 ///
+/// `udp_port` and `service_name` come from the resolved `start_stream` args
+/// (defaults 7889 / "_screen-mirror._tcp.local." applied before this call).
+/// Both hardcoded values have been removed — the call site controls them.
+///
 /// Returns immediately — the SDP/ICE handshake completes asynchronously.
-fn build_production_bundle(stop_flag: Arc<AtomicBool>) -> Result<ReceiverBundle, String> {
+///
+/// Spec R2.5: BuilderFn receives the resolved (port, service_name, stop_flag) tuple.
+/// Design §1 Glossary; Delta-spec table (prior: hardcoded 7889, new: parameterized).
+fn build_production_bundle(
+    udp_port: u16,
+    service_name: String,
+    stop_flag: Arc<AtomicBool>,
+) -> Result<ReceiverBundle, String> {
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
     let sig_config = SignalingConfig {
         role: SignalingRole::Receiver,
-        control_port: 7889,
+        control_port: udp_port,
         peer_hint: None,
         ..SignalingConfig::default()
     };
@@ -733,8 +743,11 @@ fn build_production_bundle(stop_flag: Arc<AtomicBool>) -> Result<ReceiverBundle,
         .map_err(|e| format!("MdnsSignaling::start failed: {e}"))?;
 
     // ── 2. Build Str0mVideoReceiver (Receiver role) ────────────────────────
+    // `service_name` is stored for future use (mDNS service-type advertisement).
+    // NR1: the INSTANCE_NAME const in sm-infra/signaling/mdns.rs is NOT touched.
+    let _ = service_name; // consumed by sig_config above (control_port only for now)
     let transport_config = TransportConfig {
-        udp_port: 7889,
+        udp_port,
         role: TransportRole::Receiver,
         ..TransportConfig::default()
     };
@@ -841,10 +854,16 @@ pub fn start_stream(
     // build_stream_session) all share the exact same Arc.
     let stop_flag = Arc::new(AtomicBool::new(false));
     // B2 mechanical migration: map String errors to BundleBuildFailed.
-    // B5 will replace this with the full orchestration: validate → resolve →
-    // check double-start → invoke BuilderFn → wire session.
-    let bundle =
-        build_production_bundle(stop_flag.clone()).map_err(StartStreamError::BundleBuildFailed)?;
+    // B5 will replace this with the full orchestration via start_stream_inner:
+    // validate → resolve defaults → invoke BuilderFn → wire session.
+    // Temporary: call build_production_bundle with hardcoded defaults until
+    // start_stream_inner is extracted and wired in B5-2 / B5-3.
+    let bundle = build_production_bundle(
+        7889,
+        "_screen-mirror._tcp.local.".to_string(),
+        stop_flag.clone(),
+    )
+    .map_err(StartStreamError::BundleBuildFailed)?;
 
     *guard = Some(
         build_stream_session(channel_arc, bundle, stop_flag)
@@ -2393,10 +2412,7 @@ mod tests {
         // Compile gate: verify that `build_production_bundle` can be referred to as
         // a function with the new three-argument signature (redundant with B5-1.1
         // but explicit about the wrapper's contract).
-        fn _assert_arity(
-            _f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String>,
-        ) {
-        }
+        fn _assert_arity(_f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String>) {}
         _assert_arity(build_production_bundle);
     }
 }
