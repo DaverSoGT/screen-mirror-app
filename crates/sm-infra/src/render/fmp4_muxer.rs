@@ -889,6 +889,41 @@ impl Mp4Muxer {
     }
 }
 
+// ─── SPS+PPS extractor — B7 helper ───────────────────────────────────────────
+
+/// Extract SPS (NAL type 7) and PPS (NAL type 8) bytes from an Annex-B IDR packet.
+///
+/// Called by the `sm-stream-mux` thread on the first IDR to obtain the raw SPS and PPS
+/// NAL bytes needed to call [`Mp4Muxer::build_init_segment`].
+///
+/// # Arguments
+///
+/// * `annex_b` — full Annex-B packet (e.g., `EncodedPacket::data`). May contain
+///   SPS, PPS, and IDR NAL units in any order (in practice: SPS → PPS → IDR).
+///
+/// # Returns
+///
+/// `Some((sps_nal, pps_nal))` when both NAL types are found; `None` otherwise.
+/// The returned slices are raw NAL bytes **without** Annex-B start codes.
+pub fn extract_sps_pps_from_idr(annex_b: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+    for nal in crate::transport::annex_b::iter_nal_units(annex_b) {
+        if let Some(&first) = nal.first() {
+            let nal_type = first & 0x1F;
+            match nal_type {
+                7 if sps.is_none() => sps = Some(nal.to_vec()),
+                8 if pps.is_none() => pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+        if sps.is_some() && pps.is_some() {
+            break;
+        }
+    }
+    sps.zip(pps)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
