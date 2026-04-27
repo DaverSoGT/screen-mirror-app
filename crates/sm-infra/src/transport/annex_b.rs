@@ -12,7 +12,7 @@
 //!
 //! str0m's `H264Depacketizer` with `is_avc = false` (the **default**) outputs
 //! Annex-B framing in `MediaData.data` directly — 4-byte start codes (`00 00 00 01`)
-//! prepended to each NAL. The AVCC branch in [`reconstruct_annex_b`] is kept as a
+//! prepended to each NAL. The AVCC branch in `reconstruct_annex_b` is kept as a
 //! safety net for potential future API changes but is NOT triggered in normal operation.
 //!
 //! All functions are deterministic, pure (no I/O), and fully unit-tested.
