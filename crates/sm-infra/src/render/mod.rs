@@ -4,3 +4,4 @@
 //      + `avcc` (SPS parser + AVCDecoderConfigurationRecord builder).
 
 pub mod avcc;
+pub mod fmp4_muxer;
