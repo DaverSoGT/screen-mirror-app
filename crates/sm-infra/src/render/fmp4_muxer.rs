@@ -765,6 +765,34 @@ mod tests {
     use super::*;
     use crate::render::avcc::parse_sps;
 
+    // ─── Capability F (B6): mdat box builder ───────────────────────────────
+
+    #[test]
+    fn build_mdat_wraps_payload_in_mdat_box() {
+        let payload: &[u8] = &[0x00, 0x00, 0x00, 0x03, 0x65, 0xAB, 0xCD];
+        let mdat = build_mdat(payload);
+        assert_eq!(&mdat[4..8], b"mdat", "box type must be mdat");
+        let size = u32::from_be_bytes([mdat[0], mdat[1], mdat[2], mdat[3]]) as usize;
+        assert_eq!(size, mdat.len());
+        assert_eq!(&mdat[8..], payload, "mdat payload must match input verbatim");
+    }
+
+    #[test]
+    fn build_mdat_empty_payload_produces_8_byte_box() {
+        let mdat = build_mdat(&[]);
+        assert_eq!(&mdat[4..8], b"mdat");
+        assert_eq!(mdat.len(), 8);
+    }
+
+    #[test]
+    fn build_mdat_total_size_is_8_plus_payload_len() {
+        let payload = vec![0xAAu8; 256];
+        let mdat = build_mdat(&payload);
+        assert_eq!(mdat.len(), 8 + 256);
+        let size = u32::from_be_bytes([mdat[0], mdat[1], mdat[2], mdat[3]]) as usize;
+        assert_eq!(size, 8 + 256);
+    }
+
     // ─── Capability A (B6): annex_b_to_avcc ────────────────────────────────
 
     #[test]
