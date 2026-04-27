@@ -819,6 +819,57 @@ fn build_production_bundle(
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
 
+/// Core of `start_stream` — extracted for unit testing without the Tauri runtime.
+///
+/// `bridge` is a plain reference (not `tauri::State`) so unit tests can call it
+/// directly. `channel` is an `Arc<dyn ChannelLike>` — production code wraps the
+/// Tauri `Channel<InvokeResponseBody>` in `TauriChannel`; tests use `FakeChannel`.
+///
+/// `udp_port` and `service_name` accept `Option<_>` — `None` resolves to the
+/// respective default. Validation and default-resolution both live here (B5-3 wires
+/// them; for B5-2 this function is extracted with the existing pre-B5 logic).
+///
+/// Design §10 OQ-A2 (option a): `pub(crate)` so the `#[tauri::command]` wrapper is
+/// a thin 4-line forwarder and tests exercise the same code path.
+///
+/// NOTE (B5 intermediate state): `udp_port` and `service_name` args are accepted but
+/// validation + default-resolution are wired in B5-3. The existing `is_running()`
+/// early-return is PRESERVED here per the Anti-Scope-Creep Guard — B6 replaces it
+/// with the `AlreadyRunning` payload from `current_args`.
+pub(crate) fn start_stream_inner(
+    bridge: &StreamBridge,
+    channel: Arc<dyn ChannelLike>,
+    udp_port: Option<u16>,
+    service_name: Option<String>,
+) -> Result<(), StartStreamError> {
+    // B5 intermediate: idempotent early-return preserved (B6 will replace with AlreadyRunning).
+    if bridge.is_running() {
+        return Ok(());
+    }
+    let mut guard = bridge.session.lock().unwrap();
+
+    // Resolve defaults (B5-3 wires validators before this step).
+    let resolved_port = udp_port.unwrap_or(7889);
+    let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
+
+    // Clone the builder Arc (cheap atomic increment) so no borrow of bridge.builder
+    // is held during the (potentially slow) build call (design §6, OQ-D1).
+    let builder = bridge.builder.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let bundle = match (builder)(resolved_port, resolved_name, stop_flag.clone()) {
+        Ok(b) => b,
+        Err(e) => return Err(StartStreamError::BundleBuildFailed(e)),
+    };
+
+    *guard = Some(
+        build_stream_session(channel, bundle, stop_flag)
+            .map_err(StartStreamError::BundleBuildFailed)?,
+    );
+
+    Ok(())
+}
+
 /// Start the streaming session.
 ///
 /// Accepts a `Channel<InvokeResponseBody>` from the frontend (OQ-tauri-emit-1 pivot).
@@ -834,43 +885,16 @@ fn build_production_bundle(
 /// Idempotent: if a session is already running, returns `Ok(())` immediately.
 /// Returns immediately — SDP/ICE handshake completes asynchronously via drain threads.
 ///
-/// Return type migrated from `Result<(), String>` to `Result<(), StartStreamError>`
-/// in B2 (mechanical migration — full orchestration wiring lands in B5). (Spec R3.5)
+/// Thin wrapper over `start_stream_inner` (extracted in B5-2 per design §10 OQ-A2).
+/// `udp_port` and `service_name` args are wired in B5-3.
+/// Return type: `Result<(), StartStreamError>` (migrated from `Result<(), String>` in B2).
 #[tauri::command]
 pub fn start_stream(
     bridge: tauri::State<StreamBridge>,
     channel: tauri::ipc::Channel<InvokeResponseBody>,
 ) -> Result<(), StartStreamError> {
-    if bridge.is_running() {
-        return Ok(()); // idempotent
-    }
-    let mut guard = bridge.session.lock().unwrap();
-
-    // Wrap the Tauri channel in Arc<dyn ChannelLike> — cloned into the mux thread.
     let channel_arc: Arc<dyn ChannelLike> = Arc::new(TauriChannel(channel.clone()));
-
-    // Pre-allocate the stop_flag so that drain threads (built inside
-    // build_production_bundle) and the mux thread (built inside
-    // build_stream_session) all share the exact same Arc.
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    // B2 mechanical migration: map String errors to BundleBuildFailed.
-    // B5 will replace this with the full orchestration via start_stream_inner:
-    // validate → resolve defaults → invoke BuilderFn → wire session.
-    // Temporary: call build_production_bundle with hardcoded defaults until
-    // start_stream_inner is extracted and wired in B5-2 / B5-3.
-    let bundle = build_production_bundle(
-        7889,
-        "_screen-mirror._tcp.local.".to_string(),
-        stop_flag.clone(),
-    )
-    .map_err(StartStreamError::BundleBuildFailed)?;
-
-    *guard = Some(
-        build_stream_session(channel_arc, bundle, stop_flag)
-            .map_err(StartStreamError::BundleBuildFailed)?,
-    );
-
-    Ok(())
+    start_stream_inner(&bridge, channel_arc, None, None)
 }
 
 /// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
@@ -2447,7 +2471,10 @@ mod tests {
 
         // RED: start_stream_inner does not exist yet.
         let result = start_stream_inner(&bridge, channel, None, None);
-        assert!(result.is_ok(), "start_stream_inner must return Ok(()) for default args: {result:?}");
+        assert!(
+            result.is_ok(),
+            "start_stream_inner must return Ok(()) for default args: {result:?}"
+        );
 
         // After a successful call, builder was invoked.
         let calls = probe.lock().unwrap();
@@ -2475,6 +2502,9 @@ mod tests {
         start_stream_inner(&bridge, channel, None, None).unwrap();
 
         // Session must be populated.
-        assert!(bridge.is_running(), "bridge must be running after start_stream_inner succeeds");
+        assert!(
+            bridge.is_running(),
+            "bridge must be running after start_stream_inner succeeds"
+        );
     }
 }
