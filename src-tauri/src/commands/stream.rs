@@ -3511,4 +3511,22 @@ mod tests {
             "current_args must be None after stop_stream_session, got {args:?}"
         );
     }
+
+    // ─── B3.T1 RED: BundleError enum exists and displays correctly (R2.1, R2.2) ──
+
+    #[test]
+    fn bundle_error_enum_exists_and_displays() {
+        let port_err = BundleError::PortInUse(7889);
+        let other_err = BundleError::Other("fail".to_string());
+        assert_eq!(
+            format!("{port_err}"),
+            "UDP port 7889 already in use",
+            "PortInUse Display must be 'UDP port 7889 already in use'"
+        );
+        assert_eq!(
+            format!("{other_err}"),
+            "bundle build failed: fail",
+            "Other Display must be 'bundle build failed: fail'"
+        );
+    }
 }
