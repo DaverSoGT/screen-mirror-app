@@ -29,7 +29,26 @@ use std::time::{Duration, Instant};
 use sm_domain::encode::EncodedPacket;
 use sm_domain::transport::{TRANSPORT_CHANNEL_CAPACITY, TransportError};
 use sm_infra::render::fmp4_muxer::{Mp4Muxer, extract_sps_pps_from_idr};
+use tauri::ipc::InvokeResponseBody;
 use tauri::Emitter;
+
+// ─── Frame discriminants ──────────────────────────────────────────────────────
+
+/// Byte 0 of a raw channel frame identifying the payload type.
+pub(crate) const FRAME_INIT: u8 = 0x00;
+/// Byte 0 of a raw channel frame identifying a media segment.
+pub(crate) const FRAME_SEGMENT: u8 = 0x01;
+
+// ─── ChannelLike — abstraction over tauri::ipc::Channel for testability ──────
+
+/// Minimal interface over a binary streaming channel.
+///
+/// Production impl wraps `tauri::ipc::Channel<InvokeResponseBody>` (Clone,
+/// Send + Sync). Test impl (`FakeChannel`) captures bytes in a `Mutex<Vec<_>>`.
+pub(crate) trait ChannelLike: Send + Sync {
+    /// Send a raw frame. `discriminant` is byte 0 (`FRAME_INIT` or `FRAME_SEGMENT`).
+    fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String>;
+}
 
 // ─── Diagnostics ─────────────────────────────────────────────────────────────
 
@@ -418,9 +437,52 @@ mod tests {
         }
     }
 
+    // ─── FakeChannel: captures raw frames for assertions ─────────────────────
+
+    /// Fake channel that captures all raw frames sent through it.
+    struct FakeChannel {
+        frames: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl FakeChannel {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                frames: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Returns all captured frames (cloned).
+        fn captured(&self) -> Vec<Vec<u8>> {
+            self.frames.lock().unwrap().clone()
+        }
+
+        /// Returns true if any captured frame starts with the given discriminant.
+        fn has_discriminant(&self, disc: u8) -> bool {
+            self.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| f.first() == Some(&disc))
+        }
+    }
+
+    impl ChannelLike for FakeChannel {
+        fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String> {
+            let mut frame = Vec::with_capacity(1 + bytes.len());
+            frame.push(discriminant);
+            frame.extend(bytes);
+            self.frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
     // ─── Helper: build a StreamBridge with an active session ─────────────────
 
     fn make_bridge_with_session() -> StreamBridge {
+        make_bridge_with_channel(FakeChannel::new())
+    }
+
+    fn make_bridge_with_channel(channel: Arc<dyn ChannelLike>) -> StreamBridge {
         let bridge = StreamBridge::new();
         let counters = Arc::new(BridgeCounters::default());
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -432,9 +494,42 @@ mod tests {
                 counters,
                 receiver: Some(Box::new(FakeReceiver::new())),
                 last_pli: None,
+                channel, // RED: StreamSession does not yet have this field
             });
         }
         bridge
+    }
+
+    // ─── F-fix-1 RED: bridge holds ChannelLike ───────────────────────────────
+
+    /// F1.1 — FakeChannel captures frames with correct discriminant byte.
+    #[test]
+    fn fake_channel_captures_init_discriminant() {
+        let ch = FakeChannel::new();
+        ch.send_raw(FRAME_INIT, vec![0xAA, 0xBB]).unwrap();
+        let frames = ch.captured();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0], FRAME_INIT);
+        assert_eq!(&frames[0][1..], &[0xAA, 0xBB]);
+    }
+
+    /// F1.2 — FakeChannel captures segment discriminant correctly.
+    #[test]
+    fn fake_channel_captures_segment_discriminant() {
+        let ch = FakeChannel::new();
+        ch.send_raw(FRAME_SEGMENT, vec![0x01, 0x02, 0x03]).unwrap();
+        assert!(ch.has_discriminant(FRAME_SEGMENT));
+        let frames = ch.captured();
+        assert_eq!(frames[0][0], FRAME_SEGMENT);
+        assert_eq!(&frames[0][1..], &[0x01, 0x02, 0x03]);
+    }
+
+    /// F1.3 — StreamSession can be constructed with a FakeChannel.
+    #[test]
+    fn stream_session_holds_channel_like() {
+        let ch = FakeChannel::new();
+        let bridge = make_bridge_with_channel(ch.clone());
+        assert!(bridge.is_running());
     }
 
     // ─── Capability A: bridge state container ────────────────────────────────
