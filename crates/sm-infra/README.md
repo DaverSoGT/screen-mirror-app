@@ -110,6 +110,81 @@ if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
 This ensures the test exits cleanly on Windows Server Core, headless CI, or
 Windows 10 < 1903 without a panic.
 
+## Transport & Signaling
+
+The `transport` module (`Str0mVideoSender`, `Str0mVideoReceiver`) and the
+`signaling` module (`MdnsSignaling`, `LoopbackSignaling`) deliver the WebRTC
+media link landed by the `transport-webrtc-str0m` change. The transport stack
+is cross-platform (str0m + RustCrypto + mdns-sd, no OS-specific gates).
+
+### Running transport tests
+
+Non-ignored unit + integration tests run as part of the standard workspace
+suite:
+
+```sh
+cargo nextest run -p sm-infra
+```
+
+This covers the loopback signaling fixture, Annex-B helpers, str0m sender /
+receiver lifecycle, and the `transport_loopback` integration tests that do NOT
+require live DTLS (e.g. ICE connectivity, lifecycle, dropped-frame observability).
+
+To run only transport-related integration tests:
+
+```sh
+cargo nextest run -p sm-infra --tests transport_loopback
+```
+
+### Running ignored transport / signaling tests
+
+Three transport / signaling tests are `#[ignore]` because they need either mDNS
+multicast or a complete DTLS handshake to pass deterministically. Run them all
+on a Windows or Linux host with multicast support:
+
+```sh
+cargo nextest run -p sm-infra --run-ignored only
+```
+
+| Test | File | Why `#[ignore]` |
+|------|------|----------------|
+| `mdns_signaling_pair_round_trip` | `src/signaling/mdns.rs` | Requires mDNS multicast on the loopback / LAN interface; CI runners frequently disable multicast. |
+| `transport_loopback_media_flow_end_to_end` | `tests/transport_loopback.rs` | Requires str0m's DTLS handshake to complete; verifies `Str0mVideoSender` → `Str0mVideoReceiver` actually delivers `EncodedPacket`s over loopback UDP. |
+| `transport_loopback_rtcp_pli_reaches_encoder` | `tests/transport_loopback.rs` | Same DTLS prerequisite + receiver-side `request_keyframe()` must reach the sender's encoder. |
+
+### Composability smoke example (`crates/sm-infra/examples/transport_smoke.rs`)
+
+End-to-end smoke that wires `Str0mVideoSender` ↔ loopback UDP ↔
+`Str0mVideoReceiver` with `LoopbackSignaling` for SDP / ICE exchange. Pumps
+synthetic Annex-B IDR frames at ~30 fps for 5 s and asserts that at least one
+keyframe is received on the far side.
+
+```sh
+cargo run -p sm-infra --example transport_smoke
+```
+
+Expected output: ICE connects within ~1 s, ~150 keyframes received over
+loopback UDP, no panics on shutdown.
+
+### mDNS LAN smoke (deferred — requires hardware)
+
+Task 7.6 from the original change calls for a LAN smoke between two physical
+machines (one publisher, one subscriber) over real mDNS. This is NOT
+automatable in CI and is documented here for manual verification:
+
+1. Build on machine A: `cargo build -p sm-infra --example transport_smoke`.
+2. Build on machine B: same command.
+3. Adapt `examples/transport_smoke.rs` to use `MdnsSignaling` instead of
+   `LoopbackSignaling` and split the example into "publisher" and "subscriber"
+   roles.
+4. Run the publisher on machine A and the subscriber on machine B (same VLAN,
+   multicast permitted).
+5. Verify the subscriber sees `TransportEvent::Connected` and at least one
+   `EncodedPacket { is_keyframe: true, .. }` within 10 s.
+
+This validates the real-world mDNS discovery path that the unit / integration
+tests stub out for determinism.
+
 ## Local Windows clippy
 
 CI runs clippy on Ubuntu only (tracked as follow-up change `ci-windows-clippy`).
