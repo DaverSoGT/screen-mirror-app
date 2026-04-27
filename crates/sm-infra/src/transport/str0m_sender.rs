@@ -907,6 +907,26 @@ mod tests {
         sender.stop().unwrap();
     }
 
+    /// R9.3 / S9.3 — `start()` MUST return `Err(InvalidConfig)` if no encoder was set.
+    #[test]
+    fn str0m_sender_start_without_encoder_returns_invalid_config_s9_3() {
+        let mut sender = Str0mVideoSender::new(TransportConfig {
+            udp_port: 0,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+        // Note: NO set_encoder() call.
+
+        let (_pkt_tx, pkt_rx) = sync_channel(4);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+
+        let result = sender.start(pkt_rx, event_tx);
+        assert!(
+            matches!(result, Err(TransportError::InvalidConfig(_))),
+            "start() without prior set_encoder() must return Err(InvalidConfig), got: {result:?}"
+        );
+    }
+
     /// R14.3, S14.2 — When the event channel is full and a PLI fires, the sender
     /// MUST NOT panic or block.
     #[test]
