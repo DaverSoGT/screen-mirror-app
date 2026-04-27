@@ -874,6 +874,63 @@ mod tests {
         assert_ne!(flags & 0x000004, 0, "first_sample_flags_present bit must be set for IDR");
     }
 
+    // ─── Capability E (B6): moof + traf hierarchy assembler ────────────────
+
+    #[test]
+    fn build_moof_contains_moof_mfhd_traf_tfhd_tfdt_trun_tags() {
+        let samples = vec![make_sample(100)];
+        let moof = build_moof(1, 0, &samples, 0);
+        let required: &[&[u8; 4]] = &[b"moof", b"mfhd", b"traf", b"tfhd", b"tfdt", b"trun"];
+        for tag in required {
+            assert!(
+                moof.windows(4).any(|w| w == &tag[..]),
+                "moof must contain box tag {:?}",
+                std::str::from_utf8(*tag).unwrap_or("<non-utf8>")
+            );
+        }
+    }
+
+    #[test]
+    fn build_moof_mfhd_sequence_number_is_correct() {
+        let samples = vec![make_sample(10)];
+        let moof = build_moof(7, 0, &samples, 0);
+        let mfhd_pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
+        // mfhd full-box: [size:4][tag:4][v+f:4][seq_num:4]
+        // After tag: v+f at +4, seq at +8
+        let seq_offset = mfhd_pos + 4 + 4; // skip version+flags
+        let seq = u32::from_be_bytes([
+            moof[seq_offset],
+            moof[seq_offset + 1],
+            moof[seq_offset + 2],
+            moof[seq_offset + 3],
+        ]);
+        assert_eq!(seq, 7, "mfhd.sequence_number must match input");
+    }
+
+    #[test]
+    fn build_moof_sequence_numbers_increment_across_calls() {
+        let samples = vec![make_sample(50)];
+        let moof1 = build_moof(1, 0, &samples, 0);
+        let moof2 = build_moof(2, 0, &samples, 0);
+        let moof3 = build_moof(3, 0, &samples, 0);
+
+        fn extract_seq(moof: &[u8]) -> u32 {
+            let pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
+            let off = pos + 4 + 4;
+            u32::from_be_bytes([moof[off], moof[off + 1], moof[off + 2], moof[off + 3]])
+        }
+        assert_eq!(extract_seq(&moof1), 1);
+        assert_eq!(extract_seq(&moof2), 2);
+        assert_eq!(extract_seq(&moof3), 3);
+    }
+
+    #[test]
+    fn build_moof_starts_with_moof_box() {
+        let samples = vec![make_sample(100)];
+        let moof = build_moof(1, 0, &samples, 0);
+        assert_eq!(&moof[4..8], b"moof", "first box tag must be moof");
+    }
+
     #[test]
     fn annex_b_to_avcc_preserves_nal_payload_bytes() {
         // Payload bytes after length prefix must match original NAL body.
