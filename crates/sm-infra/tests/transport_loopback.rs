@@ -36,14 +36,14 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::Duration;
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, VideoEncoder};
-use sm_domain::signaling::{
-    IceCandidate, Signaling, SignalingEvent, SignalingRole,
+use sm_domain::signaling::{IceCandidate, Signaling, SignalingEvent, SignalingRole};
+use sm_domain::transport::{
+    TransportConfig, TransportEvent, TransportRole, VideoReceiver, VideoSender,
 };
-use sm_domain::transport::{TransportConfig, TransportEvent, TransportRole, VideoReceiver, VideoSender};
 use sm_infra::signaling::loopback::LoopbackSignaling;
 use sm_infra::transport::{Str0mVideoReceiver, Str0mVideoSender};
 
@@ -57,6 +57,7 @@ struct FakeLoopbackEncoder {
     keyframe_called: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
     /// When `Some`, the start() call will pump synthetic packets onto this channel.
+    #[allow(dead_code)]
     pkt_tx: Option<std::sync::mpsc::SyncSender<EncodedPacket>>,
 }
 
@@ -126,10 +127,9 @@ fn synthetic_idr_frame() -> Arc<[u8]> {
 }
 
 /// Build a minimal P-frame Annex-B payload (NAL type 1 = 0x41).
+#[allow(dead_code)]
 fn synthetic_p_frame() -> Arc<[u8]> {
-    Arc::from(
-        [0x00u8, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x20].as_slice(),
-    )
+    Arc::from([0x00u8, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x20].as_slice())
 }
 
 // ─── Helper: perform the full loopback signaling exchange ────────────────────
@@ -142,6 +142,7 @@ fn synthetic_p_frame() -> Arc<[u8]> {
 ///
 /// This function blocks for at most `timeout` waiting for events on the signaling
 /// channels before declaring failure.
+#[allow(dead_code)]
 fn perform_signaling_exchange(
     sender: &Str0mVideoSender,
     receiver: &mut Str0mVideoReceiver,
@@ -217,7 +218,7 @@ fn transport_loopback_signaling_exchange_completes() {
     })
     .expect("sender new must succeed");
 
-    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+    let receiver = Str0mVideoReceiver::new(TransportConfig {
         udp_port: 0,
         role: TransportRole::Receiver,
         ..TransportConfig::default()
@@ -350,7 +351,11 @@ fn transport_loopback_sender_receiver_start_stop() {
     std::thread::sleep(Duration::from_millis(20));
 
     // Sender must report dropped_frames() = 0 (no packets sent yet).
-    assert_eq!(sender.dropped_frames(), 0, "sender dropped_frames must be 0");
+    assert_eq!(
+        sender.dropped_frames(),
+        0,
+        "sender dropped_frames must be 0"
+    );
     // Receiver must report dropped_frames() = 0 (no packets received yet).
     assert_eq!(
         receiver.dropped_frames(),
@@ -395,7 +400,11 @@ fn transport_loopback_dropped_frames_observable() {
     .expect("receiver new");
 
     // Before start: dropped_frames() must be 0.
-    assert_eq!(sender.dropped_frames(), 0, "sender pre-start dropped must be 0");
+    assert_eq!(
+        sender.dropped_frames(),
+        0,
+        "sender pre-start dropped must be 0"
+    );
     assert_eq!(
         receiver.dropped_frames(),
         0,
@@ -410,7 +419,9 @@ fn transport_loopback_dropped_frames_observable() {
     let (receiver_event_tx, _) = sync_channel::<TransportEvent>(4);
 
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
-    receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
 
     // Send a few synthetic packets. Pre-negotiation, they will be dropped by
     // the sender tick loop (ICE/DTLS not ready). dropped_frames() must increase
@@ -465,7 +476,9 @@ fn transport_loopback_stop_is_idempotent() {
     let (receiver_event_tx, _) = sync_channel::<TransportEvent>(4);
 
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
-    receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
 
     drop(pkt_tx);
 
@@ -494,7 +507,7 @@ fn transport_loopback_full_wire_up_no_error() {
     let (mut sender_sig, mut receiver_sig) =
         LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
 
-    let (sender_sig_event_tx, sender_sig_event_rx) = sync_channel::<SignalingEvent>(8);
+    let (sender_sig_event_tx, _sender_sig_event_rx) = sync_channel::<SignalingEvent>(8);
     let (receiver_sig_event_tx, receiver_sig_event_rx) = sync_channel::<SignalingEvent>(8);
 
     sender_sig.start(sender_sig_event_tx).unwrap();
@@ -534,7 +547,9 @@ fn transport_loopback_full_wire_up_no_error() {
     let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
 
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
-    receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
 
     // Now send the answer to the sender via the control inbox (post-start path).
     sender
@@ -664,7 +679,9 @@ fn transport_loopback_media_flow_end_to_end() {
     let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
 
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
-    receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
 
     sender.apply_remote_answer(answer).expect("apply answer");
 
@@ -718,7 +735,9 @@ fn transport_loopback_media_flow_end_to_end() {
     );
 
     // Assert 3: request_keyframe() reaches encoder via RTCP PLI.
-    receiver.request_keyframe().expect("request_keyframe must succeed");
+    receiver
+        .request_keyframe()
+        .expect("request_keyframe must succeed");
     std::thread::sleep(Duration::from_secs(2));
     assert!(
         keyframe_called.load(Ordering::Acquire),
@@ -801,7 +820,9 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
     let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
 
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
-    receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
 
     // Step 4: Retrieve effective local addresses from both adapters.
     let sender_addr = sender
@@ -816,10 +837,10 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
 
     // Step 6: Exchange ICE candidates — tell each peer where the other is listening.
     // str0m's Candidate implements serde::Serialize, so we JSON-serialize the candidate.
-    let sender_candidate = str0m::Candidate::host(sender_addr, "udp")
-        .expect("sender host candidate");
-    let receiver_candidate = str0m::Candidate::host(receiver_addr, "udp")
-        .expect("receiver host candidate");
+    let sender_candidate =
+        str0m::Candidate::host(sender_addr, "udp").expect("sender host candidate");
+    let receiver_candidate =
+        str0m::Candidate::host(receiver_addr, "udp").expect("receiver host candidate");
 
     let sender_cand_json =
         serde_json::to_string(&sender_candidate).expect("serialise sender candidate");

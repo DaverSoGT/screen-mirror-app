@@ -34,6 +34,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use str0m::change::SdpPendingOffer;
+use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
@@ -469,19 +470,37 @@ fn run_sender_loop(
         }
 
         // ── 3. Drain encoded packets and write to str0m ───────────────────
-        // Only write if we have a valid mid and pt (post-negotiation).
-        if let (Some(mid), Some(pt)) = (pre_neg.mid, pre_neg.pt) {
+        // Only write if we have a valid mid (post-negotiation).
+        // The payload type (pt) is resolved lazily from the writer's
+        // payload_params() to handle the case where MediaAdded fires
+        // before or after the first write attempt.
+        if let Some(mid) = pre_neg.mid {
             while let Ok(pkt) = rx.try_recv() {
-                let rtp_ts = duration_to_90khz(pkt.timestamp);
-                let rtp_time = MediaTime::from_90khz(rtp_ts);
-                let wallclock = Instant::now();
-
-                if let Some(writer) = rtc.writer(mid) {
-                    // Pass the entire Annex-B frame. str0m's H264Packetizer
-                    // handles start-code stripping, FU-A fragmentation, SRTP.
-                    if let Err(_e) = writer.write(pt, wallclock, rtp_time, pkt.data.as_ref()) {
-                        state.dropped.fetch_add(1, Ordering::Relaxed);
+                // Resolve H264 PT lazily if not yet known.
+                if pre_neg.pt.is_none() {
+                    if let Some(writer) = rtc.writer(mid) {
+                        pre_neg.pt = writer
+                            .payload_params()
+                            .find(|p| p.spec().codec == Codec::H264)
+                            .map(|p| p.pt());
                     }
+                }
+
+                if let Some(pt) = pre_neg.pt {
+                    let rtp_ts = duration_to_90khz(pkt.timestamp);
+                    let rtp_time = MediaTime::from_90khz(rtp_ts);
+                    let wallclock = Instant::now();
+
+                    if let Some(writer) = rtc.writer(mid) {
+                        // Pass the entire Annex-B frame. str0m's H264Packetizer
+                        // handles start-code stripping, FU-A fragmentation, SRTP.
+                        if let Err(_e) = writer.write(pt, wallclock, rtp_time, pkt.data.as_ref()) {
+                            state.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                } else {
+                    // PT not yet resolved — drop this packet (pre-DTLS).
+                    state.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
         } else {
@@ -499,14 +518,12 @@ fn run_sender_loop(
                     let _ = udp.send_to(&t.contents, t.destination);
                 }
                 Ok(Output::Event(ev)) => {
-                    // Capture mid/pt from MediaAdded event.
+                    // Capture mid from MediaAdded; resolve PT lazily in the write path.
+                    // `MediaAdded` fires once SDP negotiation is complete. We store the
+                    // mid here so the packet write path knows when to start trying to
+                    // resolve the payload type.
                     if let Event::MediaAdded(ref added) = ev {
-                        if pre_neg.pt.is_none() {
-                            // Find H264 PT from the session's codec config.
-                            // The mid is already stored; get the payload type.
-                            pre_neg.mid = Some(added.mid);
-                            // pt resolution deferred to next writer call.
-                        }
+                        pre_neg.mid = Some(added.mid);
                     }
                     handle_sender_event(ev, &state, &encoder, &event_tx);
                 }
