@@ -3,8 +3,84 @@
 // This is the inverse of `crates/sm-infra/src/encode/bgra_to_i420.rs`.
 // No cfg gate — pure Rust, cross-platform: Linux/macOS CI catches regressions
 // before any Windows machine sees them.
-//
-// Implementation: see `convert` below (added in GREEN pass).
+
+/// Convert planar I420 (YUV 4:2:0) to packed BGRA8 in-place.
+///
+/// # Parameters
+///
+/// - `y`      — Y (luma) plane; must be exactly `width × height` bytes.
+/// - `u`      — U (Cb) plane; must be exactly `(width/2) × (height/2)` bytes
+///              (integer division — no padding).
+/// - `v`      — V (Cr) plane; same size as `u`.
+/// - `width`  — frame width in pixels.
+/// - `height` — frame height in pixels.
+/// - `dst`    — output buffer; MUST be exactly `width * height * 4` bytes.
+///              Output byte order per pixel: `[B, G, R, A]` (A = 255 opaque).
+///
+/// # Panics
+///
+/// Panics if `dst.len() != width * height * 4`.
+///
+/// # Color space
+///
+/// BT.601 limited-range (studio swing, matching [`crate::encode::bgra_to_i420`]):
+///
+/// ```text
+/// R = clamp((298*(Y-16) + 409*(V-128)                        + 128) >> 8, 0, 255)
+/// G = clamp((298*(Y-16) - 100*(U-128) - 208*(V-128)          + 128) >> 8, 0, 255)
+/// B = clamp((298*(Y-16) + 516*(U-128)                        + 128) >> 8, 0, 255)
+/// ```
+///
+/// The integer scaling factor of 256 (× 256 base, `>> 8` at the end) mirrors the
+/// forward transform in `bgra_to_i420`, enabling a lossless cross-module
+/// coefficient audit.
+///
+/// # Round-trip fidelity
+///
+/// For any BGRA pixel, the round-trip `BGRA → I420 → BGRA` is within ±2 per
+/// channel due to BT.601 quantization and chroma subsampling (R4.5).
+pub fn convert(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32, dst: &mut [u8]) {
+    let w = width as usize;
+    let h = height as usize;
+    let expected_dst = w * h * 4;
+    assert_eq!(
+        dst.len(),
+        expected_dst,
+        "dst.len()={} but expected width*height*4={}",
+        dst.len(),
+        expected_dst
+    );
+
+    // I420 chroma planes use integer-division stride (no padding).
+    let chroma_w = w / 2;
+
+    for row in 0..h {
+        for col in 0..w {
+            let y_val = y[row * w + col] as i32;
+            let u_val = u[(row / 2) * chroma_w + (col / 2)] as i32;
+            let v_val = v[(row / 2) * chroma_w + (col / 2)] as i32;
+
+            // BT.601 limited-range inverse (integer fixed-point, scale × 256, shift >> 8).
+            // Coefficients (all × 256):
+            //   298 ≈ 1.164 × 256  (Y contribution)
+            //   409 ≈ 1.596 × 256  (V → R)
+            //   100 ≈ 0.391 × 256  (U → G, negative)
+            //   208 ≈ 0.813 × 256  (V → G, negative)
+            //   516 ≈ 2.018 × 256  (U → B)
+            let c = 298 * (y_val - 16);
+            let r = ((c + 409 * (v_val - 128) + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((c - 100 * (u_val - 128) - 208 * (v_val - 128) + 128) >> 8).clamp(0, 255)
+                as u8;
+            let b = ((c + 516 * (u_val - 128) + 128) >> 8).clamp(0, 255) as u8;
+
+            let px = (row * w + col) * 4;
+            dst[px] = b;
+            dst[px + 1] = g;
+            dst[px + 2] = r;
+            dst[px + 3] = 0xFF;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
