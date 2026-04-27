@@ -17,12 +17,6 @@
 //!
 //! All functions are deterministic, pure (no I/O), and fully unit-tested.
 
-// ─── Lint configuration ──────────────────────────────────────────────────────
-// These functions are pub(crate) helpers consumed by str0m_sender and
-// str0m_receiver (tasks 4.4 and 4.6). The allow is removed once those modules
-// import the helpers and clippy can verify end-to-end usage.
-#![allow(dead_code)]
-
 // ─── Start-code detection ────────────────────────────────────────────────────
 
 /// Location and length of an Annex-B start code in a byte slice.
