@@ -3090,4 +3090,108 @@ mod tests {
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
     }
+
+    // ─── B6-3 RED: stop_stream_session clears current_args ───────────────────────
+
+    /// B6-3 / T7.9 — start → stop → start with DIFFERENT args → second start
+    ///                returns `Ok(())`.
+    ///
+    /// Spec R6.7: "After stop_stream_session, a subsequent start_stream with any
+    /// valid args MUST succeed (assuming no other session is active)."
+    /// Spec R6.3: `stop_stream_session` MUST clear `current_args` to `None`.
+    ///
+    /// RED: `stop_stream_session` currently does NOT clear `current_args`, so the
+    /// second `start_stream_inner` call will see `Some((old_port, old_name))` and
+    /// return `Err(AlreadyRunning)` instead of `Ok(())`.
+    #[test]
+    fn test_stop_clears_current_args_and_second_start_succeeds() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // Step 1: start with port 7889.
+        start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+            .expect("first start must succeed");
+
+        // Step 2: stop.
+        stop_stream_session(&bridge);
+
+        // Step 3: verify current_args is None after stop.
+        let args = bridge.current_args.lock().unwrap();
+        assert!(
+            args.is_none(),
+            "current_args must be None after stop_stream_session, got {args:?}"
+        );
+        drop(args);
+
+        // Step 4: start with DIFFERENT args (7900).
+        // Must return Ok(()) — stop cleared the state so no AlreadyRunning.
+        start_stream_inner(
+            &bridge,
+            channel.clone(),
+            Some(7900),
+            Some("_other-service._tcp.local.".to_string()),
+        )
+        .expect("second start with different args must succeed after stop");
+
+        // Step 5: verify current_args is updated to the new args.
+        let args = bridge.current_args.lock().unwrap();
+        assert_eq!(
+            *args,
+            Some((7900u16, "_other-service._tcp.local.".to_string())),
+            "current_args must reflect the new args after the second successful start"
+        );
+    }
+
+    /// B6-3 extra — `stop_stream_session` on an active session sets
+    ///               `bridge.current_args` to `None` immediately on return.
+    ///
+    /// Spec R6.3: "When stop_stream_session completes successfully, current_args
+    /// MUST be cleared to None."
+    ///
+    /// RED: `stop_stream_session` does not clear `current_args`.
+    #[test]
+    fn test_stop_stream_session_clears_current_args() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // Start to populate current_args.
+        start_stream_inner(&bridge, channel, Some(7889), None)
+            .expect("start must succeed to populate current_args");
+
+        // Verify current_args is populated before stop.
+        assert!(
+            bridge.current_args.lock().unwrap().is_some(),
+            "current_args must be Some before stop"
+        );
+
+        // Stop.
+        stop_stream_session(&bridge);
+
+        // Verify current_args is cleared after stop.
+        let args = bridge.current_args.lock().unwrap();
+        assert!(
+            args.is_none(),
+            "current_args must be None after stop_stream_session, got {args:?}"
+        );
+    }
 }
