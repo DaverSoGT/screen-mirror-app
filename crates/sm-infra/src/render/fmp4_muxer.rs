@@ -451,6 +451,82 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability E (B6): moof + traf hierarchy assembler ──────────────────────
+
+/// Build an `mfhd` (Movie Fragment Header) box.
+///
+/// Layout: `[size:4][b"mfhd":4][version:1 = 0][flags:3 = 0][sequence_number:4]`
+fn build_mfhd(sequence_number: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, sequence_number);
+    let mut out = Vec::new();
+    write_box(&mut out, b"mfhd", &payload);
+    out
+}
+
+/// Build a `traf` (Track Fragment) box containing `tfhd`, `tfdt`, and `trun`.
+///
+/// # Arguments
+///
+/// * `base_dts`    — DTS of the first sample in this fragment (90 kHz).
+/// * `samples`     — per-sample data for the `trun` box.
+/// * `data_offset` — byte offset from start of `moof` box to first byte of `mdat` payload.
+/// * `is_idr`      — if true, marks the first sample as an IDR (keyframe).
+fn build_traf(
+    base_dts: u64,
+    samples: &[TrunSample],
+    data_offset: i32,
+    is_idr: bool,
+) -> Vec<u8> {
+    let tfhd = build_tfhd(1, 0x02_0000); // default-base-is-moof flag
+    let tfdt = build_tfdt(base_dts);
+    let trun = build_trun(samples, data_offset, is_idr);
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&tfhd);
+    payload.extend_from_slice(&tfdt);
+    payload.extend_from_slice(&trun);
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"traf", &payload);
+    out
+}
+
+/// Build a complete `moof` (Movie Fragment) box.
+///
+/// Layout: `moof[mfhd[seq_num], traf[tfhd, tfdt, trun]]`.
+///
+/// # Arguments
+///
+/// * `sequence_number` — monotonically increasing fragment sequence number for `mfhd`.
+/// * `base_dts`        — DTS of the first sample in this fragment (90 kHz).
+/// * `samples`         — per-sample size data for `trun`.
+/// * `mdat_offset`     — signed byte offset from start of `moof` to first `mdat` payload byte.
+pub(crate) fn build_moof(
+    sequence_number: u32,
+    base_dts: u64,
+    samples: &[TrunSample],
+    mdat_offset: i32,
+) -> Vec<u8> {
+    // Determine is_idr from sample flags: if sequence_number > 0 and the fragment
+    // starts with an IDR, the caller sets it. We use a simple heuristic:
+    // the caller controls `mdat_offset`; for fragment assembly `is_idr` is always true
+    // (each fragment starts with an IDR per design §3.6).
+    let is_idr = true; // V1 strategy: every fragment starts with an IDR
+
+    let mfhd = build_mfhd(sequence_number);
+    let traf = build_traf(base_dts, samples, mdat_offset, is_idr);
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&mfhd);
+    payload.extend_from_slice(&traf);
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"moof", &payload);
+    out
+}
+
 // ─── Capability D (B6): trun (Track Fragment Run) box builder ────────────────
 
 /// Per-sample data for a `trun` box.
