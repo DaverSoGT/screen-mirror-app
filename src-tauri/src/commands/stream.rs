@@ -1773,4 +1773,133 @@ mod tests {
         let json = serde_json::to_string(&reason).expect("PortRejectReason::Zero must serialize");
         assert_eq!(json, "\"Zero\"");
     }
+
+    // ─── B2-2 RED: StartStreamError serialization + Display shape (R3.1–R3.4) ──
+
+    /// B2-2.1 — `StartStreamError::InvalidPort` serializes with `"kind"/"data"`
+    ///           shape per R3.4: `{"kind":"InvalidPort","data":{"value":80,"reason":"Privileged"}}`.
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_invalid_port_serialization() {
+        let err = StartStreamError::InvalidPort {
+            value: 80,
+            reason: PortRejectReason::Privileged,
+        };
+        let json = serde_json::to_string(&err).expect("StartStreamError must serialize");
+        assert!(
+            json.contains("\"kind\":\"InvalidPort\""),
+            "expected kind=InvalidPort, got: {json}"
+        );
+        assert!(
+            json.contains("\"reason\":\"Privileged\""),
+            "expected reason=Privileged, got: {json}"
+        );
+        assert!(
+            json.contains("\"value\":80"),
+            "expected value=80, got: {json}"
+        );
+    }
+
+    /// B2-2.2 — `StartStreamError::AlreadyRunning` serializes with `"kind":"AlreadyRunning"`.
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_already_running_serialization() {
+        let err = StartStreamError::AlreadyRunning {
+            current_port: 7889,
+            current_service_name: "_screen-mirror._tcp.local.".to_string(),
+        };
+        let json = serde_json::to_string(&err).expect("AlreadyRunning must serialize");
+        assert!(
+            json.contains("\"kind\":\"AlreadyRunning\""),
+            "expected kind=AlreadyRunning, got: {json}"
+        );
+        assert!(
+            json.contains("\"current_port\":7889"),
+            "expected current_port=7889, got: {json}"
+        );
+    }
+
+    /// B2-2.3 — `StartStreamError::BundleBuildFailed("foo")` serializes with
+    ///           `"kind":"BundleBuildFailed"` and `"data":"foo"` (tuple variant).
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_bundle_build_failed_serialization() {
+        let err = StartStreamError::BundleBuildFailed("foo".to_string());
+        let json = serde_json::to_string(&err).expect("BundleBuildFailed must serialize");
+        assert!(
+            json.contains("\"kind\":\"BundleBuildFailed\""),
+            "expected kind=BundleBuildFailed, got: {json}"
+        );
+        assert!(
+            json.contains("\"data\":\"foo\""),
+            "expected data=foo, got: {json}"
+        );
+    }
+
+    /// B2-2.4 — All 5 `StartStreamError` variants produce non-empty Display strings
+    ///           (thiserror `#[error("...")]` derivation, R3.4 + S3.4).
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_display_non_empty_for_all_variants() {
+        let variants: Vec<StartStreamError> = vec![
+            StartStreamError::AlreadyRunning {
+                current_port: 7889,
+                current_service_name: "_screen-mirror._tcp.local.".to_string(),
+            },
+            StartStreamError::InvalidPort {
+                value: 80,
+                reason: PortRejectReason::Privileged,
+            },
+            StartStreamError::InvalidServiceName {
+                value: "bogus".to_string(),
+                reason: "must end with '.local.'".to_string(),
+            },
+            StartStreamError::PortInUse { port: 7889 },
+            StartStreamError::BundleBuildFailed("some error".to_string()),
+        ];
+        for err in &variants {
+            let display = format!("{err}");
+            assert!(
+                !display.is_empty(),
+                "Display must be non-empty for {err:?}"
+            );
+        }
+    }
+
+    /// B2-2.5 — `StartStreamError::InvalidServiceName` serializes correctly.
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_invalid_service_name_serialization() {
+        let err = StartStreamError::InvalidServiceName {
+            value: "bogus".to_string(),
+            reason: "must end with '.local.'".to_string(),
+        };
+        let json = serde_json::to_string(&err).expect("InvalidServiceName must serialize");
+        assert!(
+            json.contains("\"kind\":\"InvalidServiceName\""),
+            "expected kind=InvalidServiceName, got: {json}"
+        );
+    }
+
+    /// B2-2.6 — `StartStreamError::PortInUse` serializes with `"kind":"PortInUse"`.
+    ///
+    /// RED: `StartStreamError` does not exist yet.
+    #[test]
+    fn test_start_stream_error_port_in_use_serialization() {
+        let err = StartStreamError::PortInUse { port: 7889 };
+        let json = serde_json::to_string(&err).expect("PortInUse must serialize");
+        assert!(
+            json.contains("\"kind\":\"PortInUse\""),
+            "expected kind=PortInUse, got: {json}"
+        );
+        assert!(
+            json.contains("\"port\":7889"),
+            "expected port=7889, got: {json}"
+        );
+    }
 }
