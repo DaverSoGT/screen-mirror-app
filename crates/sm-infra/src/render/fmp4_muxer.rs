@@ -691,6 +691,51 @@ mod tests {
         assert_eq!(tfhd.len(), 16);
     }
 
+    // ─── Capability C (B6): tfdt box builder ───────────────────────────────
+
+    #[test]
+    fn tfdt_golden_bytes_version1_u64_time() {
+        // tfdt version=1 contains a 64-bit base_media_decode_time.
+        // Layout: [size:4][b"tfdt":4][version:1=1][flags:3=0][decode_time:8]
+        // total = 8+4+8 = 20 bytes
+        let tfdt = build_tfdt(90_000); // 1 second at 90 kHz
+        assert_eq!(&tfdt[4..8], b"tfdt", "box type must be tfdt");
+        let size = u32::from_be_bytes([tfdt[0], tfdt[1], tfdt[2], tfdt[3]]) as usize;
+        assert_eq!(size, tfdt.len(), "size field must match actual length");
+        assert_eq!(tfdt.len(), 20, "tfdt v1 must be 20 bytes");
+        // version = 1 at byte 8
+        assert_eq!(tfdt[8], 1, "version must be 1 (u64 time field)");
+        // flags bytes 9..12 must be zero
+        assert_eq!(&tfdt[9..12], &[0, 0, 0], "flags must be 0");
+        // base_media_decode_time at bytes 12..20
+        let dts = u64::from_be_bytes([
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
+            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+        ]);
+        assert_eq!(dts, 90_000);
+    }
+
+    #[test]
+    fn tfdt_zero_dts_produces_all_zero_time_field() {
+        let tfdt = build_tfdt(0);
+        let dts = u64::from_be_bytes([
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
+            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+        ]);
+        assert_eq!(dts, 0);
+    }
+
+    #[test]
+    fn tfdt_large_dts_fits_in_u64() {
+        let large_dts: u64 = u32::MAX as u64 + 1;
+        let tfdt = build_tfdt(large_dts);
+        let dts = u64::from_be_bytes([
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
+            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+        ]);
+        assert_eq!(dts, large_dts);
+    }
+
     #[test]
     fn annex_b_to_avcc_preserves_nal_payload_bytes() {
         // Payload bytes after length prefix must match original NAL body.
