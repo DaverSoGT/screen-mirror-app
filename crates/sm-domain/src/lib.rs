@@ -17,6 +17,9 @@
 //!   error taxonomy, configuration, and monitor enumeration types.
 //! - [`encode`] — port boundary for video encoding: `VideoEncoder` trait,
 //!   `EncoderConfig`, `EncodedPacket`, `EncoderError`, and `RateControlMode`.
+//! - [`decode`] — port boundary for video decoding: `VideoDecoder` trait,
+//!   `DecoderConfig`, `DecodedFrame`, `PixelData`, `DecoderError`, and
+//!   `DECODE_CHANNEL_CAPACITY`.
 
 pub mod capture;
 
@@ -36,6 +39,12 @@ pub use encode::EncoderError;
 pub use encode::RateControlMode;
 pub use encode::VideoEncoder;
 pub mod decode;
+pub use decode::DecodedFrame;
+pub use decode::DecoderConfig;
+pub use decode::DecoderError;
+pub use decode::PixelData;
+pub use decode::VideoDecoder;
+pub use decode::DECODE_CHANNEL_CAPACITY;
 pub mod error;
 pub mod session;
 pub mod signaling;
