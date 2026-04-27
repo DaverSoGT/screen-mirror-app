@@ -12,13 +12,28 @@
 //!
 //! A background thread (`sm-stream-mux`) drains the packet channel, fires PLI on
 //! the first packet, buffers non-keyframe packets until the first IDR, builds the
-//! init segment from SPS+PPS, and emits `"stream/init"` + `"stream/segment"` events
-//! to the WebView via `tauri::AppHandle::emit`.
+//! init segment from SPS+PPS, and sends fMP4 frames to the WebView via
+//! `tauri::ipc::Channel<InvokeResponseBody>` (binary, no JSON encoding).
 //!
-//! # OQ-tauri-emit-1 — SUPERSEDED
+//! # OQ-tauri-emit-1 resolution — Channel\<Bytes\>
 //!
-//! The V1 decision to keep `app.emit(Vec<u8>)` (JSON encoding) is overridden.
-//! See the pivot to `tauri::ipc::Channel<InvokeResponseBody>` implemented below.
+//! V1 target: 1080p30 H.264 (~500 KB/segment, one fragment per IDR).
+//! The original `app.emit(Vec<u8>)` path serialises via `serde_json` → JSON
+//! `Array<number>` on the JS side: 1.5–2 MB per segment plus a synchronous
+//! `JSON.parse` on the WebView main thread → perceptible jank at 1080p.
+//!
+//! **Resolution (B7-fix)**: `start_stream` accepts a
+//! `tauri::ipc::Channel<InvokeResponseBody>` argument from the frontend.
+//! The mux thread calls `channel.send(InvokeResponseBody::Raw(frame_bytes))`
+//! where `frame_bytes[0]` is a discriminant byte (`0x00` = init, `0x01` = segment).
+//! The Channel API delivers the raw bytes as an `ArrayBuffer` in JS — no JSON round-trip.
+//!
+//! API surface verified from `tauri-2.10.3/src/ipc/channel.rs`:
+//! - `Channel<TSend>` is `Clone` + `Send + Sync` — safe to clone into the mux thread.
+//! - `channel.send(body: TSend) -> crate::Result<()>` where `TSend: IpcResponse`.
+//! - `InvokeResponseBody::Raw(Vec<u8>)` implements `IpcResponse` without JSON encoding.
+//! - Small payloads (< 1024 B, e.g. init segment) take the `webview.eval` fast path.
+//! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
