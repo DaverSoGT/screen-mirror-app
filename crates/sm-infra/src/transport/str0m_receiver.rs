@@ -930,4 +930,31 @@ mod tests {
 
         receiver.stop().unwrap();
     }
+
+    // ─── B2 RED: classify_bind_error logic unit test (R1.4) ───────────────────
+
+    #[test]
+    fn classify_bind_error_addr_in_use_maps_to_transport_addr_in_use() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let result = classify_bind_error(io_err, 9876);
+        match result {
+            TransportError::AddrInUse { port: 9876 } => {}
+            other => panic!("expected TransportError::AddrInUse {{ port: 9876 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_bind_error_other_error_maps_to_transport_io() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let result = classify_bind_error(io_err, 9876);
+        match result {
+            TransportError::Io(msg) => {
+                assert!(
+                    msg.contains("UDP bind failed on"),
+                    "Io message must contain 'UDP bind failed on', got: {msg}"
+                );
+            }
+            other => panic!("expected TransportError::Io(_), got {other:?}"),
+        }
+    }
 }
