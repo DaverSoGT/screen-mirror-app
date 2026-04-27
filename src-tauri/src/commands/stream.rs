@@ -1970,4 +1970,115 @@ mod tests {
             "expected port=7889, got: {json}"
         );
     }
+
+    // ─── B3 RED: validate_udp_port boundary scenarios (R4.2–R4.6) ───────────────
+
+    /// B3.1 — `validate_udp_port(0)` returns `Err(InvalidPort { value: 0, reason: Zero })`.
+    ///
+    /// Spec R4.2: port 0 would silently corrupt the ICE candidate (Risk #1).
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_zero() {
+        let result = validate_udp_port(0);
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 0,
+                reason: PortRejectReason::Zero,
+            }) => {}
+            other => panic!("expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}"),
+        }
+    }
+
+    /// B3.2 — `validate_udp_port(1)` returns `Err(InvalidPort { value: 1, reason: Privileged })`.
+    ///
+    /// Spec R4.3: lower boundary of the privileged range (1..=1023).
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_privileged_lower() {
+        let result = validate_udp_port(1);
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 1,
+                reason: PortRejectReason::Privileged,
+            }) => {}
+            other => panic!(
+                "expected Err(InvalidPort {{ value: 1, reason: Privileged }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B3.3 — `validate_udp_port(80)` returns `Err(InvalidPort { value: 80, reason: Privileged })`.
+    ///
+    /// Spec R4.3: canonical privileged port (HTTP).
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_privileged_mid() {
+        let result = validate_udp_port(80);
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 80,
+                reason: PortRejectReason::Privileged,
+            }) => {}
+            other => panic!(
+                "expected Err(InvalidPort {{ value: 80, reason: Privileged }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B3.4 — `validate_udp_port(1023)` returns `Err(InvalidPort { value: 1023, reason: Privileged })`.
+    ///
+    /// Spec R4.3: upper boundary of the privileged range (1..=1023).
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_privileged_upper() {
+        let result = validate_udp_port(1023);
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 1023,
+                reason: PortRejectReason::Privileged,
+            }) => {}
+            other => panic!(
+                "expected Err(InvalidPort {{ value: 1023, reason: Privileged }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B3.5 — `validate_udp_port(1024)` returns `Ok(())`.
+    ///
+    /// Spec R4.4: port 1024 is the first non-privileged port.
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_first_valid() {
+        let result = validate_udp_port(1024);
+        assert!(
+            result.is_ok(),
+            "port 1024 is the first non-privileged port — must return Ok(()), got {result:?}"
+        );
+    }
+
+    /// B3.6 — `validate_udp_port(7889)` returns `Ok(())`.
+    ///
+    /// Spec R4.5: the default port must pass its own validation.
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_default() {
+        let result = validate_udp_port(7889);
+        assert!(
+            result.is_ok(),
+            "default port 7889 must pass validation, got {result:?}"
+        );
+    }
+
+    /// B3.7 — `validate_udp_port(65535)` returns `Ok(())`.
+    ///
+    /// Spec R4.6: maximum valid u16 must be accepted.
+    /// RED: `validate_udp_port` does not exist yet.
+    #[test]
+    fn test_validate_udp_port_max() {
+        let result = validate_udp_port(65535);
+        assert!(
+            result.is_ok(),
+            "max u16 port 65535 must pass validation, got {result:?}"
+        );
+    }
 }
