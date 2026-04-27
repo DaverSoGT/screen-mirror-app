@@ -656,7 +656,8 @@ pub(crate) fn build_tfhd(track_id: u32, flags: u32) -> Vec<u8> {
 /// length-prefixed with a 4-byte big-endian value equal to the byte length of
 /// the NAL body (excluding the start code). Start codes are stripped.
 ///
-/// This is the inverse of [`crate::transport::annex_b::reconstruct_annex_b`].
+/// This is the inverse of `crate::transport::annex_b::reconstruct_annex_b`
+/// (which lives in the transport module and is `pub(crate)`-scoped).
 ///
 /// # Arguments
 ///
