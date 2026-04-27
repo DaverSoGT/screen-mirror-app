@@ -2507,4 +2507,168 @@ mod tests {
             "bridge must be running after start_stream_inner succeeds"
         );
     }
+
+    // ─── B5-3 RED: argument plumbing + validation wiring ─────────────────────
+
+    /// B5-3.1 — `start_stream_inner(bridge, ch, Some(0), None)` returns
+    ///           `Err(InvalidPort { value: 0, reason: Zero })` WITHOUT invoking
+    ///           the builder (spec R4.8: S4.8 guard pattern).
+    ///
+    /// RED: validation is NOT yet wired in start_stream_inner — the function
+    /// calls the builder regardless (no validate_udp_port call before builder).
+    /// This test must FAIL until the validators are wired in B5-3 GREEN.
+    #[test]
+    fn test_start_stream_inner_invalid_port_zero_rejects_before_builder() {
+        // Builder panics if called — ensures validator short-circuits before builder.
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            panic!("builder must NOT be called when port validation fails")
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, Some(0), None);
+
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 0,
+                reason: PortRejectReason::Zero,
+            }) => {}
+            other => panic!(
+                "expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B5-3.2 — `start_stream_inner(bridge, ch, Some(80), None)` returns
+    ///           `Err(InvalidPort { value: 80, reason: Privileged })` WITHOUT invoking
+    ///           the builder.
+    ///
+    /// RED: validators not yet wired.
+    #[test]
+    fn test_start_stream_inner_invalid_port_privileged_rejects_before_builder() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            panic!("builder must NOT be called when port validation fails")
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, Some(80), None);
+
+        match result {
+            Err(StartStreamError::InvalidPort {
+                value: 80,
+                reason: PortRejectReason::Privileged,
+            }) => {}
+            other => panic!(
+                "expected Err(InvalidPort {{ value: 80, reason: Privileged }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B5-3.3 — `start_stream_inner(bridge, ch, None, Some("bogus".into()))` returns
+    ///           `Err(InvalidServiceName { .. })` WITHOUT invoking the builder.
+    ///
+    /// RED: validators not yet wired.
+    #[test]
+    fn test_start_stream_inner_invalid_service_name_rejects_before_builder() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            panic!("builder must NOT be called when service-name validation fails")
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, None, Some("bogus".to_string()));
+
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "bogus");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B5-3.4 — `start_stream_inner(bridge, ch, None, None)` resolves defaults
+    ///           and passes `(7889, "_screen-mirror._tcp.local.")` to the builder.
+    ///
+    /// GREEN in B5-2 (defaults already resolved), but this test records the contract
+    /// explicitly and asserts the exact values (not just "builder called once").
+    ///
+    /// RED: the assertions in B5-2.1 only check `calls.len() == 1`; this test also
+    /// checks the specific port and name values. Already passes in B5-2 because
+    /// start_stream_inner already resolves defaults — this is effectively a GREEN
+    /// test from the start. Include as documentation-level test.
+    #[test]
+    fn test_start_stream_inner_none_args_resolve_to_defaults_in_builder() {
+        let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
+        let probe_clone = probe.clone();
+        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+            probe_clone.lock().unwrap().push((port, name));
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(&bridge, channel, None, None).unwrap();
+
+        let calls = probe.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // Spec R2.2: None → 7889. Spec R2.3: None → "_screen-mirror._tcp.local.".
+        assert_eq!(
+            calls[0],
+            (7889u16, "_screen-mirror._tcp.local.".to_string()),
+            "default args must be (7889, \"_screen-mirror._tcp.local.\") when None is passed"
+        );
+    }
+
+    /// B5-3.5 — `start_stream_inner(bridge, ch, Some(7900), Some("_my-mirror._tcp.local.".into()))`
+    ///           passes the exact provided args to the builder.
+    ///
+    /// Spec R2.5: builder receives resolved (port, service_name, stop_flag) tuple.
+    /// Also implicitly tests S2.2.
+    ///
+    /// RED: validators will reject Some(7900) as valid ONLY if validate_udp_port is wired
+    /// correctly. Actually 7900 is valid (> 1023), so this is a GREEN-from-start test once
+    /// the extraction is done — but it confirms the plumbing. Keeping here to expose
+    /// any regression in plumbing.
+    #[test]
+    fn test_start_stream_inner_custom_args_reach_builder() {
+        let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
+        let probe_clone = probe.clone();
+        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+            probe_clone.lock().unwrap().push((port, name));
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(
+            &bridge,
+            channel,
+            Some(7900),
+            Some("_my-mirror._tcp.local.".to_string()),
+        )
+        .unwrap();
+
+        let calls = probe.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            (7900u16, "_my-mirror._tcp.local.".to_string()),
+            "custom args must be passed through to the builder unchanged"
+        );
+    }
 }
