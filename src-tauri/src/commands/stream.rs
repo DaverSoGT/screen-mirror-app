@@ -284,27 +284,19 @@ fn run_signaling_drain(
                 SignalingEvent::PeerFound { host, port } => {
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
-                SignalingEvent::OfferReceived(offer) => {
-                    match receiver.apply_remote_offer(offer) {
-                        Ok(answer) => {
-                            if let Err(e) = signaling.publish_local_answer(answer) {
-                                eprintln!(
-                                    "[sm-signaling-drain] publish_local_answer failed: {e}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[sm-signaling-drain] apply_remote_offer failed: {e}"
-                            );
+                SignalingEvent::OfferReceived(offer) => match receiver.apply_remote_offer(offer) {
+                    Ok(answer) => {
+                        if let Err(e) = signaling.publish_local_answer(answer) {
+                            eprintln!("[sm-signaling-drain] publish_local_answer failed: {e}");
                         }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("[sm-signaling-drain] apply_remote_offer failed: {e}");
+                    }
+                },
                 SignalingEvent::CandidateReceived(cand) => {
                     if let Err(e) = receiver.add_remote_candidate(cand) {
-                        eprintln!(
-                            "[sm-signaling-drain] add_remote_candidate failed: {e}"
-                        );
+                        eprintln!("[sm-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
                 SignalingEvent::Closed => {
@@ -1249,8 +1241,8 @@ mod tests {
             _drain_senders: Vec::new(),
         };
 
-        let session = build_stream_session(ch, bundle, stop_flag)
-            .expect("build_stream_session must succeed");
+        let session =
+            build_stream_session(ch, bundle, stop_flag).expect("build_stream_session must succeed");
 
         // Wrap in a bridge and call stop_stream_session.
         let bridge = StreamBridge::new();
@@ -1291,8 +1283,8 @@ mod tests {
     ///          No panics, no blocking beyond the 500 ms timeout.
     #[test]
     fn transport_event_drain_absorbs_events_without_blocking() {
-        use std::sync::mpsc::sync_channel;
         use sm_domain::transport::TransportEvent;
+        use std::sync::mpsc::sync_channel;
 
         let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1334,8 +1326,8 @@ mod tests {
     ///          the drain exits cleanly without needing stop_flag.
     #[test]
     fn transport_event_drain_exits_on_channel_disconnect() {
-        use std::sync::mpsc::sync_channel;
         use sm_domain::transport::TransportEvent;
+        use std::sync::mpsc::sync_channel;
 
         let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(4);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1349,7 +1341,9 @@ mod tests {
         drop(ev_tx);
 
         let start = std::time::Instant::now();
-        drain.join().expect("drain must exit after channel disconnect");
+        drain
+            .join()
+            .expect("drain must exit after channel disconnect");
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(700),
@@ -1366,8 +1360,8 @@ mod tests {
     /// RED: `run_signaling_drain` does not exist yet.
     #[test]
     fn signaling_drain_offer_received_calls_apply_and_publish() {
-        use std::sync::mpsc::sync_channel;
         use sm_domain::signaling::{SdpAnswer, SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
 
         // FakeReceiverForSig: records the offer it received and returns a canned answer.
         struct FakeReceiverForSig {
@@ -1381,10 +1375,7 @@ mod tests {
             }
         }
         impl SignalingReceiverOps for FakeReceiverForSig {
-            fn apply_remote_offer(
-                &self,
-                offer: SdpOffer,
-            ) -> Result<SdpAnswer, TransportError> {
+            fn apply_remote_offer(&self, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
                 *self.last_offer.lock().unwrap() = Some(offer);
                 Ok(SdpAnswer("v=0\r\nanswer".to_string()))
             }
@@ -1438,7 +1429,9 @@ mod tests {
 
         // Send an OfferReceived event.
         let test_offer = SdpOffer("v=0\r\noffer".to_string());
-        ev_tx.send(SignalingEvent::OfferReceived(test_offer.clone())).unwrap();
+        ev_tx
+            .send(SignalingEvent::OfferReceived(test_offer.clone()))
+            .unwrap();
 
         // Give the drain a moment to process.
         std::thread::sleep(Duration::from_millis(100));
@@ -1469,9 +1462,9 @@ mod tests {
     ///            calls `receiver.add_remote_candidate(cand)`.
     #[test]
     fn signaling_drain_candidate_received_calls_add_remote_candidate() {
+        use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
         use std::sync::atomic::AtomicU32;
         use std::sync::mpsc::sync_channel;
-        use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
 
         struct FakeReceiverForCand {
             cand_count: AtomicU32,
@@ -1495,8 +1488,18 @@ mod tests {
 
         struct NoopSignalingPublish;
         impl SignalingPublishOps for NoopSignalingPublish {
-            fn publish_local_answer(&self, _: SdpAnswer) -> Result<(), sm_domain::signaling::SignalingError> { Ok(()) }
-            fn publish_local_candidate(&self, _: IceCandidate) -> Result<(), sm_domain::signaling::SignalingError> { Ok(()) }
+            fn publish_local_answer(
+                &self,
+                _: SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _: IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
         }
 
         let recv = FakeReceiverForCand::new();
@@ -1506,7 +1509,12 @@ mod tests {
         let stop_clone = stop_flag.clone();
 
         let drain = thread::spawn(move || {
-            run_signaling_drain(ev_rx, recv_clone, Arc::new(NoopSignalingPublish), stop_clone);
+            run_signaling_drain(
+                ev_rx,
+                recv_clone,
+                Arc::new(NoopSignalingPublish),
+                stop_clone,
+            );
         });
 
         ev_tx
