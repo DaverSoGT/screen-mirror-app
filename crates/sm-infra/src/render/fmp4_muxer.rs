@@ -687,29 +687,52 @@ pub fn annex_b_to_avcc(annex_b: &[u8]) -> Result<Vec<u8>, MuxerError> {
 
 // ─── Mp4Muxer public API ─────────────────────────────────────────────────────
 
+/// Per-sample metadata accumulated during fragment assembly.
+struct PendingSample {
+    /// AVCC-framed NAL bytes for this sample.
+    avcc: Vec<u8>,
+    /// DTS of this sample in 90 kHz units.
+    dts_90khz: u64,
+}
+
 /// fMP4 muxer for screen-mirror live streaming.
 ///
 /// Builds an init segment (`ftyp` + `moov`) from the first SPS + PPS NAL bytes,
 /// then emits media segments (`moof` + `mdat`) per IDR-aligned GOP.
 ///
+/// # Fragmentation strategy (design §3.6)
+///
+/// One fragment per GOP (IDR-aligned). The first IDR starts accumulation and returns
+/// `None`; each subsequent IDR flushes the accumulated previous GOP as a media segment
+/// and begins accumulating the new GOP.
+///
 /// # Example
 ///
 /// ```rust,ignore
-/// let muxer = Mp4Muxer::new(1920, 1080, 30, 1);
+/// let mut muxer = Mp4Muxer::new(1920, 1080, 30, 1);
 /// let init = muxer.build_init_segment(sps_nal, pps_nal)?;
 /// // emit init bytes to the frontend once
+/// while let Ok(pkt) = pkt_rx.recv() {
+///     if let Some(segment) = muxer.append_packet(&pkt) {
+///         // emit segment bytes to the frontend
+///     }
+/// }
 /// ```
 pub struct Mp4Muxer {
     /// Frame width in pixels (pre-validated from the SPS or caller-supplied).
     width: u32,
     /// Frame height in pixels (pre-validated from the SPS or caller-supplied).
     height: u32,
-    /// Frame rate numerator (e.g. 30 for 30 fps). Reserved for B6 media-segment timing.
+    /// Frame rate numerator (e.g. 30 for 30 fps).
     #[allow(dead_code)]
     fps_num: u32,
-    /// Frame rate denominator (e.g. 1 for 30 fps). Reserved for B6 media-segment timing.
+    /// Frame rate denominator (e.g. 1 for 30 fps).
     #[allow(dead_code)]
     fps_den: u32,
+    /// Monotonically increasing fragment sequence number for `mfhd`.
+    fragment_seq: u32,
+    /// Samples accumulated for the current pending fragment.
+    pending: Vec<PendingSample>,
 }
 
 impl Mp4Muxer {
@@ -733,6 +756,8 @@ impl Mp4Muxer {
             height,
             fps_num,
             fps_den,
+            fragment_seq: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -766,6 +791,90 @@ impl Mp4Muxer {
         out.extend_from_slice(&ftyp);
         out.extend_from_slice(&moov);
         Ok(out)
+    }
+
+    /// Append an encoded packet to the muxer's pending-fragment buffer.
+    ///
+    /// # Fragmentation strategy (design §3.6)
+    ///
+    /// - **Non-IDR (P-frame)**: accumulate into pending buffer; return `None`.
+    /// - **IDR with empty pending**: first IDR of stream; begin accumulation; return `None`.
+    /// - **IDR with non-empty pending**: flush the accumulated previous GOP as a media
+    ///   segment (`moof` + `mdat`); accumulate the current IDR into fresh pending;
+    ///   return `Some(segment_bytes)`.
+    ///
+    /// # Returns
+    ///
+    /// `None` while buffering. `Some(bytes)` when a complete fragment is ready.
+    /// The bytes are `[moof][mdat]` suitable for `SourceBuffer.appendBuffer(...)`.
+    pub fn append_packet(
+        &mut self,
+        packet: &sm_domain::encode::EncodedPacket,
+    ) -> Option<Vec<u8>> {
+        // Convert Annex-B payload to AVCC-framed bytes.
+        // If conversion fails (e.g., empty data), skip this packet silently.
+        let avcc = annex_b_to_avcc(&packet.data).ok()?;
+        let dts = crate::transport::annex_b::duration_to_90khz(packet.timestamp);
+
+        if packet.is_keyframe && !self.pending.is_empty() {
+            // Flush the current accumulated GOP as a media segment.
+            let segment = self.flush_pending();
+
+            // Accumulate the triggering IDR into the fresh pending buffer.
+            self.pending.push(PendingSample { avcc, dts_90khz: dts });
+
+            Some(segment)
+        } else {
+            // P-frame or first IDR: accumulate.
+            self.pending.push(PendingSample { avcc, dts_90khz: dts });
+            None
+        }
+    }
+
+    /// Flush the current pending samples as a `moof` + `mdat` media segment.
+    ///
+    /// Increments `fragment_seq`. Clears `pending`.
+    fn flush_pending(&mut self) -> Vec<u8> {
+        self.fragment_seq += 1;
+        let seq = self.fragment_seq;
+
+        // Base DTS is the timestamp of the first sample in the fragment.
+        let base_dts = self.pending.first().map(|s| s.dts_90khz).unwrap_or(0);
+
+        // Build the concatenated AVCC mdat payload.
+        let mdat_payload: Vec<u8> = self.pending.iter().flat_map(|s| s.avcc.iter().copied()).collect();
+
+        // Build trun samples (size-only for now; baseline = no B-frames → DTS=PTS=CTS).
+        let trun_samples: Vec<TrunSample> = self
+            .pending
+            .iter()
+            .map(|s| TrunSample {
+                duration: None,
+                size: s.avcc.len() as u32,
+                flags: None,
+            })
+            .collect();
+
+        // Compute moof size to determine data_offset.
+        // data_offset = size_of(moof) + 8  (8 bytes for the mdat size+tag header).
+        // We approximate by building moof with offset=0 first to get its size.
+        let moof_placeholder = build_moof(seq, base_dts, &trun_samples, 0);
+        let moof_size = moof_placeholder.len() as i32;
+        // data_offset in trun = bytes from start of moof box to first byte of mdat payload.
+        // mdat box header = 8 bytes (size + tag).
+        let data_offset = moof_size + 8;
+
+        // Rebuild moof with the correct data_offset.
+        let moof = build_moof(seq, base_dts, &trun_samples, data_offset);
+        let mdat = build_mdat(&mdat_payload);
+
+        // Clear pending for the next GOP.
+        self.pending.clear();
+
+        let mut segment = Vec::with_capacity(moof.len() + mdat.len());
+        segment.extend_from_slice(&moof);
+        segment.extend_from_slice(&mdat);
+        segment
     }
 
     /// fMP4 timescale used by this muxer. Always 90 000 Hz (matches RTP).
@@ -883,17 +992,19 @@ mod tests {
         let idr2 = make_packet(true, 2000, 200);
         let segment = muxer.append_packet(&idr2).expect("should emit segment");
 
-        // Find tfdt in segment
+        // Find tfdt in segment.
+        // windows(4).position finds the offset where the 4-byte tag b"tfdt" appears.
+        // Box layout: [size:4][tag:4][version:1][flags:3][time:8]
+        // The size field is at (tfdt_pos - 4); the tag is at tfdt_pos.
+        // After the tag: version at tfdt_pos+4, flags at +5..8, time at +8..16.
         let tfdt_pos = segment.windows(4).position(|w| w == b"tfdt").expect("tfdt must be in segment");
-        // tfdt v1: [size:4][tag:4][version:1][flags:3][time:8]
-        // tag at pos, version at pos+4, time at pos+12
         let version = segment[tfdt_pos + 4];
         assert_eq!(version, 1, "tfdt must be version 1");
         let dts = u64::from_be_bytes([
+            segment[tfdt_pos + 8],  segment[tfdt_pos + 9],
+            segment[tfdt_pos + 10], segment[tfdt_pos + 11],
             segment[tfdt_pos + 12], segment[tfdt_pos + 13],
             segment[tfdt_pos + 14], segment[tfdt_pos + 15],
-            segment[tfdt_pos + 16], segment[tfdt_pos + 17],
-            segment[tfdt_pos + 18], segment[tfdt_pos + 19],
         ]);
         // IDR1 was at 1000ms → 90_000 ticks
         assert_eq!(dts, 90_000, "tfdt.base_media_decode_time must be 90_000 (1000ms at 90kHz)");
