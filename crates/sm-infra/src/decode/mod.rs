@@ -7,3 +7,6 @@
 // Module stubs are empty until B1/B2/B3 fill them in.
 
 pub mod i420_to_bgra;
+
+#[cfg(target_os = "windows")]
+pub mod windows_openh264;
