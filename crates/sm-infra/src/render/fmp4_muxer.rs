@@ -494,7 +494,12 @@ impl Mp4Muxer {
     pub fn new(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Self {
         assert!(width > 0, "Mp4Muxer: width must be > 0");
         assert!(height > 0, "Mp4Muxer: height must be > 0");
-        Self { width, height, fps_num, fps_den }
+        Self {
+            width,
+            height,
+            fps_num,
+            fps_den,
+        }
     }
 
     /// Build the fMP4 init segment from the first SPS and PPS NAL bytes.
@@ -506,7 +511,11 @@ impl Mp4Muxer {
     ///
     /// - `Err(MuxerError::InvalidInput)` if `sps_nal` or `pps_nal` is empty.
     /// - `Err(MuxerError::AvccError)` if the SPS bytes are malformed or unparseable.
-    pub fn build_init_segment(&self, sps_nal: &[u8], pps_nal: &[u8]) -> Result<Vec<u8>, MuxerError> {
+    pub fn build_init_segment(
+        &self,
+        sps_nal: &[u8],
+        pps_nal: &[u8],
+    ) -> Result<Vec<u8>, MuxerError> {
         if sps_nal.is_empty() {
             return Err(MuxerError::InvalidInput("sps_nal must not be empty".into()));
         }
@@ -632,9 +641,9 @@ mod tests {
             .expect("build_moov should succeed");
 
         let required_tags: &[&[u8; 4]] = &[
-            b"moov", b"mvhd", b"trak", b"tkhd", b"mdia", b"mdhd", b"hdlr",
-            b"minf", b"vmhd", b"dinf", b"dref", b"url ", b"stbl", b"stsd",
-            b"avc1", b"avcC", b"stts", b"stsc", b"stsz", b"stco",
+            b"moov", b"mvhd", b"trak", b"tkhd", b"mdia", b"mdhd", b"hdlr", b"minf", b"vmhd",
+            b"dinf", b"dref", b"url ", b"stbl", b"stsd", b"avc1", b"avcC", b"stts", b"stsc",
+            b"stsz", b"stco",
         ];
 
         for tag in required_tags {
@@ -665,8 +674,8 @@ mod tests {
         let payload_end = avcc_box_start + avcc_size;
         let embedded_avcc = &moov[payload_start..payload_end];
 
-        let expected = build_avcc(&sps_info, SPS_320X240, MINIMAL_PPS)
-            .expect("build_avcc should succeed");
+        let expected =
+            build_avcc(&sps_info, SPS_320X240, MINIMAL_PPS).expect("build_avcc should succeed");
 
         assert_eq!(embedded_avcc, expected.as_slice());
     }
@@ -729,7 +738,11 @@ mod tests {
             .build_init_segment(SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         // bytes[0..4] = ftyp box size; bytes[4..8] = 'ftyp' tag
-        assert_eq!(&bytes[4..8], b"ftyp", "init segment must start with ftyp box tag");
+        assert_eq!(
+            &bytes[4..8],
+            b"ftyp",
+            "init segment must start with ftyp box tag"
+        );
     }
 
     #[test]
@@ -747,7 +760,10 @@ mod tests {
         let bytes = muxer
             .build_init_segment(SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
-        assert!(bytes.windows(4).any(|w| w == b"moov"), "init segment must contain moov box");
+        assert!(
+            bytes.windows(4).any(|w| w == b"moov"),
+            "init segment must contain moov box"
+        );
     }
 
     #[test]
@@ -756,7 +772,10 @@ mod tests {
         let bytes = muxer
             .build_init_segment(SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
-        assert!(bytes.windows(4).any(|w| w == b"avc1"), "init segment must contain avc1 sample entry");
+        assert!(
+            bytes.windows(4).any(|w| w == b"avc1"),
+            "init segment must contain avc1 sample entry"
+        );
     }
 
     #[test]
@@ -765,7 +784,11 @@ mod tests {
         let bytes = muxer
             .build_init_segment(SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
-        assert!(bytes.len() > 200, "init segment must be > 200 bytes, got {}", bytes.len());
+        assert!(
+            bytes.len() > 200,
+            "init segment must be > 200 bytes, got {}",
+            bytes.len()
+        );
     }
 
     #[test]
@@ -783,8 +806,12 @@ mod tests {
     #[test]
     fn init_segment_is_deterministic() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
-        let bytes1 = muxer.build_init_segment(SPS_320X240, MINIMAL_PPS).expect("ok");
-        let bytes2 = muxer.build_init_segment(SPS_320X240, MINIMAL_PPS).expect("ok");
+        let bytes1 = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("ok");
+        let bytes2 = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("ok");
         assert_eq!(bytes1, bytes2, "build_init_segment must be deterministic");
     }
 
@@ -826,8 +853,16 @@ mod tests {
 
         let payload_start = avcc_tag_pos + 4;
         assert_eq!(bytes[payload_start], 1, "configurationVersion must be 1");
-        assert_eq!(bytes[payload_start + 1], 0x42, "profile must be 0x42 (baseline)");
-        assert_eq!(bytes[payload_start + 2], 0xC0, "constraint_set_flags must be 0xC0");
+        assert_eq!(
+            bytes[payload_start + 1],
+            0x42,
+            "profile must be 0x42 (baseline)"
+        );
+        assert_eq!(
+            bytes[payload_start + 2],
+            0xC0,
+            "constraint_set_flags must be 0xC0"
+        );
         assert_eq!(bytes[payload_start + 3], 0x0D, "level must be 0x0D");
     }
 
