@@ -209,8 +209,7 @@ pub enum StartStreamError {
     /// Distinguished from `BundleBuildFailed` so the frontend can suggest
     /// "try a different port" instead of a generic failure message.
     ///
-    /// `#[allow(dead_code)]`: constructed in B5-4 (PortInUse substring detection shim).
-    #[allow(dead_code)]
+    /// Constructed in `start_stream_inner` by the OQ-A1 substring-detection shim (B5-4).
     #[error("UDP port {port} is already in use")]
     PortInUse { port: u16 },
 
@@ -893,7 +892,26 @@ pub(crate) fn start_stream_inner(
     let bundle = match (builder)(resolved_port, resolved_name, stop_flag.clone()) {
         Ok(b) => b,
         Err(e) => {
-            // PortInUse detection added in B5-4; for B5-3 return BundleBuildFailed.
+            // OQ-A1 — PortInUse substring detection shim (B5-4).
+            //
+            // `build_production_bundle` wraps `std::io::Error` via `format!("...: {e}")`.
+            // The OS-level `AddrInUse` message differs per platform:
+            //   Linux/macOS : "address already in use"
+            //   Windows     : "only one usage of each socket address ..."
+            //
+            // We lowercase-compare to tolerate capitalisation differences (e.g. macOS
+            // `Error { kind: AddrInUse, message: "Address already in use" }`).
+            //
+            // FIXME(V1.2): replace string-match with typed bundle errors once
+            // `build_production_bundle` returns a typed error enum.
+            let e_lower = e.to_lowercase();
+            if e_lower.contains("address already in use")
+                || e_lower.contains("only one usage of each socket address")
+            {
+                return Err(StartStreamError::PortInUse {
+                    port: resolved_port,
+                });
+            }
             return Err(StartStreamError::BundleBuildFailed(e));
         }
     };
@@ -2743,9 +2761,7 @@ mod tests {
 
         match result {
             Err(StartStreamError::PortInUse { port: 7900 }) => {}
-            other => panic!(
-                "expected Err(PortInUse {{ port: 7900 }}), got {other:?}"
-            ),
+            other => panic!("expected Err(PortInUse {{ port: 7900 }}), got {other:?}"),
         }
     }
 
@@ -2768,9 +2784,7 @@ mod tests {
 
         match result {
             Err(StartStreamError::PortInUse { port: 7889 }) => {}
-            other => panic!(
-                "expected Err(PortInUse {{ port: 7889 }}), got {other:?}"
-            ),
+            other => panic!("expected Err(PortInUse {{ port: 7889 }}), got {other:?}"),
         }
     }
 
@@ -2787,9 +2801,8 @@ mod tests {
     /// must still be returned for non-AddrInUse errors.
     #[test]
     fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
-            Err("some unrelated build failure".to_string())
-        });
+        let builder: BuilderFn =
+            Arc::new(|_port, _name, _stop_flag| Err("some unrelated build failure".to_string()));
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
