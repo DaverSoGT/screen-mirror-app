@@ -3230,6 +3230,105 @@ mod tests {
         );
     }
 
+    // ─── B7-2 RED: T7.3 + T7.4 + T7.5 (validation-rejection, builder NOT called) ─
+
+    /// B7-2.1 / T7.3 — `start_stream_inner(Some(0), None)` must return
+    ///                   `Err(InvalidPort { value: 0, reason: Zero })` and the
+    ///                   builder must NOT be called (spec R7.4 T7.3, R4.1, S4.8).
+    ///
+    /// "Builder NOT called" is asserted by checking `probe.call_count() == 0`.
+    ///
+    /// RED: `BuilderProbe::call_count()` does not exist yet → E0599.
+    #[test]
+    fn test_t7_3_port_zero_builder_not_called() {
+        let probe = BuilderProbe::new();
+        let builder = make_test_builder(probe.clone(), Ok(()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let err = start_stream_inner(&bridge, channel, Some(0), None)
+            .expect_err("T7.3: port=0 must return Err(InvalidPort { value: 0, reason: Zero })");
+
+        match err {
+            StartStreamError::InvalidPort {
+                value: 0,
+                reason: PortRejectReason::Zero,
+            } => {}
+            other => panic!("T7.3: expected InvalidPort(Zero), got {other:?}"),
+        }
+
+        assert_eq!(
+            probe.call_count(),
+            0,
+            "T7.3: builder must NOT be called when port=0 is rejected by validation"
+        );
+    }
+
+    /// B7-2.2 / T7.4 — `start_stream_inner(Some(80), None)` must return
+    ///                   `Err(InvalidPort { value: 80, reason: Privileged })` and the
+    ///                   builder must NOT be called (spec R7.4 T7.4, R4.3, S4.8).
+    ///
+    /// RED: `BuilderProbe::call_count()` does not exist yet → E0599.
+    #[test]
+    fn test_t7_4_privileged_port_builder_not_called() {
+        let probe = BuilderProbe::new();
+        let builder = make_test_builder(probe.clone(), Ok(()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let err = start_stream_inner(&bridge, channel, Some(80), None).expect_err(
+            "T7.4: port=80 must return Err(InvalidPort { value: 80, reason: Privileged })",
+        );
+
+        match err {
+            StartStreamError::InvalidPort {
+                value: 80,
+                reason: PortRejectReason::Privileged,
+            } => {}
+            other => panic!("T7.4: expected InvalidPort(Privileged, 80), got {other:?}"),
+        }
+
+        assert_eq!(
+            probe.call_count(),
+            0,
+            "T7.4: builder must NOT be called when port=80 is rejected as Privileged"
+        );
+    }
+
+    /// B7-2.3 / T7.5 — `start_stream_inner(None, Some("bogus"), channel)` must return
+    ///                   `Err(InvalidServiceName { .. })` and the builder must NOT be
+    ///                   called (spec R7.4 T7.5, R5.1, S5.8).
+    ///
+    /// RED: `BuilderProbe::call_count()` does not exist yet → E0599.
+    #[test]
+    fn test_t7_5_bogus_service_name_builder_not_called() {
+        let probe = BuilderProbe::new();
+        let builder = make_test_builder(probe.clone(), Ok(()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let err =
+            start_stream_inner(&bridge, channel, None, Some("bogus".to_string())).expect_err(
+                "T7.5: service_name='bogus' must return Err(InvalidServiceName { .. })",
+            );
+
+        match err {
+            StartStreamError::InvalidServiceName { value, .. } => {
+                assert_eq!(
+                    value, "bogus",
+                    "T7.5: InvalidServiceName must carry the rejected value"
+                );
+            }
+            other => panic!("T7.5: expected InvalidServiceName, got {other:?}"),
+        }
+
+        assert_eq!(
+            probe.call_count(),
+            0,
+            "T7.5: builder must NOT be called when service_name='bogus' is rejected"
+        );
+    }
+
     // ─── B7-1 RED: BuilderProbe + T7.1 + T7.2 (args flow to builder) ───────────
 
     /// B7-1.1 / T7.1 — `start_stream_inner(None, None, channel)` with a recording
