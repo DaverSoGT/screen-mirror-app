@@ -624,6 +624,49 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    // ─── Capability B (B6): tfhd box builder ───────────────────────────────
+
+    #[test]
+    fn tfhd_golden_bytes_default_base_is_moof_flag() {
+        // flags = 0x020000 (default-base-is-moof) only; track_id = 1
+        // Expected layout (full box):
+        //   [size:4][b"tfhd":4][version:1][flags:3][track_id:4]
+        // size = 8(box) + 4(v+f) + 4(track_id) = 16 bytes
+        let tfhd = build_tfhd(1, 0x02_0000);
+        assert_eq!(&tfhd[4..8], b"tfhd", "box type must be tfhd");
+        let size = u32::from_be_bytes([tfhd[0], tfhd[1], tfhd[2], tfhd[3]]) as usize;
+        assert_eq!(size, tfhd.len(), "size field must match actual length");
+        // version = 0 at byte 8
+        assert_eq!(tfhd[8], 0, "version must be 0");
+        // flags (3 bytes big-endian at 9..12)
+        let flags = u32::from_be_bytes([0, tfhd[9], tfhd[10], tfhd[11]]);
+        assert_eq!(flags, 0x02_0000);
+        // track_id at 12..16
+        let track_id = u32::from_be_bytes([tfhd[12], tfhd[13], tfhd[14], tfhd[15]]);
+        assert_eq!(track_id, 1);
+    }
+
+    #[test]
+    fn tfhd_track_id_is_encoded_big_endian() {
+        let tfhd = build_tfhd(42, 0);
+        let track_id = u32::from_be_bytes([tfhd[12], tfhd[13], tfhd[14], tfhd[15]]);
+        assert_eq!(track_id, 42);
+    }
+
+    #[test]
+    fn tfhd_flags_field_is_encoded_big_endian() {
+        let tfhd = build_tfhd(1, 0x00_0020); // default-sample-flags present
+        let flags = u32::from_be_bytes([0, tfhd[9], tfhd[10], tfhd[11]]);
+        assert_eq!(flags, 0x00_0020);
+    }
+
+    #[test]
+    fn tfhd_total_size_is_16_bytes() {
+        let tfhd = build_tfhd(1, 0);
+        // Full box header = 4+4+4 = 12; track_id = 4 → total = 16
+        assert_eq!(tfhd.len(), 16);
+    }
+
     #[test]
     fn annex_b_to_avcc_preserves_nal_payload_bytes() {
         // Payload bytes after length prefix must match original NAL body.
