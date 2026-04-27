@@ -2116,4 +2116,158 @@ mod tests {
             "max u16 port 65535 must pass validation, got {result:?}"
         );
     }
+
+    // ─── B4 RED: validate_service_name accept/reject scenarios (R5.5, R5.6) ─────
+
+    // ── Reject set (R5.5) ────────────────────────────────────────────────────────
+
+    /// B4.1 — `validate_service_name("")` returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: empty string must be rejected.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_empty_rejected() {
+        let result = validate_service_name("");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "", "error must carry the rejected value");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B4.2 — `validate_service_name("bogus")` returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: no leading `_`, no protocol segment.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_bogus_rejected() {
+        let result = validate_service_name("bogus");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "bogus");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B4.3 — `validate_service_name("_screen-mirror._tcp.local")` (missing trailing dot)
+    ///         returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: missing trailing dot is a common mistake — must be rejected.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_missing_trailing_dot_rejected() {
+        let result = validate_service_name("_screen-mirror._tcp.local");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "_screen-mirror._tcp.local");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B4.4 — `validate_service_name("_screen-mirror.tcp.local.")` (protocol missing `_`)
+    ///         returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: protocol segment must start with `_`.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_protocol_missing_underscore_rejected() {
+        let result = validate_service_name("_screen-mirror.tcp.local.");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "_screen-mirror.tcp.local.");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B4.5 — `validate_service_name("screen-mirror._tcp.local.")` (service missing `_`)
+    ///         returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: service segment must start with `_`.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_service_missing_underscore_rejected() {
+        let result = validate_service_name("screen-mirror._tcp.local.");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "screen-mirror._tcp.local.");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    /// B4.6 — `validate_service_name("_screen-mirror._tcp.local..")` (double trailing dot)
+    ///         returns `Err(InvalidServiceName { .. })`.
+    ///
+    /// Spec R5.5: double trailing dot — must be rejected.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_double_trailing_dot_rejected() {
+        let result = validate_service_name("_screen-mirror._tcp.local..");
+        match result {
+            Err(StartStreamError::InvalidServiceName { value, .. }) => {
+                assert_eq!(value, "_screen-mirror._tcp.local..");
+            }
+            other => panic!("expected Err(InvalidServiceName), got {other:?}"),
+        }
+    }
+
+    // ── Accept set (R5.6) ────────────────────────────────────────────────────────
+
+    /// B4.7 — `validate_service_name("_screen-mirror._tcp.local.")` returns `Ok(())`.
+    ///
+    /// Spec R5.3 + R5.6: default value must pass its own validation.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_default_accepted() {
+        let result = validate_service_name("_screen-mirror._tcp.local.");
+        assert!(
+            result.is_ok(),
+            "default service name must be accepted, got {result:?}"
+        );
+    }
+
+    /// B4.8 — `validate_service_name("_my-mirror._tcp.local.")` returns `Ok(())`.
+    ///
+    /// Spec R5.6: custom service, TCP protocol.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_custom_tcp_accepted() {
+        let result = validate_service_name("_my-mirror._tcp.local.");
+        assert!(
+            result.is_ok(),
+            "_my-mirror._tcp.local. must be accepted, got {result:?}"
+        );
+    }
+
+    /// B4.9 — `validate_service_name("_my-mirror._udp.local.")` returns `Ok(())`.
+    ///
+    /// Spec R5.6: custom service, UDP protocol.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_custom_udp_accepted() {
+        let result = validate_service_name("_my-mirror._udp.local.");
+        assert!(
+            result.is_ok(),
+            "_my-mirror._udp.local. must be accepted, got {result:?}"
+        );
+    }
+
+    /// B4.10 — `validate_service_name("_a._b.local.")` returns `Ok(())`.
+    ///
+    /// Spec R5.6: minimal valid form — single-char service and protocol segments.
+    /// The pattern `^_[A-Za-z0-9-]+\._[A-Za-z0-9-]+\.local\.$` (R5.2) accepts
+    /// any `[A-Za-z0-9-]+` in both segments — not restricted to `tcp`/`udp`.
+    /// RED: `validate_service_name` does not exist yet.
+    #[test]
+    fn test_validate_service_name_minimal_accepted() {
+        let result = validate_service_name("_a._b.local.");
+        assert!(
+            result.is_ok(),
+            "_a._b.local. must be accepted (minimal valid form), got {result:?}"
+        );
+    }
 }
