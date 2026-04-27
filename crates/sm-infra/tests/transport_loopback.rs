@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, VideoEncoder};
 use sm_domain::signaling::{
-    IceCandidate, Signaling, SignalingEvent, SignalingRole, SdpAnswer, SdpOffer,
+    IceCandidate, Signaling, SignalingEvent, SignalingRole,
 };
 use sm_domain::transport::{TransportConfig, TransportEvent, TransportRole, VideoReceiver, VideoSender};
 use sm_infra::signaling::loopback::LoopbackSignaling;
@@ -762,54 +762,38 @@ fn transport_loopback_rtcp_pli_reaches_encoder() {
 ///
 /// # What needs to happen for this to pass (task 6.2)
 ///
-/// 1. Both sender and receiver bind ephemeral UDP sockets.
-/// 2. Both get their local bound addresses via `UdpSocket::local_addr()`.
-/// 3. Their addresses are exchanged as ICE candidates via `add_remote_candidate`.
+/// 1. Both sender and receiver bind ephemeral UDP sockets (udp_port: 0).
+/// 2. After `start()`, both expose their effective local address via `local_addr()`.
+/// 3. Their addresses are serialized as JSON and exchanged via `add_remote_candidate`.
 /// 4. str0m's ICE layer sends STUN binding requests to the peer's address.
 /// 5. Both tick loops process the incoming STUN and send responses.
 /// 6. ICE transitions to `Connected`.
 ///
-/// In the current implementation, ICE candidates are only added if `start()` has
-/// been called AND if `apply_remote_answer` has been called to complete the SDP
-/// negotiation. The test wires all of these together and waits for
+/// The test wires all of these together and waits for
 /// `TransportEvent::IceConnected` within 5 seconds.
-///
-/// If the current implementation does NOT forward candidate addresses to the peer,
-/// this test will fail with timeout.
 #[test]
 fn transport_loopback_ice_connects_over_loopback_r11_2() {
-    use std::net::UdpSocket as StdUdpSocket;
-
-    // Step 1: bind two ephemeral UDP sockets on 127.0.0.1 to get port numbers.
-    // These ports are what we will tell each peer to use as ICE candidates.
-    let probe_sender = StdUdpSocket::bind("127.0.0.1:0").expect("probe sender bind");
-    let probe_receiver = StdUdpSocket::bind("127.0.0.1:0").expect("probe receiver bind");
-    let sender_port = probe_sender.local_addr().unwrap().port();
-    let receiver_port = probe_receiver.local_addr().unwrap().port();
-    drop(probe_sender);
-    drop(probe_receiver);
-
-    // Step 2: Build sender and receiver on the discovered ports.
     let enc = FakeLoopbackEncoder::new();
 
+    // Step 1: Build sender and receiver with ephemeral ports.
     let mut sender = Str0mVideoSender::new(TransportConfig {
-        udp_port: sender_port,
+        udp_port: 0,
         ..TransportConfig::default()
     })
     .expect("sender new");
 
     let mut receiver = Str0mVideoReceiver::new(TransportConfig {
-        udp_port: receiver_port,
+        udp_port: 0,
         role: TransportRole::Receiver,
         ..TransportConfig::default()
     })
     .expect("receiver new");
 
-    // Step 3: Pre-start signaling exchange.
+    // Step 2: Pre-start signaling exchange.
     let offer = sender.create_local_offer().expect("offer");
     let answer = receiver.apply_remote_offer(offer).expect("answer");
 
-    // Step 4: Start both.
+    // Step 3: Start both.
     sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
     let (pkt_tx, pkt_rx) = sync_channel(4);
     let (sender_event_tx, sender_event_rx) = sync_channel::<TransportEvent>(8);
@@ -819,28 +803,28 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
     receiver.start(pkt_out_tx, receiver_event_tx).expect("receiver start");
 
-    // Step 5: Apply the answer to sender.
+    // Step 4: Retrieve effective local addresses from both adapters.
+    let sender_addr = sender
+        .local_addr()
+        .expect("sender must expose local_addr after start()");
+    let receiver_addr = receiver
+        .local_addr()
+        .expect("receiver must expose local_addr after start()");
+
+    // Step 5: Apply the answer to sender (post-start path via control inbox).
     sender.apply_remote_answer(answer).expect("apply answer");
 
     // Step 6: Exchange ICE candidates — tell each peer where the other is listening.
-    // The candidate format must be parseable by str0m: plain JSON-serialised Candidate.
-    // str0m's Candidate implements Serialize so we can build them via str0m directly.
-    let sender_candidate = str0m::Candidate::host(
-        format!("127.0.0.1:{sender_port}").parse().unwrap(),
-        "udp",
-    )
-    .expect("sender host candidate");
+    // str0m's Candidate implements serde::Serialize, so we JSON-serialize the candidate.
+    let sender_candidate = str0m::Candidate::host(sender_addr, "udp")
+        .expect("sender host candidate");
+    let receiver_candidate = str0m::Candidate::host(receiver_addr, "udp")
+        .expect("receiver host candidate");
 
-    let receiver_candidate = str0m::Candidate::host(
-        format!("127.0.0.1:{receiver_port}").parse().unwrap(),
-        "udp",
-    )
-    .expect("receiver host candidate");
-
-    let sender_cand_json = serde_json::to_string(&sender_candidate)
-        .expect("serialise sender candidate");
-    let receiver_cand_json = serde_json::to_string(&receiver_candidate)
-        .expect("serialise receiver candidate");
+    let sender_cand_json =
+        serde_json::to_string(&sender_candidate).expect("serialise sender candidate");
+    let receiver_cand_json =
+        serde_json::to_string(&receiver_candidate).expect("serialise receiver candidate");
 
     // Tell receiver about sender's address.
     receiver
@@ -876,8 +860,8 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
 
     assert!(
         ice_connected,
-        "ICE must reach Connected state within 5 s over 127.0.0.1 loopback; \
-         check that both sender and receiver exchange STUN binding requests via \
-         their respective tick loops"
+        "ICE must reach Connected state within 5 s over 127.0.0.1 loopback \
+         (sender_addr={sender_addr}, receiver_addr={receiver_addr}); \
+         check that both tick loops process STUN binding requests correctly"
     );
 }

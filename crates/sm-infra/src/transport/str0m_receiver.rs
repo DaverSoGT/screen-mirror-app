@@ -126,6 +126,8 @@ pub struct Str0mVideoReceiver {
     control_tx: Option<SyncSender<ReceiverControl>>,
     /// Join handle for the tick thread. `Some` while running.
     handle: Option<JoinHandle<()>>,
+    /// Effective local socket address after `start()`. `None` before start.
+    local_addr: Option<std::net::SocketAddr>,
 }
 
 impl std::fmt::Debug for Str0mVideoReceiver {
@@ -170,6 +172,7 @@ impl VideoReceiver for Str0mVideoReceiver {
             state: ReceiverShared::new(),
             control_tx: None,
             handle: None,
+            local_addr: None,
         })
     }
 
@@ -205,12 +208,19 @@ impl VideoReceiver for Str0mVideoReceiver {
                 .ok_or_else(|| TransportError::Internal("Rtc already moved to thread".into()))?
         };
 
-        // Add local ICE host candidate if addr is not wildcard.
+        // Compute the effective local address for ICE candidate registration and
+        // for the `Input::Receive { destination }` field in the tick loop.
+        // When bound to the wildcard address (0.0.0.0), fall back to 127.0.0.1
+        // with the actual bound port.
+        let effective_local_addr: std::net::SocketAddr = if local_addr.ip().is_unspecified() {
+            format!("127.0.0.1:{}", local_addr.port()).parse().unwrap()
+        } else {
+            local_addr
+        };
+
         let mut rtc_tmp = pre_neg.rtc;
-        if !local_addr.ip().is_unspecified() {
-            if let Ok(cand) = Candidate::host(local_addr, "udp") {
-                rtc_tmp.add_local_candidate(cand);
-            }
+        if let Ok(cand) = Candidate::host(effective_local_addr, "udp") {
+            rtc_tmp.add_local_candidate(cand);
         }
 
         let pre_neg_with_candidate = ReceiverPreNeg {
@@ -230,7 +240,7 @@ impl VideoReceiver for Str0mVideoReceiver {
                 run_receiver_loop(
                     pre_neg_with_candidate,
                     udp,
-                    local_addr,
+                    effective_local_addr,
                     pkt_tx,
                     event_tx,
                     ctrl_rx,
@@ -240,6 +250,8 @@ impl VideoReceiver for Str0mVideoReceiver {
             .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
 
         self.handle = Some(handle);
+        // Store the effective local address so callers can retrieve it for candidate exchange.
+        self.local_addr = Some(effective_local_addr);
         Ok(())
     }
 
@@ -336,6 +348,16 @@ impl Drop for Str0mVideoReceiver {
     /// Ensure the tick thread is joined when the adapter is dropped.
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+impl Str0mVideoReceiver {
+    /// Return the effective local socket address after `start()`.
+    ///
+    /// Returns `None` before `start()` is called. Used by integration tests and
+    /// signaling adapters to discover the bound ephemeral port for ICE candidate exchange.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
     }
 }
 
@@ -491,7 +513,13 @@ fn handle_receiver_event(
     event_tx: &SyncSender<TransportEvent>,
 ) {
     match ev {
-        Event::IceConnectionStateChange(IceConnectionState::Connected) => {
+        // `Connected` fires when at least one candidate pair is working but gathering
+        // may still be in progress. `Completed` fires when the best pair is selected
+        // and gathering is done. With a single candidate pair (loopback tests, most
+        // prod scenarios), the state jumps directly to `Completed`, skipping `Connected`.
+        // We map both to `TransportEvent::IceConnected`.
+        Event::IceConnectionStateChange(IceConnectionState::Connected)
+        | Event::IceConnectionStateChange(IceConnectionState::Completed) => {
             let _ = event_tx.try_send(TransportEvent::IceConnected);
         }
         Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {

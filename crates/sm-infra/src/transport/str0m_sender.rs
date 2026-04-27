@@ -126,6 +126,9 @@ pub struct Str0mVideoSender {
     control_tx: Option<SyncSender<SenderControl>>,
     /// Join handle for the tick thread. `Some` while running, `None` otherwise.
     handle: Option<JoinHandle<()>>,
+    /// Effective local socket address after `start()`. `None` before start.
+    /// Used by integration tests to discover the bound port for candidate exchange.
+    local_addr: Option<std::net::SocketAddr>,
 }
 
 impl std::fmt::Debug for Str0mVideoSender {
@@ -193,6 +196,7 @@ impl VideoSender for Str0mVideoSender {
             encoder: None,
             control_tx: None,
             handle: None,
+            local_addr: None,
         })
     }
 
@@ -228,16 +232,21 @@ impl VideoSender for Str0mVideoSender {
                 .ok_or_else(|| TransportError::Internal("Rtc already moved to thread".into()))?
         };
 
-        // Add the local UDP address as an ICE host candidate.
-        // `Candidate::host` rejects the wildcard address (0.0.0.0) which is legal
-        // when the OS picks an ephemeral port via bind("0.0.0.0:0"). In that case we
-        // skip the local candidate — the peer will supply remote candidates via
-        // `add_remote_candidate` and ICE will proceed normally.
-        let local_candidate_opt = if local_addr.ip().is_unspecified() {
-            None
+        // Compute the effective local address for ICE candidate registration and
+        // for the `Input::Receive { destination }` field in the tick loop.
+        // When bound to the wildcard address (0.0.0.0), fall back to 127.0.0.1
+        // with the actual bound port so that loopback tests and single-host setups
+        // work without explicit candidate injection. The effective address is also
+        // what we tell str0m is the "destination" when a UDP datagram arrives —
+        // str0m uses this to match packets to ICE candidates.
+        let effective_local_addr: std::net::SocketAddr = if local_addr.ip().is_unspecified() {
+            format!("127.0.0.1:{}", local_addr.port()).parse().unwrap()
         } else {
-            Candidate::host(local_addr, "udp").ok()
+            local_addr
         };
+
+        let local_candidate_opt = Candidate::host(effective_local_addr, "udp").ok();
+
         {
             // We need &mut rtc to add the candidate. Briefly borrow from pre_neg.
             // pre_neg is now owned locally.
@@ -269,7 +278,7 @@ impl VideoSender for Str0mVideoSender {
                     run_sender_loop(
                         pre_neg_with_candidate,
                         udp,
-                        local_addr,
+                        effective_local_addr,
                         rx,
                         event_tx,
                         ctrl_rx,
@@ -281,6 +290,9 @@ impl VideoSender for Str0mVideoSender {
 
             self.handle = Some(handle);
         }
+
+        // Store the effective local address so callers can retrieve it for candidate exchange.
+        self.local_addr = Some(effective_local_addr);
 
         Ok(())
     }
@@ -345,6 +357,16 @@ impl VideoSender for Str0mVideoSender {
 impl Drop for Str0mVideoSender {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+impl Str0mVideoSender {
+    /// Return the effective local socket address after `start()`.
+    ///
+    /// Returns `None` before `start()` is called. Used by integration tests and
+    /// signaling adapters to discover the bound ephemeral port for ICE candidate exchange.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
     }
 }
 
@@ -502,11 +524,15 @@ fn run_sender_loop(
         }
 
         // ── 5. Blocking recv_from with deadline-derived timeout ──────────
+        // Cap at 200 ms so that stop() and control-inbox messages (remote
+        // candidates, answer) unblock quickly.
         let now = Instant::now();
         let remaining = deadline
             .checked_duration_since(now)
             .unwrap_or(Duration::from_millis(1));
-        let timeout = remaining.max(Duration::from_millis(1));
+        let timeout = remaining
+            .min(Duration::from_millis(200))
+            .max(Duration::from_millis(1));
 
         if let Err(e) = udp.set_read_timeout(Some(timeout)) {
             let _ = event_tx.try_send(TransportEvent::ConnectionLost {
@@ -555,7 +581,13 @@ fn handle_sender_event(
 ) {
     let _ = state; // state.dropped used for packet drops, not event drops
     match ev {
-        Event::IceConnectionStateChange(IceConnectionState::Connected) => {
+        // `Connected` fires when at least one candidate pair is working but gathering
+        // may still be in progress. `Completed` fires when the best pair is selected
+        // and gathering is done. With a single candidate pair (loopback tests, most
+        // prod scenarios), the state jumps directly to `Completed`, skipping `Connected`.
+        // We map both to `TransportEvent::IceConnected`.
+        Event::IceConnectionStateChange(IceConnectionState::Connected)
+        | Event::IceConnectionStateChange(IceConnectionState::Completed) => {
             let _ = event_tx.try_send(TransportEvent::IceConnected);
         }
         Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
