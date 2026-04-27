@@ -194,8 +194,15 @@ impl VideoReceiver for Str0mVideoReceiver {
         self.state.seq.store(0, Ordering::Release);
 
         let bind_addr = format!("0.0.0.0:{}", self.config.udp_port);
-        let udp = UdpSocket::bind(&bind_addr)
-            .map_err(|e| TransportError::Io(format!("UDP bind failed on {bind_addr}: {e}")))?;
+        let udp = UdpSocket::bind(&bind_addr).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                TransportError::AddrInUse {
+                    port: self.config.udp_port,
+                }
+            } else {
+                TransportError::Io(format!("UDP bind failed on {bind_addr}: {e}"))
+            }
+        })?;
         let local_addr = udp
             .local_addr()
             .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -548,6 +555,24 @@ fn handle_receiver_event(
             }
         }
         _ => {}
+    }
+}
+
+// ─── B2 — classify_bind_error: AddrInUse detection helper (R1.4) ─────────────
+
+/// Translate a `UdpSocket::bind` `io::Error` into the appropriate `TransportError`.
+///
+/// Checks `e.kind() == ErrorKind::AddrInUse` BEFORE stringifying. On `AddrInUse`,
+/// returns `TransportError::AddrInUse { port }`. On any other kind, falls through to
+/// the legacy `TransportError::Io(format!("UDP bind failed on 0.0.0.0:{port}: {e}"))`.
+///
+/// Cross-platform: stdlib maps `EADDRINUSE` (Linux/macOS) and `WSAEADDRINUSE`
+/// (Windows, errno 10048) to `ErrorKind::AddrInUse`.
+fn classify_bind_error(e: std::io::Error, port: u16) -> TransportError {
+    if e.kind() == std::io::ErrorKind::AddrInUse {
+        TransportError::AddrInUse { port }
+    } else {
+        TransportError::Io(format!("UDP bind failed on 0.0.0.0:{port}: {e}"))
     }
 }
 
@@ -932,6 +957,8 @@ mod tests {
     }
 
     // ─── B2 RED: classify_bind_error logic unit test (R1.4) ───────────────────
+
+    use super::classify_bind_error;
 
     #[test]
     fn classify_bind_error_addr_in_use_maps_to_transport_addr_in_use() {
