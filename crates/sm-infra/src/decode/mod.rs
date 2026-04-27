@@ -5,3 +5,5 @@
 // V2: a future `windows_mf::WindowsMfDecoder` behind the `hw-decoder` Cargo feature.
 //
 // Module stubs are empty until B1/B2/B3 fill them in.
+
+pub mod i420_to_bgra;
