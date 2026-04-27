@@ -304,22 +304,81 @@ fn ue_to_se(ue: u32) -> i32 {
     sign * mag
 }
 
-// ─── Capability B stub (GREEN will add implementation) ────────────────────────
+// ─── Capability B: avcC box builder ──────────────────────────────────────────
 
 /// Build an `AVCDecoderConfigurationRecord` (`avcC`) byte buffer.
 ///
-/// Layout (ISO/IEC 14496-15 §5.2.4.1.2): see module docs.
+/// Layout (ISO/IEC 14496-15 §5.2.4.1.2):
+///
+/// ```text
+/// 1 byte   configurationVersion = 1
+/// 1 byte   AVCProfileIndication  = profile_idc
+/// 1 byte   profile_compatibility = constraint_set_flags
+/// 1 byte   AVCLevelIndication    = level_idc
+/// 1 byte   0xFC | lengthSizeMinusOne (= 0xFF for 4-byte length prefix)
+/// 1 byte   0xE0 | numSequenceParameterSets (= 0xE1 for exactly 1 SPS)
+/// 2 bytes  sequenceParameterSetLength  (u16 big-endian)
+/// N bytes  SPS NAL bytes (with NAL header byte, without Annex-B start code)
+/// 1 byte   numPictureParameterSets = 1
+/// 2 bytes  pictureParameterSetLength   (u16 big-endian)
+/// M bytes  PPS NAL bytes (with NAL header byte, without Annex-B start code)
+/// ```
 ///
 /// # Errors
 ///
-/// Returns `Err(AvccError::InvalidInput(_))` if `sps_nal` or `pps_nal` is empty.
+/// Returns `Err(AvccError::InvalidInput(_))` if `sps_nal` or `pps_nal` is empty, or if
+/// either NAL is longer than `u16::MAX` bytes.
 pub fn build_avcc(
     sps_info: &SpsInfo,
     sps_nal: &[u8],
     pps_nal: &[u8],
 ) -> Result<Vec<u8>, AvccError> {
-    let _ = (sps_info, sps_nal, pps_nal);
-    unimplemented!("build_avcc — Capability B GREEN stub")
+    if sps_nal.is_empty() {
+        return Err(AvccError::InvalidInput("sps_nal must not be empty".into()));
+    }
+    if pps_nal.is_empty() {
+        return Err(AvccError::InvalidInput("pps_nal must not be empty".into()));
+    }
+
+    let sps_len = sps_nal.len();
+    let pps_len = pps_nal.len();
+
+    if sps_len > u16::MAX as usize {
+        return Err(AvccError::InvalidInput(format!(
+            "SPS NAL too large: {} bytes (max {})",
+            sps_len,
+            u16::MAX
+        )));
+    }
+    if pps_len > u16::MAX as usize {
+        return Err(AvccError::InvalidInput(format!(
+            "PPS NAL too large: {} bytes (max {})",
+            pps_len,
+            u16::MAX
+        )));
+    }
+
+    let total = 6 + 2 + sps_len + 1 + 2 + pps_len;
+    let mut buf = Vec::with_capacity(total);
+
+    // Fixed 6-byte header.
+    buf.push(1u8); // configurationVersion = 1
+    buf.push(sps_info.profile_idc); // AVCProfileIndication
+    buf.push(sps_info.constraint_set_flags); // profile_compatibility
+    buf.push(sps_info.level_idc); // AVCLevelIndication
+    buf.push(0xFC | 0x03); // reserved(6b=0b111111) | lengthSizeMinusOne(2b=3) → 0xFF
+    buf.push(0xE0 | 0x01); // reserved(3b=0b111) | numSequenceParameterSets(5b=1) → 0xE1
+
+    // SPS NAL.
+    buf.extend_from_slice(&(sps_len as u16).to_be_bytes());
+    buf.extend_from_slice(sps_nal);
+
+    // PPS NAL.
+    buf.push(1u8); // numPictureParameterSets = 1
+    buf.extend_from_slice(&(pps_len as u16).to_be_bytes());
+    buf.extend_from_slice(pps_nal);
+
+    Ok(buf)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -527,85 +586,116 @@ mod tests {
         }
     }
 
-    // ─── Capability B: build_avcc — RED stubs (#[should_panic]) ───────────
-    // These will become real assertions in the GREEN B commit.
+    // ─── Capability B: build_avcc — error paths (GREEN) ───────────────────
 
     #[test]
-    #[should_panic]
     fn build_avcc_empty_sps_returns_err() {
-        let _ = build_avcc(&minimal_sps_info(), &[], MINIMAL_PPS);
+        let err = build_avcc(&minimal_sps_info(), &[], MINIMAL_PPS).unwrap_err();
+        assert!(matches!(err, AvccError::InvalidInput(_)));
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_empty_pps_returns_err() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, &[]);
+        let err = build_avcc(&minimal_sps_info(), MINIMAL_SPS, &[]).unwrap_err();
+        assert!(matches!(err, AvccError::InvalidInput(_)));
     }
 
+    // ─── Capability B: build_avcc — byte layout (GREEN) ───────────────────
+
     #[test]
-    #[should_panic]
     fn build_avcc_configuration_version_is_one() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        assert_eq!(buf[0], 1, "configurationVersion must be 1");
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_profile_compatibility_level_correct() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let info = minimal_sps_info();
+        let buf = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        assert_eq!(buf[1], 66, "AVCProfileIndication = profile_idc");
+        assert_eq!(buf[2], 0xC0, "profile_compatibility = constraint_set_flags");
+        assert_eq!(buf[3], 31, "AVCLevelIndication = level_idc");
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_length_size_minus_one_is_three() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        // byte 4: 0xFC | 0x03 = 0xFF
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        assert_eq!(buf[4], 0xFF, "lengthSizeMinusOne byte must be 0xFF");
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_num_sps_field_is_0xe1() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        // byte 5: 0xE0 | 0x01 = 0xE1
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        assert_eq!(buf[5], 0xE1, "numSPS byte must be 0xE1");
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_sps_length_is_big_endian() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        let sps_len = u16::from_be_bytes([buf[6], buf[7]]);
+        assert_eq!(sps_len as usize, MINIMAL_SPS.len());
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_sps_bytes_verbatim() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        let sps_start = 8;
+        assert_eq!(&buf[sps_start..sps_start + MINIMAL_SPS.len()], MINIMAL_SPS);
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_num_pps_is_one() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        assert_eq!(buf[8 + MINIMAL_SPS.len()], 1);
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_pps_length_is_big_endian() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        let pps_len_off = 8 + MINIMAL_SPS.len() + 1;
+        let pps_len = u16::from_be_bytes([buf[pps_len_off], buf[pps_len_off + 1]]);
+        assert_eq!(pps_len as usize, MINIMAL_PPS.len());
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_pps_bytes_verbatim() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        let pps_start = 8 + MINIMAL_SPS.len() + 1 + 2;
+        assert_eq!(&buf[pps_start..pps_start + MINIMAL_PPS.len()], MINIMAL_PPS);
     }
 
     #[test]
-    #[should_panic]
     fn build_avcc_total_size_correct() {
-        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+        let buf = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS)
+            .expect("build_avcc should succeed");
+        let expected = 6 + 2 + MINIMAL_SPS.len() + 1 + 2 + MINIMAL_PPS.len();
+        assert_eq!(buf.len(), expected);
     }
 
+    // ─── Capability B: round-trip (GREEN) ─────────────────────────────────
+
     #[test]
-    #[should_panic]
     fn build_avcc_golden_round_trip_320x240() {
-        let info = parse_sps(SPS_320X240).expect("parse");
-        let _ = build_avcc(&info, SPS_320X240, MINIMAL_PPS);
+        // Parse 320x240 SPS → build avcC → verify key bytes match spec.
+        let info = parse_sps(SPS_320X240).expect("should parse");
+        let buf = build_avcc(&info, SPS_320X240, MINIMAL_PPS).expect("should build");
+
+        assert_eq!(buf[0], 1, "configurationVersion = 1");
+        assert_eq!(buf[1], 66, "AVCProfileIndication = 66");
+        assert_eq!(buf[2], 0xC0, "profile_compatibility = 0xC0");
+        assert_eq!(buf[3], 13, "AVCLevelIndication = 13 (Level 1.3)");
+        assert_eq!(buf[4], 0xFF, "lengthSizeMinusOne = 3 → 0xFF");
+        assert_eq!(buf[5], 0xE1, "numSPS = 1 → 0xE1");
     }
 }
