@@ -77,11 +77,7 @@ pub fn unwrap_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
 
     while i < rbsp.len() {
         // Detect 0x00 0x00 0x03 triplet and strip the 0x03.
-        if i + 2 < rbsp.len()
-            && rbsp[i] == 0x00
-            && rbsp[i + 1] == 0x00
-            && rbsp[i + 2] == 0x03
-        {
+        if i + 2 < rbsp.len() && rbsp[i] == 0x00 && rbsp[i + 1] == 0x00 && rbsp[i + 2] == 0x03 {
             out.push(0x00);
             out.push(0x00);
             i += 3;
@@ -413,18 +409,12 @@ mod tests {
     //
     // Parsed: width=(19+1)*16=320, height=1*(14+1)*16=240, progressive
 
-    const SPS_320X240: &[u8] = &[
-        0x67, 0x42, 0xC0, 0x0D,
-        0xF4, 0x0A, 0x0F, 0xC0,
-    ];
+    const SPS_320X240: &[u8] = &[0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0];
 
     // SPS_320X240_INTERLACED: same but frame_mbs_only_flag=0.
     // bit 24 → 0, so byte 3 of RBSP = 0100 0000 = 0x40.
     // Parsed: width=320, height=2*(14+1)*16=480, interlaced.
-    const SPS_320X240_INTERLACED: &[u8] = &[
-        0x67, 0x42, 0xC0, 0x0D,
-        0xF4, 0x0A, 0x0F, 0x40,
-    ];
+    const SPS_320X240_INTERLACED: &[u8] = &[0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0x40];
 
     // SPS_1280X720: Baseline Level 3.1, 1280×720 progressive.
     //
@@ -447,21 +437,13 @@ mod tests {
     //   [byte 4: 1100 0000 = 0xC0]
     //
     // Parsed: width=(79+1)*16=1280, height=1*(44+1)*16=720
-    const SPS_1280X720: &[u8] = &[
-        0x67, 0x42, 0xC0, 0x1F,
-        0xF4, 0x02, 0x80, 0x2D, 0xC0,
-    ];
+    const SPS_1280X720: &[u8] = &[0x67, 0x42, 0xC0, 0x1F, 0xF4, 0x02, 0x80, 0x2D, 0xC0];
 
     // GOLDEN_SPS_1920X1080: real SPS bytes from openh264 for 1920×1080 Baseline Level 4.0.
     // Contains emulation-prevention bytes (0x03) at positions 13 and 18.
     const GOLDEN_SPS_1920X1080: &[u8] = &[
-        0x67, 0x42, 0xC0, 0x28,
-        0xD9, 0x00, 0xA0, 0x47,
-        0xFE, 0xC0, 0x44, 0x00,
-        0x00, 0x03, 0x00, 0x04,
-        0x00, 0x00, 0x03, 0x00,
-        0xCA, 0x3C, 0x48, 0x96,
-        0x58,
+        0x67, 0x42, 0xC0, 0x28, 0xD9, 0x00, 0xA0, 0x47, 0xFE, 0xC0, 0x44, 0x00, 0x00, 0x03, 0x00,
+        0x04, 0x00, 0x00, 0x03, 0x00, 0xCA, 0x3C, 0x48, 0x96, 0x58,
     ];
 
     const MINIMAL_SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x1F, 0xAB, 0xCD];
@@ -612,8 +594,7 @@ mod tests {
     #[test]
     fn build_avcc_profile_compatibility_level_correct() {
         let info = minimal_sps_info();
-        let buf = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS)
-            .expect("build_avcc should succeed");
+        let buf = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS).expect("build_avcc should succeed");
         assert_eq!(buf[1], 66, "AVCProfileIndication = profile_idc");
         assert_eq!(buf[2], 0xC0, "profile_compatibility = constraint_set_flags");
         assert_eq!(buf[3], 31, "AVCLevelIndication = level_idc");
