@@ -214,6 +214,13 @@ impl VideoSender for Str0mVideoSender {
             return Err(TransportError::AlreadyRunning);
         }
 
+        // R9.3 — encoder must be set before start so PLI events have somewhere to go.
+        if self.encoder.is_none() {
+            return Err(TransportError::InvalidConfig(
+                "encoder not set; call set_encoder() before start()".into(),
+            ));
+        }
+
         // Reset stop flag in case this sender is restarted.
         self.state.stop.store(false, Ordering::Release);
 
