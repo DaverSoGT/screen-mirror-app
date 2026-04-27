@@ -170,10 +170,8 @@ pub enum PortRejectReason {
 /// All variants are now constructed: `BundleBuildFailed` (B2), `InvalidPort`/
 /// `InvalidServiceName` (B3/B4 pure fns, called in B5-3 `start_stream_inner`).
 /// `PortInUse` is constructed in B5-4; `AlreadyRunning` is constructed in B6.
-/// `#[allow(dead_code)]` has been removed — B5 wires the final call sites.
-/// (B6's `AlreadyRunning` construction is the only remaining dead-code path; its
-/// suppressor lives on the variant itself until B6 lands — but the enum-level
-/// allow is no longer needed since at least one variant is constructed per gate.)
+/// All variants are now constructed: B2 (BundleBuildFailed), B3/B4 (InvalidPort/InvalidServiceName),
+/// B5-4 (PortInUse), B6 (AlreadyRunning). No `#[allow(dead_code)]` attributes remain.
 #[derive(Debug, thiserror::Error, serde::Serialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum StartStreamError {
@@ -183,8 +181,6 @@ pub enum StartStreamError {
     /// "running with port=X service=Y". Both same-args and diff-args double-start
     /// return this variant (PQ-E: no silent ignore).
     ///
-    /// `#[allow(dead_code)]`: constructed in B6 (current_args lifecycle).
-    #[allow(dead_code)]
     #[error("a stream session is already running on port {current_port} ({current_service_name})")]
     AlreadyRunning {
         current_port: u16,
@@ -399,6 +395,12 @@ impl StreamBridge {
     }
 
     /// Returns `true` if a session is currently running.
+    ///
+    /// Used in tests and diagnostics. In production code, running state is
+    /// determined via `current_args` (set on start, cleared on stop). The
+    /// `#[allow(dead_code)]` suppresses the dead-code lint for the `lib`
+    /// target — this method IS exercised by the `#[cfg(test)]` suite.
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.session
             .lock()
@@ -441,6 +443,9 @@ struct StreamSession {
 }
 
 impl StreamSession {
+    /// Returns `true` if the session's stop flag has not been set.
+    /// Called by `StreamBridge::is_running()` — see that method's doc.
+    #[allow(dead_code)]
     fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
     }
@@ -848,15 +853,18 @@ fn build_production_bundle(
 /// 1. Validate `udp_port` (if `Some`) — pure fn, no locks held.
 /// 2. Validate `service_name` (if `Some`) — pure fn, no locks held.
 /// 3. Resolve defaults for `None` args — static values, not validated (known-good).
-/// 4. Check running state (B5 intermediate: idempotent; B6 replaces with AlreadyRunning).
+/// 4. Acquire `current_args` lock; check `Some(cur)` → `Err(AlreadyRunning)` (PQ-E).
+///    Release lock before builder invocation (builder may take seconds).
 /// 5. Invoke the `BuilderFn` with resolved `(port, name, stop_flag)`.
+/// 6. Acquire session lock; store session.
+/// 7. Set `current_args = Some((port, name))`.
+///
+/// Lock-ordering discipline (design §4):
+///   start path: `current_args` FIRST, then `session`.
+///   stop path: `session` FIRST, then `current_args` (see `stop_stream_session`).
 ///
 /// Design §10 OQ-A2 (option a): `pub(crate)` so the `#[tauri::command]` wrapper is
 /// a thin 4-line forwarder and tests exercise the same code path.
-///
-/// NOTE (B5 intermediate state): The existing `is_running()` early-return is
-/// PRESERVED per the Anti-Scope-Creep Guard — B6 replaces it with the
-/// `AlreadyRunning` error carrying `current_args`.
 pub(crate) fn start_stream_inner(
     bridge: &StreamBridge,
     channel: Arc<dyn ChannelLike>,
@@ -886,25 +894,32 @@ pub(crate) fn start_stream_inner(
     let resolved_port = udp_port.unwrap_or(7889);
     let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
 
-    // Step 4 — Check running state.
-    // B5 intermediate: idempotent early-return is REPLACED in B6-2 with the
-    // AlreadyRunning error using current_args. For B6-1, we add the current_args
-    // population logic here — the is_running() guard stays until B6-2 removes it.
+    // Step 4 — Acquire current_args lock FIRST (design §4 lock-order: current_args → session).
     //
-    // Lock-ordering note (design §4):
-    //   start path: acquire current_args FIRST, then session.
-    //   stop path:  acquire session FIRST, then current_args.
-    // This asymmetry is intentional — see stop_stream_session for the complementary
-    // side. The ordering must NOT be reversed in future changes.
-    //
-    // B6-2 will replace the is_running() early-return below with:
-    //   match &*args_guard { Some((p, n)) => Err(AlreadyRunning {..}), None => {} }
-    if bridge.is_running() {
-        return Ok(());
+    // Lock-ordering discipline (design §4, spec R6.6):
+    //   start path: current_args FIRST, then session.
+    //   stop path:  session FIRST, then current_args (see stop_stream_session).
+    // This asymmetry is intentional and MUST NOT be reversed in future changes.
+    // The start path needs to atomically check-and-set both; the stop path can
+    // release session before current_args because no concurrent start will see
+    // the inconsistent state (session is the visible signal of "running").
+    {
+        let args_guard = bridge.current_args.lock().unwrap();
+        if let Some((cur_port, cur_name)) = &*args_guard {
+            // PQ-E (spec R6.4): ALWAYS return AlreadyRunning on double-start, regardless
+            // of whether the new args match the current args. No silent ignore.
+            // Spec R6.5: error MUST carry the CURRENT session's args, NOT the new caller's.
+            return Err(StartStreamError::AlreadyRunning {
+                current_port: *cur_port,
+                current_service_name: cur_name.clone(),
+            });
+        }
+        // Fall through: current_args is None — no active session.
+        // Drop args_guard here so the builder (potentially slow: sockets, mDNS) runs
+        // without holding the lock. A concurrent start will also see None and enter the
+        // builder — acceptable race for V1.1; the session lock below serializes the
+        // final wiring. current_args will be set again after session is stored.
     }
-    // Acquire current_args lock BEFORE session lock (design §4 lock-order: current_args → session).
-    let mut args_guard = bridge.current_args.lock().unwrap();
-    let mut guard = bridge.session.lock().unwrap();
 
     // Step 5 — Clone the builder Arc (cheap atomic increment) and invoke.
     // No borrow of bridge.builder held during the (potentially slow) build.
@@ -939,16 +954,18 @@ pub(crate) fn start_stream_inner(
         }
     };
 
+    // Step 6 — Acquire session lock and store the new session.
+    let mut guard = bridge.session.lock().unwrap();
     let session = build_stream_session(channel, bundle, stop_flag)
         .map_err(StartStreamError::BundleBuildFailed)?;
     *guard = Some(session);
+    drop(guard);
 
-    // Step 6 — Populate current_args AFTER session is successfully stored.
+    // Step 7 — Populate current_args AFTER session is successfully stored.
+    // Re-acquire current_args lock (released at end of step 4 block).
     // Spec R6.2: "When start_stream completes successfully, current_args MUST
     // be set to Some((resolved_port, resolved_service_name))."
-    // Lock is already held (acquired in step 4 above). Set after session store
-    // so that the visible state is always: session=Some ↔ current_args=Some.
-    *args_guard = Some((resolved_port, resolved_name));
+    *bridge.current_args.lock().unwrap() = Some((resolved_port, resolved_name));
 
     Ok(())
 }
