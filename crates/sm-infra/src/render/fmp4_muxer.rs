@@ -761,6 +761,62 @@ mod tests {
         assert_eq!(dts, large_dts);
     }
 
+    // ─── Capability D (B6): trun box builder ───────────────────────────────
+
+    /// Helper to create a `TrunSample` with just a size (no duration/flags override).
+    fn make_sample(size: u32) -> TrunSample {
+        TrunSample { duration: None, size, flags: None }
+    }
+
+    #[test]
+    fn trun_golden_bytes_single_sample() {
+        // One sample, data_offset = 8 (arbitrary), no per-sample duration/flags.
+        // flags = 0x000301 (data-offset-present | sample-size-present)
+        // Layout: [size][b"trun"][v=0][flags:3][sample_count:4][data_offset:4][size_0:4]
+        let samples = vec![make_sample(100)];
+        let trun = build_trun(&samples, 8, false);
+        assert_eq!(&trun[4..8], b"trun", "box type must be trun");
+        let size = u32::from_be_bytes([trun[0], trun[1], trun[2], trun[3]]) as usize;
+        assert_eq!(size, trun.len(), "size field must match actual length");
+        // version at byte 8
+        assert_eq!(trun[8], 0, "version must be 0");
+        // sample_count at bytes 12..16
+        let sample_count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]);
+        assert_eq!(sample_count, 1);
+        // data_offset at bytes 16..20
+        let data_offset = i32::from_be_bytes([trun[16], trun[17], trun[18], trun[19]]);
+        assert_eq!(data_offset, 8);
+    }
+
+    #[test]
+    fn trun_sample_count_matches_input_slice_length() {
+        let samples = vec![make_sample(10), make_sample(20), make_sample(30)];
+        let trun = build_trun(&samples, 0, false);
+        let sample_count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]);
+        assert_eq!(sample_count, 3);
+    }
+
+    #[test]
+    fn trun_per_sample_sizes_are_big_endian() {
+        let samples = vec![make_sample(0x12345678), make_sample(0x9ABCDEF0)];
+        let trun = build_trun(&samples, 0, false);
+        // After fixed header (12) + sample_count (4) + data_offset (4) = offset 20
+        // per-sample: size (4 bytes each)
+        let s0 = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
+        let s1 = u32::from_be_bytes([trun[24], trun[25], trun[26], trun[27]]);
+        assert_eq!(s0, 0x12345678);
+        assert_eq!(s1, 0x9ABCDEF0);
+    }
+
+    #[test]
+    fn trun_with_first_sample_flags_sets_flag_bit() {
+        // When is_idr=true, flags should include first_sample_flags_present (0x000004).
+        let samples = vec![make_sample(50)];
+        let trun = build_trun(&samples, 0, true);
+        let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(flags & 0x000004, 0, "first_sample_flags_present bit must be set for IDR");
+    }
+
     #[test]
     fn annex_b_to_avcc_preserves_nal_payload_bytes() {
         // Payload bytes after length prefix must match original NAL body.
