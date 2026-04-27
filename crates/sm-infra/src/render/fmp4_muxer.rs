@@ -451,6 +451,30 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability B (B6): tfhd (Track Fragment Header) box builder ─────────────
+
+/// Build a `tfhd` (Track Fragment Header) full box.
+///
+/// Layout (ISO/IEC 14496-12 §8.8.7):
+/// ```text
+/// [size:4][b"tfhd":4][version:1 = 0][flags:3][track_id:4]
+/// ```
+///
+/// Total: 16 bytes (no optional fields; flags control which optional fields are present).
+///
+/// # Arguments
+///
+/// * `track_id` — must be 1 for a single-track fMP4 stream.
+/// * `flags`    — 24-bit flags field (e.g. 0x020000 = default-base-is-moof).
+pub(crate) fn build_tfhd(track_id: u32, flags: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, flags);
+    write_u32_be(&mut payload, track_id);
+    let mut out = Vec::new();
+    write_box(&mut out, b"tfhd", &payload);
+    out
+}
+
 // ─── Capability A (B6): Annex-B → AVCC framing converter ────────────────────
 
 /// Convert an Annex-B NAL byte stream to AVCC length-prefixed format.
