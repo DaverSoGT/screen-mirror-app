@@ -451,6 +451,22 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability F (B6): mdat box builder + AVCC payload ──────────────────────
+
+/// Build an `mdat` (Media Data) box wrapping an AVCC-framed NAL byte payload.
+///
+/// The payload is the concatenation of length-prefixed NAL units produced by
+/// [`annex_b_to_avcc`]. Reuses [`write_box`] from B5 — no new boxing logic.
+///
+/// # Arguments
+///
+/// * `avcc_payload` — AVCC-framed bytes to embed verbatim as the `mdat` payload.
+pub(crate) fn build_mdat(avcc_payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_box(&mut out, b"mdat", avcc_payload);
+    out
+}
+
 // ─── Capability E (B6): moof + traf hierarchy assembler ──────────────────────
 
 /// Build an `mfhd` (Movie Fragment Header) box.
