@@ -11,6 +11,25 @@
 //! runtime dep, best fit for live MSE streaming. The `mp4` crate is NOT a runtime
 //! dependency.
 
+// ─── ISO/IEC 14496-12 box framing primitive ──────────────────────────────────
+
+/// Write a single ISO base-media file format box into `out`.
+///
+/// Layout: `[u32_BE total_size][4 ASCII type bytes][payload bytes]`.
+/// The `total_size` field is `payload.len() + 8` (4 bytes for size + 4 bytes for type).
+///
+/// # Arguments
+///
+/// * `out`      — output buffer to extend.
+/// * `box_type` — exactly 4 ASCII bytes identifying the box type (e.g. `b"ftyp"`).
+/// * `payload`  — box payload bytes (may be empty).
+pub(crate) fn write_box(out: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
+    let size = (payload.len() + 8) as u32;
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(box_type);
+    out.extend_from_slice(payload);
+}
+
 // ─── Tests (Capability A — ISO box framing primitive) ────────────────────────
 
 #[cfg(test)]
