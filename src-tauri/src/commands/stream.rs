@@ -114,6 +114,25 @@ struct BridgeCounters {
     keyframe_requests_fired: AtomicU64,
 }
 
+// ─── BuilderFn — injectable seam for ReceiverBundle construction ─────────────
+
+/// Factory closure type: produces a fully-started `ReceiverBundle` given
+/// runtime args `(udp_port, service_name, stop_flag)`.
+///
+/// Production: wraps `build_production_bundle` (ignores port/name for now;
+/// B5 will wire them in). Tests inject a closure that returns a fake bundle
+/// (FakeReceiver + disconnected pkt_rx + None signaling) without real sockets.
+///
+/// Resolved design decisions (design #288 §1.1):
+/// - PQ-A: `Arc<dyn Fn(...) + Send + Sync>` — non-generic bridge keeps Tauri
+///   `.manage()` happy and prevents infra types from leaking into `lib.rs`.
+/// - PQ-B: `(u16, String, Arc<AtomicBool>)` — args flow EXPLICITLY; no capture.
+/// - OQ-D1: plain `Arc<dyn Fn>` — no `Mutex` wrapper. The `Arc` is `Clone +
+///   Send + Sync`; the underlying `Fn` (not `FnMut`) makes concurrent calls safe.
+/// - OQ-D7: builder does NOT see the `Channel`; returns just `ReceiverBundle`.
+pub(crate) type BuilderFn =
+    Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> + Send + Sync>;
+
 // ─── StreamBridge — Capability A ─────────────────────────────────────────────
 
 /// Tauri managed state for an active streaming session.
@@ -123,13 +142,58 @@ struct BridgeCounters {
 /// immutable Tauri command references.
 pub struct StreamBridge {
     session: Mutex<Option<StreamSession>>,
+
+    /// Factory closure used by `start_stream` to build the `ReceiverBundle`.
+    /// Plain `Arc<dyn Fn>` — no `Mutex`. Set once in `new_with_builder`; read-only
+    /// thereafter. Cloned cheaply (one atomic increment) before each invocation so
+    /// no borrow of `bridge.builder` is held during the (potentially slow) build.
+    /// (Design #288 §1.4, §6; spec #287 R1.1, R1.5)
+    ///
+    /// `#[allow(dead_code)]`: field is added in B1; first read site lands in B5
+    /// (start_stream_inner). Remove this attribute when B5 lands.
+    #[allow(dead_code)]
+    pub(crate) builder: BuilderFn,
+
+    /// Args of the currently-active session: `Some((port, name))` while running,
+    /// `None` otherwise. Set by `start_stream` BEFORE invoking the builder; cleared
+    /// by `stop_stream_session` AFTER all threads join (design #288 §1.4, §4).
+    ///
+    /// OQ-D3 resolved: one `Mutex<Option<(u16, String)>>` — not two separate
+    /// per-field mutexes. Plain `Mutex` (not `RwLock`): contention is bounded to
+    /// start/stop only.
+    ///
+    /// `#[allow(dead_code)]`: field is added in B1; first read site lands in B6
+    /// (double-start detection). Remove this attribute when B6 lands.
+    #[allow(dead_code)]
+    pub(crate) current_args: Mutex<Option<(u16, String)>>,
 }
 
 impl StreamBridge {
-    /// Create an empty bridge (no active session).
+    /// Create a bridge using the production `build_production_bundle` factory.
+    ///
+    /// The production factory currently ignores `udp_port` and `service_name`
+    /// (B1 wrapper shim — B5 will wire them into `build_production_bundle`).
+    /// (Spec #287 R1.2)
     pub fn new() -> Self {
+        // Wrapper closure: adapts the current `build_production_bundle(stop_flag)`
+        // signature into the `BuilderFn(port, name, stop_flag)` shape.
+        // B5 will replace this with a direct call once `build_production_bundle`
+        // accepts (udp_port, service_name, stop_flag).
+        Self::new_with_builder(Arc::new(|_port, _name, stop_flag| {
+            build_production_bundle(stop_flag)
+        }))
+    }
+
+    /// Create a bridge with a custom builder factory (test seam).
+    ///
+    /// Both production code and test code may use this constructor.
+    /// No `#[cfg(test)]` gate — the constructor is intentionally public so tests
+    /// can inject fake builders without a setter (spec #287 R1.3, R1.4).
+    pub(crate) fn new_with_builder(builder: BuilderFn) -> Self {
         Self {
             session: Mutex::new(None),
+            builder,
+            current_args: Mutex::new(None),
         }
     }
 
@@ -243,7 +307,7 @@ trait SignalingPublishOps: Send + Sync {
 /// ```
 /// FnOnce(Arc<AtomicBool>) -> Result<ReceiverBundle, String>
 /// ```
-struct ReceiverBundle {
+pub(crate) struct ReceiverBundle {
     /// The receiver, ready for PLI calls and `dropped_frames()` reads.
     receiver: Box<dyn ReceiverOps>,
     /// The packet receive end — handed to the mux thread.
@@ -1365,9 +1429,8 @@ mod tests {
 
         // Construct a bridge with a closure that panics if called — the test only
         // checks that the constructor compiles and the builder is stored.
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
-            panic!("builder must not be called in this test")
-        });
+        let builder: BuilderFn =
+            Arc::new(|_port, _name, _stop_flag| panic!("builder must not be called in this test"));
         let bridge = StreamBridge::new_with_builder(builder);
         // builder field must be populated: Arc strong count is at least 1.
         assert!(Arc::strong_count(&bridge.builder) >= 1);
