@@ -781,6 +781,124 @@ mod tests {
     use super::*;
     use crate::render::avcc::parse_sps;
 
+    // ─── Capability G (B6): Mp4Muxer::append_packet orchestrator ──────────
+
+    use std::sync::Arc;
+    use sm_domain::encode::EncodedPacket;
+    use std::time::Duration;
+
+    fn make_packet(is_keyframe: bool, timestamp_ms: u64, size_bytes: usize) -> EncodedPacket {
+        // Minimal Annex-B NAL: [00 00 00 01 65/41 ...payload...] for IDR/P-frame
+        let nal_type: u8 = if is_keyframe { 0x65 } else { 0x41 };
+        let mut data = vec![0x00u8, 0x00, 0x00, 0x01, nal_type];
+        data.extend(vec![0xAAu8; size_bytes.saturating_sub(5)]);
+        EncodedPacket {
+            data: Arc::from(data.into_boxed_slice()),
+            is_keyframe,
+            timestamp: Duration::from_millis(timestamp_ms),
+            sequence: timestamp_ms / 33, // ~30fps
+        }
+    }
+
+    #[test]
+    fn append_packet_non_keyframe_returns_none() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // Three P-frame packets; none should emit a segment.
+        for i in 0..3u64 {
+            let pkt = make_packet(false, i * 33, 100);
+            let result = muxer.append_packet(&pkt);
+            assert!(result.is_none(), "P-frame must not emit a segment");
+        }
+    }
+
+    #[test]
+    fn append_packet_first_idr_returns_none() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let pkt = make_packet(true, 0, 200);
+        let result = muxer.append_packet(&pkt);
+        // First IDR starts a new GOP; nothing to flush yet.
+        assert!(result.is_none(), "first IDR must not emit (nothing buffered before it)");
+    }
+
+    #[test]
+    fn append_packet_second_keyframe_flushes_first_gop() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // IDR1 (timestamp 0ms)
+        let idr1 = make_packet(true, 0, 200);
+        assert!(muxer.append_packet(&idr1).is_none(), "IDR1 must buffer");
+        // 3 P-frames
+        for i in 1..4u64 {
+            assert!(muxer.append_packet(&make_packet(false, i * 33, 100)).is_none());
+        }
+        // IDR2 → must flush GOP containing IDR1 + P-frames
+        let idr2 = make_packet(true, 4 * 33, 200);
+        let segment = muxer.append_packet(&idr2);
+        assert!(segment.is_some(), "IDR2 must flush the previous GOP");
+    }
+
+    #[test]
+    fn media_segment_starts_with_moof_then_mdat() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let idr1 = make_packet(true, 0, 200);
+        muxer.append_packet(&idr1);
+        // One P-frame to ensure pending is non-empty when IDR2 arrives
+        muxer.append_packet(&make_packet(false, 33, 100));
+        let idr2 = make_packet(true, 66, 200);
+        let segment = muxer.append_packet(&idr2).expect("should emit segment on IDR2");
+
+        // Check moof appears first
+        let moof_pos = segment.windows(4).position(|w| w == b"moof").expect("moof must be present");
+        let mdat_pos = segment.windows(4).position(|w| w == b"mdat").expect("mdat must be present");
+        assert!(moof_pos < mdat_pos, "moof must come before mdat");
+        // First box tag in segment (at bytes[4..8]) must be moof
+        assert_eq!(&segment[4..8], b"moof", "segment must start with moof box");
+    }
+
+    #[test]
+    fn media_segment_mfhd_sequence_number_increments() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // Helper to extract sequence number from a segment's mfhd box
+        fn extract_seq(seg: &[u8]) -> u32 {
+            let mfhd_pos = seg.windows(4).position(|w| w == b"mfhd").unwrap();
+            let off = mfhd_pos + 4 + 4; // skip version+flags
+            u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]])
+        }
+
+        // Three IDRs → two emitted segments (IDR1 buffers, IDR2 emits, IDR3 emits)
+        muxer.append_packet(&make_packet(true, 0, 200));
+        let seg1 = muxer.append_packet(&make_packet(true, 33, 200)).expect("seg1");
+        let seg2 = muxer.append_packet(&make_packet(true, 66, 200)).expect("seg2");
+
+        let seq1 = extract_seq(&seg1);
+        let seq2 = extract_seq(&seg2);
+        assert!(seq2 > seq1, "mfhd.sequence_number must increment across segments: got {} then {}", seq1, seq2);
+    }
+
+    #[test]
+    fn media_segment_tfdt_base_decode_time_reflects_first_sample_timestamp() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // IDR at t=1000ms = 90_000 ticks
+        let idr1 = make_packet(true, 1000, 200);
+        muxer.append_packet(&idr1);
+        let idr2 = make_packet(true, 2000, 200);
+        let segment = muxer.append_packet(&idr2).expect("should emit segment");
+
+        // Find tfdt in segment
+        let tfdt_pos = segment.windows(4).position(|w| w == b"tfdt").expect("tfdt must be in segment");
+        // tfdt v1: [size:4][tag:4][version:1][flags:3][time:8]
+        // tag at pos, version at pos+4, time at pos+12
+        let version = segment[tfdt_pos + 4];
+        assert_eq!(version, 1, "tfdt must be version 1");
+        let dts = u64::from_be_bytes([
+            segment[tfdt_pos + 12], segment[tfdt_pos + 13],
+            segment[tfdt_pos + 14], segment[tfdt_pos + 15],
+            segment[tfdt_pos + 16], segment[tfdt_pos + 17],
+            segment[tfdt_pos + 18], segment[tfdt_pos + 19],
+        ]);
+        // IDR1 was at 1000ms → 90_000 ticks
+        assert_eq!(dts, 90_000, "tfdt.base_media_decode_time must be 90_000 (1000ms at 90kHz)");
+    }
+
     // ─── Capability F (B6): mdat box builder ───────────────────────────────
 
     #[test]
