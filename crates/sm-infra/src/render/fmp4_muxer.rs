@@ -451,6 +451,42 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability A (B6): Annex-B → AVCC framing converter ────────────────────
+
+/// Convert an Annex-B NAL byte stream to AVCC length-prefixed format.
+///
+/// Each NAL unit in the input (identified by 3-byte or 4-byte start codes) is
+/// length-prefixed with a 4-byte big-endian value equal to the byte length of
+/// the NAL body (excluding the start code). Start codes are stripped.
+///
+/// This is the inverse of [`crate::transport::annex_b::reconstruct_annex_b`].
+///
+/// # Arguments
+///
+/// * `annex_b` — raw Annex-B byte stream (may contain mixed 3-byte and 4-byte start codes).
+///
+/// # Returns
+///
+/// `Ok(vec![])` if `annex_b` is empty or contains no valid start codes.
+/// `Ok(bytes)` where each NAL is prefixed with a 4-byte big-endian length field.
+///
+/// # ISO/IEC 14496-15 §5.2.4.1.1
+///
+/// Matches `length_size_minus_one = 3` (4-byte length prefix) declared in `avcC`.
+pub fn annex_b_to_avcc(annex_b: &[u8]) -> Result<Vec<u8>, MuxerError> {
+    if annex_b.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(annex_b.len());
+    for nal in crate::transport::annex_b::iter_nal_units(annex_b) {
+        let len = nal.len() as u32;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(nal);
+    }
+    Ok(out)
+}
+
 // ─── Mp4Muxer public API ─────────────────────────────────────────────────────
 
 /// fMP4 muxer for screen-mirror live streaming.
