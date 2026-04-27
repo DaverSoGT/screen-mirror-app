@@ -451,6 +451,86 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Mp4Muxer public API ─────────────────────────────────────────────────────
+
+/// fMP4 muxer for screen-mirror live streaming.
+///
+/// Builds an init segment (`ftyp` + `moov`) from the first SPS + PPS NAL bytes,
+/// then emits media segments (`moof` + `mdat`) per IDR-aligned GOP.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let muxer = Mp4Muxer::new(1920, 1080, 30, 1);
+/// let init = muxer.build_init_segment(sps_nal, pps_nal)?;
+/// // emit init bytes to the frontend once
+/// ```
+pub struct Mp4Muxer {
+    /// Frame width in pixels (pre-validated from the SPS or caller-supplied).
+    width: u32,
+    /// Frame height in pixels (pre-validated from the SPS or caller-supplied).
+    height: u32,
+    /// Frame rate numerator (e.g. 30 for 30 fps). Reserved for B6 media-segment timing.
+    #[allow(dead_code)]
+    fps_num: u32,
+    /// Frame rate denominator (e.g. 1 for 30 fps). Reserved for B6 media-segment timing.
+    #[allow(dead_code)]
+    fps_den: u32,
+}
+
+impl Mp4Muxer {
+    /// Construct a new muxer with the target track parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `width`   — frame width in pixels (must be > 0).
+    /// * `height`  — frame height in pixels (must be > 0).
+    /// * `fps_num` — nominal frame rate numerator.
+    /// * `fps_den` — nominal frame rate denominator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `width == 0` or `height == 0`.
+    pub fn new(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Self {
+        assert!(width > 0, "Mp4Muxer: width must be > 0");
+        assert!(height > 0, "Mp4Muxer: height must be > 0");
+        Self { width, height, fps_num, fps_den }
+    }
+
+    /// Build the fMP4 init segment from the first SPS and PPS NAL bytes.
+    ///
+    /// Output layout: `[ftyp][moov]`. Concatenate with subsequent media segments
+    /// (from `append_packet`, B6) to form a valid fMP4 stream.
+    ///
+    /// # Errors
+    ///
+    /// - `Err(MuxerError::InvalidInput)` if `sps_nal` or `pps_nal` is empty.
+    /// - `Err(MuxerError::AvccError)` if the SPS bytes are malformed or unparseable.
+    pub fn build_init_segment(&self, sps_nal: &[u8], pps_nal: &[u8]) -> Result<Vec<u8>, MuxerError> {
+        if sps_nal.is_empty() {
+            return Err(MuxerError::InvalidInput("sps_nal must not be empty".into()));
+        }
+        if pps_nal.is_empty() {
+            return Err(MuxerError::InvalidInput("pps_nal must not be empty".into()));
+        }
+
+        let sps_info = crate::render::avcc::parse_sps(sps_nal)?;
+
+        let ftyp = build_ftyp();
+        let moov = build_moov(self.width, self.height, &sps_info, sps_nal, pps_nal)?;
+
+        let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        Ok(out)
+    }
+
+    /// fMP4 timescale used by this muxer. Always 90 000 Hz (matches RTP).
+    pub const fn timescale() -> u32 {
+        TIMESCALE
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
