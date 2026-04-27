@@ -16,12 +16,232 @@
 //! | [`DecoderError`]            | Unified error enum for all decoder operations.          |
 //! | [`DECODE_CHANNEL_CAPACITY`] | Bounded channel capacity constant (4).                  |
 
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Bounded channel capacity for decoder input and output channels.
+///
+/// Mirrors `CAPTURE_CHANNEL_CAPACITY` (4), `ENCODE_CHANNEL_CAPACITY` (4), and
+/// `TRANSPORT_CHANNEL_CAPACITY` (4). At 30 fps a 4-slot bounded channel buffers
+/// ~133 ms — within the glass-to-glass budget while still backpressuring
+/// egregiously slow consumers.
+pub const DECODE_CHANNEL_CAPACITY: usize = 4;
+
+/// Raw pixel data for a decoded frame.
+///
+/// V1 decoder adapters emit `I420` natively (openh264 output, BT.601 limited range).
+/// `Bgra8` is reserved for the `i420_to_bgra` converter helper and the V2 native
+/// render path.
+///
+/// Cloning is cheap — all `Arc<[u8]>` fields are reference-counted.
+#[derive(Debug, Clone)]
+pub enum PixelData {
+    /// Planar YUV 4:2:0 (8-bit, BT.601 limited range).
+    ///
+    /// Plane sizes:
+    /// - `y.len() == width * height`
+    /// - `u.len() == (width / 2) * (height / 2)`
+    /// - `v.len() == (width / 2) * (height / 2)`
+    ///
+    /// This invariant is enforced by the adapter when constructing `PixelData::I420`.
+    I420 {
+        /// Luma plane (`width × height` bytes).
+        y: Arc<[u8]>,
+        /// Cb (blue-difference chroma) plane (`(width/2) × (height/2)` bytes).
+        u: Arc<[u8]>,
+        /// Cr (red-difference chroma) plane (`(width/2) × (height/2)` bytes).
+        v: Arc<[u8]>,
+        /// Frame width in pixels.
+        width: u32,
+        /// Frame height in pixels.
+        height: u32,
+    },
+    /// Packed BGRA 8-bit.
+    ///
+    /// `data.len() == width * height * 4` (4 bytes per pixel: Blue, Green, Red, Alpha=255).
+    Bgra8 {
+        /// Pixel data buffer (`width × height × 4` bytes).
+        data: Arc<[u8]>,
+        /// Frame width in pixels.
+        width: u32,
+        /// Frame height in pixels.
+        height: u32,
+    },
+}
+
+/// A single decoded frame emitted by the decoder thread.
+///
+/// Cloning is cheap — all buffers inside [`PixelData`] are `Arc<[u8]>`, so
+/// clones share the underlying allocation (no byte copies).
+#[derive(Debug, Clone)]
+pub struct DecodedFrame {
+    /// Raw pixel data. Layout and dimensions depend on the variant.
+    pub data: PixelData,
+    /// Capture timestamp inherited from the source [`crate::encode::EncodedPacket`].
+    pub timestamp: Duration,
+    /// Monotonically increasing sequence number; resets to 0 after each `start()` call.
+    pub sequence: u64,
+}
+
+/// Configuration for a decoder session.
+///
+/// # Defaults
+///
+/// - `width`:  1920 (PQ-D5; hint only — decoder adapts to actual SPS)
+/// - `height`: 1080 (PQ-D5; hint only)
+///
+/// Fields are `pub` to allow `DecoderConfig { width: 1280, ..Default::default() }`
+/// ergonomics without a builder.
+#[derive(Debug, Clone)]
+pub struct DecoderConfig {
+    /// Expected initial frame width in pixels (hint; decoder adapts to the actual SPS).
+    pub width: u32,
+    /// Expected initial frame height in pixels (hint; decoder adapts to the actual SPS).
+    pub height: u32,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+        }
+    }
+}
+
+/// Errors produced by decoder operations.
+///
+/// Platform errors are converted to `String` at the adapter boundary so
+/// `sm-domain` never names any platform-specific type. No `#[from]` on any
+/// variant — all conversions are explicit (parity with `CaptureError`,
+/// `EncoderError`, `TransportError`).
+#[derive(Debug, thiserror::Error)]
+pub enum DecoderError {
+    /// Configuration value rejected by the adapter, OR a required injection
+    /// was missing (e.g., `start()` called before `set_receiver()` — R1.4 guard).
+    #[error("invalid decoder config: {0}")]
+    InvalidConfig(String),
+
+    /// The decoder backend failed to initialise.
+    #[error("decoder initialisation failed: {0}")]
+    InitFailed(String),
+
+    /// The decoder backend failed to decode a packet (corrupt NAL, missing IDR, etc.).
+    #[error("decode failed: {0}")]
+    DecodeFailed(String),
+
+    /// The output channel has no receivers (consumer dropped `frame_rx`).
+    #[error("output channel closed by consumer")]
+    ChannelClosed,
+
+    /// Generic wrapper for platform-level errors not worth a dedicated variant.
+    #[error("internal decoder error: {0}")]
+    Internal(String),
+}
+
+/// Port boundary for platform-specific decoder adapters.
+///
+/// # Channel discipline
+///
+/// `start(rx, frame_tx)` injects both channel ends. The decoder thread owns `rx`
+/// and pulls [`crate::encode::EncodedPacket`]s, then pushes [`DecodedFrame`]s via
+/// `frame_tx.try_send`. When the output channel is full the frame is dropped
+/// (drop-newest) and [`dropped_frames()`](VideoDecoder::dropped_frames) is
+/// incremented. The decoder thread exits when `rx` closes (`Err(RecvError)`) or
+/// when `frame_tx` becomes disconnected (`Err(TrySendError::Disconnected)`).
+///
+/// # Thread model
+///
+/// `new()` does NOT spawn a thread. `start()` spawns exactly one OS thread.
+/// `stop()` is idempotent and joins the thread.
+///
+/// CALLER MUST DROP the input `Sender<EncodedPacket>` BEFORE calling `stop()`
+/// so the thread's `rx.recv()` unblocks naturally — same discipline as the encoder
+/// and sender adapters.
+///
+/// # Receiver injection
+///
+/// Call [`set_receiver`](VideoDecoder::set_receiver) BEFORE [`start`](VideoDecoder::start).
+/// `start()` returns `Err(InvalidConfig)` if no receiver is set (R1.4 guard,
+/// mirroring `VideoSender::set_encoder` / R9.3).
+///
+/// The receiver is held inside the decoder thread for direct PLI response: when
+/// decode errors accumulate or the very first IDR is awaited, the thread calls
+/// `receiver.request_keyframe()` directly via the held `Arc`, without a channel hop.
+pub trait VideoDecoder: Send + Sync {
+    /// Construct a decoder with the given configuration.
+    ///
+    /// Validates `config` (e.g., `width > 0`, `height > 0`). Does NOT spawn a
+    /// thread or initialise the codec backend — call
+    /// [`start`](VideoDecoder::start) to begin.
+    fn new(config: DecoderConfig) -> Result<Self, DecoderError>
+    where
+        Self: Sized;
+
+    /// Inject the receiver reference for PLI feedback.
+    ///
+    /// MUST be called BEFORE [`start`](VideoDecoder::start). The receiver is held
+    /// as `Arc<dyn VideoReceiver + Send + Sync>` so the decode thread can call
+    /// `request_keyframe()` directly without a channel hop. Mirrors
+    /// [`VideoSender::set_encoder`](crate::transport::VideoSender::set_encoder).
+    fn set_receiver(
+        &mut self,
+        receiver: Arc<dyn crate::transport::VideoReceiver + Send + Sync>,
+    );
+
+    /// Begin decoding. Spawns one OS thread that owns the codec backend.
+    ///
+    /// Returns `Err(DecoderError::InvalidConfig(_))` if `set_receiver()` was not
+    /// called first (R1.4 guard). Returns `Ok(())` once the thread is spawned;
+    /// decoding errors after `start()` surface by dropping `frame_tx`, causing the
+    /// consumer's `frame_rx.recv()` to return `Err(RecvError)`.
+    ///
+    /// CALLER MUST DROP the input `Sender<EncodedPacket>` BEFORE calling `stop()`.
+    fn start(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<crate::encode::EncodedPacket>,
+        frame_tx: std::sync::mpsc::SyncSender<DecodedFrame>,
+    ) -> Result<(), DecoderError>;
+
+    /// Stop the decoder. Idempotent. Joins the thread.
+    ///
+    /// A second call returns `Ok(())` without panicking (R1.6).
+    fn stop(&mut self) -> Result<(), DecoderError>;
+
+    /// Trigger an upstream PLI: signals the injected receiver to call
+    /// `request_keyframe()`. No-op if no receiver was set or the decoder is
+    /// already stopped. Thread-safe.
+    fn request_keyframe(&self);
+
+    /// Cumulative count of [`DecodedFrame`]s dropped due to output-channel backpressure.
+    ///
+    /// Monotonically non-decreasing. Thread-safe (backed by `AtomicU64`).
+    fn dropped_frames(&self) -> u64;
+
+    /// Cumulative count of [`crate::encode::EncodedPacket`]s rejected by the
+    /// decoder backend (corrupt NALs, missing IDR before recovery, etc.).
+    ///
+    /// Monotonically non-decreasing. Thread-safe. Distinct from `dropped_frames` —
+    /// this counts INPUT-side rejections; `dropped_frames` counts OUTPUT-side
+    /// congestion.
+    fn dropped_packets(&self) -> u64;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
-    use std::sync::Arc;
+
+    // ─── Compile-time trait bound assertion ──────────────────────────────────────
+    //
+    // Matches the const-fn pattern established in transport.rs.
+    const _: () = {
+        const fn _assert_send_sync<T: Send + Sync + ?Sized>() {}
+        const fn _assert_video_decoder() {
+            _assert_send_sync::<dyn VideoDecoder>();
+        }
+    };
 
     // ─── 1.1 RED: types + constant ───────────────────────────────────────────────
 
@@ -137,7 +357,7 @@ mod tests {
                 width: 2,
                 height: 2,
             },
-            timestamp: std::time::Duration::ZERO,
+            timestamp: Duration::ZERO,
             sequence: 0,
         };
         let cloned = frame.clone();
@@ -163,7 +383,7 @@ mod tests {
                 width: 2,
                 height: 2,
             },
-            timestamp: std::time::Duration::ZERO,
+            timestamp: Duration::ZERO,
             sequence: 0,
         };
         let cloned = frame.clone();
@@ -225,15 +445,7 @@ mod tests {
 
     // ─── 1.5 RED: VideoDecoder trait + FakeVideoDecoder ──────────────────────────
 
-    // ── S1.5: dyn VideoDecoder is Send + Sync (compile-time) ─────────────────────
-
-    // Compile-time assertion — matching the pattern in transport.rs
-    const _: () = {
-        const fn _assert_send_sync<T: Send + Sync + ?Sized>() {}
-        const fn _assert_video_decoder() {
-            _assert_send_sync::<dyn VideoDecoder>();
-        }
-    };
+    // ── S1.5: dyn VideoDecoder is Send + Sync (runtime check mirrors compile-time) ─
 
     #[test]
     fn video_decoder_trait_is_dyn_send_sync() {
@@ -308,6 +520,7 @@ mod tests {
     /// In-memory `VideoDecoder` for domain-level unit tests.
     /// Drains rx, emits a dummy `DecodedFrame` per packet, tracks counters.
     struct FakeVideoDecoder {
+        #[allow(dead_code)]
         config: DecoderConfig,
         receiver: Option<Arc<dyn crate::transport::VideoReceiver + Send + Sync>>,
         keyframe_pending: Arc<AtomicBool>,
@@ -360,7 +573,7 @@ mod tests {
             let receiver = self.receiver.clone();
 
             let handle = std::thread::spawn(move || {
-                // Fire initial PLI so the remote sends an IDR (R3.8 / R1.4).
+                // Fire initial PLI so the remote sends an IDR (R1.4 / R3.8 pattern).
                 if let Some(ref recv) = receiver {
                     let _ = recv.request_keyframe();
                 }
@@ -369,7 +582,7 @@ mod tests {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    // Apply any pending PLI request.
+                    // Apply any pending PLI request before blocking on recv.
                     if keyframe_pending.swap(false, Ordering::AcqRel) {
                         if let Some(ref recv) = receiver {
                             let _ = recv.request_keyframe();
@@ -379,7 +592,7 @@ mod tests {
                         Ok(p) => p,
                         Err(_) => break,
                     };
-                    // Simulate a "corrupt" packet: data is shorter than 5 bytes.
+                    // Simulate "corrupt" packet: data shorter than 5 bytes.
                     if pkt.data.len() < 5 {
                         dropped_packets.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -506,20 +719,22 @@ mod tests {
         let (frame_tx, _frame_rx) = std::sync::mpsc::sync_channel::<DecodedFrame>(4);
         dec.start(pkt_rx, frame_tx).unwrap();
 
-        // Give the thread a moment to fire the initial PLI (R3.8 / first-frame).
+        // Give the thread a moment to fire the initial PLI (first-frame PLI).
         std::thread::sleep(std::time::Duration::from_millis(50));
         let after_start = count.load(Ordering::Relaxed);
-        assert!(after_start >= 1, "initial PLI must fire at least once on start");
+        assert!(
+            after_start >= 1,
+            "initial PLI must fire at least once on start"
+        );
 
         // Request another keyframe via the public API.
         dec.request_keyframe();
-        // Give time for the flag to propagate.
-        // We must send at least one packet so the thread wakes up and checks the flag.
-        let valid_nal = Arc::from([0x00u8, 0x00, 0x00, 0x01, 0x65].as_slice());
+        // Send a valid packet so the thread wakes up from recv() and checks the flag.
+        let valid_nal: Arc<[u8]> = Arc::from([0x00u8, 0x00, 0x00, 0x01, 0x65].as_slice());
         let _ = pkt_tx.try_send(crate::encode::EncodedPacket {
             data: valid_nal,
             is_keyframe: true,
-            timestamp: std::time::Duration::ZERO,
+            timestamp: Duration::ZERO,
             sequence: 0,
         });
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -551,13 +766,16 @@ mod tests {
             let _ = pkt_tx.try_send(crate::encode::EncodedPacket {
                 data: Arc::clone(&valid_nal),
                 is_keyframe: i == 0,
-                timestamp: std::time::Duration::from_millis(i * 33),
+                timestamp: Duration::from_millis(i * 33),
                 sequence: i,
             });
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         let dropped = dec.dropped_frames();
-        assert!(dropped > 0, "dropped_frames must be > 0 after flooding a capacity-1 channel, got {dropped}");
+        assert!(
+            dropped > 0,
+            "dropped_frames must be > 0 after flooding a capacity-1 channel, got {dropped}"
+        );
 
         drop(pkt_tx);
         dec.stop().unwrap();
@@ -580,7 +798,7 @@ mod tests {
             .send(crate::encode::EncodedPacket {
                 data: corrupt,
                 is_keyframe: false,
-                timestamp: std::time::Duration::ZERO,
+                timestamp: Duration::ZERO,
                 sequence: 0,
             })
             .unwrap();
