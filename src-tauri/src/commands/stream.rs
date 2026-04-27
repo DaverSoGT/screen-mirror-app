@@ -50,6 +50,22 @@ pub(crate) trait ChannelLike: Send + Sync {
     fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String>;
 }
 
+/// Production wrapper: a cloned `tauri::ipc::Channel<InvokeResponseBody>`.
+///
+/// `Channel<T>` is `Clone` + `Send + Sync` — safe to clone into the mux thread.
+struct TauriChannel(tauri::ipc::Channel<InvokeResponseBody>);
+
+impl ChannelLike for TauriChannel {
+    fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String> {
+        let mut frame = Vec::with_capacity(1 + bytes.len());
+        frame.push(discriminant);
+        frame.extend(bytes);
+        self.0
+            .send(InvokeResponseBody::Raw(frame))
+            .map_err(|e| e.to_string())
+    }
+}
+
 // ─── Diagnostics ─────────────────────────────────────────────────────────────
 
 /// Counters exposed via `stream_diagnostics`.
@@ -116,7 +132,7 @@ impl Default for StreamBridge {
 
 // ─── StreamSession — internal per-run state ───────────────────────────────────
 
-/// Active stream session: receiver + mux thread + counters.
+/// Active stream session: receiver + channel + mux thread + counters.
 struct StreamSession {
     /// Stop flag shared with the mux thread. Set by `stop_stream`.
     stop_flag: Arc<AtomicBool>,
@@ -129,6 +145,10 @@ struct StreamSession {
     receiver: Option<Box<dyn ReceiverOps>>,
     /// PLI rate-limit: timestamp of the last keyframe request.
     last_pli: Option<Instant>,
+    /// Binary streaming channel to the WebView (F-fix-1: Channel<Bytes>).
+    /// Kept here to extend the Arc's lifetime until stop_stream.
+    #[allow(dead_code)]
+    channel: Arc<dyn ChannelLike>,
 }
 
 impl StreamSession {
@@ -150,47 +170,42 @@ trait ReceiverOps: Send {
 
 /// Start the streaming session.
 ///
-/// Constructs a `Str0mVideoReceiver` (in production), starts it, and spawns the
-/// `sm-stream-mux` thread which drains packets, builds fMP4 segments, and emits
-/// them to the WebView via `app.emit("stream/init", ...)` / `app.emit("stream/segment", ...)`.
+/// Accepts a `Channel<InvokeResponseBody>` from the frontend (OQ-tauri-emit-1 pivot).
+/// Spawns the `sm-stream-mux` thread which drains packets, builds fMP4 segments,
+/// and delivers them as binary `InvokeResponseBody::Raw` frames through the channel.
+///
+/// Frame layout (byte 0 = discriminant):
+/// - `FRAME_INIT` (`0x00`) = fMP4 init segment (one per session)
+/// - `FRAME_SEGMENT` (`0x01`) = fMP4 media segment (one per GOP)
 ///
 /// Idempotent: if a session is already running, returns `Ok(())` immediately.
 #[tauri::command]
 pub fn start_stream(
-    app: tauri::AppHandle,
     bridge: tauri::State<StreamBridge>,
+    channel: tauri::ipc::Channel<InvokeResponseBody>,
 ) -> Result<(), String> {
     if bridge.is_running() {
         return Ok(()); // idempotent
     }
     let mut guard = bridge.session.lock().unwrap();
 
-    // For non-test builds: construct a real Str0mVideoReceiver.
-    // The receiver is started with a sync_channel; the mux thread drains pkt_rx.
-    //
-    // In V1 we hard-code a default TransportConfig (receiver listens on port 7889).
-    // A future command can accept a config struct for multi-session or custom ports.
-    //
-    // NOTE: This code path is NOT unit-tested (requires live transport + Tauri runtime).
-    // Unit tests cover `StreamBridge::is_running`, init-segment gating, PLI, and backpressure
-    // via `FakeReceiver` in `mod tests`.
-
     let counters = Arc::new(BridgeCounters::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let counters_clone = counters.clone();
     let stop_flag_clone = stop_flag.clone();
-    let app_clone = app.clone();
 
-    // Production: spawn mux thread with a FakeReceiver stub.
-    // Full integration requires a real Str0mVideoReceiver — wired in B8.
-    // For now the thread is scaffolded to satisfy the compile gate (S10.3).
+    // Wrap the Tauri channel in Arc<dyn ChannelLike> — Clone it into the mux thread.
+    let channel_arc: Arc<dyn ChannelLike> = Arc::new(TauriChannel(channel.clone()));
+    let channel_for_thread = channel_arc.clone();
+
+    // Production: spawn mux thread with packet pipe scaffolded for B8 wiring.
     let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
 
     let handle = thread::Builder::new()
         .name("sm-stream-mux".into())
         .spawn(move || {
-            mux_thread(pkt_rx, stop_flag_clone, counters_clone, app_clone);
+            mux_thread(pkt_rx, stop_flag_clone, counters_clone, channel_for_thread);
         })
         .map_err(|e| format!("failed to spawn mux thread: {e}"))?;
 
@@ -200,6 +215,7 @@ pub fn start_stream(
         counters,
         receiver: None, // production receiver wired in B8
         last_pli: None,
+        channel: channel_arc,
     });
 
     Ok(())
@@ -278,18 +294,18 @@ pub fn stream_diagnostics(bridge: tauri::State<StreamBridge>) -> Result<StreamSt
     })
 }
 
-// ─── Mux thread — Capabilities B + D ─────────────────────────────────────────
+// ─── Mux thread — Capabilities B + D + F-fix-2 ───────────────────────────────
 
 /// The `sm-stream-mux` thread body.
 ///
 /// Drains `pkt_rx`, fires PLI on the first packet, buffers non-keyframe
 /// packets until the first IDR, builds the fMP4 init segment from SPS+PPS,
-/// and emits `"stream/init"` + `"stream/segment"` events to the frontend.
+/// and sends frames through the `ChannelLike` (F-fix-2: replaces app.emit).
 fn mux_thread(
     pkt_rx: Receiver<EncodedPacket>,
     stop_flag: Arc<AtomicBool>,
     counters: Arc<BridgeCounters>,
-    app: tauri::AppHandle,
+    channel: Arc<dyn ChannelLike>,
 ) {
     // Muxer is created lazily on the first IDR (SPS+PPS required for init segment).
     let mut muxer: Option<Mp4Muxer> = None;
@@ -530,6 +546,60 @@ mod tests {
         let ch = FakeChannel::new();
         let bridge = make_bridge_with_channel(ch.clone());
         assert!(bridge.is_running());
+    }
+
+    // ─── F-fix-2 RED: emit helpers route through Channel.send_raw ────────────
+
+    /// F2.1 — emit_init sends FRAME_INIT discriminant through channel.
+    #[test]
+    fn emit_init_sends_init_discriminant() {
+        let ch = FakeChannel::new();
+        let counters = Arc::new(BridgeCounters::default());
+        emit_init(&(ch.clone() as Arc<dyn ChannelLike>), &counters, vec![0xDE, 0xAD]);
+        assert!(ch.has_discriminant(FRAME_INIT));
+        assert_eq!(counters.init_segments_emitted.load(Ordering::Relaxed), 1);
+    }
+
+    /// F2.2 — emit_segment sends FRAME_SEGMENT discriminant through channel.
+    #[test]
+    fn emit_segment_sends_segment_discriminant() {
+        let ch = FakeChannel::new();
+        let counters = Arc::new(BridgeCounters::default());
+        emit_segment(&(ch.clone() as Arc<dyn ChannelLike>), &counters, vec![0xBE, 0xEF]);
+        assert!(ch.has_discriminant(FRAME_SEGMENT));
+        assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 1);
+    }
+
+    /// F2.3 — channel failure in emit_init increments dropped_segments.
+    #[test]
+    fn emit_init_channel_failure_increments_dropped() {
+        struct FailChannel;
+        impl ChannelLike for FailChannel {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Err("closed".into())
+            }
+        }
+        let ch: Arc<dyn ChannelLike> = Arc::new(FailChannel);
+        let counters = Arc::new(BridgeCounters::default());
+        emit_init(&ch, &counters, vec![1, 2, 3]);
+        assert_eq!(counters.dropped_segments.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.init_segments_emitted.load(Ordering::Relaxed), 0);
+    }
+
+    /// F2.4 — channel failure in emit_segment increments dropped_segments.
+    #[test]
+    fn emit_segment_channel_failure_increments_dropped() {
+        struct FailChannel;
+        impl ChannelLike for FailChannel {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Err("closed".into())
+            }
+        }
+        let ch: Arc<dyn ChannelLike> = Arc::new(FailChannel);
+        let counters = Arc::new(BridgeCounters::default());
+        emit_segment(&ch, &counters, vec![1, 2, 3]);
+        assert_eq!(counters.dropped_segments.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 0);
     }
 
     // ─── Capability A: bridge state container ────────────────────────────────
