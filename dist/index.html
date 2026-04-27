@@ -3,47 +3,85 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Screen Mirror — R10.2 smoke</title>
+    <title>Screen Mirror</title>
     <style>
-      body { font-family: system-ui, sans-serif; padding: 2rem; max-width: 720px; }
-      h1 { margin-bottom: 0.5rem; }
-      .status { margin-top: 1rem; padding: 1rem; border-radius: 6px; font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
-      .status.pending { background: #fff7cc; }
-      .status.pass    { background: #d4f7d4; }
-      .status.fail    { background: #f7d4d4; }
-      button { margin-top: 1rem; padding: 0.5rem 1rem; font-size: 1rem; }
+      body {
+        margin: 0;
+        background: #111;
+        color: #ddd;
+        font-family: system-ui, sans-serif;
+      }
+      #stage {
+        display: grid;
+        place-items: center;
+        height: 100vh;
+      }
+      video {
+        max-width: 100%;
+        max-height: 100%;
+        background: #000;
+      }
+      #status {
+        position: fixed;
+        bottom: 8px;
+        left: 8px;
+        font-size: 12px;
+        opacity: 0.7;
+        font-family: ui-monospace, monospace;
+      }
+      /* ── R10.2 smoke section (debug) ────────────────────────────────── */
+      #smoke-section {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 360px;
+        padding: 0.5rem;
+        background: rgba(0, 0, 0, 0.75);
+        font-size: 11px;
+        font-family: ui-monospace, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
+        display: none; /* hidden by default; open DevTools console to see logs */
+      }
     </style>
   </head>
   <body>
-    <h1>Screen Mirror — R10.2 smoke</h1>
-    <p>Validates that <code>WindowsCaptureSource</code> starts cleanly under the Tauri 2 main-thread COM apartment. Auto-runs when the WebView loads.</p>
-    <div id="status" class="status pending">running...</div>
-    <button id="rerun" type="button">Re-run smoke</button>
+    <!-- R11.1: <video> element with autoplay + muted (R11.8) -->
+    <div id="stage">
+      <video id="player" autoplay muted playsinline></video>
+    </div>
+
+    <!-- Status line for MSE state -->
+    <div id="status">starting…</div>
+
+    <!-- R11.7: no import / require — plain module script -->
+    <script type="module" src="./mse-client.js"></script>
+
+    <!-- R10.2 smoke test (retained for debug builds) -->
+    <div id="smoke-section">
+      <strong>R10.2 smoke</strong>
+      <div id="smoke-status" class="pending">running...</div>
+      <button id="smoke-rerun" type="button">Re-run</button>
+    </div>
     <script type="module">
-      // Tauri 2 exposes invoke on window.__TAURI__.core.invoke
+      // R10.2 smoke: only runs if the smoke section is made visible.
       const invoke = window.__TAURI__?.core?.invoke;
-      const status = document.getElementById("status");
+      const smokeStatus = document.getElementById("smoke-status");
 
       async function runSmoke() {
-        if (!invoke) {
-          status.className = "status fail";
-          status.textContent = "ERROR — window.__TAURI__.core.invoke not available (not running inside Tauri).";
-          return;
-        }
-        status.className = "status pending";
-        status.textContent = "running smoke_com_apartment (up to 10s)...";
+        if (!invoke || !smokeStatus) return;
+        smokeStatus.textContent = "running smoke_com_apartment (up to 10s)...";
         try {
           const msg = await invoke("smoke_com_apartment");
-          status.className = "status pass";
-          status.textContent = msg;
+          smokeStatus.textContent = msg;
         } catch (err) {
-          status.className = "status fail";
-          status.textContent = String(err);
+          smokeStatus.textContent = String(err);
         }
       }
 
-      document.getElementById("rerun").addEventListener("click", runSmoke);
-      runSmoke();
+      document
+        .getElementById("smoke-rerun")
+        ?.addEventListener("click", runSmoke);
     </script>
   </body>
 </html>
