@@ -28,3 +28,6 @@ openh264-sys2 = "0.9"
 [target.'cfg(target_os = "macos")'.dependencies]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+
+[dev-dependencies]
+mp4 = "0.14.0"
