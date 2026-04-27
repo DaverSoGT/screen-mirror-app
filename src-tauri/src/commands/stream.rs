@@ -15,15 +15,10 @@
 //! init segment from SPS+PPS, and emits `"stream/init"` + `"stream/segment"` events
 //! to the WebView via `tauri::AppHandle::emit`.
 //!
-//! # OQ-tauri-emit-1 resolution
+//! # OQ-tauri-emit-1 — SUPERSEDED
 //!
-//! Tauri 2 `AppHandle::emit` serializes the payload via `serde_json`. A `Vec<u8>`
-//! becomes a JSON array of numbers `[12, 34, ...]` on the JS side — 3–4× bloat for
-//! binary data. The `toUint8Array()` helper in `dist/mse-client.js` wraps the
-//! `Array<number>` into a `Uint8Array` before `appendBuffer`. For V1 the bandwidth
-//! overhead is acceptable (avg segment ~4 KB after JSON encoding ≈ 12 KB; well within
-//! 100 Mbps LAN capacity). The `tauri::ipc::Channel<T>` API is deferred to V2 if
-//! profiling reveals JSON encoding as a bottleneck. Decision logged in apply-progress.
+//! The V1 decision to keep `app.emit(Vec<u8>)` (JSON encoding) is overridden.
+//! See the pivot to `tauri::ipc::Channel<InvokeResponseBody>` implemented below.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
