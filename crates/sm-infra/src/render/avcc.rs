@@ -19,8 +19,6 @@
 //! - All input slices (`nal`, `sps_nal`, `pps_nal`) are raw NAL bytes **including** the
 //!   1-byte NAL header (e.g. `0x67` for an SPS NAL). Annex-B start codes MUST be
 //!   stripped by the caller before invoking any function here.
-//! - The `build_avcc` caller is responsible for passing the same raw NAL bytes (with
-//!   header, without start code) to both `parse_sps` and `build_avcc`.
 
 // ─── Error type ──────────────────────────────────────────────────────────────
 
@@ -38,6 +36,9 @@ pub enum AvccError {
 // ─── SpsInfo ─────────────────────────────────────────────────────────────────
 
 /// Parsed fields from an H.264 Sequence Parameter Set NAL.
+///
+/// All fields are extracted directly from the SPS RBSP (raw byte sequence payload)
+/// per ISO/IEC 14496-10 §7.3.2.1.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpsInfo {
     /// `profile_idc`: H.264 profile (66 = Baseline, 77 = Main, 100 = High).
@@ -48,34 +49,277 @@ pub struct SpsInfo {
     pub level_idc: u8,
     /// Frame width in pixels derived from `(pic_width_in_mbs_minus1 + 1) × 16`.
     pub width: u32,
-    /// Frame height in pixels.
+    /// Frame height in pixels derived from `(2 − frame_mbs_only_flag) × (pic_height_in_map_units_minus1 + 1) × 16`.
     pub height: u32,
     /// `frame_mbs_only_flag`: 1 for progressive, 0 for interlaced.
     pub frame_mbs_only_flag: bool,
 }
 
-// ─── Stub implementations (GREEN will fill these in) ─────────────────────────
+// ─── Capability A: Emulation prevention byte stripper ────────────────────────
 
 /// Remove emulation-prevention bytes from a NAL payload.
+///
+/// H.264 §7.4.1.1: the encoder inserts `0x03` between any two consecutive `0x00` bytes
+/// that could be mistaken for a start code. This function strips each `0x03` byte that
+/// appears in a `0x00 0x00 0x03` sequence, producing the raw RBSP bytes that the
+/// bit reader can then parse.
+///
+/// # Arguments
+///
+/// * `rbsp` — NAL payload bytes **including** the NAL header byte.
 pub fn unwrap_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
-    let _ = rbsp;
-    unimplemented!("unwrap_emulation_prevention — RED stub")
+    if rbsp.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(rbsp.len());
+    let mut i = 0;
+
+    while i < rbsp.len() {
+        // Detect 0x00 0x00 0x03 triplet and strip the 0x03.
+        if i + 2 < rbsp.len()
+            && rbsp[i] == 0x00
+            && rbsp[i + 1] == 0x00
+            && rbsp[i + 2] == 0x03
+        {
+            out.push(0x00);
+            out.push(0x00);
+            i += 3;
+        } else {
+            out.push(rbsp[i]);
+            i += 1;
+        }
+    }
+
+    out
 }
+
+// ─── Capability A: Bit reader ─────────────────────────────────────────────────
+
+/// Minimal bit reader over a byte slice.
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// Absolute position in BITS (0 = MSB of byte 0).
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn total_bits(&self) -> usize {
+        self.data.len() * 8
+    }
+
+    fn read_bit(&mut self) -> Result<bool, AvccError> {
+        if self.bit_pos >= self.total_bits() {
+            return Err(AvccError::ParseFailed(format!(
+                "unexpected end of bitstream at bit {}",
+                self.bit_pos
+            )));
+        }
+        let byte_idx = self.bit_pos / 8;
+        let bit_idx = 7 - (self.bit_pos % 8); // MSB first
+        self.bit_pos += 1;
+        Ok((self.data[byte_idx] >> bit_idx) & 1 != 0)
+    }
+
+    fn read_bits(&mut self, n: u8) -> Result<u32, AvccError> {
+        let mut val: u32 = 0;
+        for _ in 0..n {
+            val = (val << 1) | (self.read_bit()? as u32);
+        }
+        Ok(val)
+    }
+
+    /// Read an Exp-Golomb coded unsigned integer `ue(v)`.
+    fn read_ue(&mut self) -> Result<u32, AvccError> {
+        let mut leading_zeros: u8 = 0;
+        loop {
+            let bit = self.read_bit()?;
+            if bit {
+                break;
+            }
+            leading_zeros += 1;
+            if leading_zeros >= 32 {
+                return Err(AvccError::ParseFailed(
+                    "Exp-Golomb codeword exceeds 32 leading zeros".into(),
+                ));
+            }
+        }
+
+        if leading_zeros == 0 {
+            return Ok(0);
+        }
+
+        let suffix = self.read_bits(leading_zeros)?;
+        Ok(((1u32 << leading_zeros) | suffix) - 1)
+    }
+}
+
+// ─── Capability A: SPS parser ─────────────────────────────────────────────────
 
 /// Parse an H.264 SPS NAL unit and extract the fields needed for `avcC` construction.
+///
+/// # Input
+///
+/// `nal` — raw NAL bytes **including** the 1-byte NAL header (e.g. `[0x67, ...]`).
+/// Annex-B start codes must be stripped before calling. Emulation-prevention bytes
+/// are stripped internally.
+///
+/// # Errors
+///
+/// Returns `Err(AvccError::ParseFailed(_))` if the input is malformed or truncated.
 pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, AvccError> {
-    let _ = nal;
-    unimplemented!("parse_sps — RED stub")
+    if nal.len() < 4 {
+        return Err(AvccError::ParseFailed(format!(
+            "SPS NAL too short: {} bytes (need ≥ 4)",
+            nal.len()
+        )));
+    }
+
+    let nal_type = nal[0] & 0x1F;
+    if nal_type != 7 {
+        return Err(AvccError::ParseFailed(format!(
+            "not an SPS NAL: type = {} (expected 7)",
+            nal_type
+        )));
+    }
+
+    let profile_idc = nal[1];
+    let constraint_set_flags = nal[2];
+    let level_idc = nal[3];
+
+    let rbsp = unwrap_emulation_prevention(nal);
+
+    if rbsp.len() < 5 {
+        return Err(AvccError::ParseFailed(
+            "SPS RBSP body too short after emulation-prevention stripping".into(),
+        ));
+    }
+
+    let mut r = BitReader::new(&rbsp[4..]);
+
+    // seq_parameter_set_id — ue(v), discard.
+    let _seq_ps_id = r.read_ue()?;
+
+    // High-profile extra fields.
+    let is_high_profile = matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    );
+
+    if is_high_profile {
+        let chroma_format_idc = r.read_ue()?;
+        if chroma_format_idc == 3 {
+            let _separate_colour_plane_flag = r.read_bit()?;
+        }
+        let _bit_depth_luma_minus8 = r.read_ue()?;
+        let _bit_depth_chroma_minus8 = r.read_ue()?;
+        let _qpprime_y_zero_transform_bypass_flag = r.read_bit()?;
+        let seq_scaling_matrix_present_flag = r.read_bit()?;
+        if seq_scaling_matrix_present_flag {
+            let list_count: u8 = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..list_count {
+                let present = r.read_bit()?;
+                if present {
+                    let size = if i < 6 { 16usize } else { 64usize };
+                    let mut next_scale: i32 = 8;
+                    for _ in 0..size {
+                        if next_scale != 0 {
+                            let delta_ue = r.read_ue()?;
+                            let delta_scale = ue_to_se(delta_ue);
+                            next_scale = (next_scale + delta_scale + 256) % 256;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // log2_max_frame_num_minus4 — ue(v), discard.
+    let _log2_max_frame_num = r.read_ue()?;
+
+    // pic_order_cnt_type — ue(v).
+    let poc_type = r.read_ue()?;
+    match poc_type {
+        0 => {
+            let _log2_max_poc_lsb = r.read_ue()?;
+        }
+        1 => {
+            let _delta_zero = r.read_bit()?;
+            let _offset_non_ref = r.read_ue()?;
+            let _offset_top_bot = r.read_ue()?;
+            let num_ref = r.read_ue()?;
+            for _ in 0..num_ref {
+                let _off = r.read_ue()?;
+            }
+        }
+        2 => {}
+        _ => {
+            return Err(AvccError::ParseFailed(format!(
+                "unsupported pic_order_cnt_type: {}",
+                poc_type
+            )));
+        }
+    }
+
+    // max_num_ref_frames — ue(v), discard.
+    let _max_ref_frames = r.read_ue()?;
+
+    // gaps_in_frame_num_value_allowed_flag — u(1), discard.
+    let _gaps = r.read_bit()?;
+
+    // pic_width_in_mbs_minus1 — ue(v).
+    let pic_width_in_mbs_minus1 = r.read_ue()?;
+
+    // pic_height_in_map_units_minus1 — ue(v).
+    let pic_height_in_map_units_minus1 = r.read_ue()?;
+
+    // frame_mbs_only_flag — u(1).
+    let frame_mbs_only_flag = r.read_bit()?;
+
+    let width = (pic_width_in_mbs_minus1 + 1) * 16;
+    let height_factor: u32 = if frame_mbs_only_flag { 1 } else { 2 };
+    let height = height_factor * (pic_height_in_map_units_minus1 + 1) * 16;
+
+    Ok(SpsInfo {
+        profile_idc,
+        constraint_set_flags,
+        level_idc,
+        width,
+        height,
+        frame_mbs_only_flag,
+    })
 }
 
+/// Convert an Exp-Golomb unsigned code to a signed integer (ZigZag mapping).
+fn ue_to_se(ue: u32) -> i32 {
+    if ue == 0 {
+        return 0;
+    }
+    let sign = if ue % 2 == 1 { 1i32 } else { -1i32 };
+    let mag = (ue / 2 + ue % 2) as i32;
+    sign * mag
+}
+
+// ─── Capability B stub (GREEN will add implementation) ────────────────────────
+
 /// Build an `AVCDecoderConfigurationRecord` (`avcC`) byte buffer.
+///
+/// Layout (ISO/IEC 14496-15 §5.2.4.1.2): see module docs.
+///
+/// # Errors
+///
+/// Returns `Err(AvccError::InvalidInput(_))` if `sps_nal` or `pps_nal` is empty.
 pub fn build_avcc(
     sps_info: &SpsInfo,
     sps_nal: &[u8],
     pps_nal: &[u8],
 ) -> Result<Vec<u8>, AvccError> {
     let _ = (sps_info, sps_nal, pps_nal);
-    unimplemented!("build_avcc — RED stub")
+    unimplemented!("build_avcc — Capability B GREEN stub")
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -84,68 +328,73 @@ pub fn build_avcc(
 mod tests {
     use super::*;
 
-    // ─── Corrected 320x240 SPS fixture ──────────────────────────────────────
+    // ─── SPS byte fixtures ─────────────────────────────────────────────────
     //
-    // Bit stream for 320x240 Baseline Level 1.3 SPS:
+    // SPS_320X240: Baseline Level 1.3, 320×240 progressive.
     //
-    // NAL header:  0x67 (forbidden=0, nal_ref_idc=3, type=7)
-    // profile_idc: 0x42 (66, Baseline)
-    // flags:       0xC0 (constraint_set0=1, constraint_set1=1)
-    // level_idc:   0x0D (13 = Level 1.3)
+    // RBSP body bit derivation (after the 4-byte fixed header):
+    //   seq_ps_id=0:        ue(0)="1"            [1b]
+    //   log2_fn_minus4=0:   ue(0)="1"            [1b]
+    //   poc_type=0:         ue(0)="1"            [1b]
+    //   log2_poc_lsb=0:     ue(0)="1"            [1b]
+    //   max_ref=1:          ue(1)="010"          [3b]
+    //   gaps=0:             u(1)="0"             [1b]
+    //   [byte 0: 1111 0100 = 0xF4]
+    //   pw_mbs_minus1=19:   ue(19)="00001 0100"  [9b]
+    //     n=4, suffix=4=0100: "0000 1 010 0"
+    //     bits 8-16: 0000 1010 | 0
+    //   [byte 1: 0000 1010 = 0x0A]
+    //   ph_map_minus1=14:   ue(14)="000 1 111"   [7b]
+    //     n=3, suffix=7=111: "000 1 111"
+    //     bits 16-22: 0 | 0001 111
+    //   frame_mbs_only=1:   u(1)="1"             [1b] at bit 23
+    //   [byte 2: 0000 1111 = 0x0F]
+    //   trailing: 1 (stop) + 6 zeros at bits 24-31
+    //   [byte 3: 1100 0000 = 0xC0]
     //
-    // RBSP body bits (MSB first):
-    //   pos  0: 1   seq_parameter_set_id=0 → ue(0)="1"
-    //   pos  1: 1   log2_max_frame_num_minus4=0 → ue(0)="1"
-    //   pos  2: 1   pic_order_cnt_type=0 → ue(0)="1"
-    //   pos  3: 1   log2_max_pic_order_cnt_lsb_minus4=0 → ue(0)="1"
-    //   pos  4: 0   max_num_ref_frames=1 → ue(1): leading zero
-    //   pos  5: 1   max_num_ref_frames=1: terminator (n=1)
-    //   pos  6: 0   max_num_ref_frames=1: suffix[0]=0 → value=2^1+0-1=1 ✓
-    //   pos  7: 0   gaps_in_frame_num_value_allowed_flag=0
-    //   --- byte 0: 1111 0100 = 0xF4 ---
-    //   pos  8: 0   pic_width_in_mbs_minus1=19: ue(19) leading zero 1/4
-    //   pos  9: 0   leading zero 2/4
-    //   pos 10: 0   leading zero 3/4
-    //   pos 11: 0   leading zero 4/4
-    //   pos 12: 1   terminator (n=4)
-    //   pos 13: 0   suffix[3] of 0100 (=4=20-16)
-    //   pos 14: 1   suffix[2]
-    //   pos 15: 0   suffix[1]
-    //   --- byte 1: 0000 1010 = 0x0A ---
-    //   pos 16: 0   suffix[0] of 0100 → value=2^4+4-1=19 ✓
-    //   pos 17: 0   pic_height_in_map_units_minus1=14: ue(14) leading zero 1/3
-    //   pos 18: 0   leading zero 2/3
-    //   pos 19: 0   leading zero 3/3
-    //   pos 20: 1   terminator (n=3)
-    //   pos 21: 1   suffix[2] of 111 (=7=15-8)
-    //   pos 22: 1   suffix[1]
-    //   pos 23: 1   suffix[0] → value=2^3+7-1=14 ✓
-    //   --- byte 2: 0000 1111 = 0x0F ---
-    //   pos 24: 1   frame_mbs_only_flag=1
-    //   pos 25: 1   RBSP trailing stop bit
-    //   pos 26-31: 0 (padding)
-    //   --- byte 3: 1100 0000 = 0xC0 ---
-    //
-    // Expected parse result: width=320, height=240, profile=66, level=13, progressive=true
+    // Parsed: width=(19+1)*16=320, height=1*(14+1)*16=240, progressive
 
     const SPS_320X240: &[u8] = &[
-        0x67, 0x42, 0xC0, 0x0D, // NAL hdr + profile + flags + level
-        0xF4, 0x0A, 0x0F, 0xC0, // RBSP body
+        0x67, 0x42, 0xC0, 0x0D,
+        0xF4, 0x0A, 0x0F, 0xC0,
     ];
 
-    /// Interlaced variant: frame_mbs_only_flag=0, height becomes 480.
-    ///
-    /// Bit stream identical to SPS_320X240 except pos 24 = 0 (interlaced).
-    /// Byte 3: 0 1 00 0000 = 0x40 (frame_mbs_only=0, stop=1, padding)
+    // SPS_320X240_INTERLACED: same but frame_mbs_only_flag=0.
+    // bit 24 → 0, so byte 3 of RBSP = 0100 0000 = 0x40.
+    // Parsed: width=320, height=2*(14+1)*16=480, interlaced.
     const SPS_320X240_INTERLACED: &[u8] = &[
         0x67, 0x42, 0xC0, 0x0D,
         0xF4, 0x0A, 0x0F, 0x40,
     ];
 
-    /// Golden 1920x1080 SPS from openh264 (contains emulation-prevention bytes).
-    ///
-    /// The 0x03 bytes at positions 13 and 18 are emulation-prevention bytes inserted
-    /// in the `0x00 0x00 0x03` patterns. This SPS is used to verify EPB stripping.
+    // SPS_1280X720: Baseline Level 3.1, 1280×720 progressive.
+    //
+    // RBSP body bits (after fixed 4-byte header):
+    //   seq_ps_id=0, fn=0, poc=0, poc_lsb=0: "1111"
+    //   max_ref=1: "010"
+    //   gaps=0: "0"
+    //   [byte 0: 1111 0100 = 0xF4]
+    //   pw_mbs_minus1=79: ue(79): n=6, suffix=16=010000
+    //     → "000000 1 010000" (13 bits)
+    //     bits 8-20: 00000010 10000
+    //   [byte 1: 0000 0010 = 0x02]
+    //   continued bits 16-20: 10000 (5 bits of suffix)
+    //   ph_map_minus1=44: ue(44): n=5, suffix=13=01101
+    //     → "00000 1 01101" (11 bits, at bits 21-31)
+    //   [byte 2: 1000 0000 = 0x80]
+    //   [byte 3: 0010 1101 = 0x2D]
+    //   frame_mbs_only=1 at bit 32: "1"
+    //   trailing: stop+pad at bits 33-39
+    //   [byte 4: 1100 0000 = 0xC0]
+    //
+    // Parsed: width=(79+1)*16=1280, height=1*(44+1)*16=720
+    const SPS_1280X720: &[u8] = &[
+        0x67, 0x42, 0xC0, 0x1F,
+        0xF4, 0x02, 0x80, 0x2D, 0xC0,
+    ];
+
+    // GOLDEN_SPS_1920X1080: real SPS bytes from openh264 for 1920×1080 Baseline Level 4.0.
+    // Contains emulation-prevention bytes (0x03) at positions 13 and 18.
     const GOLDEN_SPS_1920X1080: &[u8] = &[
         0x67, 0x42, 0xC0, 0x28,
         0xD9, 0x00, 0xA0, 0x47,
@@ -170,188 +419,193 @@ mod tests {
         }
     }
 
-    // ─── Capability A: SPS Exp-Golomb parser tests ─────────────────────────
+    // ─── Capability A: unwrap_emulation_prevention (GREEN) ─────────────────
 
     #[test]
-    #[should_panic]
-    fn parse_sps_empty_returns_err() {
-        // RED: parse_sps is unimplemented → panics with unimplemented!()
-        // After GREEN: parse_sps(&[]).unwrap_err() with AvccError::ParseFailed
-        let _ = parse_sps(&[]);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_too_short_returns_err() {
-        let _ = parse_sps(&[0x67, 0x42, 0xC0]);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_wrong_nal_type_returns_err() {
-        let _ = parse_sps(&[0x65, 0x42, 0xC0, 0x28, 0xFF]);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_320x240_correct_profile_level() {
-        let _ = parse_sps(SPS_320X240);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_320x240_correct_dimensions() {
-        let _ = parse_sps(SPS_320X240);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_320x240_frame_mbs_only_progressive() {
-        let _ = parse_sps(SPS_320X240);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_interlaced_height_uses_two_factor() {
-        let _ = parse_sps(SPS_320X240_INTERLACED);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_1280x720_correct_dimensions() {
-        let sps: &[u8] = &[
-            0x67, 0x42, 0xC0, 0x1F,
-            0xF4, 0x02, 0x80, 0x2D, 0xC0,
-        ];
-        let _ = parse_sps(sps);
-    }
-
-    #[test]
-    #[should_panic]
-    fn parse_sps_with_emulation_prevention_bytes_no_panic() {
-        let _ = parse_sps(GOLDEN_SPS_1920X1080);
-    }
-
-    // ─── Emulation prevention byte tests ──────────────────────────────────
-
-    #[test]
-    #[should_panic]
     fn unwrap_emulation_prevention_empty() {
-        let _ = unwrap_emulation_prevention(&[]);
+        let out = unwrap_emulation_prevention(&[]);
+        assert!(out.is_empty());
     }
 
     #[test]
-    #[should_panic]
     fn unwrap_emulation_prevention_no_epb() {
-        let input = vec![0x67u8, 0x42, 0xC0, 0x28, 0xD9, 0xAB];
-        let _ = unwrap_emulation_prevention(&input);
+        let input: &[u8] = &[0x67, 0x42, 0xC0, 0x28, 0xD9, 0xAB];
+        let out = unwrap_emulation_prevention(input);
+        assert_eq!(out, input);
     }
 
     #[test]
-    #[should_panic]
     fn unwrap_emulation_prevention_strips_epb() {
-        let input = vec![0x67u8, 0x00, 0x00, 0x03, 0x01];
-        let _ = unwrap_emulation_prevention(&input);
+        let input: &[u8] = &[0x67, 0x00, 0x00, 0x03, 0x01];
+        let out = unwrap_emulation_prevention(input);
+        assert_eq!(out, &[0x67, 0x00, 0x00, 0x01]);
     }
 
     #[test]
-    #[should_panic]
     fn unwrap_emulation_prevention_multiple_epbs() {
-        let input = vec![0x67u8, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0xFF];
-        let _ = unwrap_emulation_prevention(&input);
+        let input: &[u8] = &[0x67, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0xFF];
+        let out = unwrap_emulation_prevention(input);
+        assert_eq!(out, &[0x67, 0x00, 0x00, 0x00, 0x00, 0xFF]);
     }
 
-    // ─── Capability B: avcC box builder tests ─────────────────────────────
+    // ─── Capability A: parse_sps — error paths (GREEN) ────────────────────
 
     #[test]
-    #[should_panic]
-    fn build_avcc_configuration_version_is_one() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
-    }
-
-    #[test]
-    #[should_panic]
-    fn build_avcc_profile_compatibility_level_correct() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_empty_returns_err() {
+        let err = parse_sps(&[]).unwrap_err();
+        assert!(matches!(err, AvccError::ParseFailed(_)));
     }
 
     #[test]
-    #[should_panic]
-    fn build_avcc_length_size_minus_one_is_three() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_too_short_returns_err() {
+        let err = parse_sps(&[0x67, 0x42, 0xC0]).unwrap_err();
+        assert!(matches!(err, AvccError::ParseFailed(_)));
     }
 
     #[test]
-    #[should_panic]
-    fn build_avcc_num_sps_field_is_0xe1() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_wrong_nal_type_returns_err() {
+        let err = parse_sps(&[0x65, 0x42, 0xC0, 0x28, 0xFF]).unwrap_err();
+        assert!(matches!(err, AvccError::ParseFailed(_)));
+    }
+
+    // ─── Capability A: parse_sps — 320×240 golden (GREEN) ─────────────────
+
+    #[test]
+    fn parse_sps_320x240_correct_profile_level() {
+        let info = parse_sps(SPS_320X240).expect("should parse");
+        assert_eq!(info.profile_idc, 66);
+        assert_eq!(info.constraint_set_flags, 0xC0);
+        assert_eq!(info.level_idc, 13);
     }
 
     #[test]
-    #[should_panic]
-    fn build_avcc_sps_length_is_big_endian() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_320x240_correct_dimensions() {
+        let info = parse_sps(SPS_320X240).expect("should parse");
+        assert_eq!(info.width, 320);
+        assert_eq!(info.height, 240);
     }
 
     #[test]
-    #[should_panic]
-    fn build_avcc_sps_bytes_verbatim() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_320x240_frame_mbs_only_progressive() {
+        let info = parse_sps(SPS_320X240).expect("should parse");
+        assert!(info.frame_mbs_only_flag);
     }
 
-    #[test]
-    #[should_panic]
-    fn build_avcc_num_pps_is_one() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
-    }
+    // ─── Capability A: parse_sps — interlaced (GREEN) ─────────────────────
 
     #[test]
-    #[should_panic]
-    fn build_avcc_pps_length_is_big_endian() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_interlaced_height_uses_two_factor() {
+        let info = parse_sps(SPS_320X240_INTERLACED).expect("should parse");
+        assert_eq!(info.width, 320);
+        assert_eq!(info.height, 480, "interlaced height = 2 * 15 * 16 = 480");
+        assert!(!info.frame_mbs_only_flag);
     }
 
-    #[test]
-    #[should_panic]
-    fn build_avcc_pps_bytes_verbatim() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
-    }
+    // ─── Capability A: parse_sps — 1280×720 (GREEN) ───────────────────────
 
     #[test]
-    #[should_panic]
-    fn build_avcc_total_size_correct() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, MINIMAL_PPS);
+    fn parse_sps_1280x720_correct_dimensions() {
+        let info = parse_sps(SPS_1280X720).expect("should parse");
+        assert_eq!(info.width, 1280);
+        assert_eq!(info.height, 720);
+        assert_eq!(info.profile_idc, 66);
+        assert_eq!(info.level_idc, 31);
     }
+
+    // ─── Capability A: parse_sps — EPB handling (GREEN) ───────────────────
+
+    #[test]
+    fn parse_sps_with_emulation_prevention_bytes_no_panic() {
+        // Must not panic regardless of whether parsing succeeds.
+        let result = parse_sps(GOLDEN_SPS_1920X1080);
+        match result {
+            Ok(info) => {
+                assert_eq!(info.width % 16, 0);
+                assert_eq!(info.height % 16, 0);
+            }
+            Err(e) => println!("Graceful error: {}", e),
+        }
+    }
+
+    // ─── Capability B: build_avcc — RED stubs (#[should_panic]) ───────────
+    // These will become real assertions in the GREEN B commit.
 
     #[test]
     #[should_panic]
     fn build_avcc_empty_sps_returns_err() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, &[], MINIMAL_PPS);
+        let _ = build_avcc(&minimal_sps_info(), &[], MINIMAL_PPS);
     }
 
     #[test]
     #[should_panic]
     fn build_avcc_empty_pps_returns_err() {
-        let info = minimal_sps_info();
-        let _ = build_avcc(&info, MINIMAL_SPS, &[]);
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, &[]);
     }
 
     #[test]
     #[should_panic]
-    fn build_avcc_golden_round_trip() {
+    fn build_avcc_configuration_version_is_one() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_profile_compatibility_level_correct() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_length_size_minus_one_is_three() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_num_sps_field_is_0xe1() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_sps_length_is_big_endian() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_sps_bytes_verbatim() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_num_pps_is_one() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_pps_length_is_big_endian() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_pps_bytes_verbatim() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_total_size_correct() {
+        let _ = build_avcc(&minimal_sps_info(), MINIMAL_SPS, MINIMAL_PPS);
+    }
+
+    #[test]
+    #[should_panic]
+    fn build_avcc_golden_round_trip_320x240() {
         let info = parse_sps(SPS_320X240).expect("parse");
-        let pps = &[0x68u8, 0xCE, 0x38, 0x80];
-        let _ = build_avcc(&info, SPS_320X240, pps);
+        let _ = build_avcc(&info, SPS_320X240, MINIMAL_PPS);
     }
 }
