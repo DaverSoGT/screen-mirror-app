@@ -451,6 +451,31 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability C (B6): tfdt (Track Fragment Decode Time) box builder ────────
+
+/// Build a `tfdt` (Track Fragment Decode Time) full box, version 1 (64-bit).
+///
+/// Layout (ISO/IEC 14496-12 §8.8.12, version 1):
+/// ```text
+/// [size:4][b"tfdt":4][version:1 = 1][flags:3 = 0][base_media_decode_time:8]
+/// ```
+/// Total: 20 bytes.
+///
+/// Using version 1 (u64 field) provides ~5.8 million years of headroom at 90 kHz,
+/// avoiding the 47 721-second overflow that version 0 (u32 field) would hit.
+///
+/// # Arguments
+///
+/// * `base_media_decode_time` — DTS of the first sample in this fragment, in 90 kHz units.
+pub(crate) fn build_tfdt(base_media_decode_time: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 1, 0); // version = 1, flags = 0
+    payload.extend_from_slice(&base_media_decode_time.to_be_bytes());
+    let mut out = Vec::new();
+    write_box(&mut out, b"tfdt", &payload);
+    out
+}
+
 // ─── Capability B (B6): tfhd (Track Fragment Header) box builder ─────────────
 
 /// Build a `tfhd` (Track Fragment Header) full box.
