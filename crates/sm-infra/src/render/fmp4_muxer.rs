@@ -451,6 +451,63 @@ pub(crate) fn build_moov(
     Ok(out)
 }
 
+// ─── Capability D (B6): trun (Track Fragment Run) box builder ────────────────
+
+/// Per-sample data for a `trun` box.
+pub(crate) struct TrunSample {
+    /// Optional per-sample duration override (in 90 kHz units). `None` → use track default.
+    pub duration: Option<u32>,
+    /// Byte size of this sample (NAL AVCC payload for this sample).
+    pub size: u32,
+    /// Optional per-sample flags override. `None` → use default from `tfhd`.
+    pub flags: Option<u32>,
+}
+
+/// Build a `trun` (Track Fragment Run) full box.
+///
+/// Layout (ISO/IEC 14496-12 §8.8.8, version 0):
+/// ```text
+/// [size:4][b"trun":4][version:1 = 0][flags:3]
+/// [sample_count:4][data_offset:4]
+/// [first_sample_flags:4]  (if is_idr — indicates IDR frame)
+/// per-sample: [size:4] × N
+/// ```
+///
+/// # flags selection (24-bit field)
+///
+/// - `0x000001` — `data-offset-present`
+/// - `0x000004` — `first-sample-flags-present` (set when `is_idr = true`)
+/// - `0x000200` — `sample-size-present`
+///
+/// # Arguments
+///
+/// * `samples`     — per-sample size values (and optional per-sample overrides).
+/// * `data_offset` — signed byte offset from start of `moof` to start of `mdat` payload.
+/// * `is_idr`      — if true, inserts a `first_sample_flags` field marking the IDR sample.
+pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
+    // flags: data-offset-present (0x1) + sample-size-present (0x200) + optionally first-sample-flags (0x4)
+    let flags: u32 = 0x0000_0001 | 0x0000_0200 | if is_idr { 0x0000_0004 } else { 0 };
+
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, flags);
+    write_u32_be(&mut payload, samples.len() as u32); // sample_count
+    payload.extend_from_slice(&data_offset.to_be_bytes()); // data_offset (signed i32 BE)
+
+    if is_idr {
+        // first_sample_flags: sample_depends_on = 2 (IDR — does not depend on others)
+        // 0x02000000 encodes sample_is_non_sync_sample=0, sample_depends_on=2
+        write_u32_be(&mut payload, 0x0200_0000);
+    }
+
+    for s in samples {
+        write_u32_be(&mut payload, s.size);
+    }
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"trun", &payload);
+    out
+}
+
 // ─── Capability C (B6): tfdt (Track Fragment Decode Time) box builder ────────
 
 /// Build a `tfdt` (Track Fragment Decode Time) full box, version 1 (64-bit).
