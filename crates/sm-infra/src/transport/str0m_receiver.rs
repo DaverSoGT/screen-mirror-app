@@ -57,6 +57,15 @@ enum ReceiverControl {
     AddCandidate(IceCandidate),
     /// Send an RTCP PLI to the remote peer at the next tick.
     RequestKeyframe,
+    /// Process a remote SDP offer on the tick thread and reply with the answer.
+    ///
+    /// Used by the post-start path of `apply_remote_offer` (design §3.2).
+    /// The `reply` sender is a `SyncSender` with capacity 1 so that `try_send`
+    /// is non-blocking on the tick thread even if the caller already timed out.
+    ApplyOffer {
+        offer: SdpOffer,
+        reply: std::sync::mpsc::SyncSender<Result<SdpAnswer, TransportError>>,
+    },
 }
 
 // ─── Pre-negotiation state ───────────────────────────────────────────────────
@@ -246,43 +255,51 @@ impl VideoReceiver for Str0mVideoReceiver {
 
     /// Accept a remote SDP offer and return the local SDP answer.
     ///
-    /// Deserialises the domain `SdpOffer` string → str0m `SdpOffer` → calls
-    /// `rtc.sdp_api().accept_offer(offer)` → serialises the resulting `SdpAnswer`
-    /// to the domain `SdpAnswer` newtype.
+    /// Implements a dual-path strategy so the method is callable both before and
+    /// after `start()` (spec R6.3, design §3.2):
     ///
-    /// Can be called before or after `start()`. Returns `Err(Internal)` if the
-    /// `Rtc` has already been moved to the tick thread (i.e., after `start()` was
-    /// called and the offer was not yet applied).
+    /// - **Path A (pre-start)**: `Rtc` is still in `pre_neg`. Process the offer
+    ///   synchronously on the caller's thread. The `pre_neg` lock is released
+    ///   before any blocking call to prevent potential future deadlocks.
+    /// - **Path B (post-start)**: `Rtc` has been moved to the tick thread. Send
+    ///   an `ApplyOffer` control message with a reply channel, then block with a
+    ///   2-second timeout. This is generous for an in-process operation but
+    ///   bounded so a dead/wedged tick thread cannot hang the caller forever.
     fn apply_remote_offer(&self, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
-        let mut guard = self
-            .pre_neg
-            .lock()
-            .map_err(|e| TransportError::Internal(format!("mutex poisoned: {e}")))?;
-
-        match guard.as_mut() {
-            None => Err(TransportError::Internal(
-                "Rtc already moved to thread; apply_remote_offer must be called before start()"
-                    .into(),
-            )),
-            Some(pn) => {
-                // Parse the domain SdpOffer (plain SDP text) to str0m's SdpOffer.
-                // The offer is produced by Str0mVideoSender using SdpOffer::to_string()
-                // (the Display impl outputs the SDP session description text).
-                let str0m_offer =
-                    str0m::change::SdpOffer::from_sdp_string(&offer.0).map_err(|e| {
-                        TransportError::Internal(format!("SDP offer parse failed: {e}"))
-                    })?;
-
-                // Accept the offer and produce an answer.
-                let str0m_answer =
-                    pn.rtc.sdp_api().accept_offer(str0m_offer).map_err(|e| {
-                        TransportError::Internal(format!("accept_offer failed: {e}"))
-                    })?;
-
-                // Serialise the str0m SdpAnswer to plain SDP text (symmetric with offer).
-                Ok(SdpAnswer(str0m_answer.to_string()))
+        // Path A: Rtc is still in pre_neg (pre-start). Process synchronously.
+        // The scope `{ ... }` ensures the guard is dropped — and the lock released —
+        // BEFORE any blocking call, preventing future deadlocks if the tick thread
+        // ever needs the pre_neg lock.
+        {
+            let mut guard = self
+                .pre_neg
+                .lock()
+                .map_err(|e| TransportError::Internal(format!("mutex poisoned: {e}")))?;
+            if let Some(pn) = guard.as_mut() {
+                return apply_offer_to_rtc(&mut pn.rtc, offer);
             }
-        }
+        } // lock released here
+
+        // Path B: Rtc moved to tick thread (post-start). Send via control inbox
+        // and block on the reply channel.
+        let tx = self.control_tx.as_ref().ok_or(TransportError::NotRunning)?;
+
+        let (reply_tx, reply_rx) =
+            std::sync::mpsc::sync_channel::<Result<SdpAnswer, TransportError>>(1);
+
+        tx.try_send(ReceiverControl::ApplyOffer {
+            offer,
+            reply: reply_tx,
+        })
+        .map_err(|_| TransportError::Internal("control inbox full or disconnected".into()))?;
+
+        // 2 s is generous for an in-process operation but bounded so a dead/wedged
+        // tick thread cannot hang the caller forever.
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|e| {
+                TransportError::Internal(format!("apply_remote_offer reply timeout: {e}"))
+            })?
     }
 
     /// Add a remote ICE candidate. Posts to the tick thread's control inbox.
@@ -320,6 +337,25 @@ impl Drop for Str0mVideoReceiver {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+// ─── SDP helper ─────────────────────────────────────────────────────────────
+
+/// Parse a domain [`SdpOffer`], feed it to an [`Rtc`], and return the domain
+/// [`SdpAnswer`].
+///
+/// Shared by both paths of [`Str0mVideoReceiver::apply_remote_offer`]:
+/// - **Path A** (pre-start): called directly on the caller's thread.
+/// - **Path B** (post-start): called on the tick thread after the offer arrives
+///   via the `ReceiverControl::ApplyOffer` message.
+fn apply_offer_to_rtc(rtc: &mut Rtc, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
+    let str0m_offer = str0m::change::SdpOffer::from_sdp_string(&offer.0)
+        .map_err(|e| TransportError::Internal(format!("SDP offer parse failed: {e}")))?;
+    let str0m_answer = rtc
+        .sdp_api()
+        .accept_offer(str0m_offer)
+        .map_err(|e| TransportError::Internal(format!("accept_offer failed: {e}")))?;
+    Ok(SdpAnswer(str0m_answer.to_string()))
 }
 
 // ─── Tick loop ───────────────────────────────────────────────────────────────
@@ -363,6 +399,14 @@ fn run_receiver_loop(
                             let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
                         }
                     }
+                }
+                ReceiverControl::ApplyOffer { offer, reply } => {
+                    // Process the offer on this thread (which owns `rtc`) and
+                    // send the result back to the caller.
+                    // If the caller already timed out and dropped `reply`, the
+                    // send silently fails — that is acceptable.
+                    let result = apply_offer_to_rtc(rtc, offer);
+                    let _ = reply.try_send(result);
                 }
             }
         }
@@ -815,8 +859,8 @@ mod tests {
     fn str0m_receiver_apply_remote_offer_after_start_returns_answer_r6_3() {
         use std::time::Duration;
 
-        use str0m::media::{Direction, MediaKind};
         use str0m::Rtc;
+        use str0m::media::{Direction, MediaKind};
 
         // Build a minimal sender-side Rtc to generate a real SDP offer.
         let crypto_s = str0m::crypto::from_feature_flags();
