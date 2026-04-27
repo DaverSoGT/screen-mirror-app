@@ -2865,4 +2865,77 @@ mod tests {
         );
         assert_eq!(cfg.control_port, 7889);
     }
+
+    // ─── B6-1 RED: current_args populated on successful start_stream_inner ───────
+
+    /// B6-1.1 — After a successful `start_stream_inner` call with explicit custom
+    ///           args, `bridge.current_args` must be `Some((7900, "_my-mirror._tcp.local."))`.
+    ///
+    /// Spec R6.2: "When `start_stream` completes successfully, `current_args` MUST
+    /// be set to `Some((resolved_port, resolved_service_name))`."
+    ///
+    /// RED: `start_stream_inner` currently does NOT write to `current_args`.
+    #[test]
+    fn test_current_args_set_on_successful_start_custom_args() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(
+            &bridge,
+            channel,
+            Some(7900),
+            Some("_my-mirror._tcp.local.".to_string()),
+        )
+        .expect("start_stream_inner must succeed with valid args");
+
+        let args = bridge.current_args.lock().unwrap();
+        assert_eq!(
+            *args,
+            Some((7900u16, "_my-mirror._tcp.local.".to_string())),
+            "current_args must be Some((7900, \"_my-mirror._tcp.local.\")) after successful start"
+        );
+    }
+
+    /// B6-1.2 — After a successful `start_stream_inner` call with `None` args
+    ///           (defaults), `bridge.current_args` must be
+    ///           `Some((7889, "_screen-mirror._tcp.local."))`.
+    ///
+    /// Spec R6.2; the resolved defaults must be stored (not the raw `None`).
+    ///
+    /// RED: `start_stream_inner` currently does NOT write to `current_args`.
+    #[test]
+    fn test_current_args_set_on_successful_start_default_args() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(&bridge, channel, None, None)
+            .expect("start_stream_inner must succeed with default args");
+
+        let args = bridge.current_args.lock().unwrap();
+        assert_eq!(
+            *args,
+            Some((7889u16, "_screen-mirror._tcp.local.".to_string())),
+            "current_args must be Some((7889, \"_screen-mirror._tcp.local.\")) after successful default start"
+        );
+    }
 }
