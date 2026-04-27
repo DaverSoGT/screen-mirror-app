@@ -1,21 +1,36 @@
-// Screen Mirror — MSE client (Capability G, B7).
+// Screen Mirror — MSE client (Capability G, B7 / F-fix-3).
 //
-// Wires <video> + MediaSource + SourceBuffer to Tauri event stream.
-// Listens for "stream/init" and "stream/segment" events emitted from Rust.
+// Wires <video> + MediaSource + SourceBuffer to a Tauri Channel<Bytes>.
 //
-// OQ-tauri-emit-1 resolution:
-//   Tauri 2 app.emit() with Vec<u8> payload serializes as Array<number> on the
-//   JS side (serde_json encoding). The toUint8Array() helper wraps it into a
-//   Uint8Array before appendBuffer. Acceptable for V1 (LAN streaming).
+// OQ-tauri-emit-1 pivot (F-fix-3):
+//   Previously used window.__TAURI__.event.listen("stream/init", ...) which
+//   received a JSON Array<number> payload (serde_json encoding of Vec<u8>).
+//   At 1080p30 H.264 (~500 KB/segment) this produces 1.5–2 MB of JSON per
+//   segment plus a synchronous JSON.parse on the WebView main thread — jank.
 //
-// No import / require. Plain JS module. Depends on window.__TAURI__ (global
-// Tauri API injected by withGlobalTauri: true in tauri.conf.json).
+//   Resolution: frontend creates a Channel via window.__TAURI_INTERNALS__.Channel,
+//   passes it to Rust's start_stream as a command argument. Rust sends
+//   InvokeResponseBody::Raw(bytes) — no JSON encoding. The Channel delivers an
+//   ArrayBuffer directly to onmessage. The toUint8Array() helper is no longer needed.
 //
-// R11.7: no npm, no bundler, no node_modules.
+//   Frame layout (byte 0 = discriminant):
+//     0x00 (FRAME_INIT)    = fMP4 init segment (moov box, one per session)
+//     0x01 (FRAME_SEGMENT) = fMP4 media segment (moof+mdat, one per GOP)
+//
+// JS binding verified:
+//   window.__TAURI_INTERNALS__.Channel is the constructor available in Tauri 2
+//   when withGlobalTauri: true is set in tauri.conf.json. invoke() is available
+//   as window.__TAURI__.core.invoke or window.__TAURI_INTERNALS__.invoke.
+//
+// No import / require. Plain JS module. R11.7.
 
 const CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
+
+// Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT in stream.rs).
+const FRAME_INIT = 0x00;
+const FRAME_SEGMENT = 0x01;
 
 function setStatus(msg) {
   if (STATUS_EL) STATUS_EL.textContent = msg;
@@ -103,49 +118,55 @@ async function main() {
   }
   const trimHandle = setInterval(trimSourceBuffer, 5000);
 
-  // ── 4. Tauri event subscriptions (R11.3) ──────────────────────────────────
-  const { listen } = window.__TAURI__.event;
+  // ── 4. Create a Tauri Channel<Bytes> (F-fix-3) ───────────────────────────
+  //
+  // window.__TAURI_INTERNALS__.Channel is the Tauri 2 Channel constructor.
+  // The channel is passed to start_stream as a command argument; Rust clones
+  // it into the mux thread and calls channel.send(InvokeResponseBody::Raw(bytes)).
+  //
+  // onmessage receives an ArrayBuffer. Byte 0 is the discriminant:
+  //   0x00 = init segment → feed to SourceBuffer first
+  //   0x01 = media segment → feed to SourceBuffer after init
+  const Channel = window.__TAURI_INTERNALS__.Channel;
+  const streamChannel = new Channel();
 
-  await listen("stream/init", (event) => {
-    // OQ-tauri-emit-1: payload is Array<number> from serde_json → wrap to Uint8Array.
-    const init = toUint8Array(event.payload);
-    setStatus("init segment received (" + init.byteLength + " bytes)");
-    initReceived = true;
-    enqueue(init.buffer);
-  });
-
-  await listen("stream/segment", (event) => {
-    if (!initReceived) {
-      console.warn("[mse] segment arrived before init — discarding");
+  streamChannel.onmessage = (payload) => {
+    // payload is ArrayBuffer (InvokeResponseBody::Raw path).
+    const data = new Uint8Array(payload);
+    if (data.length === 0) {
+      console.warn("[mse] empty frame received — ignoring");
       return;
     }
-    const seg = toUint8Array(event.payload);
-    enqueue(seg.buffer);
-  });
 
-  // ── 5. Invoke start_stream after sourceopen ───────────────────────────────
-  // R-D3: frontend calls start_stream after MSE is ready to consume segments.
+    const discriminant = data[0];
+    const frameBytes = data.subarray(1).buffer; // strip the discriminant byte
+
+    if (discriminant === FRAME_INIT) {
+      setStatus("init segment received (" + (data.length - 1) + " bytes)");
+      initReceived = true;
+      enqueue(frameBytes);
+    } else if (discriminant === FRAME_SEGMENT) {
+      if (!initReceived) {
+        console.warn("[mse] segment arrived before init — discarding");
+        return;
+      }
+      enqueue(frameBytes);
+    } else {
+      console.warn("[mse] unknown frame discriminant: 0x" + discriminant.toString(16));
+    }
+  };
+
+  // ── 5. Invoke start_stream, passing the Channel ref (F-fix-3) ────────────
+  //
+  // Tauri serializes Channel<T> as a "__CHANNEL__:{id}" string on the JS side,
+  // which the Rust CommandArg impl deserialises back into Channel<InvokeResponseBody>.
   try {
-    await window.__TAURI__.core.invoke("start_stream");
+    await window.__TAURI__.core.invoke("start_stream", { channel: streamChannel });
     setStatus("start_stream invoked — waiting for first IDR…");
   } catch (e) {
     setStatus("start_stream failed: " + e);
     clearInterval(trimHandle);
   }
-}
-
-/**
- * Convert a Tauri 2 emit payload to Uint8Array.
- *
- * Tauri 2 app.emit() with Vec<u8> → JSON Array<number> on the JS side.
- * Channel<T> API would deliver a Uint8Array directly (V2 migration path).
- *
- * @param {number[]|Uint8Array} payload
- * @returns {Uint8Array}
- */
-function toUint8Array(payload) {
-  if (payload instanceof Uint8Array) return payload;
-  return new Uint8Array(payload);
 }
 
 main().catch((e) => setStatus("startup failed: " + e));
