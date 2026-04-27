@@ -6,7 +6,7 @@
 //! [`WindowsOpenH264Encoder`] wraps `openh264::encoder::Encoder` behind the
 //! [`VideoEncoder`] domain trait. It owns one OS thread (spawned in `start`)
 //! that reads [`CaptureFrame`]s from the injected channel, converts them to
-//! I420 via [`bgra_to_i420::convert`], and encodes them with OpenH264.
+//! I420 via `bgra_to_i420::convert`, and encodes them with OpenH264.
 //!
 //! # OpenH264 knobs
 //!
@@ -18,7 +18,7 @@
 //!
 //! # Color space
 //!
-//! Input is BGRA8 (WGC output). [`bgra_to_i420::convert`] converts to I420 using
+//! Input is BGRA8 (WGC output). `bgra_to_i420::convert` converts to I420 using
 //! **BT.601 limited-range** coefficients, which matches OpenH264's default decode
 //! color space. The conversion is stride-aware: WGC may pad rows to a GPU-aligned
 //! stride > `width * 4`; using `width * 4` as the row pitch causes "diagonal tearing".

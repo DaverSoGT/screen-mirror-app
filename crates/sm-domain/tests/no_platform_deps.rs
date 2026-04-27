@@ -13,13 +13,13 @@ const BANNED: &[&str] = &[
     "windows-targets",
     "tauri",
     "wasm-bindgen",
-    "openh264", // encoder backend must stay in sm-infra (R10.2)
-    "str0m",    // WebRTC stack must stay in sm-infra (transport adapter)
-    "mdns-sd",       // mDNS discovery must stay in sm-infra (signaling adapter)
-    "if-addrs",      // multi-NIC enumeration must stay in sm-infra
-    "ffmpeg-next",   // LGPL/GPL — must never enter sm-domain (R12.1, R12.2)
-    "rusty-ffmpeg",  // LGPL/GPL wrapper — same prohibition (R12.2)
-    "ffmpeg",        // any ffmpeg umbrella crate — same prohibition (R12.4)
+    "openh264",     // encoder backend must stay in sm-infra (R10.2)
+    "str0m",        // WebRTC stack must stay in sm-infra (transport adapter)
+    "mdns-sd",      // mDNS discovery must stay in sm-infra (signaling adapter)
+    "if-addrs",     // multi-NIC enumeration must stay in sm-infra
+    "ffmpeg-next",  // LGPL/GPL — must never enter sm-domain (R12.1, R12.2)
+    "rusty-ffmpeg", // LGPL/GPL wrapper — same prohibition (R12.2)
+    "ffmpeg",       // any ffmpeg umbrella crate — same prohibition (R12.4)
 ];
 
 #[test]
