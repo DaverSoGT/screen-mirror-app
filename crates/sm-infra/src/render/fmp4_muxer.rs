@@ -30,6 +30,33 @@ pub(crate) fn write_box(out: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+// ─── ftyp box builder ────────────────────────────────────────────────────────
+
+/// Build the `ftyp` box for a live fMP4 stream.
+///
+/// Layout per ISO/IEC 14496-12 §4.3:
+/// - major_brand: `iso5`
+/// - minor_version: `0x00000200`
+/// - compatible_brands: `[iso5, avc1, iso6, mp42]`
+///
+/// Total: 4 (size) + 4 (type) + 4 (major_brand) + 4 (minor_version) + 16 (brands) = 32 bytes.
+pub(crate) fn build_ftyp() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(24);
+    // major_brand = 'iso5'
+    payload.extend_from_slice(b"iso5");
+    // minor_version = 0x00000200
+    payload.extend_from_slice(&0x0000_0200u32.to_be_bytes());
+    // compatible_brands: iso5, avc1, iso6, mp42
+    payload.extend_from_slice(b"iso5");
+    payload.extend_from_slice(b"avc1");
+    payload.extend_from_slice(b"iso6");
+    payload.extend_from_slice(b"mp42");
+
+    let mut out = Vec::with_capacity(32);
+    write_box(&mut out, b"ftyp", &payload);
+    out
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
