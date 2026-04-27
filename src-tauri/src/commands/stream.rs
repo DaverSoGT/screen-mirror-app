@@ -1331,6 +1331,71 @@ mod tests {
         }
     }
 
+    // ─── BuilderProbe + make_test_builder — C7 test-double infrastructure ────
+    //
+    // Design #288 §7: `BuilderProbe` records every `(port, name)` pair the
+    // `BuilderFn` receives. `make_test_builder` wraps it into a `BuilderFn` that
+    // either returns a fake bundle (Ok variant) or a specified error (Err variant).
+    //
+    // Used by T7.1–T7.5, T7.8 (spec R7.1–R7.4). Matches design §7.1 exactly.
+    // No struct, trait, or derive is introduced for the fake (R7.2).
+    // No real sockets, no mDNS threads, no I/O (R7.3).
+
+    /// Records every `(port, name)` invocation of a test `BuilderFn`.
+    ///
+    /// Construct via `BuilderProbe::new()`. Retrieve recorded calls via
+    /// `probe.calls()`. The `Arc` wrapper allows the probe to be shared
+    /// between the closure captured by `make_test_builder` and the test body.
+    ///
+    /// Design #288 §7.1: "Records the args every time the builder is invoked."
+    #[derive(Default)]
+    struct BuilderProbe {
+        invocations: Mutex<Vec<(u16, String)>>,
+    }
+
+    impl BuilderProbe {
+        /// Create a new, empty probe wrapped in an `Arc` for sharing.
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Return a snapshot of recorded `(port, name)` pairs (cloned).
+        fn calls(&self) -> Vec<(u16, String)> {
+            self.invocations.lock().unwrap().clone()
+        }
+    }
+
+    /// Build a `BuilderFn` that records invocations into `probe` and returns
+    /// either a fake bundle (`Ok(())` path) or an error (`Err(&str)` path).
+    ///
+    /// The fake bundle uses `FakeReceiver`, a disconnected `pkt_rx`, and no
+    /// signaling or drain handles. The disconnected `pkt_rx` causes the mux
+    /// thread to exit cleanly on `Disconnected` — no real I/O, no sockets.
+    ///
+    /// Pass `result: Ok(())` for the happy path (T7.1, T7.2) or
+    /// `result: Err("msg")` to simulate a builder failure (T7.8).
+    ///
+    /// Design #288 §7.1: "build a `BuilderFn` that, when invoked, records the args
+    /// into `probe` and returns a fake bundle".
+    fn make_test_builder(probe: Arc<BuilderProbe>, result: Result<(), &'static str>) -> BuilderFn {
+        Arc::new(move |port, name, _stop_flag| {
+            probe.invocations.lock().unwrap().push((port, name));
+            match result {
+                Ok(()) => {
+                    let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                    Ok(ReceiverBundle {
+                        receiver: Box::new(FakeReceiver::new()),
+                        pkt_rx,
+                        signaling: None,
+                        drain_handles: Vec::new(),
+                        _drain_senders: Vec::new(),
+                    })
+                }
+                Err(msg) => Err(msg.to_string()),
+            }
+        })
+    }
+
     // ─── Helper: build a StreamBridge with an active session ─────────────────
 
     fn make_bridge_with_session() -> StreamBridge {
