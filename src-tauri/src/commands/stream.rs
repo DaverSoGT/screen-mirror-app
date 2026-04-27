@@ -3165,6 +3165,91 @@ mod tests {
         );
     }
 
+    // ─── B7-1 RED: BuilderProbe + T7.1 + T7.2 (args flow to builder) ───────────
+
+    /// B7-1.1 / T7.1 — `start_stream_inner(None, None, channel)` with a recording
+    ///                   builder must call the builder with the resolved defaults:
+    ///                   `(7889, "_screen-mirror._tcp.local.", _)`.
+    ///
+    /// Spec R7.4 T7.1: `start_stream(None, None, channel)` → `Ok(())`, builder called
+    /// with `(7889, "_screen-mirror._tcp.local.", _)`.
+    /// Spec R2.2, R2.3, R2.5: defaults resolve to (7889, "_screen-mirror._tcp.local.")
+    /// and these MUST be passed to the BuilderFn verbatim.
+    ///
+    /// RED: `BuilderProbe` and `make_test_builder` do not exist yet → E0422/E0425.
+    #[test]
+    fn test_t7_1_default_args_builder_called_with_defaults() {
+        let probe = BuilderProbe::new();
+        let builder = make_test_builder(probe.clone(), Ok(()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(&bridge, channel, None, None)
+            .expect("T7.1: start_stream_inner with default args must return Ok(())");
+
+        let calls = probe.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "T7.1: builder must be called exactly once, got {} calls",
+            calls.len()
+        );
+        assert_eq!(
+            calls[0].0, 7889,
+            "T7.1: builder must receive resolved default port 7889, got {}",
+            calls[0].0
+        );
+        assert_eq!(
+            calls[0].1, "_screen-mirror._tcp.local.",
+            "T7.1: builder must receive resolved default service name, got {:?}",
+            calls[0].1
+        );
+    }
+
+    /// B7-1.2 / T7.2 — `start_stream_inner(Some(7900), Some("_my-mirror._tcp.local."), channel)`
+    ///                   with a recording builder must call the builder with the custom args:
+    ///                   `(7900, "_my-mirror._tcp.local.", _)`.
+    ///
+    /// Spec R7.4 T7.2: `start_stream(Some(7900), Some("_my-mirror._tcp.local."), channel)` →
+    /// `Ok(())`, builder called with `(7900, "_my-mirror._tcp.local.", _)`.
+    /// Spec R2.5: "start_stream MUST pass the resolved (u16, String) values to the BuilderFn
+    /// as positional parameters".
+    ///
+    /// RED: `BuilderProbe` and `make_test_builder` do not exist yet → E0422/E0425.
+    #[test]
+    fn test_t7_2_custom_args_builder_called_with_custom_args() {
+        let probe = BuilderProbe::new();
+        let builder = make_test_builder(probe.clone(), Ok(()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(
+            &bridge,
+            channel,
+            Some(7900),
+            Some("_my-mirror._tcp.local.".to_string()),
+        )
+        .expect("T7.2: start_stream_inner with custom args must return Ok(())");
+
+        let calls = probe.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "T7.2: builder must be called exactly once, got {} calls",
+            calls.len()
+        );
+        assert_eq!(
+            calls[0].0, 7900,
+            "T7.2: builder must receive custom port 7900, got {}",
+            calls[0].0
+        );
+        assert_eq!(
+            calls[0].1, "_my-mirror._tcp.local.",
+            "T7.2: builder must receive custom service name '_my-mirror._tcp.local.', got {:?}",
+            calls[0].1
+        );
+    }
+
     /// B6-3 extra — `stop_stream_session` on an active session sets
     ///               `bridge.current_args` to `None` immediately on return.
     ///
