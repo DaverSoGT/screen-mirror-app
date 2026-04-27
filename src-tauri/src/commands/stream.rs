@@ -2720,4 +2720,88 @@ mod tests {
             "custom args must be passed through to the builder unchanged"
         );
     }
+
+    // ─── B5-4 RED: PortInUse substring detection shim (OQ-A1) ───────────────
+
+    /// B5-4.1 — When the builder returns `Err("address already in use")`,
+    ///           `start_stream_inner` must return `Err(PortInUse { port: <resolved> })`
+    ///           NOT `Err(BundleBuildFailed(...))`.
+    ///
+    /// Design §3 step 7 + §10 OQ-A1: substring-match on "address already in use"
+    /// (Linux/macOS OS message, lowercase-compared).
+    ///
+    /// RED: `start_stream_inner` currently returns `BundleBuildFailed` for all
+    /// builder errors — the substring-detection shim is not yet implemented.
+    #[test]
+    fn test_start_stream_inner_builder_addr_in_use_returns_port_in_use() {
+        let builder: BuilderFn =
+            Arc::new(|_port, _name, _stop_flag| Err("address already in use".to_string()));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, Some(7900), None);
+
+        match result {
+            Err(StartStreamError::PortInUse { port: 7900 }) => {}
+            other => panic!(
+                "expected Err(PortInUse {{ port: 7900 }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B5-4.2 — Windows variant: builder returns
+    ///           `Err("only one usage of each socket address")` →
+    ///           `start_stream_inner` returns `Err(PortInUse { port })`.
+    ///
+    /// Design §10 OQ-A1: match BOTH substrings for cross-platform coverage.
+    ///
+    /// RED: shim not yet implemented.
+    #[test]
+    fn test_start_stream_inner_builder_windows_addr_in_use_returns_port_in_use() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            Err("only one usage of each socket address (protocol/network address/port) is normally permitted.".to_string())
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, None, None);
+
+        match result {
+            Err(StartStreamError::PortInUse { port: 7889 }) => {}
+            other => panic!(
+                "expected Err(PortInUse {{ port: 7889 }}), got {other:?}"
+            ),
+        }
+    }
+
+    /// B5-4.3 — Builder returns an unrelated error `Err("some other failure")` →
+    ///           `start_stream_inner` must return `Err(BundleBuildFailed("some other failure"))`,
+    ///           NOT `PortInUse`.
+    ///
+    /// RED: currently all builder errors go to BundleBuildFailed, but B5-4.1 adds
+    /// PortInUse detection — this test ensures the non-AddrInUse path still goes
+    /// to BundleBuildFailed.
+    ///
+    /// This test is actually GREEN in the pre-B5-4 code (all errors → BundleBuildFailed).
+    /// It serves as a regression guard: once B5-4 shim is added, BundleBuildFailed
+    /// must still be returned for non-AddrInUse errors.
+    #[test]
+    fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            Err("some unrelated build failure".to_string())
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, None, None);
+
+        match result {
+            Err(StartStreamError::BundleBuildFailed(msg)) => {
+                assert_eq!(msg, "some unrelated build failure");
+            }
+            other => panic!(
+                "expected Err(BundleBuildFailed(\"some unrelated build failure\")), got {other:?}"
+            ),
+        }
+    }
 }
