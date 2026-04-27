@@ -250,6 +250,89 @@ pub(crate) fn validate_udp_port(value: u16) -> Result<(), StartStreamError> {
     Ok(())
 }
 
+// ─── Validation helper (C5) ──────────────────────────────────────────────────
+
+/// RFC 6763 service-name validator.
+///
+/// Accepts strings matching `^_[A-Za-z0-9-]+\._[A-Za-z0-9-]+\.local\.$`:
+/// - Both segments must start with `_`.
+/// - Each segment after `_` must be non-empty `[A-Za-z0-9-]+`.
+/// - The string must end with `.local.` (FQDN trailing dot required).
+///
+/// Hand-rolled char-class validator — NO `regex` crate (spec #287 R5.2, PQ-D,
+/// design #288 OQ-D5).
+///
+/// Spec #287 R5.1, R5.2, R5.3, R5.4, R5.5, R5.6, R5.7.
+///
+/// `#[allow(dead_code)]`: first call site lands in B5 (`start_stream_inner`).
+/// Remove this attribute when B5 lands.
+#[allow(dead_code)]
+pub(crate) fn validate_service_name(s: &str) -> Result<(), StartStreamError> {
+    let invalid = |reason: &str| StartStreamError::InvalidServiceName {
+        value: s.to_string(),
+        reason: reason.to_string(),
+    };
+
+    // Must end with ".local." (the FQDN trailing dot is required by RFC 6763).
+    const SUFFIX: &str = ".local.";
+    if !s.ends_with(SUFFIX) {
+        return Err(invalid("must end with '.local.'"));
+    }
+    let head = &s[..s.len() - SUFFIX.len()];
+
+    // Exactly two dot-separated segments between the start and ".local.".
+    let dot_pos = match head.find('.') {
+        Some(pos) => pos,
+        None => {
+            return Err(invalid(
+                "must contain exactly one '.' separating service and protocol",
+            ));
+        }
+    };
+    // If there is more than one dot in `head`, the split would yield >2 parts.
+    // Check: no second dot allowed in `head`.
+    if head[dot_pos + 1..].contains('.') {
+        return Err(invalid(
+            "must contain exactly one '.' separating service and protocol",
+        ));
+    }
+
+    let svc_seg = &head[..dot_pos];
+    let proto_seg = &head[dot_pos + 1..];
+
+    // Service segment: must start with '_' followed by 1+ [A-Za-z0-9-] chars.
+    let svc_body = match svc_seg.strip_prefix('_') {
+        Some(body) => body,
+        None => return Err(invalid("service segment must start with '_'")),
+    };
+    if svc_body.is_empty() {
+        return Err(invalid("service segment must not be empty after '_'"));
+    }
+    if !svc_body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(invalid("service segment may only contain [A-Za-z0-9-]"));
+    }
+
+    // Protocol segment: must start with '_' followed by 1+ [A-Za-z0-9-] chars.
+    let proto_body = match proto_seg.strip_prefix('_') {
+        Some(body) => body,
+        None => return Err(invalid("protocol segment must start with '_'")),
+    };
+    if proto_body.is_empty() {
+        return Err(invalid("protocol segment must not be empty after '_'"));
+    }
+    if !proto_body
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(invalid("protocol segment may only contain [A-Za-z0-9-]"));
+    }
+
+    Ok(())
+}
+
 // ─── StreamBridge — Capability A ─────────────────────────────────────────────
 
 /// Tauri managed state for an active streaming session.
