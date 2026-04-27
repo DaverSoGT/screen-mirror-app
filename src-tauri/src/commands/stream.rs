@@ -2953,4 +2953,124 @@ mod tests {
             "current_args must be Some((7889, \"_screen-mirror._tcp.local.\")) after successful default start"
         );
     }
+
+    // ─── B6-2 RED: double-start returns AlreadyRunning (T7.6, T7.7) per PQ-E ───
+
+    /// B6-2 / T7.6 — Double-start with SAME args returns
+    ///                `Err(AlreadyRunning { current_port: 7889, current_service_name: ... })`.
+    ///
+    /// Spec R6.4 (PQ-E): "ALWAYS return Err(AlreadyRunning) on double-start regardless
+    /// of whether new args match current args."
+    /// Spec R6.5: "The AlreadyRunning error MUST carry the CURRENT session's args."
+    ///
+    /// RED: `start_stream_inner` currently returns `Ok(())` on double-start (is_running()
+    /// guard). B6-2 GREEN replaces that with the AlreadyRunning error.
+    #[test]
+    fn test_double_start_same_args_returns_already_running() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // First start — must succeed.
+        start_stream_inner(
+            &bridge,
+            channel.clone(),
+            Some(7889),
+            None, // resolves to "_screen-mirror._tcp.local."
+        )
+        .expect("first start must succeed");
+
+        // Second start with the SAME args — must return AlreadyRunning.
+        let err = start_stream_inner(
+            &bridge,
+            channel.clone(),
+            Some(7889),
+            None,
+        )
+        .expect_err("second start must return AlreadyRunning, not Ok(())");
+
+        match err {
+            StartStreamError::AlreadyRunning {
+                current_port,
+                current_service_name,
+            } => {
+                assert_eq!(current_port, 7889, "AlreadyRunning must carry the CURRENT port (7889)");
+                assert_eq!(
+                    current_service_name,
+                    "_screen-mirror._tcp.local.",
+                    "AlreadyRunning must carry the CURRENT service name"
+                );
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+    }
+
+    /// B6-2 / T7.7 — Double-start with DIFFERENT args returns
+    ///                `Err(AlreadyRunning { current_port: 7889, .. })` where the
+    ///                payload carries the CURRENT args (not the new caller's args).
+    ///
+    /// Spec R6.4, R6.5: CURRENT args must be in the error, not the new caller's args.
+    ///
+    /// RED: `start_stream_inner` currently returns `Ok(())` on double-start.
+    #[test]
+    fn test_double_start_different_args_returns_already_running_with_current_args() {
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // First start with port 7889 and default name.
+        start_stream_inner(
+            &bridge,
+            channel.clone(),
+            Some(7889),
+            None,
+        )
+        .expect("first start must succeed");
+
+        // Second start with DIFFERENT port (7900) and different name.
+        let err = start_stream_inner(
+            &bridge,
+            channel.clone(),
+            Some(7900),
+            Some("_other-service._tcp.local.".to_string()),
+        )
+        .expect_err("second start must return AlreadyRunning, not Ok(())");
+
+        match err {
+            StartStreamError::AlreadyRunning {
+                current_port,
+                current_service_name,
+            } => {
+                // CRITICAL: must carry CURRENT args (7889 / default name), NOT new args (7900).
+                assert_eq!(
+                    current_port, 7889,
+                    "AlreadyRunning must carry the CURRENT port (7889), not the new caller's port (7900)"
+                );
+                assert_eq!(
+                    current_service_name,
+                    "_screen-mirror._tcp.local.",
+                    "AlreadyRunning must carry the CURRENT service name, not the new caller's"
+                );
+            }
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+    }
 }
