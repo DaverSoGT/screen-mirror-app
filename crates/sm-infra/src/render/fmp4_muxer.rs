@@ -30,7 +30,7 @@ pub(crate) fn write_box(out: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-// ─── Tests (Capability A — ISO box framing primitive) ────────────────────────
+// ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -40,9 +40,6 @@ mod tests {
 
     #[test]
     fn write_box_golden_bytes_with_payload() {
-        // write_box(out, b"test", &[0x01, 0x02, 0x03])
-        // Expected: [0,0,0,11, 't','e','s','t', 1, 2, 3]
-        // size = 4 (size field) + 4 (type) + 3 (payload) = 11
         let mut out = Vec::new();
         write_box(&mut out, b"test", &[0x01, 0x02, 0x03]);
         assert_eq!(
@@ -53,8 +50,6 @@ mod tests {
 
     #[test]
     fn write_box_empty_payload_produces_8_bytes() {
-        // write_box(out, b"empt", &[])
-        // Expected: [0,0,0,8, 'e','m','p','t']
         let mut out = Vec::new();
         write_box(&mut out, b"empt", &[]);
         assert_eq!(out, &[0, 0, 0, 8, b'e', b'm', b'p', b't']);
@@ -62,7 +57,6 @@ mod tests {
 
     #[test]
     fn write_box_large_payload_correct_size_field() {
-        // Payload > 64 KB — verify the 32-bit big-endian size field is correct.
         let payload = vec![0xABu8; 70_000];
         let mut out = Vec::new();
         write_box(&mut out, b"lrge", &payload);
@@ -78,5 +72,44 @@ mod tests {
         let mut out = Vec::new();
         write_box(&mut out, b"moov", &[0x01]);
         assert_eq!(&out[4..8], b"moov");
+    }
+
+    // ─── Capability B: ftyp box builder ────────────────────────────────────
+
+    #[test]
+    fn build_ftyp_starts_with_size_then_ftyp_tag() {
+        let ftyp = build_ftyp();
+        let size = u32::from_be_bytes([ftyp[0], ftyp[1], ftyp[2], ftyp[3]]) as usize;
+        assert_eq!(size, ftyp.len(), "ftyp box size must equal total byte length");
+        assert_eq!(&ftyp[4..8], b"ftyp");
+    }
+
+    #[test]
+    fn build_ftyp_major_brand_is_iso5() {
+        let ftyp = build_ftyp();
+        assert_eq!(&ftyp[8..12], b"iso5");
+    }
+
+    #[test]
+    fn build_ftyp_minor_version_is_0x00000200() {
+        let ftyp = build_ftyp();
+        let minor = u32::from_be_bytes([ftyp[12], ftyp[13], ftyp[14], ftyp[15]]);
+        assert_eq!(minor, 0x0000_0200);
+    }
+
+    #[test]
+    fn build_ftyp_compatible_brands_include_avc1_and_mp42() {
+        let ftyp = build_ftyp();
+        let brands = &ftyp[16..];
+        let brand_strings: Vec<&[u8]> = brands.chunks(4).collect();
+        assert!(brand_strings.contains(&&b"avc1"[..]), "must contain avc1 compatible brand");
+        assert!(brand_strings.contains(&&b"mp42"[..]), "must contain mp42 compatible brand");
+    }
+
+    #[test]
+    fn build_ftyp_is_deterministic() {
+        let ftyp1 = build_ftyp();
+        let ftyp2 = build_ftyp();
+        assert_eq!(ftyp1, ftyp2, "build_ftyp must be deterministic");
     }
 }
