@@ -191,6 +191,19 @@ mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;
 
+    // ─── Trait bound assertion: Signaling is Send + Sync ──────────────────────
+    //
+    // Concrete adapters (`MdnsSignaling`, `LoopbackSignaling`) are already
+    // `Send + Sync` by composition. This compile-time assertion locks the
+    // contract so callers can hold `Arc<dyn Signaling>` cross-thread. Closes
+    // verify-report SUGGESTION 3 from `transport-webrtc-str0m`.
+    const _: () = {
+        const fn _assert_send_sync<T: Send + Sync + ?Sized>() {}
+        const fn _assert_signaling() {
+            _assert_send_sync::<dyn Signaling>();
+        }
+    };
+
     // ─── FakeSignaling ────────────────────────────────────────────────────────
 
     /// In-memory `Signaling` implementation for domain-level unit tests.

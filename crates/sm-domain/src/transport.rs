@@ -254,6 +254,25 @@ mod tests {
     use std::sync::mpsc::{SyncSender, sync_channel};
     use std::time::Duration;
 
+    // ─── Trait bound assertions: VideoSender / VideoReceiver are Send + Sync ────
+    //
+    // The original `transport-webrtc-str0m` change defined both traits as `Send`
+    // only. Concrete adapters (`Str0mVideoSender`, `Str0mVideoReceiver`) are
+    // already `Send + Sync` by composition. This compile-time assertion locks
+    // the contract so callers can hold `Arc<dyn VideoSender>` / `Arc<dyn
+    // VideoReceiver>` for stats polling from another thread without per-method
+    // serialization. Closes verify-report SUGGESTION 3 from
+    // `transport-webrtc-str0m`.
+    const _: () = {
+        const fn _assert_send_sync<T: Send + Sync + ?Sized>() {}
+        const fn _assert_video_sender() {
+            _assert_send_sync::<dyn VideoSender>();
+        }
+        const fn _assert_video_receiver() {
+            _assert_send_sync::<dyn VideoReceiver>();
+        }
+    };
+
     // ─── FakeVideoSender ────────────────────────────────────────────────────────
 
     /// In-memory `VideoSender` for domain-level unit tests.
