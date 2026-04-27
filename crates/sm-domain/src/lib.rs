@@ -35,6 +35,7 @@ pub use encode::EncoderConfig;
 pub use encode::EncoderError;
 pub use encode::RateControlMode;
 pub use encode::VideoEncoder;
+pub mod decode;
 pub mod error;
 pub mod session;
 pub mod signaling;
