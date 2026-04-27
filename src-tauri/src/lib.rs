@@ -3,7 +3,14 @@ mod commands;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![smoke::smoke_com_apartment])
+        .manage(commands::stream::StreamBridge::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::stream::start_stream,
+            commands::stream::stop_stream,
+            commands::stream::attach_stream,
+            commands::stream::stream_diagnostics,
+            smoke::smoke_com_apartment,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
