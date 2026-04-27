@@ -713,6 +713,28 @@ impl SignalingPublishOps for MdnsSignalingOps {
     }
 }
 
+/// Build the `SignalingConfig` for a receiver session.
+///
+/// Extracted pure helper so `build_production_bundle` can be tested without
+/// binding real sockets, and so `service_name` is provably threaded into
+/// `SignalingConfig::service_name` (B5-fix-A: the original inline construction
+/// left `service_name` shadowed by `..SignalingConfig::default()`).
+///
+/// Spec R2.5: BuilderFn receives the resolved `(port, service_name, stop_flag)` tuple.
+/// Explore #284: `SignalingConfig::service_name` is the correct vehicle for the
+/// mDNS service-type string.
+pub(crate) fn build_signaling_config_for_receiver(
+    udp_port: u16,
+    service_name: String,
+) -> SignalingConfig {
+    SignalingConfig {
+        service_name,
+        control_port: udp_port,
+        role: SignalingRole::Receiver,
+        peer_hint: None,
+    }
+}
+
 /// Build the production `ReceiverBundle`: real `Str0mVideoReceiver` + `MdnsSignaling`.
 ///
 /// The signaling adapter is started first so it begins mDNS discovery immediately.
@@ -733,12 +755,7 @@ fn build_production_bundle(
     stop_flag: Arc<AtomicBool>,
 ) -> Result<ReceiverBundle, String> {
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
-    let sig_config = SignalingConfig {
-        role: SignalingRole::Receiver,
-        control_port: udp_port,
-        peer_hint: None,
-        ..SignalingConfig::default()
-    };
+    let sig_config = build_signaling_config_for_receiver(udp_port, service_name);
     let mut signaling =
         MdnsSignaling::new(sig_config).map_err(|e| format!("MdnsSignaling::new failed: {e}"))?;
 
@@ -748,9 +765,6 @@ fn build_production_bundle(
         .map_err(|e| format!("MdnsSignaling::start failed: {e}"))?;
 
     // ── 2. Build Str0mVideoReceiver (Receiver role) ────────────────────────
-    // `service_name` is stored for future use (mDNS service-type advertisement).
-    // NR1: the INSTANCE_NAME const in sm-infra/signaling/mdns.rs is NOT touched.
-    let _ = service_name; // consumed by sig_config above (control_port only for now)
     let transport_config = TransportConfig {
         udp_port,
         role: TransportRole::Receiver,
@@ -2831,8 +2845,7 @@ mod tests {
     fn test_build_signaling_config_for_receiver_threads_service_name() {
         let cfg = build_signaling_config_for_receiver(7900, "_my-mirror._tcp.local.".to_string());
         assert_eq!(
-            cfg.service_name,
-            "_my-mirror._tcp.local.",
+            cfg.service_name, "_my-mirror._tcp.local.",
             "service_name must be threaded into SignalingConfig::service_name"
         );
         assert_eq!(cfg.control_port, 7900);
@@ -2845,11 +2858,9 @@ mod tests {
     /// RED: helper does not exist yet → E0425.
     #[test]
     fn test_build_signaling_config_for_receiver_no_default_shadowing() {
-        let cfg =
-            build_signaling_config_for_receiver(7889, "_default._tcp.local.".to_string());
+        let cfg = build_signaling_config_for_receiver(7889, "_default._tcp.local.".to_string());
         assert_eq!(
-            cfg.service_name,
-            "_default._tcp.local.",
+            cfg.service_name, "_default._tcp.local.",
             "the default spread must not overwrite the supplied service_name"
         );
         assert_eq!(cfg.control_port, 7889);
