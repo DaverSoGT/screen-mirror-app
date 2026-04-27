@@ -804,4 +804,58 @@ mod tests {
             "stop() must return within 500 ms, took: {elapsed:?}"
         );
     }
+
+    /// R6.3 — `apply_remote_offer` MUST work AFTER `start()` as well as before.
+    ///
+    /// RED: today this fails because `apply_remote_offer` returns
+    /// `Err(Internal("Rtc already moved to thread; …"))` once `start()` has
+    /// taken the `Rtc` out of `pre_neg`.  The dual-path inbox+reply
+    /// implementation (design §3.2) will make this pass.
+    #[test]
+    fn str0m_receiver_apply_remote_offer_after_start_returns_answer_r6_3() {
+        use std::time::Duration;
+
+        use str0m::media::{Direction, MediaKind};
+        use str0m::Rtc;
+
+        // Build a minimal sender-side Rtc to generate a real SDP offer.
+        let crypto_s = str0m::crypto::from_feature_flags();
+        let mut rtc_sender = Rtc::builder()
+            .set_crypto_provider(std::sync::Arc::new(crypto_s))
+            .build(std::time::Instant::now());
+        let mut change = rtc_sender.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (str0m_offer, _pending) = change.apply().unwrap();
+        let domain_offer = sm_domain::signaling::SdpOffer(str0m_offer.to_string());
+
+        // Construct and START the receiver before calling apply_remote_offer.
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(4);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        // Give the tick thread a moment to enter its first loop iteration.
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Post-start call — MUST succeed via the inbox+reply path (design §3.2).
+        let result = receiver.apply_remote_offer(domain_offer);
+        assert!(
+            result.is_ok(),
+            "apply_remote_offer AFTER start() must return Ok(SdpAnswer), got: {result:?}"
+        );
+        let answer = result.unwrap();
+        assert!(
+            answer.0.contains("v=0"),
+            "SdpAnswer must be valid SDP containing 'v=0', got: {}",
+            answer.0
+        );
+
+        receiver.stop().unwrap();
+    }
 }
