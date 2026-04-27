@@ -547,6 +547,60 @@ mod tests {
     use super::*;
     use crate::render::avcc::parse_sps;
 
+    // ─── Capability A (B6): annex_b_to_avcc ────────────────────────────────
+
+    #[test]
+    fn annex_b_to_avcc_single_4byte_startcode_nal() {
+        // Input: [00 00 00 01 65 AB CD] → NAL body = [65 AB CD], length = 3
+        // Output: [00 00 00 03 65 AB CD]
+        let input: &[u8] = &[0x00, 0x00, 0x00, 0x01, 0x65, 0xAB, 0xCD];
+        let result = annex_b_to_avcc(input).expect("should succeed");
+        assert_eq!(result, &[0x00, 0x00, 0x00, 0x03, 0x65, 0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn annex_b_to_avcc_single_3byte_startcode_nal() {
+        // Input: [00 00 01 67 AB] → NAL body = [67 AB], length = 2
+        // Output: [00 00 00 02 67 AB]
+        let input: &[u8] = &[0x00, 0x00, 0x01, 0x67, 0xAB];
+        let result = annex_b_to_avcc(input).expect("should succeed");
+        assert_eq!(result, &[0x00, 0x00, 0x00, 0x02, 0x67, 0xAB]);
+    }
+
+    #[test]
+    fn annex_b_to_avcc_two_nals_produces_two_length_prefixed_units() {
+        // SPS + PPS with 4-byte start codes each.
+        let input: &[u8] = &[
+            0x00, 0x00, 0x00, 0x01, 0x67, // SPS: [67]
+            0x00, 0x00, 0x00, 0x01, 0x68, // PPS: [68]
+        ];
+        let result = annex_b_to_avcc(input).expect("should succeed");
+        // Expected: [00 00 00 01 67] [00 00 00 01 68]
+        assert_eq!(
+            result,
+            &[0x00, 0x00, 0x00, 0x01, 0x67, 0x00, 0x00, 0x00, 0x01, 0x68]
+        );
+    }
+
+    #[test]
+    fn annex_b_to_avcc_empty_input_returns_empty_vec() {
+        let result = annex_b_to_avcc(b"").expect("should succeed on empty input");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn annex_b_to_avcc_preserves_nal_payload_bytes() {
+        // Payload bytes after length prefix must match original NAL body.
+        let nal_body: &[u8] = &[0x65, 0x11, 0x22, 0x33, 0x44];
+        let mut input = vec![0x00u8, 0x00, 0x00, 0x01];
+        input.extend_from_slice(nal_body);
+        let result = annex_b_to_avcc(&input).expect("should succeed");
+        // First 4 bytes = length (5 = nal_body.len())
+        let len = u32::from_be_bytes([result[0], result[1], result[2], result[3]]) as usize;
+        assert_eq!(len, nal_body.len());
+        assert_eq!(&result[4..], nal_body);
+    }
+
     /// SPS: Baseline Level 1.3, 320×240 progressive.
     const SPS_320X240: &[u8] = &[0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0];
     /// Minimal PPS for unit tests.
