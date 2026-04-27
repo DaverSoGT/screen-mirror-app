@@ -1363,6 +1363,14 @@ mod tests {
         fn calls(&self) -> Vec<(u16, String)> {
             self.invocations.lock().unwrap().clone()
         }
+
+        /// Return the number of times the builder was invoked.
+        ///
+        /// Used by T7.3–T7.5 to assert "builder NOT called" (spec R7.4 S7.2):
+        /// `assert_eq!(probe.call_count(), 0)`.
+        fn call_count(&self) -> usize {
+            self.invocations.lock().unwrap().len()
+        }
     }
 
     /// Build a `BuilderFn` that records invocations into `probe` and returns
@@ -3307,10 +3315,8 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        let err =
-            start_stream_inner(&bridge, channel, None, Some("bogus".to_string())).expect_err(
-                "T7.5: service_name='bogus' must return Err(InvalidServiceName { .. })",
-            );
+        let err = start_stream_inner(&bridge, channel, None, Some("bogus".to_string()))
+            .expect_err("T7.5: service_name='bogus' must return Err(InvalidServiceName { .. })");
 
         match err {
             StartStreamError::InvalidServiceName { value, .. } => {
