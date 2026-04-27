@@ -196,6 +196,43 @@ trait SignalingOps: Send {
     fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError>;
 }
 
+/// Receiver-side operations needed by the signaling drain thread.
+///
+/// Split from `ReceiverOps` so the drain thread can call `apply_remote_offer`
+/// and `add_remote_candidate` without needing the full `ReceiverOps` surface.
+trait SignalingReceiverOps: Send + Sync {
+    /// Apply the remote SDP offer and return our local answer.
+    fn apply_remote_offer(
+        &self,
+        offer: sm_domain::signaling::SdpOffer,
+    ) -> Result<sm_domain::signaling::SdpAnswer, TransportError>;
+    /// Forward a remote ICE candidate to the receiver.
+    fn add_remote_candidate(
+        &self,
+        cand: sm_domain::signaling::IceCandidate,
+    ) -> Result<(), TransportError>;
+}
+
+/// Signaling publish operations needed by the signaling drain thread.
+///
+/// Split from `SignalingOps` so the drain thread can publish answers and
+/// candidates without needing `stop()`.
+trait SignalingPublishOps: Send + Sync {
+    /// Publish our local SDP answer to the peer.
+    fn publish_local_answer(
+        &self,
+        answer: sm_domain::signaling::SdpAnswer,
+    ) -> Result<(), sm_domain::signaling::SignalingError>;
+    /// Publish a local ICE candidate to the peer.
+    ///
+    /// Used when trickle ICE candidates are received after the answer is sent.
+    #[allow(dead_code)]
+    fn publish_local_candidate(
+        &self,
+        cand: sm_domain::signaling::IceCandidate,
+    ) -> Result<(), sm_domain::signaling::SignalingError>;
+}
+
 /// Factory closure type: produces a `Box<dyn ReceiverOps>` that has already had
 /// its tick thread started and the `pkt_tx` wired in.
 ///
@@ -218,6 +255,103 @@ struct ReceiverBundle {
     /// Senders kept alive so their associated drain threads keep running.
     /// These are dropped first in stop_stream to unblock the drain threads.
     _drain_senders: Vec<SyncSender<()>>,
+}
+
+// ─── Drain functions (W2-fix-B, W2-fix-C) ────────────────────────────────────
+
+/// Signaling-event drain loop.
+///
+/// Runs on its own OS thread spawned by `build_production_bundle`.
+/// Dispatches `SignalingEvent`s:
+/// - `OfferReceived(offer)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
+/// - `CandidateReceived(c)` → `receiver.add_remote_candidate(c)`
+/// - `PeerFound` → log
+/// - `Closed` / `Error` → log + exit
+///
+/// Exits when `stop_flag` is set or the event channel is disconnected.
+fn run_signaling_drain(
+    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    receiver: Arc<dyn SignalingReceiverOps>,
+    signaling: Arc<dyn SignalingPublishOps>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        match ev_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => match ev {
+                SignalingEvent::PeerFound { host, port } => {
+                    eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
+                }
+                SignalingEvent::OfferReceived(offer) => {
+                    match receiver.apply_remote_offer(offer) {
+                        Ok(answer) => {
+                            if let Err(e) = signaling.publish_local_answer(answer) {
+                                eprintln!(
+                                    "[sm-signaling-drain] publish_local_answer failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[sm-signaling-drain] apply_remote_offer failed: {e}"
+                            );
+                        }
+                    }
+                }
+                SignalingEvent::CandidateReceived(cand) => {
+                    if let Err(e) = receiver.add_remote_candidate(cand) {
+                        eprintln!(
+                            "[sm-signaling-drain] add_remote_candidate failed: {e}"
+                        );
+                    }
+                }
+                SignalingEvent::Closed => {
+                    eprintln!("[sm-signaling-drain] signaling closed");
+                    break;
+                }
+                SignalingEvent::Error(e) => {
+                    eprintln!("[sm-signaling-drain] signaling error: {e}");
+                }
+                _ => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Transport-event drain loop (W2-fix-C).
+///
+/// Runs on its own OS thread. Absorbs `TransportEvent`s — logs significant
+/// events (ICE connected/failed) and discards the rest. Exits when `stop_flag`
+/// is set or the event channel is disconnected.
+fn run_transport_event_drain(
+    ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        match ev_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => match ev {
+                TransportEvent::IceConnected => {
+                    eprintln!("[sm-transport-drain] ICE connected");
+                }
+                TransportEvent::IceFailed => {
+                    eprintln!("[sm-transport-drain] ICE failed");
+                }
+                TransportEvent::ConnectionLost { reason } => {
+                    eprintln!("[sm-transport-drain] connection lost: {reason}");
+                }
+                _ => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 // ─── Session builder ─────────────────────────────────────────────────────────
@@ -263,17 +397,70 @@ fn build_stream_session(
     })
 }
 
+// ─── Production adapter wrappers ─────────────────────────────────────────────
+
+/// Wrapper around `Arc<Mutex<Str0mVideoReceiver>>` implementing both
+/// `ReceiverOps` and `SignalingReceiverOps`. All trait methods take `&self`
+/// and acquire the Mutex for each call.
+struct Str0mReceiverOps(Arc<Mutex<Str0mVideoReceiver>>);
+
+impl ReceiverOps for Str0mReceiverOps {
+    fn request_keyframe(&self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().request_keyframe()
+    }
+    fn dropped_frames(&self) -> u64 {
+        self.0.lock().unwrap().dropped_frames()
+    }
+}
+
+impl SignalingReceiverOps for Str0mReceiverOps {
+    fn apply_remote_offer(
+        &self,
+        offer: sm_domain::signaling::SdpOffer,
+    ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+        self.0.lock().unwrap().apply_remote_offer(offer)
+    }
+    fn add_remote_candidate(
+        &self,
+        cand: sm_domain::signaling::IceCandidate,
+    ) -> Result<(), TransportError> {
+        self.0.lock().unwrap().add_remote_candidate(cand)
+    }
+}
+
+/// Wrapper around `Arc<Mutex<MdnsSignaling>>` implementing both
+/// `SignalingOps` and `SignalingPublishOps`.
+struct MdnsSignalingOps(Arc<Mutex<MdnsSignaling>>);
+
+impl SignalingOps for MdnsSignalingOps {
+    fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
+        self.0.lock().unwrap().stop()
+    }
+}
+
+impl SignalingPublishOps for MdnsSignalingOps {
+    fn publish_local_answer(
+        &self,
+        answer: sm_domain::signaling::SdpAnswer,
+    ) -> Result<(), sm_domain::signaling::SignalingError> {
+        self.0.lock().unwrap().publish_local_answer(answer)
+    }
+    fn publish_local_candidate(
+        &self,
+        cand: sm_domain::signaling::IceCandidate,
+    ) -> Result<(), sm_domain::signaling::SignalingError> {
+        self.0.lock().unwrap().publish_local_candidate(cand)
+    }
+}
+
 /// Build the production `ReceiverBundle`: real `Str0mVideoReceiver` + `MdnsSignaling`.
 ///
 /// The signaling adapter is started first so it begins mDNS discovery immediately.
-/// The receiver is started second so it can process the offer/answer that arrives
-/// asynchronously via the signaling-event drain thread.
+/// The receiver is started second. Drain threads are spawned for transport events
+/// (W2-fix-C) and signaling events (W2-fix-B). All threads share `stop_flag`.
 ///
-/// Both adapters run their own OS threads. This function returns immediately —
-/// the full SDP/ICE handshake completes asynchronously in the drain threads.
-fn build_production_bundle(
-    stop_flag: Arc<AtomicBool>,
-) -> Result<ReceiverBundle, String> {
+/// Returns immediately — the SDP/ICE handshake completes asynchronously.
+fn build_production_bundle(stop_flag: Arc<AtomicBool>) -> Result<ReceiverBundle, String> {
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
     let sig_config = SignalingConfig {
         role: SignalingRole::Receiver,
@@ -284,8 +471,7 @@ fn build_production_bundle(
     let mut signaling =
         MdnsSignaling::new(sig_config).map_err(|e| format!("MdnsSignaling::new failed: {e}"))?;
 
-    let (sig_event_tx, sig_event_rx) =
-        sync_channel::<SignalingEvent>(TRANSPORT_CHANNEL_CAPACITY);
+    let (sig_event_tx, sig_event_rx) = sync_channel::<SignalingEvent>(TRANSPORT_CHANNEL_CAPACITY);
     signaling
         .start(sig_event_tx)
         .map_err(|e| format!("MdnsSignaling::start failed: {e}"))?;
@@ -304,132 +490,59 @@ fn build_production_bundle(
         sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
 
     receiver
-        .start(pkt_tx.clone(), transport_event_tx)
+        .start(pkt_tx, transport_event_tx)
         .map_err(|e| format!("Str0mVideoReceiver::start failed: {e}"))?;
 
-    // ── 3. Spawn transport-event drain thread (W2-fix-C) ──────────────────
+    // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
+    let receiver_mutex = Arc::new(Mutex::new(receiver));
+    let signaling_mutex = Arc::new(Mutex::new(signaling));
+
+    // Clone Arcs: each consumer gets its own Arc clone pointing to the same Mutex.
+    // recv_ops_for_bridge is a plain Str0mReceiverOps (implements ReceiverOps).
+    // recv_ops_for_drain is an Arc<dyn SignalingReceiverOps> for the drain thread.
+    let recv_ops_for_bridge = Str0mReceiverOps(receiver_mutex.clone());
+    let recv_ops_for_drain: Arc<dyn SignalingReceiverOps> =
+        Arc::new(Str0mReceiverOps(receiver_mutex));
+
+    let sig_ops_for_stop: Arc<Mutex<MdnsSignaling>> = signaling_mutex.clone();
+    let sig_publish_for_drain: Arc<dyn SignalingPublishOps> =
+        Arc::new(MdnsSignalingOps(signaling_mutex));
+
+    // ── 4. Spawn transport-event drain thread (W2-fix-C) ──────────────────
     let stop_flag_t = stop_flag.clone();
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
         .spawn(move || {
-            loop {
-                if stop_flag_t.load(Ordering::Relaxed) {
-                    break;
-                }
-                match transport_event_rx
-                    .recv_timeout(Duration::from_millis(500))
-                {
-                    Ok(ev) => match ev {
-                        TransportEvent::IceConnected => {
-                            eprintln!("[sm-transport-event-drain] ICE connected");
-                        }
-                        TransportEvent::IceFailed => {
-                            eprintln!("[sm-transport-event-drain] ICE failed");
-                        }
-                        TransportEvent::ConnectionLost { reason } => {
-                            eprintln!("[sm-transport-event-drain] connection lost: {reason}");
-                        }
-                        _ => {}
-                    },
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
+            run_transport_event_drain(transport_event_rx, stop_flag_t);
         })
         .map_err(|e| format!("failed to spawn transport-event drain: {e}"))?;
 
-    // ── 4. Wrap receiver in Arc for shared access across threads ───────────
-    // The signaling-event drain thread needs to call `receiver.apply_remote_offer`
-    // and `receiver.add_remote_candidate`. We wrap in Arc<Mutex<>> so the drain
-    // thread can take &mut self calls.
-    let receiver_arc = Arc::new(Mutex::new(receiver));
-    let receiver_arc_for_drain = receiver_arc.clone();
-
     // ── 5. Spawn signaling-event drain thread (W2-fix-B) ──────────────────
     let stop_flag_s = stop_flag.clone();
-    let signaling_arc = Arc::new(Mutex::new(signaling));
-    let signaling_arc_for_drain = signaling_arc.clone();
-
     let sig_drain = thread::Builder::new()
         .name("sm-signaling-event-drain".into())
         .spawn(move || {
-            loop {
-                if stop_flag_s.load(Ordering::Relaxed) {
-                    break;
-                }
-                match sig_event_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(ev) => match ev {
-                        SignalingEvent::PeerFound { host, port } => {
-                            eprintln!(
-                                "[sm-signaling-event-drain] peer found: {host}:{port}"
-                            );
-                        }
-                        SignalingEvent::OfferReceived(offer) => {
-                            // Apply the remote offer and publish our answer.
-                            let answer_result = {
-                                let recv = receiver_arc_for_drain.lock().unwrap();
-                                recv.apply_remote_offer(offer)
-                            };
-                            match answer_result {
-                                Ok(answer) => {
-                                    let sig = signaling_arc_for_drain.lock().unwrap();
-                                    if let Err(e) = sig.publish_local_answer(answer) {
-                                        eprintln!("[sm-signaling-event-drain] publish_local_answer failed: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[sm-signaling-event-drain] apply_remote_offer failed: {e}");
-                                }
-                            }
-                        }
-                        SignalingEvent::CandidateReceived(cand) => {
-                            let recv = receiver_arc_for_drain.lock().unwrap();
-                            if let Err(e) = recv.add_remote_candidate(cand) {
-                                eprintln!("[sm-signaling-event-drain] add_remote_candidate failed: {e}");
-                            }
-                        }
-                        SignalingEvent::Closed => {
-                            eprintln!("[sm-signaling-event-drain] signaling closed");
-                            break;
-                        }
-                        SignalingEvent::Error(e) => {
-                            eprintln!("[sm-signaling-event-drain] signaling error: {e}");
-                        }
-                        _ => {}
-                    },
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
+            run_signaling_drain(
+                sig_event_rx,
+                recv_ops_for_drain,
+                sig_publish_for_drain,
+                stop_flag_s,
+            );
         })
         .map_err(|e| format!("failed to spawn signaling-event drain: {e}"))?;
 
-    // ── 6. Build the ReceiverOps wrapper around Arc<Mutex<Str0mVideoReceiver>> ──
-    struct ArcReceiverOps(Arc<Mutex<Str0mVideoReceiver>>);
-
-    impl ReceiverOps for ArcReceiverOps {
-        fn request_keyframe(&self) -> Result<(), TransportError> {
-            self.0.lock().unwrap().request_keyframe()
-        }
-
-        fn dropped_frames(&self) -> u64 {
-            self.0.lock().unwrap().dropped_frames()
-        }
-    }
-
-    // ── 7. Build SignalingOps wrapper around Arc<Mutex<MdnsSignaling>> ────
-    struct ArcSignalingOps(Arc<Mutex<MdnsSignaling>>);
-
-    impl SignalingOps for ArcSignalingOps {
+    // ── 6. Build SignalingOps for stop_stream ─────────────────────────────
+    struct MdnsStopOps(Arc<Mutex<MdnsSignaling>>);
+    impl SignalingOps for MdnsStopOps {
         fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
             self.0.lock().unwrap().stop()
         }
     }
 
     Ok(ReceiverBundle {
-        receiver: Box::new(ArcReceiverOps(receiver_arc)),
+        receiver: Box::new(recv_ops_for_bridge),
         pkt_rx,
-        signaling: Some(Box::new(ArcSignalingOps(signaling_arc))),
+        signaling: Some(Box::new(MdnsStopOps(sig_ops_for_stop))),
         drain_handles: vec![transport_drain, sig_drain],
         _drain_senders: vec![],
     })
