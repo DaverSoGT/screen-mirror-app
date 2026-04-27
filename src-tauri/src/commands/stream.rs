@@ -90,6 +90,84 @@ impl Default for StreamBridge {
     }
 }
 
+// ─── Diagnostics ─────────────────────────────────────────────────────────────
+
+/// Counters exposed via `stream_diagnostics`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StreamStats {
+    /// Number of media segments (moof+mdat) successfully emitted to the frontend.
+    pub fragments_emitted: u64,
+    /// Number of init segments emitted (should be 1 per session in V1).
+    pub init_segments_emitted: u64,
+    /// Number of segments dropped due to backpressure (drop-newest strategy).
+    pub dropped_segments: u64,
+    /// Number of `EncodedPacket`s dropped by the transport receiver (backpressure).
+    pub receiver_dropped_frames: u64,
+    /// Number of PLI (keyframe requests) fired toward the sender.
+    pub keyframe_requests_fired: u64,
+}
+
+// ─── Tauri commands ───────────────────────────────────────────────────────────
+
+/// Attach the frontend MSE consumer and fire a PLI to request an IDR.
+///
+/// Called from the frontend after `MediaSource` `sourceopen` fires.
+/// Rate-limited to 1 PLI per 2-second window.
+#[tauri::command]
+pub fn attach_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
+    let mut guard = bridge.session.lock().unwrap();
+    if let Some(session) = guard.as_mut() {
+        let now = Instant::now();
+        let should_fire = session
+            .last_pli
+            .map(|t| now.duration_since(t) >= std::time::Duration::from_secs(2))
+            .unwrap_or(true);
+
+        if should_fire {
+            if let Some(recv) = &session.receiver {
+                let _ = recv.request_keyframe();
+                session
+                    .counters
+                    .keyframe_requests_fired
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            session.last_pli = Some(now);
+        }
+    }
+    Ok(())
+}
+
+/// Return current streaming diagnostics.
+#[tauri::command]
+pub fn stream_diagnostics(bridge: tauri::State<StreamBridge>) -> Result<StreamStats, String> {
+    let guard = bridge.session.lock().unwrap();
+    let (fragments, inits, dropped, receiver_drops, pli_count) =
+        if let Some(session) = guard.as_ref() {
+            let c = &session.counters;
+            (
+                c.fragments_emitted.load(Ordering::Relaxed),
+                c.init_segments_emitted.load(Ordering::Relaxed),
+                c.dropped_segments.load(Ordering::Relaxed),
+                session
+                    .receiver
+                    .as_ref()
+                    .map(|r| r.dropped_frames())
+                    .unwrap_or(0),
+                c.keyframe_requests_fired.load(Ordering::Relaxed),
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+
+    Ok(StreamStats {
+        fragments_emitted: fragments,
+        init_segments_emitted: inits,
+        dropped_segments: dropped,
+        receiver_dropped_frames: receiver_drops,
+        keyframe_requests_fired: pli_count,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
