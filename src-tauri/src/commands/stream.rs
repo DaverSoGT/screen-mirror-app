@@ -1351,6 +1351,55 @@ mod tests {
         );
     }
 
+    // ─── B1 RED: StreamBridge builder seam (R1.1–R1.5) ──────────────────────────
+
+    /// B1.1 — `StreamBridge::new_with_builder` stores the supplied closure and
+    ///         the bridge remains `Send + Sync` (compile-time assertion).
+    ///
+    /// RED: `BuilderFn`, `new_with_builder`, and the `builder` field do not exist.
+    #[test]
+    fn test_bridge_new_with_builder_stores_builder() {
+        // This compile-time function asserts `StreamBridge: Send + Sync + 'static`.
+        fn _assert_send_sync_static<T: Send + Sync + 'static>() {}
+        _assert_send_sync_static::<StreamBridge>();
+
+        // Construct a bridge with a closure that panics if called — the test only
+        // checks that the constructor compiles and the builder is stored.
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            panic!("builder must not be called in this test")
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        // builder field must be populated: Arc strong count is at least 1.
+        assert!(Arc::strong_count(&bridge.builder) >= 1);
+        // current_args must default to None.
+        assert!(bridge.current_args.lock().unwrap().is_none());
+    }
+
+    /// B1.2 — `StreamBridge::new()` delegates to `new_with_builder` and keeps the
+    ///         builder accessible via `Arc::clone`.
+    ///
+    /// RED: `builder` field does not exist yet.
+    #[test]
+    fn test_bridge_new_uses_production_builder() {
+        let bridge = StreamBridge::new();
+        // The bridge is constructed; builder Arc is valid (strong count >= 1).
+        assert!(Arc::strong_count(&bridge.builder) >= 1);
+        // current_args defaults to None.
+        assert!(bridge.current_args.lock().unwrap().is_none());
+    }
+
+    /// B1.3 — `Send + Sync + 'static` compile-time gate (R1.1, S1.3).
+    ///
+    /// RED: only fails to compile if `StreamBridge` is not `Send + Sync + 'static`.
+    /// With the `Arc<dyn Fn + Send + Sync>` field this should always be GREEN
+    /// immediately after B1.T2.
+    #[test]
+    fn test_send_sync_compile_gate() {
+        // compile-time gate: the generics fn forces the compiler to verify the bound.
+        fn _s<T: Send + Sync + 'static>() {}
+        _s::<StreamBridge>();
+    }
+
     // ─── W2-fix-B RED: signaling drain bridges offer → apply_remote_offer → publish_local_answer ──
 
     /// B.SIG.1 — On `SignalingEvent::OfferReceived`, `run_signaling_drain` calls
