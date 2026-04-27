@@ -1371,6 +1371,18 @@ mod tests {
         fn call_count(&self) -> usize {
             self.invocations.lock().unwrap().len()
         }
+
+        /// Panic if the builder was not called exactly once.
+        ///
+        /// Used by T7.8 to prove the builder WAS invoked (validation passed, error
+        /// originated inside the builder, not from a validation reject).
+        fn assert_called_once(&self) {
+            let count = self.invocations.lock().unwrap().len();
+            assert_eq!(
+                count, 1,
+                "expected builder to be called exactly once, but it was called {count} times"
+            );
+        }
     }
 
     /// Build a `BuilderFn` that records invocations into `probe` and returns
