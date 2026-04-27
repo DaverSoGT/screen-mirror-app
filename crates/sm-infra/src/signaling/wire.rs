@@ -56,8 +56,18 @@ pub enum SignalingFrame {
 ///
 /// Flushes the writer after writing so the bytes reach the peer in one batch.
 pub fn write_frame<W: Write>(w: &mut W, frame: &SignalingFrame) -> io::Result<()> {
-    let _ = (w, frame);
-    unimplemented!("write_frame: not yet implemented")
+    let body =
+        serde_json::to_vec(frame).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len = body.len();
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {len} bytes (max {MAX_FRAME_BYTES})"),
+        ));
+    }
+    w.write_all(&(len as u32).to_be_bytes())?;
+    w.write_all(&body)?;
+    w.flush()
 }
 
 /// Read a length-prefixed frame from `r`.
@@ -66,8 +76,18 @@ pub fn write_frame<W: Write>(w: &mut W, frame: &SignalingFrame) -> io::Result<()
 /// exceeds [`MAX_FRAME_BYTES`] or the body is not valid [`SignalingFrame`] JSON.
 /// Returns `Err` with [`io::ErrorKind::UnexpectedEof`] on partial reads.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<SignalingFrame> {
-    let _ = r;
-    unimplemented!("read_frame: not yet implemented")
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: declared {len} bytes (max {MAX_FRAME_BYTES})"),
+        ));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
