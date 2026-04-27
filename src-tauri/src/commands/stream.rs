@@ -2415,4 +2415,66 @@ mod tests {
         fn _assert_arity(_f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String>) {}
         _assert_arity(build_production_bundle);
     }
+
+    // ─── B5-2 RED: start_stream_inner extraction ─────────────────────────────
+
+    /// B5-2.1 — `start_stream_inner` must exist as a `pub(crate)` function with signature:
+    ///   `fn start_stream_inner(bridge: &StreamBridge, channel: Arc<dyn ChannelLike>,
+    ///       udp_port: Option<u16>, service_name: Option<String>) -> Result<(), StartStreamError>`
+    ///
+    /// The `#[tauri::command] start_stream` must become a thin wrapper calling it.
+    ///
+    /// RED: `start_stream_inner` does not exist yet — this call will fail E0425.
+    ///
+    /// Spec R2.1; design §10 OQ-A2 (option a: extract as pub(crate) fn).
+    #[test]
+    fn test_start_stream_inner_exists_and_returns_ok_for_valid_args() {
+        let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
+        let probe_clone = probe.clone();
+        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+            probe_clone.lock().unwrap().push((port, name));
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // RED: start_stream_inner does not exist yet.
+        let result = start_stream_inner(&bridge, channel, None, None);
+        assert!(result.is_ok(), "start_stream_inner must return Ok(()) for default args: {result:?}");
+
+        // After a successful call, builder was invoked.
+        let calls = probe.lock().unwrap();
+        assert_eq!(calls.len(), 1, "builder must be invoked exactly once");
+    }
+
+    /// B5-2.2 — After `start_stream_inner` returns `Ok(())`, the bridge session must be `Some`.
+    ///
+    /// RED: `start_stream_inner` does not exist.
+    #[test]
+    fn test_start_stream_inner_sets_session_on_success() {
+        let builder: BuilderFn = Arc::new(move |_port, _name, _stop_flag| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            })
+        });
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        start_stream_inner(&bridge, channel, None, None).unwrap();
+
+        // Session must be populated.
+        assert!(bridge.is_running(), "bridge must be running after start_stream_inner succeeds");
+    }
 }
