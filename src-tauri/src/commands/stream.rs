@@ -1206,6 +1206,79 @@ mod tests {
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
     }
 
+    // ─── W2-fix-C RED: transport-event drain absorbs events without blocking ───
+
+    /// C.T.1 — `run_transport_event_drain` processes all sent TransportEvents
+    ///          and exits cleanly when stop_flag is set.
+    ///          No panics, no blocking beyond the 500 ms timeout.
+    #[test]
+    fn transport_event_drain_absorbs_events_without_blocking() {
+        use std::sync::mpsc::sync_channel;
+        use sm_domain::transport::TransportEvent;
+
+        let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+
+        let drain = thread::spawn(move || {
+            run_transport_event_drain(ev_rx, stop_clone);
+        });
+
+        // Send several events — the drain must absorb them without panicking.
+        ev_tx.send(TransportEvent::IceConnected).unwrap();
+        ev_tx.send(TransportEvent::IceFailed).unwrap();
+        ev_tx
+            .send(TransportEvent::ConnectionLost {
+                reason: "test".to_string(),
+            })
+            .unwrap();
+        ev_tx
+            .send(TransportEvent::PacketDropped { count: 5 })
+            .unwrap();
+
+        // Allow time to process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Signal stop.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        // Must join within a short time (no hang).
+        let start = std::time::Instant::now();
+        drain.join().expect("drain thread must exit cleanly");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "drain must join within 700 ms, took {elapsed:?}"
+        );
+    }
+
+    /// C.T.2 — When the transport-event channel disconnects (sender dropped),
+    ///          the drain exits cleanly without needing stop_flag.
+    #[test]
+    fn transport_event_drain_exits_on_channel_disconnect() {
+        use std::sync::mpsc::sync_channel;
+        use sm_domain::transport::TransportEvent;
+
+        let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(4);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+
+        let drain = thread::spawn(move || {
+            run_transport_event_drain(ev_rx, stop_clone);
+        });
+
+        // Drop the sender — the drain should see Disconnected and exit.
+        drop(ev_tx);
+
+        let start = std::time::Instant::now();
+        drain.join().expect("drain must exit after channel disconnect");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "drain must join within 700 ms after disconnect, took {elapsed:?}"
+        );
+    }
+
     // ─── W2-fix-B RED: signaling drain bridges offer → apply_remote_offer → publish_local_answer ──
 
     /// B.SIG.1 — On `SignalingEvent::OfferReceived`, `run_signaling_drain` calls
