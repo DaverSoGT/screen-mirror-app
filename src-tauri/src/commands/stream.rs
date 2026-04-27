@@ -3,6 +3,93 @@
 //! Implements the Tauri command surface for the screen-mirror live stream:
 //! `start_stream`, `stop_stream`, `attach_stream`, `stream_diagnostics`.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+use sm_domain::transport::TransportError;
+
+// ─── Bridge bookkeeping ───────────────────────────────────────────────────────
+
+/// Shared bookkeeping counters for the mux thread + diagnostics command.
+#[derive(Debug, Default)]
+pub(crate) struct BridgeCounters {
+    pub fragments_emitted: AtomicU64,
+    pub init_segments_emitted: AtomicU64,
+    pub dropped_segments: AtomicU64,
+    pub keyframe_requests_fired: AtomicU64,
+}
+
+// ─── Minimal receiver ops trait ───────────────────────────────────────────────
+
+/// Minimal interface needed from the receiver by the bridge (avoids pulling the
+/// full `VideoReceiver` bound into tests).
+pub(crate) trait ReceiverOps: Send {
+    /// Fire a PLI toward the sender.
+    fn request_keyframe(&self) -> Result<(), TransportError>;
+    /// Count of dropped frames (backpressure).
+    fn dropped_frames(&self) -> u64;
+}
+
+// ─── StreamSession — internal per-run state ───────────────────────────────────
+
+/// Active stream session: receiver + mux thread + counters.
+pub(crate) struct StreamSession {
+    /// Stop flag shared with the mux thread. Set by `stop_stream`.
+    pub stop_flag: Arc<AtomicBool>,
+    /// Join handle for the `sm-stream-mux` thread.
+    pub mux_handle: Option<JoinHandle<()>>,
+    /// Shared counters observable via `stream_diagnostics`.
+    pub counters: Arc<BridgeCounters>,
+    /// The receiver — kept alive so packets flow until stop.
+    pub receiver: Option<Box<dyn ReceiverOps>>,
+    /// PLI rate-limit: timestamp of the last keyframe request.
+    pub last_pli: Option<Instant>,
+}
+
+impl StreamSession {
+    pub fn is_running(&self) -> bool {
+        !self.stop_flag.load(Ordering::Relaxed)
+    }
+}
+
+// ─── StreamBridge — Capability A ─────────────────────────────────────────────
+
+/// Tauri managed state for an active streaming session.
+///
+/// Held behind `State<StreamBridge>` in Tauri commands.
+/// Wraps a `Mutex<Option<StreamSession>>` to allow mutation inside
+/// immutable Tauri command references.
+pub struct StreamBridge {
+    pub(crate) session: Mutex<Option<StreamSession>>,
+}
+
+impl StreamBridge {
+    /// Create an empty bridge (no active session).
+    pub fn new() -> Self {
+        Self {
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Returns `true` if a session is currently running.
+    pub fn is_running(&self) -> bool {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.is_running())
+            .unwrap_or(false)
+    }
+}
+
+impl Default for StreamBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
