@@ -36,14 +36,20 @@
 //! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sm_domain::encode::EncodedPacket;
-use sm_domain::transport::{TRANSPORT_CHANNEL_CAPACITY, TransportError};
+use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+use sm_domain::transport::{
+    TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, TransportRole,
+    VideoReceiver,
+};
 use sm_infra::render::fmp4_muxer::{Mp4Muxer, extract_sps_pps_from_idr};
+use sm_infra::signaling::mdns::MdnsSignaling;
+use sm_infra::transport::Str0mVideoReceiver;
 use tauri::ipc::InvokeResponseBody;
 
 // ─── Frame discriminants ──────────────────────────────────────────────────────
@@ -163,6 +169,10 @@ struct StreamSession {
     /// Kept here to extend the Arc's lifetime until stop_stream.
     #[allow(dead_code)]
     channel: Arc<dyn ChannelLike>,
+    /// Signaling adapter — stopped in stop_stream. None in test sessions.
+    signaling: Option<Box<dyn SignalingOps>>,
+    /// Drain thread handles (transport-event + signaling-event drains).
+    drain_handles: Vec<JoinHandle<()>>,
 }
 
 impl StreamSession {
@@ -180,19 +190,267 @@ trait ReceiverOps: Send {
     fn dropped_frames(&self) -> u64;
 }
 
+/// Minimal interface needed from the signaling adapter by the bridge.
+trait SignalingOps: Send {
+    /// Stop the signaling adapter.
+    fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError>;
+}
+
+/// Factory closure type: produces a `Box<dyn ReceiverOps>` that has already had
+/// its tick thread started and the `pkt_tx` wired in.
+///
+/// The factory also returns the `pkt_rx` end (owned by the mux thread) and an
+/// optional `Box<dyn SignalingOps>` plus drain thread handles.
+///
+/// Signature:
+/// ```
+/// FnOnce(Arc<AtomicBool>) -> Result<ReceiverBundle, String>
+/// ```
+struct ReceiverBundle {
+    /// The receiver, ready for PLI calls and `dropped_frames()` reads.
+    receiver: Box<dyn ReceiverOps>,
+    /// The packet receive end — handed to the mux thread.
+    pkt_rx: Receiver<EncodedPacket>,
+    /// Signaling adapter (optional — None in tests using FakeReceiver).
+    signaling: Option<Box<dyn SignalingOps>>,
+    /// Drain thread handles (transport-event drain + signaling-event drain).
+    drain_handles: Vec<JoinHandle<()>>,
+    /// Senders kept alive so their associated drain threads keep running.
+    /// These are dropped first in stop_stream to unblock the drain threads.
+    _drain_senders: Vec<SyncSender<()>>,
+}
+
+// ─── Session builder ─────────────────────────────────────────────────────────
+
+/// Build a `StreamSession` from a `ReceiverBundle`, a `ChannelLike`, and a
+/// pre-allocated `stop_flag`.
+///
+/// Extracted from `start_stream` so tests can inject fake receivers without
+/// launching the Tauri runtime. Production code passes the real bundle built
+/// from `Str0mVideoReceiver` + `MdnsSignaling` (whose drain threads already
+/// hold a clone of `stop_flag`). Tests pass a bundle with a `FakeReceiver`
+/// and a fresh disconnected `pkt_rx`.
+///
+/// The mux thread takes ownership of `bundle.pkt_rx`.
+fn build_stream_session(
+    channel: Arc<dyn ChannelLike>,
+    bundle: ReceiverBundle,
+    stop_flag: Arc<AtomicBool>,
+) -> Result<StreamSession, String> {
+    let counters = Arc::new(BridgeCounters::default());
+
+    let counters_clone = counters.clone();
+    let stop_flag_clone = stop_flag.clone();
+    let channel_for_thread = channel.clone();
+    let pkt_rx = bundle.pkt_rx;
+
+    let handle = thread::Builder::new()
+        .name("sm-stream-mux".into())
+        .spawn(move || {
+            mux_thread(pkt_rx, stop_flag_clone, counters_clone, channel_for_thread);
+        })
+        .map_err(|e| format!("failed to spawn mux thread: {e}"))?;
+
+    Ok(StreamSession {
+        stop_flag,
+        mux_handle: Some(handle),
+        counters,
+        receiver: Some(bundle.receiver),
+        last_pli: None,
+        channel,
+        signaling: bundle.signaling,
+        drain_handles: bundle.drain_handles,
+    })
+}
+
+/// Build the production `ReceiverBundle`: real `Str0mVideoReceiver` + `MdnsSignaling`.
+///
+/// The signaling adapter is started first so it begins mDNS discovery immediately.
+/// The receiver is started second so it can process the offer/answer that arrives
+/// asynchronously via the signaling-event drain thread.
+///
+/// Both adapters run their own OS threads. This function returns immediately —
+/// the full SDP/ICE handshake completes asynchronously in the drain threads.
+fn build_production_bundle(
+    stop_flag: Arc<AtomicBool>,
+) -> Result<ReceiverBundle, String> {
+    // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
+    let sig_config = SignalingConfig {
+        role: SignalingRole::Receiver,
+        control_port: 7889,
+        peer_hint: None,
+        ..SignalingConfig::default()
+    };
+    let mut signaling =
+        MdnsSignaling::new(sig_config).map_err(|e| format!("MdnsSignaling::new failed: {e}"))?;
+
+    let (sig_event_tx, sig_event_rx) =
+        sync_channel::<SignalingEvent>(TRANSPORT_CHANNEL_CAPACITY);
+    signaling
+        .start(sig_event_tx)
+        .map_err(|e| format!("MdnsSignaling::start failed: {e}"))?;
+
+    // ── 2. Build Str0mVideoReceiver (Receiver role) ────────────────────────
+    let transport_config = TransportConfig {
+        udp_port: 7889,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    };
+    let mut receiver = Str0mVideoReceiver::new(transport_config)
+        .map_err(|e| format!("Str0mVideoReceiver::new failed: {e}"))?;
+
+    let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+    let (transport_event_tx, transport_event_rx) =
+        sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+
+    receiver
+        .start(pkt_tx.clone(), transport_event_tx)
+        .map_err(|e| format!("Str0mVideoReceiver::start failed: {e}"))?;
+
+    // ── 3. Spawn transport-event drain thread (W2-fix-C) ──────────────────
+    let stop_flag_t = stop_flag.clone();
+    let transport_drain = thread::Builder::new()
+        .name("sm-transport-event-drain".into())
+        .spawn(move || {
+            loop {
+                if stop_flag_t.load(Ordering::Relaxed) {
+                    break;
+                }
+                match transport_event_rx
+                    .recv_timeout(Duration::from_millis(500))
+                {
+                    Ok(ev) => match ev {
+                        TransportEvent::IceConnected => {
+                            eprintln!("[sm-transport-event-drain] ICE connected");
+                        }
+                        TransportEvent::IceFailed => {
+                            eprintln!("[sm-transport-event-drain] ICE failed");
+                        }
+                        TransportEvent::ConnectionLost { reason } => {
+                            eprintln!("[sm-transport-event-drain] connection lost: {reason}");
+                        }
+                        _ => {}
+                    },
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn transport-event drain: {e}"))?;
+
+    // ── 4. Wrap receiver in Arc for shared access across threads ───────────
+    // The signaling-event drain thread needs to call `receiver.apply_remote_offer`
+    // and `receiver.add_remote_candidate`. We wrap in Arc<Mutex<>> so the drain
+    // thread can take &mut self calls.
+    let receiver_arc = Arc::new(Mutex::new(receiver));
+    let receiver_arc_for_drain = receiver_arc.clone();
+
+    // ── 5. Spawn signaling-event drain thread (W2-fix-B) ──────────────────
+    let stop_flag_s = stop_flag.clone();
+    let signaling_arc = Arc::new(Mutex::new(signaling));
+    let signaling_arc_for_drain = signaling_arc.clone();
+
+    let sig_drain = thread::Builder::new()
+        .name("sm-signaling-event-drain".into())
+        .spawn(move || {
+            loop {
+                if stop_flag_s.load(Ordering::Relaxed) {
+                    break;
+                }
+                match sig_event_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(ev) => match ev {
+                        SignalingEvent::PeerFound { host, port } => {
+                            eprintln!(
+                                "[sm-signaling-event-drain] peer found: {host}:{port}"
+                            );
+                        }
+                        SignalingEvent::OfferReceived(offer) => {
+                            // Apply the remote offer and publish our answer.
+                            let answer_result = {
+                                let recv = receiver_arc_for_drain.lock().unwrap();
+                                recv.apply_remote_offer(offer)
+                            };
+                            match answer_result {
+                                Ok(answer) => {
+                                    let sig = signaling_arc_for_drain.lock().unwrap();
+                                    if let Err(e) = sig.publish_local_answer(answer) {
+                                        eprintln!("[sm-signaling-event-drain] publish_local_answer failed: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[sm-signaling-event-drain] apply_remote_offer failed: {e}");
+                                }
+                            }
+                        }
+                        SignalingEvent::CandidateReceived(cand) => {
+                            let recv = receiver_arc_for_drain.lock().unwrap();
+                            if let Err(e) = recv.add_remote_candidate(cand) {
+                                eprintln!("[sm-signaling-event-drain] add_remote_candidate failed: {e}");
+                            }
+                        }
+                        SignalingEvent::Closed => {
+                            eprintln!("[sm-signaling-event-drain] signaling closed");
+                            break;
+                        }
+                        SignalingEvent::Error(e) => {
+                            eprintln!("[sm-signaling-event-drain] signaling error: {e}");
+                        }
+                        _ => {}
+                    },
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn signaling-event drain: {e}"))?;
+
+    // ── 6. Build the ReceiverOps wrapper around Arc<Mutex<Str0mVideoReceiver>> ──
+    struct ArcReceiverOps(Arc<Mutex<Str0mVideoReceiver>>);
+
+    impl ReceiverOps for ArcReceiverOps {
+        fn request_keyframe(&self) -> Result<(), TransportError> {
+            self.0.lock().unwrap().request_keyframe()
+        }
+
+        fn dropped_frames(&self) -> u64 {
+            self.0.lock().unwrap().dropped_frames()
+        }
+    }
+
+    // ── 7. Build SignalingOps wrapper around Arc<Mutex<MdnsSignaling>> ────
+    struct ArcSignalingOps(Arc<Mutex<MdnsSignaling>>);
+
+    impl SignalingOps for ArcSignalingOps {
+        fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
+            self.0.lock().unwrap().stop()
+        }
+    }
+
+    Ok(ReceiverBundle {
+        receiver: Box::new(ArcReceiverOps(receiver_arc)),
+        pkt_rx,
+        signaling: Some(Box::new(ArcSignalingOps(signaling_arc))),
+        drain_handles: vec![transport_drain, sig_drain],
+        _drain_senders: vec![],
+    })
+}
+
 // ─── Tauri commands ───────────────────────────────────────────────────────────
 
 /// Start the streaming session.
 ///
 /// Accepts a `Channel<InvokeResponseBody>` from the frontend (OQ-tauri-emit-1 pivot).
-/// Spawns the `sm-stream-mux` thread which drains packets, builds fMP4 segments,
-/// and delivers them as binary `InvokeResponseBody::Raw` frames through the channel.
+/// Builds a `Str0mVideoReceiver` + `MdnsSignaling` pair, starts both, spawns drain
+/// threads for transport and signaling events, and spawns the `sm-stream-mux` thread
+/// which drains packets, builds fMP4 segments, and delivers them as binary
+/// `InvokeResponseBody::Raw` frames through the channel.
 ///
 /// Frame layout (byte 0 = discriminant):
 /// - `FRAME_INIT` (`0x00`) = fMP4 init segment (one per session)
 /// - `FRAME_SEGMENT` (`0x01`) = fMP4 media segment (one per GOP)
 ///
 /// Idempotent: if a session is already running, returns `Ok(())` immediately.
+/// Returns immediately — SDP/ICE handshake completes asynchronously via drain threads.
 #[tauri::command]
 pub fn start_stream(
     bridge: tauri::State<StreamBridge>,
@@ -203,49 +461,53 @@ pub fn start_stream(
     }
     let mut guard = bridge.session.lock().unwrap();
 
-    let counters = Arc::new(BridgeCounters::default());
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
-    let counters_clone = counters.clone();
-    let stop_flag_clone = stop_flag.clone();
-
-    // Wrap the Tauri channel in Arc<dyn ChannelLike> — Clone it into the mux thread.
+    // Wrap the Tauri channel in Arc<dyn ChannelLike> — cloned into the mux thread.
     let channel_arc: Arc<dyn ChannelLike> = Arc::new(TauriChannel(channel.clone()));
-    let channel_for_thread = channel_arc.clone();
 
-    // Production: spawn mux thread with packet pipe scaffolded for B8 wiring.
-    let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+    // Pre-allocate the stop_flag so that drain threads (built inside
+    // build_production_bundle) and the mux thread (built inside
+    // build_stream_session) all share the exact same Arc.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let bundle = build_production_bundle(stop_flag.clone())?;
 
-    let handle = thread::Builder::new()
-        .name("sm-stream-mux".into())
-        .spawn(move || {
-            mux_thread(pkt_rx, stop_flag_clone, counters_clone, channel_for_thread);
-        })
-        .map_err(|e| format!("failed to spawn mux thread: {e}"))?;
-
-    *guard = Some(StreamSession {
-        stop_flag,
-        mux_handle: Some(handle),
-        counters,
-        receiver: None, // production receiver wired in B8
-        last_pli: None,
-        channel: channel_arc,
-    });
+    *guard = Some(build_stream_session(channel_arc, bundle, stop_flag)?);
 
     Ok(())
 }
 
 /// Stop the streaming session. Idempotent.
+///
+/// Shutdown order (caller-must-drop-tx-first invariant):
+/// 1. Set the stop flag — signals the mux thread and all drain threads.
+/// 2. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
+/// 3. Join drain threads (they check stop_flag on every 500 ms timeout).
+/// 4. Stop the signaling adapter.
+/// 5. Drop the session (receiver + signaling are dropped here — their Drop
+///    implementations call stop() so the tick threads are joined).
 #[tauri::command]
 pub fn stop_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
     let mut guard = bridge.session.lock().unwrap();
-    if let Some(session) = guard.as_mut() {
+    if let Some(mut session) = guard.take() {
+        // 1. Signal stop to the mux thread and all drain threads.
         session.stop_flag.store(true, Ordering::Relaxed);
+
+        // 2. Join the mux thread.
         if let Some(handle) = session.mux_handle.take() {
             let _ = handle.join();
         }
+
+        // 3. Join drain threads.
+        for handle in session.drain_handles.drain(..) {
+            let _ = handle.join();
+        }
+
+        // 4. Stop the signaling adapter.
+        if let Some(mut sig) = session.signaling.take() {
+            let _ = sig.stop();
+        }
+
+        // 5. receiver and channel are dropped here (their Drop impls call stop).
     }
-    *guard = None;
     Ok(())
 }
 
@@ -524,7 +786,9 @@ mod tests {
                 counters,
                 receiver: Some(Box::new(FakeReceiver::new())),
                 last_pli: None,
-                channel, // RED: StreamSession does not yet have this field
+                channel,
+                signaling: None,
+                drain_handles: Vec::new(),
             });
         }
         bridge
@@ -831,34 +1095,46 @@ mod tests {
 
     // ─── W2-fix-A RED: start_stream wires a real receiver (Some, not None) ─────
 
-    /// W2-A.1 — build_stream_session with a factory that returns a FakeReceiver
-    ///           produces a session with receiver = Some(_), not None.
-    ///
-    /// RED: `build_stream_session` does not exist yet — this test will fail to
-    /// compile, which counts as RED in Strict TDD with a static language.
+    /// Helper: build a test `ReceiverBundle` with a `FakeReceiver` and a
+    /// disconnected `pkt_rx` (the sender end is dropped immediately so the
+    /// mux thread sees `Disconnected` and exits cleanly when stop_flag is set).
+    fn fake_bundle() -> ReceiverBundle {
+        let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        ReceiverBundle {
+            receiver: Box::new(FakeReceiver::new()),
+            pkt_rx,
+            signaling: None,
+            drain_handles: Vec::new(),
+            _drain_senders: Vec::new(),
+        }
+    }
+
+    /// W2-A.1 — build_stream_session with a FakeReceiver bundle produces a
+    ///           session with receiver = Some(_), not None.
     #[test]
     fn start_stream_wires_receiver_some_not_none() {
         let ch: Arc<dyn ChannelLike> = FakeChannel::new();
-        let factory: Box<dyn Fn() -> Box<dyn ReceiverOps>> =
-            Box::new(|| Box::new(FakeReceiver::new()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let session = build_stream_session(ch, factory).expect("build_stream_session must succeed");
+        let session = build_stream_session(ch, fake_bundle(), stop_flag)
+            .expect("build_stream_session must succeed");
+        // Eagerly stop the mux thread before the assertion so the test does not hang.
+        session.stop_flag.store(true, Ordering::Relaxed);
         assert!(
             session.receiver.is_some(),
             "start_stream must wire receiver (Some), not leave it None"
         );
     }
 
-    /// W2-A.2 — build_stream_session with factory that returns FakeReceiver
-    ///           also starts the mux thread (mux_handle is Some after build).
+    /// W2-A.2 — build_stream_session with FakeReceiver bundle spawns the mux
+    ///           thread (mux_handle is Some after build).
     #[test]
     fn start_stream_spawns_mux_thread() {
         let ch: Arc<dyn ChannelLike> = FakeChannel::new();
-        let factory: Box<dyn Fn() -> Box<dyn ReceiverOps>> =
-            Box::new(|| Box::new(FakeReceiver::new()));
+        let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let mut session =
-            build_stream_session(ch, factory).expect("build_stream_session must succeed");
+        let mut session = build_stream_session(ch, fake_bundle(), stop_flag)
+            .expect("build_stream_session must succeed");
         assert!(
             session.mux_handle.is_some(),
             "build_stream_session must spawn the mux thread"
