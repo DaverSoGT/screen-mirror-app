@@ -1206,6 +1206,78 @@ mod tests {
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
     }
 
+    // ─── W2-fix-D RED: stop_stream cleans up all threads in correct order ────────
+
+    /// D.STOP.1 — `stop_stream_session` (the extractable core of stop_stream) sets
+    ///             stop_flag, joins the mux thread, joins drain threads, and stops
+    ///             signaling — all within 500 ms.
+    ///
+    /// RED: `stop_stream_session` does not exist yet.
+    #[test]
+    fn stop_stream_joins_all_threads_within_500ms() {
+        let ch: Arc<dyn ChannelLike> = FakeChannel::new();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Build a bundle with two fake drain threads (100 ms sleep each).
+        let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let stop_for_drain1 = stop_flag.clone();
+        let stop_for_drain2 = stop_flag.clone();
+
+        let drain1 = thread::spawn(move || {
+            // Simulate a drain that checks stop_flag with 50 ms polling.
+            while !stop_for_drain1.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let drain2 = thread::spawn(move || {
+            while !stop_for_drain2.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let bundle = ReceiverBundle {
+            receiver: Box::new(FakeReceiver::new()),
+            pkt_rx,
+            signaling: None,
+            drain_handles: vec![drain1, drain2],
+            _drain_senders: Vec::new(),
+        };
+
+        let session = build_stream_session(ch, bundle, stop_flag)
+            .expect("build_stream_session must succeed");
+
+        // Wrap in a bridge and call stop_stream_session.
+        let bridge = StreamBridge::new();
+        {
+            let mut guard = bridge.session.lock().unwrap();
+            *guard = Some(session);
+        }
+
+        let t0 = std::time::Instant::now();
+        stop_stream_session(&bridge);
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "stop_stream_session must join all threads within 500 ms, took {elapsed:?}"
+        );
+        // Session must be cleared.
+        assert!(
+            !bridge.is_running(),
+            "bridge must not be running after stop_stream_session"
+        );
+    }
+
+    /// D.STOP.2 — `stop_stream_session` is idempotent: calling it twice on the same
+    ///             bridge does not panic and returns promptly.
+    #[test]
+    fn stop_stream_is_idempotent() {
+        let bridge = StreamBridge::new();
+        // Call on an empty bridge — must not panic.
+        stop_stream_session(&bridge);
+        stop_stream_session(&bridge);
+    }
+
     // ─── W2-fix-C RED: transport-event drain absorbs events without blocking ───
 
     /// C.T.1 — `run_transport_event_drain` processes all sent TransportEvents
