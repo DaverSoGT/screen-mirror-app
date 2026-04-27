@@ -829,6 +829,47 @@ mod tests {
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
     }
 
+    // ─── W2-fix-A RED: start_stream wires a real receiver (Some, not None) ─────
+
+    /// W2-A.1 — build_stream_session with a factory that returns a FakeReceiver
+    ///           produces a session with receiver = Some(_), not None.
+    ///
+    /// RED: `build_stream_session` does not exist yet — this test will fail to
+    /// compile, which counts as RED in Strict TDD with a static language.
+    #[test]
+    fn start_stream_wires_receiver_some_not_none() {
+        let ch: Arc<dyn ChannelLike> = FakeChannel::new();
+        let factory: Box<dyn Fn() -> Box<dyn ReceiverOps>> =
+            Box::new(|| Box::new(FakeReceiver::new()));
+
+        let session = build_stream_session(ch, factory).expect("build_stream_session must succeed");
+        assert!(
+            session.receiver.is_some(),
+            "start_stream must wire receiver (Some), not leave it None"
+        );
+    }
+
+    /// W2-A.2 — build_stream_session with factory that returns FakeReceiver
+    ///           also starts the mux thread (mux_handle is Some after build).
+    #[test]
+    fn start_stream_spawns_mux_thread() {
+        let ch: Arc<dyn ChannelLike> = FakeChannel::new();
+        let factory: Box<dyn Fn() -> Box<dyn ReceiverOps>> =
+            Box::new(|| Box::new(FakeReceiver::new()));
+
+        let mut session =
+            build_stream_session(ch, factory).expect("build_stream_session must succeed");
+        assert!(
+            session.mux_handle.is_some(),
+            "build_stream_session must spawn the mux thread"
+        );
+        // Clean up: signal stop and join.
+        session.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(h) = session.mux_handle.take() {
+            let _ = h.join();
+        }
+    }
+
     // ─── Capability E: Tauri command signatures (compile gate) ───────────────
 
     /// E.1 — StreamStats implements serde::Serialize (compile gate).
