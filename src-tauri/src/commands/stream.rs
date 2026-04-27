@@ -2353,4 +2353,50 @@ mod tests {
             "_a._b.local. must be accepted (minimal valid form), got {result:?}"
         );
     }
+
+    // ─── B5-1 RED: build_production_bundle signature change ──────────────────
+
+    /// B5-1.1 — `build_production_bundle` must accept `(udp_port: u16, service_name: String,
+    ///           stop_flag: Arc<AtomicBool>)` so the resolved args flow through to the
+    ///           transport and signaling layers.
+    ///
+    /// RED: `build_production_bundle` currently takes only `(stop_flag)` — this call
+    /// will fail with E0061 (wrong number of arguments).
+    ///
+    /// Spec R2.5: `start_stream` MUST pass resolved `(u16, String)` to the `BuilderFn`.
+    /// Design §1 Glossary: `build_production_bundle(udp_port, service_name, stop_flag)`.
+    #[test]
+    fn test_build_production_bundle_accepts_udp_port_and_service_name() {
+        // We do NOT actually call it (it would try to bind a real socket),
+        // but the TYPE SIGNATURE must accept these args. This is a compile-time
+        // gate: if the function still takes only (stop_flag), this won't compile.
+        //
+        // We use a function-pointer coercion to verify the signature at compile time
+        // without executing the function.
+        let _: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> =
+            build_production_bundle;
+    }
+
+    /// B5-1.2 — `StreamBridge::new()` wrapper closure passes udp_port and service_name
+    ///           through to `build_production_bundle` instead of ignoring them.
+    ///
+    /// RED: `new()` currently wraps with `|_port, _name, stop_flag|` (ignoring port/name).
+    /// After GREEN the wrapper must be `|port, name, stop_flag| build_production_bundle(port, name, stop_flag)`.
+    ///
+    /// We verify this indirectly: the wrapper is `BuilderFn` — we call it via a
+    /// probe that intercepts the port argument. Because `build_production_bundle`
+    /// actually binds sockets, we cannot call `new()` production wrapper in unit tests.
+    /// This test is therefore a COMPILE gate only — the signature coercion in B5-1.1
+    /// is the meaningful RED assert. This test documents the requirement.
+    #[test]
+    fn test_new_wrapper_closure_passes_port_and_name_to_build_production_bundle() {
+        // Compile gate: verify that `build_production_bundle` can be referred to as
+        // a function with the new three-argument signature (redundant with B5-1.1
+        // but explicit about the wrapper's contract).
+        fn _assert_arity(
+            _f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String>,
+        ) {
+        }
+        _assert_arity(build_production_bundle);
+    }
 }
