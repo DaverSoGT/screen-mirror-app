@@ -124,6 +124,17 @@ pub enum TransportError {
     #[error("transport I/O error: {0}")]
     Io(String),
 
+    /// UDP socket bind failed because the port is already in use at the OS level.
+    /// Carries the port that failed to bind so callers can produce precise UX
+    /// without re-parsing strings.
+    ///
+    /// Detected at the bind site (`Str0mVideoReceiver::start`) by matching
+    /// `io::ErrorKind::AddrInUse` BEFORE the `.map_err(...)` that stringifies.
+    /// Cross-platform: stdlib maps `EADDRINUSE` (Linux/macOS) and
+    /// `WSAEADDRINUSE` (Windows, errno 10048) to this kind.
+    #[error("UDP port {port} already in use")]
+    AddrInUse { port: u16 },
+
     /// The signaling exchange failed (e.g., SDP parse error).
     #[error("signaling failed: {0}")]
     SignalingFailed(String),
