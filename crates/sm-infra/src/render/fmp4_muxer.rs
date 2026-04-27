@@ -624,4 +624,152 @@ mod tests {
             "hdlr.handler_type must be 'vide'"
         );
     }
+
+    // ─── Capability D: Mp4Muxer::build_init_segment ─────────────────────────
+
+    /// SPS: Baseline Level 3.1, 1280×720 progressive.
+    const SPS_1280X720: &[u8] = &[0x67, 0x42, 0xC0, 0x1F, 0xF4, 0x02, 0x80, 0x2D, 0xC0];
+
+    #[test]
+    #[should_panic(expected = "width must be > 0")]
+    fn mp4_muxer_new_zero_width_panics() {
+        Mp4Muxer::new(0, 1080, 30, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "height must be > 0")]
+    fn mp4_muxer_new_zero_height_panics() {
+        Mp4Muxer::new(1920, 0, 30, 1);
+    }
+
+    #[test]
+    fn init_segment_first_8_bytes_are_ftyp_box() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        // bytes[0..4] = ftyp box size; bytes[4..8] = 'ftyp' tag
+        assert_eq!(&bytes[4..8], b"ftyp", "init segment must start with ftyp box tag");
+    }
+
+    #[test]
+    fn init_segment_ftyp_major_brand_is_iso5() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        assert_eq!(&bytes[8..12], b"iso5");
+    }
+
+    #[test]
+    fn init_segment_contains_moov_box() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        assert!(bytes.windows(4).any(|w| w == b"moov"), "init segment must contain moov box");
+    }
+
+    #[test]
+    fn init_segment_avc1_sample_entry_present() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        assert!(bytes.windows(4).any(|w| w == b"avc1"), "init segment must contain avc1 sample entry");
+    }
+
+    #[test]
+    fn init_segment_length_greater_than_200_bytes() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        assert!(bytes.len() > 200, "init segment must be > 200 bytes, got {}", bytes.len());
+    }
+
+    #[test]
+    fn init_segment_empty_sps_returns_error() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        assert!(muxer.build_init_segment(&[], MINIMAL_PPS).is_err());
+    }
+
+    #[test]
+    fn init_segment_empty_pps_returns_error() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        assert!(muxer.build_init_segment(SPS_320X240, &[]).is_err());
+    }
+
+    #[test]
+    fn init_segment_is_deterministic() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes1 = muxer.build_init_segment(SPS_320X240, MINIMAL_PPS).expect("ok");
+        let bytes2 = muxer.build_init_segment(SPS_320X240, MINIMAL_PPS).expect("ok");
+        assert_eq!(bytes1, bytes2, "build_init_segment must be deterministic");
+    }
+
+    #[test]
+    fn init_segment_mvhd_timescale_big_endian_90000() {
+        let muxer = Mp4Muxer::new(1280, 720, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_1280X720, MINIMAL_PPS)
+            .expect("should build init segment");
+
+        let mvhd_tag_pos = bytes
+            .windows(4)
+            .position(|w| w == b"mvhd")
+            .expect("mvhd must be in init segment");
+
+        // After tag: [4 v+f][4 ctime][4 mtime][4 timescale]
+        let ts_offset = mvhd_tag_pos + 4 + 4 + 4 + 4;
+        let timescale = u32::from_be_bytes([
+            bytes[ts_offset],
+            bytes[ts_offset + 1],
+            bytes[ts_offset + 2],
+            bytes[ts_offset + 3],
+        ]);
+        assert_eq!(timescale, 90_000);
+    }
+
+    #[test]
+    fn init_segment_avc_codec_bytes_match_baseline_13() {
+        // SPS_320X240: profile_idc=66=0x42, constraint_set_flags=0xC0, level_idc=13=0x0D
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+
+        let avcc_tag_pos = bytes
+            .windows(4)
+            .position(|w| w == b"avcC")
+            .expect("avcC must be in init segment");
+
+        let payload_start = avcc_tag_pos + 4;
+        assert_eq!(bytes[payload_start], 1, "configurationVersion must be 1");
+        assert_eq!(bytes[payload_start + 1], 0x42, "profile must be 0x42 (baseline)");
+        assert_eq!(bytes[payload_start + 2], 0xC0, "constraint_set_flags must be 0xC0");
+        assert_eq!(bytes[payload_start + 3], 0x0D, "level must be 0x0D");
+    }
+
+    #[test]
+    fn init_segment_mdhd_timescale_is_90000() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let bytes = muxer
+            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+
+        let mdhd_tag_pos = bytes
+            .windows(4)
+            .position(|w| w == b"mdhd")
+            .expect("mdhd must be in init segment");
+
+        let ts_offset = mdhd_tag_pos + 4 + 4 + 4 + 4;
+        let timescale = u32::from_be_bytes([
+            bytes[ts_offset],
+            bytes[ts_offset + 1],
+            bytes[ts_offset + 2],
+            bytes[ts_offset + 3],
+        ]);
+        assert_eq!(timescale, 90_000, "mdhd.timescale must be 90_000");
+    }
 }
