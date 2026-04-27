@@ -489,12 +489,7 @@ fn build_mfhd(sequence_number: u32) -> Vec<u8> {
 /// * `samples`     — per-sample data for the `trun` box.
 /// * `data_offset` — byte offset from start of `moof` box to first byte of `mdat` payload.
 /// * `is_idr`      — if true, marks the first sample as an IDR (keyframe).
-fn build_traf(
-    base_dts: u64,
-    samples: &[TrunSample],
-    data_offset: i32,
-    is_idr: bool,
-) -> Vec<u8> {
+fn build_traf(base_dts: u64, samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
     let tfhd = build_tfhd(1, 0x02_0000); // default-base-is-moof flag
     let tfdt = build_tfdt(base_dts);
     let trun = build_trun(samples, data_offset, is_idr);
@@ -548,10 +543,14 @@ pub(crate) fn build_moof(
 /// Per-sample data for a `trun` box.
 pub(crate) struct TrunSample {
     /// Optional per-sample duration override (in 90 kHz units). `None` → use track default.
+    /// Reserved for V1.5 sub-GOP fragmentation; not yet read by `build_trun`.
+    #[allow(dead_code)]
     pub duration: Option<u32>,
     /// Byte size of this sample (NAL AVCC payload for this sample).
     pub size: u32,
     /// Optional per-sample flags override. `None` → use default from `tfhd`.
+    /// Reserved for V1.5 per-sample flag control; not yet read by `build_trun`.
+    #[allow(dead_code)]
     pub flags: Option<u32>,
 }
 
@@ -807,10 +806,7 @@ impl Mp4Muxer {
     ///
     /// `None` while buffering. `Some(bytes)` when a complete fragment is ready.
     /// The bytes are `[moof][mdat]` suitable for `SourceBuffer.appendBuffer(...)`.
-    pub fn append_packet(
-        &mut self,
-        packet: &sm_domain::encode::EncodedPacket,
-    ) -> Option<Vec<u8>> {
+    pub fn append_packet(&mut self, packet: &sm_domain::encode::EncodedPacket) -> Option<Vec<u8>> {
         // Convert Annex-B payload to AVCC-framed bytes.
         // If conversion fails (e.g., empty data), skip this packet silently.
         let avcc = annex_b_to_avcc(&packet.data).ok()?;
@@ -821,12 +817,18 @@ impl Mp4Muxer {
             let segment = self.flush_pending();
 
             // Accumulate the triggering IDR into the fresh pending buffer.
-            self.pending.push(PendingSample { avcc, dts_90khz: dts });
+            self.pending.push(PendingSample {
+                avcc,
+                dts_90khz: dts,
+            });
 
             Some(segment)
         } else {
             // P-frame or first IDR: accumulate.
-            self.pending.push(PendingSample { avcc, dts_90khz: dts });
+            self.pending.push(PendingSample {
+                avcc,
+                dts_90khz: dts,
+            });
             None
         }
     }
@@ -842,7 +844,11 @@ impl Mp4Muxer {
         let base_dts = self.pending.first().map(|s| s.dts_90khz).unwrap_or(0);
 
         // Build the concatenated AVCC mdat payload.
-        let mdat_payload: Vec<u8> = self.pending.iter().flat_map(|s| s.avcc.iter().copied()).collect();
+        let mdat_payload: Vec<u8> = self
+            .pending
+            .iter()
+            .flat_map(|s| s.avcc.iter().copied())
+            .collect();
 
         // Build trun samples (size-only for now; baseline = no B-frames → DTS=PTS=CTS).
         let trun_samples: Vec<TrunSample> = self
@@ -935,29 +941,52 @@ mod tests {
         assert_eq!(&init[4..8], b"ftyp", "init must start with ftyp box");
 
         // 2. Contains moov
-        assert!(init.windows(4).any(|w| w == b"moov"), "init must contain moov");
+        assert!(
+            init.windows(4).any(|w| w == b"moov"),
+            "init must contain moov"
+        );
 
         // 3. Contains avc1 (codec sample entry)
-        assert!(init.windows(4).any(|w| w == b"avc1"), "init must contain avc1");
+        assert!(
+            init.windows(4).any(|w| w == b"avc1"),
+            "init must contain avc1"
+        );
 
         // 4. Contains avcC (decoder config)
-        assert!(init.windows(4).any(|w| w == b"avcC"), "init must contain avcC");
+        assert!(
+            init.windows(4).any(|w| w == b"avcC"),
+            "init must contain avcC"
+        );
 
         // 5. Contains mvex (movie extends — required for fMP4)
-        assert!(init.windows(4).any(|w| w == b"mvex"), "init must contain mvex (fMP4 marker)");
+        assert!(
+            init.windows(4).any(|w| w == b"mvex"),
+            "init must contain mvex (fMP4 marker)"
+        );
 
         // 6. Contains trex
-        assert!(init.windows(4).any(|w| w == b"trex"), "init must contain trex");
+        assert!(
+            init.windows(4).any(|w| w == b"trex"),
+            "init must contain trex"
+        );
 
         // 7. Parse the ftyp major brand via mp4 crate boxtype scanning.
         // major_brand at bytes [8..12]
         assert_eq!(&init[8..12], b"iso5", "ftyp.major_brand must be iso5");
 
         // 8. Verify mvhd timescale = 90_000.
-        let mvhd_pos = init.windows(4).position(|w| w == b"mvhd").expect("mvhd must exist");
+        let mvhd_pos = init
+            .windows(4)
+            .position(|w| w == b"mvhd")
+            .expect("mvhd must exist");
         // After tag: version+flags (4) + ctime (4) + mtime (4) + timescale (4)
         let ts_off = mvhd_pos + 4 + 4 + 4 + 4;
-        let timescale = u32::from_be_bytes([init[ts_off], init[ts_off+1], init[ts_off+2], init[ts_off+3]]);
+        let timescale = u32::from_be_bytes([
+            init[ts_off],
+            init[ts_off + 1],
+            init[ts_off + 2],
+            init[ts_off + 3],
+        ]);
         assert_eq!(timescale, 90_000, "mvhd.timescale must be 90_000");
     }
 
@@ -979,7 +1008,9 @@ mod tests {
             timestamp: Duration::from_millis(100),
             sequence: 1,
         };
-        let seg1 = muxer.append_packet(&idr2).expect("IDR2 must emit segment 1");
+        let seg1 = muxer
+            .append_packet(&idr2)
+            .expect("IDR2 must emit segment 1");
 
         // IDR3 → emits segment_2
         let idr3 = EncodedPacket {
@@ -988,7 +1019,9 @@ mod tests {
             timestamp: Duration::from_millis(200),
             sequence: 2,
         };
-        let seg2 = muxer.append_packet(&idr3).expect("IDR3 must emit segment 2");
+        let seg2 = muxer
+            .append_packet(&idr3)
+            .expect("IDR3 must emit segment 2");
 
         // Verify the full byte stream: init + seg1 + seg2
         let mut stream = Vec::new();
@@ -1001,29 +1034,49 @@ mod tests {
         assert_eq!(&seg2[4..8], b"moof", "seg2 must start with moof");
 
         // Both segments must contain mdat
-        assert!(seg1.windows(4).any(|w| w == b"mdat"), "seg1 must contain mdat");
-        assert!(seg2.windows(4).any(|w| w == b"mdat"), "seg2 must contain mdat");
+        assert!(
+            seg1.windows(4).any(|w| w == b"mdat"),
+            "seg1 must contain mdat"
+        );
+        assert!(
+            seg2.windows(4).any(|w| w == b"mdat"),
+            "seg2 must contain mdat"
+        );
 
         // Extract sequence numbers and verify they're monotonic
         fn extract_seq(seg: &[u8]) -> u32 {
             let pos = seg.windows(4).position(|w| w == b"mfhd").unwrap();
             let off = pos + 4 + 4;
-            u32::from_be_bytes([seg[off], seg[off+1], seg[off+2], seg[off+3]])
+            u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]])
         }
         let seq1 = extract_seq(&seg1);
         let seq2 = extract_seq(&seg2);
-        assert!(seq2 > seq1, "sequence numbers must be monotonically increasing: {} < {}", seq1, seq2);
-        assert_eq!(seq1, 1, "first emitted segment must have sequence_number = 1");
-        assert_eq!(seq2, 2, "second emitted segment must have sequence_number = 2");
+        assert!(
+            seq2 > seq1,
+            "sequence numbers must be monotonically increasing: {} < {}",
+            seq1,
+            seq2
+        );
+        assert_eq!(
+            seq1, 1,
+            "first emitted segment must have sequence_number = 1"
+        );
+        assert_eq!(
+            seq2, 2,
+            "second emitted segment must have sequence_number = 2"
+        );
 
         // Stream total size must be larger than init alone
-        assert!(stream.len() > init.len(), "full stream must be larger than init segment alone");
+        assert!(
+            stream.len() > init.len(),
+            "full stream must be larger than init segment alone"
+        );
     }
 
     // ─── Capability G (B6): Mp4Muxer::append_packet orchestrator ──────────
 
-    use std::sync::Arc;
     use sm_domain::encode::EncodedPacket;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn make_packet(is_keyframe: bool, timestamp_ms: u64, size_bytes: usize) -> EncodedPacket {
@@ -1056,7 +1109,10 @@ mod tests {
         let pkt = make_packet(true, 0, 200);
         let result = muxer.append_packet(&pkt);
         // First IDR starts a new GOP; nothing to flush yet.
-        assert!(result.is_none(), "first IDR must not emit (nothing buffered before it)");
+        assert!(
+            result.is_none(),
+            "first IDR must not emit (nothing buffered before it)"
+        );
     }
 
     #[test]
@@ -1067,7 +1123,11 @@ mod tests {
         assert!(muxer.append_packet(&idr1).is_none(), "IDR1 must buffer");
         // 3 P-frames
         for i in 1..4u64 {
-            assert!(muxer.append_packet(&make_packet(false, i * 33, 100)).is_none());
+            assert!(
+                muxer
+                    .append_packet(&make_packet(false, i * 33, 100))
+                    .is_none()
+            );
         }
         // IDR2 → must flush GOP containing IDR1 + P-frames
         let idr2 = make_packet(true, 4 * 33, 200);
@@ -1083,11 +1143,19 @@ mod tests {
         // One P-frame to ensure pending is non-empty when IDR2 arrives
         muxer.append_packet(&make_packet(false, 33, 100));
         let idr2 = make_packet(true, 66, 200);
-        let segment = muxer.append_packet(&idr2).expect("should emit segment on IDR2");
+        let segment = muxer
+            .append_packet(&idr2)
+            .expect("should emit segment on IDR2");
 
         // Check moof appears first
-        let moof_pos = segment.windows(4).position(|w| w == b"moof").expect("moof must be present");
-        let mdat_pos = segment.windows(4).position(|w| w == b"mdat").expect("mdat must be present");
+        let moof_pos = segment
+            .windows(4)
+            .position(|w| w == b"moof")
+            .expect("moof must be present");
+        let mdat_pos = segment
+            .windows(4)
+            .position(|w| w == b"mdat")
+            .expect("mdat must be present");
         assert!(moof_pos < mdat_pos, "moof must come before mdat");
         // First box tag in segment (at bytes[4..8]) must be moof
         assert_eq!(&segment[4..8], b"moof", "segment must start with moof box");
@@ -1105,12 +1173,21 @@ mod tests {
 
         // Three IDRs → two emitted segments (IDR1 buffers, IDR2 emits, IDR3 emits)
         muxer.append_packet(&make_packet(true, 0, 200));
-        let seg1 = muxer.append_packet(&make_packet(true, 33, 200)).expect("seg1");
-        let seg2 = muxer.append_packet(&make_packet(true, 66, 200)).expect("seg2");
+        let seg1 = muxer
+            .append_packet(&make_packet(true, 33, 200))
+            .expect("seg1");
+        let seg2 = muxer
+            .append_packet(&make_packet(true, 66, 200))
+            .expect("seg2");
 
         let seq1 = extract_seq(&seg1);
         let seq2 = extract_seq(&seg2);
-        assert!(seq2 > seq1, "mfhd.sequence_number must increment across segments: got {} then {}", seq1, seq2);
+        assert!(
+            seq2 > seq1,
+            "mfhd.sequence_number must increment across segments: got {} then {}",
+            seq1,
+            seq2
+        );
     }
 
     #[test]
@@ -1127,17 +1204,27 @@ mod tests {
         // Box layout: [size:4][tag:4][version:1][flags:3][time:8]
         // The size field is at (tfdt_pos - 4); the tag is at tfdt_pos.
         // After the tag: version at tfdt_pos+4, flags at +5..8, time at +8..16.
-        let tfdt_pos = segment.windows(4).position(|w| w == b"tfdt").expect("tfdt must be in segment");
+        let tfdt_pos = segment
+            .windows(4)
+            .position(|w| w == b"tfdt")
+            .expect("tfdt must be in segment");
         let version = segment[tfdt_pos + 4];
         assert_eq!(version, 1, "tfdt must be version 1");
         let dts = u64::from_be_bytes([
-            segment[tfdt_pos + 8],  segment[tfdt_pos + 9],
-            segment[tfdt_pos + 10], segment[tfdt_pos + 11],
-            segment[tfdt_pos + 12], segment[tfdt_pos + 13],
-            segment[tfdt_pos + 14], segment[tfdt_pos + 15],
+            segment[tfdt_pos + 8],
+            segment[tfdt_pos + 9],
+            segment[tfdt_pos + 10],
+            segment[tfdt_pos + 11],
+            segment[tfdt_pos + 12],
+            segment[tfdt_pos + 13],
+            segment[tfdt_pos + 14],
+            segment[tfdt_pos + 15],
         ]);
         // IDR1 was at 1000ms → 90_000 ticks
-        assert_eq!(dts, 90_000, "tfdt.base_media_decode_time must be 90_000 (1000ms at 90kHz)");
+        assert_eq!(
+            dts, 90_000,
+            "tfdt.base_media_decode_time must be 90_000 (1000ms at 90kHz)"
+        );
     }
 
     // ─── Capability F (B6): mdat box builder ───────────────────────────────
@@ -1149,7 +1236,11 @@ mod tests {
         assert_eq!(&mdat[4..8], b"mdat", "box type must be mdat");
         let size = u32::from_be_bytes([mdat[0], mdat[1], mdat[2], mdat[3]]) as usize;
         assert_eq!(size, mdat.len());
-        assert_eq!(&mdat[8..], payload, "mdat payload must match input verbatim");
+        assert_eq!(
+            &mdat[8..],
+            payload,
+            "mdat payload must match input verbatim"
+        );
     }
 
     #[test]
@@ -1270,8 +1361,7 @@ mod tests {
         assert_eq!(&tfdt[9..12], &[0, 0, 0], "flags must be 0");
         // base_media_decode_time at bytes 12..20
         let dts = u64::from_be_bytes([
-            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
-            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15], tfdt[16], tfdt[17], tfdt[18], tfdt[19],
         ]);
         assert_eq!(dts, 90_000);
     }
@@ -1280,8 +1370,7 @@ mod tests {
     fn tfdt_zero_dts_produces_all_zero_time_field() {
         let tfdt = build_tfdt(0);
         let dts = u64::from_be_bytes([
-            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
-            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15], tfdt[16], tfdt[17], tfdt[18], tfdt[19],
         ]);
         assert_eq!(dts, 0);
     }
@@ -1291,8 +1380,7 @@ mod tests {
         let large_dts: u64 = u32::MAX as u64 + 1;
         let tfdt = build_tfdt(large_dts);
         let dts = u64::from_be_bytes([
-            tfdt[12], tfdt[13], tfdt[14], tfdt[15],
-            tfdt[16], tfdt[17], tfdt[18], tfdt[19],
+            tfdt[12], tfdt[13], tfdt[14], tfdt[15], tfdt[16], tfdt[17], tfdt[18], tfdt[19],
         ]);
         assert_eq!(dts, large_dts);
     }
@@ -1301,7 +1389,11 @@ mod tests {
 
     /// Helper to create a `TrunSample` with just a size (no duration/flags override).
     fn make_sample(size: u32) -> TrunSample {
-        TrunSample { duration: None, size, flags: None }
+        TrunSample {
+            duration: None,
+            size,
+            flags: None,
+        }
     }
 
     #[test]
@@ -1350,7 +1442,11 @@ mod tests {
         let samples = vec![make_sample(50)];
         let trun = build_trun(&samples, 0, true);
         let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
-        assert_ne!(flags & 0x000004, 0, "first_sample_flags_present bit must be set for IDR");
+        assert_ne!(
+            flags & 0x000004,
+            0,
+            "first_sample_flags_present bit must be set for IDR"
+        );
     }
 
     // ─── Capability E (B6): moof + traf hierarchy assembler ────────────────
