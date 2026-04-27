@@ -1012,37 +1012,59 @@ pub fn start_stream(
 
 /// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
 ///
-/// Shutdown order (caller-must-drop-tx-first invariant):
-/// 1. Set the stop flag — signals the mux thread and all drain threads.
-/// 2. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
-/// 3. Join drain threads (they check stop_flag on every 500 ms timeout).
-/// 4. Stop the signaling adapter.
-/// 5. Drop the session (receiver + channel are dropped — their Drop impls call stop).
+/// Shutdown order (W2-fix-D + B6 current_args clear):
+/// 1. Acquire session lock; take the session (guard.take()).
+/// 2. Set the stop flag — signals the mux thread and all drain threads.
+/// 3. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
+/// 4. Join drain threads (they check stop_flag on every 500 ms timeout).
+/// 5. Stop the signaling adapter.
+/// 6. receiver and channel are dropped (their Drop impls call stop).
+/// 7. Drop session lock FIRST (step 1 guard is dropped here).
+/// 8. Acquire current_args lock; clear to None.
 ///
-/// Idempotent: if no session is active, returns immediately.
+/// Lock-ordering discipline (design §4, spec R6.6):
+///   stop path:  session FIRST, then current_args — this is the COMPLEMENTARY ordering
+///   to start_stream_inner which acquires current_args FIRST, then session.
+///   The asymmetry is intentional. Clearing current_args AFTER the session guard
+///   is released ensures that a racing start_stream_inner which sees current_args=None
+///   only enters the builder when the previous session is fully torn down.
+///
+/// Idempotent: if no session is active, returns immediately (session lock released
+/// without touching current_args, which is already None).
 fn stop_stream_session(bridge: &StreamBridge) {
-    let mut guard = bridge.session.lock().unwrap();
-    if let Some(mut session) = guard.take() {
-        // 1. Signal stop to the mux thread and all drain threads.
-        session.stop_flag.store(true, Ordering::Relaxed);
+    {
+        // Lock-order step 1: acquire session lock FIRST (stop path: session → current_args).
+        let mut guard = bridge.session.lock().unwrap();
+        if let Some(mut session) = guard.take() {
+            // 2. Signal stop to the mux thread and all drain threads.
+            session.stop_flag.store(true, Ordering::Relaxed);
 
-        // 2. Join the mux thread.
-        if let Some(handle) = session.mux_handle.take() {
-            let _ = handle.join();
+            // 3. Join the mux thread.
+            if let Some(handle) = session.mux_handle.take() {
+                let _ = handle.join();
+            }
+
+            // 4. Join drain threads.
+            for handle in session.drain_handles.drain(..) {
+                let _ = handle.join();
+            }
+
+            // 5. Stop the signaling adapter.
+            if let Some(mut sig) = session.signaling.take() {
+                let _ = sig.stop();
+            }
+
+            // 6. receiver and channel are dropped here (their Drop impls call stop).
         }
-
-        // 3. Join drain threads.
-        for handle in session.drain_handles.drain(..) {
-            let _ = handle.join();
-        }
-
-        // 4. Stop the signaling adapter.
-        if let Some(mut sig) = session.signaling.take() {
-            let _ = sig.stop();
-        }
-
-        // 5. receiver and channel are dropped here (their Drop impls call stop).
+        // 7. Session lock (guard) is released here — explicit via block scope.
+        //    Releasing session BEFORE acquiring current_args respects the lock order.
     }
+
+    // 8. Acquire current_args lock AFTER session lock is released (design §4).
+    //    Spec R6.3: clear current_args to None AFTER the drain+join+signaling stop
+    //    completes. Clearing here ensures a concurrent start_stream_inner sees None
+    //    only when the previous teardown is fully done.
+    *bridge.current_args.lock().unwrap() = None;
 }
 
 /// Stop the streaming session. Idempotent.
@@ -3007,23 +3029,20 @@ mod tests {
         .expect("first start must succeed");
 
         // Second start with the SAME args — must return AlreadyRunning.
-        let err = start_stream_inner(
-            &bridge,
-            channel.clone(),
-            Some(7889),
-            None,
-        )
-        .expect_err("second start must return AlreadyRunning, not Ok(())");
+        let err = start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+            .expect_err("second start must return AlreadyRunning, not Ok(())");
 
         match err {
             StartStreamError::AlreadyRunning {
                 current_port,
                 current_service_name,
             } => {
-                assert_eq!(current_port, 7889, "AlreadyRunning must carry the CURRENT port (7889)");
                 assert_eq!(
-                    current_service_name,
-                    "_screen-mirror._tcp.local.",
+                    current_port, 7889,
+                    "AlreadyRunning must carry the CURRENT port (7889)"
+                );
+                assert_eq!(
+                    current_service_name, "_screen-mirror._tcp.local.",
                     "AlreadyRunning must carry the CURRENT service name"
                 );
             }
@@ -3054,13 +3073,8 @@ mod tests {
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
         // First start with port 7889 and default name.
-        start_stream_inner(
-            &bridge,
-            channel.clone(),
-            Some(7889),
-            None,
-        )
-        .expect("first start must succeed");
+        start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+            .expect("first start must succeed");
 
         // Second start with DIFFERENT port (7900) and different name.
         let err = start_stream_inner(
@@ -3082,8 +3096,7 @@ mod tests {
                     "AlreadyRunning must carry the CURRENT port (7889), not the new caller's port (7900)"
                 );
                 assert_eq!(
-                    current_service_name,
-                    "_screen-mirror._tcp.local.",
+                    current_service_name, "_screen-mirror._tcp.local.",
                     "AlreadyRunning must carry the CURRENT service name, not the new caller's"
                 );
             }
