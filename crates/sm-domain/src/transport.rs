@@ -524,4 +524,21 @@ mod tests {
             "TRANSPORT_CHANNEL_CAPACITY must be 4 (range [4,8])"
         );
     }
+
+    // ─── B1 RED: TransportError::AddrInUse (R1.1, R1.2) ─────────────────────────
+
+    #[test]
+    fn transport_error_addr_in_use_display_carries_port() {
+        let err = TransportError::AddrInUse { port: 7889 };
+        let msg = format!("{err}");
+        assert_eq!(msg, "UDP port 7889 already in use");
+    }
+
+    #[test]
+    fn transport_error_addr_in_use_debug_contains_variant_name() {
+        let err = TransportError::AddrInUse { port: 7889 };
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("AddrInUse"), "Debug must contain 'AddrInUse', got: {dbg}");
+        assert!(dbg.contains("7889"), "Debug must contain '7889', got: {dbg}");
+    }
 }
