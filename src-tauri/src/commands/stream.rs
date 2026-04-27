@@ -3238,6 +3238,43 @@ mod tests {
         );
     }
 
+    // ─── B7-3 RED: T7.8 — builder error → BundleBuildFailed (probe confirms called) ─
+
+    /// B7-3 / T7.8 — When the builder returns `Err("build failed")`,
+    ///                 `start_stream_inner` must return `Err(BundleBuildFailed("build failed"))`.
+    ///                 The probe additionally proves the builder WAS invoked (once),
+    ///                 confirming that validation passed and the error originates inside
+    ///                 the builder, not from a validation reject.
+    ///
+    /// Spec R7.4 T7.8, R3.2 (BundleBuildFailed variant), design §3 step 7.
+    ///
+    /// RED: `BuilderProbe::assert_called_once` does not exist yet → E0599.
+    #[test]
+    fn test_t7_8_builder_error_returns_bundle_build_failed() {
+        let probe = BuilderProbe::new();
+        // Builder returns a non-AddrInUse error — must map to BundleBuildFailed.
+        let builder = make_test_builder(probe.clone(), Err("build failed"));
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // Use valid args (port=7889, default name) so validation does NOT reject.
+        let err = start_stream_inner(&bridge, channel, None, None)
+            .expect_err("T7.8: builder error must cause start_stream_inner to return Err");
+
+        match err {
+            StartStreamError::BundleBuildFailed(msg) => {
+                assert_eq!(
+                    msg, "build failed",
+                    "T7.8: BundleBuildFailed must carry the builder's error string verbatim"
+                );
+            }
+            other => panic!("T7.8: expected BundleBuildFailed(\"build failed\"), got {other:?}"),
+        }
+
+        // Prove the builder WAS called (validation passed, error came from builder).
+        probe.assert_called_once();
+    }
+
     // ─── B7-2 RED: T7.3 + T7.4 + T7.5 (validation-rejection, builder NOT called) ─
 
     /// B7-2.1 / T7.3 — `start_stream_inner(Some(0), None)` must return
