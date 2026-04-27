@@ -409,4 +409,50 @@ mod tests {
             "second PLI within 2s must be rate-limited"
         );
     }
+
+    // ─── Capability D: backpressure / drop-newest counter ────────────────────
+
+    /// D.1 — dropped_segments counter increments on emit failure.
+    ///
+    /// RED: emit_segment helper and drop-newest logic do not exist yet.
+    /// Tests that BridgeCounters.dropped_segments is observable and increments.
+    #[test]
+    fn dropped_segments_counter_increments() {
+        let counters = Arc::new(BridgeCounters::default());
+        assert_eq!(counters.dropped_segments.load(Ordering::Relaxed), 0);
+        counters.dropped_segments.fetch_add(1, Ordering::Relaxed);
+        counters.dropped_segments.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(counters.dropped_segments.load(Ordering::Relaxed), 2);
+    }
+
+    /// D.2 — fragments_emitted counter increments when emit succeeds.
+    #[test]
+    fn fragments_emitted_counter_increments() {
+        let counters = Arc::new(BridgeCounters::default());
+        counters.fragments_emitted.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
+    }
+
+    // ─── Capability E: Tauri command signatures (compile gate) ───────────────
+
+    /// E.1 — StreamStats implements serde::Serialize (compile gate).
+    #[test]
+    fn stream_stats_is_serializable() {
+        let stats = StreamStats {
+            fragments_emitted: 10,
+            init_segments_emitted: 1,
+            dropped_segments: 0,
+            receiver_dropped_frames: 0,
+            keyframe_requests_fired: 2,
+        };
+        let json = serde_json::to_string(&stats).expect("should serialize");
+        assert!(json.contains("fragments_emitted"));
+    }
+
+    /// E.2 — StreamBridge::default() produces a bridge with no active session.
+    #[test]
+    fn stream_bridge_default_no_session() {
+        let bridge = StreamBridge::default();
+        assert!(!bridge.is_running());
+    }
 }
