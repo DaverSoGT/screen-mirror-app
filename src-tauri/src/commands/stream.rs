@@ -2817,4 +2817,41 @@ mod tests {
             ),
         }
     }
+
+    // ─── B5-fix-A RED: service_name threads to SignalingConfig::service_name ────
+
+    /// B5-fix-A.1 — `build_signaling_config_for_receiver` must set `service_name`
+    /// to the string passed in, NOT leave it at the default.
+    ///
+    /// Spec R2.5: builder receives the resolved `service_name`; explore #284
+    /// identified `SignalingConfig::service_name` as the right vehicle.
+    ///
+    /// RED: `build_signaling_config_for_receiver` does not exist yet → E0425.
+    #[test]
+    fn test_build_signaling_config_for_receiver_threads_service_name() {
+        let cfg = build_signaling_config_for_receiver(7900, "_my-mirror._tcp.local.".to_string());
+        assert_eq!(
+            cfg.service_name,
+            "_my-mirror._tcp.local.",
+            "service_name must be threaded into SignalingConfig::service_name"
+        );
+        assert_eq!(cfg.control_port, 7900);
+        assert_eq!(cfg.role, SignalingRole::Receiver);
+    }
+
+    /// B5-fix-A.2 — Passing a non-default `service_name` must reach the field
+    /// verbatim; the `..SignalingConfig::default()` spread must NOT shadow it.
+    ///
+    /// RED: helper does not exist yet → E0425.
+    #[test]
+    fn test_build_signaling_config_for_receiver_no_default_shadowing() {
+        let cfg =
+            build_signaling_config_for_receiver(7889, "_default._tcp.local.".to_string());
+        assert_eq!(
+            cfg.service_name,
+            "_default._tcp.local.",
+            "the default spread must not overwrite the supplied service_name"
+        );
+        assert_eq!(cfg.control_port, 7889);
+    }
 }
