@@ -167,11 +167,13 @@ pub enum PortRejectReason {
 ///
 /// Design #288 §1.2; spec #287 R3.1–R3.4.
 ///
-/// `#[allow(dead_code)]`: most variants are first constructed by `validate_udp_port`
-/// (B3), `validate_service_name` (B4), and `start_stream_inner` (B5). Only
-/// `BundleBuildFailed` is constructed in B2 (the return-type migration).
-/// Remove this attribute when B5 lands.
-#[allow(dead_code)]
+/// All variants are now constructed: `BundleBuildFailed` (B2), `InvalidPort`/
+/// `InvalidServiceName` (B3/B4 pure fns, called in B5-3 `start_stream_inner`).
+/// `PortInUse` is constructed in B5-4; `AlreadyRunning` is constructed in B6.
+/// `#[allow(dead_code)]` has been removed — B5 wires the final call sites.
+/// (B6's `AlreadyRunning` construction is the only remaining dead-code path; its
+/// suppressor lives on the variant itself until B6 lands — but the enum-level
+/// allow is no longer needed since at least one variant is constructed per gate.)
 #[derive(Debug, thiserror::Error, serde::Serialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum StartStreamError {
@@ -180,6 +182,9 @@ pub enum StartStreamError {
     /// Carries the args of the active session so the frontend can show
     /// "running with port=X service=Y". Both same-args and diff-args double-start
     /// return this variant (PQ-E: no silent ignore).
+    ///
+    /// `#[allow(dead_code)]`: constructed in B6 (current_args lifecycle).
+    #[allow(dead_code)]
     #[error("a stream session is already running on port {current_port} ({current_service_name})")]
     AlreadyRunning {
         current_port: u16,
@@ -203,6 +208,9 @@ pub enum StartStreamError {
     ///
     /// Distinguished from `BundleBuildFailed` so the frontend can suggest
     /// "try a different port" instead of a generic failure message.
+    ///
+    /// `#[allow(dead_code)]`: constructed in B5-4 (PortInUse substring detection shim).
+    #[allow(dead_code)]
     #[error("UDP port {port} is already in use")]
     PortInUse { port: u16 },
 
@@ -231,9 +239,8 @@ pub enum StartStreamError {
 ///
 /// Design #288 §5.1.
 ///
-/// `#[allow(dead_code)]`: first call site lands in B5 (`start_stream_inner`).
-/// Remove this attribute when B5 lands.
-#[allow(dead_code)]
+/// Called from `start_stream_inner` (B5-3) for validated `Some(port)` args.
+/// Spec R4.1, R4.7.
 pub(crate) fn validate_udp_port(value: u16) -> Result<(), StartStreamError> {
     if value == 0 {
         return Err(StartStreamError::InvalidPort {
@@ -264,9 +271,8 @@ pub(crate) fn validate_udp_port(value: u16) -> Result<(), StartStreamError> {
 ///
 /// Spec #287 R5.1, R5.2, R5.3, R5.4, R5.5, R5.6, R5.7.
 ///
-/// `#[allow(dead_code)]`: first call site lands in B5 (`start_stream_inner`).
-/// Remove this attribute when B5 lands.
-#[allow(dead_code)]
+/// Called from `start_stream_inner` (B5-3) for validated `Some(name)` args.
+/// Spec R5.1, R5.7.
 pub(crate) fn validate_service_name(s: &str) -> Result<(), StartStreamError> {
     let invalid = |reason: &str| StartStreamError::InvalidServiceName {
         value: s.to_string(),
@@ -826,40 +832,70 @@ fn build_production_bundle(
 /// Tauri `Channel<InvokeResponseBody>` in `TauriChannel`; tests use `FakeChannel`.
 ///
 /// `udp_port` and `service_name` accept `Option<_>` — `None` resolves to the
-/// respective default. Validation and default-resolution both live here (B5-3 wires
-/// them; for B5-2 this function is extracted with the existing pre-B5 logic).
+/// respective default (7889 and "_screen-mirror._tcp.local." respectively).
+///
+/// Validation order (design §3):
+/// 1. Validate `udp_port` (if `Some`) — pure fn, no locks held.
+/// 2. Validate `service_name` (if `Some`) — pure fn, no locks held.
+/// 3. Resolve defaults for `None` args — static values, not validated (known-good).
+/// 4. Check running state (B5 intermediate: idempotent; B6 replaces with AlreadyRunning).
+/// 5. Invoke the `BuilderFn` with resolved `(port, name, stop_flag)`.
 ///
 /// Design §10 OQ-A2 (option a): `pub(crate)` so the `#[tauri::command]` wrapper is
 /// a thin 4-line forwarder and tests exercise the same code path.
 ///
-/// NOTE (B5 intermediate state): `udp_port` and `service_name` args are accepted but
-/// validation + default-resolution are wired in B5-3. The existing `is_running()`
-/// early-return is PRESERVED here per the Anti-Scope-Creep Guard — B6 replaces it
-/// with the `AlreadyRunning` payload from `current_args`.
+/// NOTE (B5 intermediate state): The existing `is_running()` early-return is
+/// PRESERVED per the Anti-Scope-Creep Guard — B6 replaces it with the
+/// `AlreadyRunning` error carrying `current_args`.
 pub(crate) fn start_stream_inner(
     bridge: &StreamBridge,
     channel: Arc<dyn ChannelLike>,
     udp_port: Option<u16>,
     service_name: Option<String>,
 ) -> Result<(), StartStreamError> {
-    // B5 intermediate: idempotent early-return preserved (B6 will replace with AlreadyRunning).
+    // Step 1 — Validate udp_port BEFORE acquiring any lock (design §3 step 1).
+    // Pure fn; cannot deadlock. Returns Err(InvalidPort{..}) on 0 or < 1024.
+    // Spec R4.1, R4.7; design §5.1.
+    if let Some(p) = udp_port {
+        validate_udp_port(p)?;
+    }
+
+    // Step 2 — Validate service_name BEFORE acquiring any lock (design §3 step 2).
+    // Pure fn; cannot deadlock. Returns Err(InvalidServiceName{..}) on RFC 6763 mismatch.
+    // Spec R5.1, R5.7; design §5.2.
+    if let Some(ref s) = service_name {
+        validate_service_name(s)?;
+    }
+
+    // Step 3 — Resolve defaults (design §3 step 3).
+    // Defaults are static and known-good — not re-validated (saving two fn calls per
+    // default-path invocation). Design §3 rationale: if defaults ever change to
+    // invalid values, unit tests for validate_* will still pass; only the
+    // start_stream_inner integration tests will catch it.
+    // Spec R2.2: None udp_port → 7889. Spec R2.3: None service_name → default.
+    let resolved_port = udp_port.unwrap_or(7889);
+    let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
+
+    // Step 4 — Check running state.
+    // B5 intermediate: idempotent early-return (B6 will replace with AlreadyRunning
+    // carrying current_args). Anti-Scope-Creep Guard: keep this behavior in B5.
     if bridge.is_running() {
         return Ok(());
     }
     let mut guard = bridge.session.lock().unwrap();
 
-    // Resolve defaults (B5-3 wires validators before this step).
-    let resolved_port = udp_port.unwrap_or(7889);
-    let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
-
-    // Clone the builder Arc (cheap atomic increment) so no borrow of bridge.builder
-    // is held during the (potentially slow) build call (design §6, OQ-D1).
+    // Step 5 — Clone the builder Arc (cheap atomic increment) and invoke.
+    // No borrow of bridge.builder held during the (potentially slow) build.
+    // Design §6, OQ-D1.
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let bundle = match (builder)(resolved_port, resolved_name, stop_flag.clone()) {
         Ok(b) => b,
-        Err(e) => return Err(StartStreamError::BundleBuildFailed(e)),
+        Err(e) => {
+            // PortInUse detection added in B5-4; for B5-3 return BundleBuildFailed.
+            return Err(StartStreamError::BundleBuildFailed(e));
+        }
     };
 
     *guard = Some(
@@ -882,19 +918,32 @@ pub(crate) fn start_stream_inner(
 /// - `FRAME_INIT` (`0x00`) = fMP4 init segment (one per session)
 /// - `FRAME_SEGMENT` (`0x01`) = fMP4 media segment (one per GOP)
 ///
-/// Idempotent: if a session is already running, returns `Ok(())` immediately.
-/// Returns immediately — SDP/ICE handshake completes asynchronously via drain threads.
+/// `udp_port`: UDP port for the receiver socket. `None` → default 7889.
+///   Valid range: 1024..=65535 (0 and 1..=1023 are rejected).
+///   Spec R2.1, R2.2. Tauri 2 maps absent JS key → Rust `None` for `Option<T>`.
+///
+/// `service_name`: mDNS service-type name (RFC 6763 format). `None` → default
+///   `"_screen-mirror._tcp.local."`.
+///   Spec R2.1, R2.3, R2.6: must be owned `String` (not `&str`) for Tauri safety.
+///
+/// Returns `Ok(())` on success; `Err(StartStreamError)` on validation failure,
+/// double-start (B6+), build failure, or OS-level port conflict.
+///
+/// Back-compat: `invoke("start_stream", { channel: streamChannel })` (no `udpPort`/
+/// `serviceName` keys) continues to work — absent keys → `None` → defaults applied.
+/// Spec R2.4.
 ///
 /// Thin wrapper over `start_stream_inner` (extracted in B5-2 per design §10 OQ-A2).
-/// `udp_port` and `service_name` args are wired in B5-3.
 /// Return type: `Result<(), StartStreamError>` (migrated from `Result<(), String>` in B2).
 #[tauri::command]
 pub fn start_stream(
     bridge: tauri::State<StreamBridge>,
+    udp_port: Option<u16>,
+    service_name: Option<String>,
     channel: tauri::ipc::Channel<InvokeResponseBody>,
 ) -> Result<(), StartStreamError> {
     let channel_arc: Arc<dyn ChannelLike> = Arc::new(TauriChannel(channel.clone()));
-    start_stream_inner(&bridge, channel_arc, None, None)
+    start_stream_inner(&bridge, channel_arc, udp_port, service_name)
 }
 
 /// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
@@ -2533,9 +2582,9 @@ mod tests {
                 value: 0,
                 reason: PortRejectReason::Zero,
             }) => {}
-            other => panic!(
-                "expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}"
-            ),
+            other => {
+                panic!("expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}")
+            }
         }
     }
 
