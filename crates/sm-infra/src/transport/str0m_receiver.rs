@@ -501,4 +501,177 @@ mod tests {
 
         receiver.stop().unwrap();
     }
+
+    // ─── Task 4.5: receiver wiring tests (RED before Batch 4.6 impl) ──────────
+
+    /// S6.2 — `apply_remote_offer` MUST return an `SdpAnswer` (not NotRunning stub).
+    ///
+    /// Currently returns `Err(NotRunning)` because the stub is not wired to str0m.
+    /// Task 4.6 GREEN implementation must satisfy this test.
+    ///
+    /// The offer passed here is a minimal but valid SDP produced by a sender `Rtc`
+    /// so that the receiver can negotiate and produce a real answer.
+    #[test]
+    fn str0m_receiver_apply_remote_offer_returns_answer_s6_2() {
+        use str0m::Rtc;
+        use str0m::media::{Direction, MediaKind};
+
+        // Build a minimal sender-side Rtc just to generate a real SDP offer.
+        let crypto_s = str0m::crypto::from_feature_flags();
+        let mut rtc_sender = Rtc::builder()
+            .set_crypto_provider(std::sync::Arc::new(crypto_s))
+            .build(std::time::Instant::now());
+        let mut change = rtc_sender.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (str0m_offer, _pending) = change.apply().unwrap();
+        // Serialise to the domain SdpOffer newtype (plain SDP text).
+        let domain_offer = sm_domain::signaling::SdpOffer(str0m_offer.to_string());
+
+        // Build a receiver and call apply_remote_offer BEFORE start().
+        // Per design §8.3 "apply_remote_offer: permitted before OR after start()".
+        let receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        // RED: currently returns Err(NotRunning).
+        // Task 4.6 must return Ok(SdpAnswer(...)) with non-empty SDP.
+        let result = receiver.apply_remote_offer(domain_offer);
+        assert!(
+            result.is_ok(),
+            "apply_remote_offer must return Ok(SdpAnswer), got: {result:?}"
+        );
+        let answer = result.unwrap();
+        assert!(!answer.0.is_empty(), "SdpAnswer must be non-empty");
+        assert!(
+            answer.0.contains("v=0"),
+            "SdpAnswer must be a valid SDP starting with v=0, got: {}",
+            answer.0
+        );
+    }
+
+    /// S6.3 — `apply_remote_offer` BEFORE `start()` MUST NOT panic.
+    ///
+    /// This is a weaker form of S6.2. Even if the impl returns an error,
+    /// it must not panic. Currently passes (stub returns Err). Remains passing
+    /// through task 4.6 (impl may return Ok or Err, but must not panic).
+    #[test]
+    fn str0m_receiver_apply_remote_offer_before_start_no_panic_s6_3() {
+        let receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let dummy_offer = sm_domain::signaling::SdpOffer("v=0\r\n".into());
+        // Must not panic regardless of return value.
+        let _ = receiver.apply_remote_offer(dummy_offer);
+    }
+
+    /// R6.5, S6.3 — `request_keyframe` before start returns `Err(NotRunning)`.
+    /// After start, `request_keyframe()` MUST return `Ok(())`.
+    #[test]
+    fn str0m_receiver_request_keyframe_before_start_returns_not_running() {
+        let receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let result = receiver.request_keyframe();
+        assert!(
+            matches!(result, Err(TransportError::NotRunning)),
+            "request_keyframe before start must return Err(NotRunning), got: {result:?}"
+        );
+    }
+
+    /// R6.5 — `request_keyframe()` MUST return `Ok(())` while the receiver is running.
+    #[test]
+    fn str0m_receiver_request_keyframe_while_running_ok() {
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(4);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        let result = receiver.request_keyframe();
+        assert!(
+            result.is_ok(),
+            "request_keyframe() while running must return Ok, got: {result:?}"
+        );
+
+        receiver.stop().unwrap();
+    }
+
+    /// S14.2 — When the output channel is full and the receiver produces packets,
+    /// `dropped_frames()` MUST increase and no panic or block MUST occur.
+    ///
+    /// This test is currently GREEN (tick loop drops all packets since MediaData
+    /// events are not yet emitted in the stub). Remains GREEN after 4.6 when the
+    /// real impl uses `try_send` with drop-newest.
+    #[test]
+    fn str0m_receiver_full_output_channel_no_panic_s14_2() {
+        use std::time::Duration;
+
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        // Capacity-1 channel we NEVER drain.
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(1);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        // Let the receiver tick for a short time.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Must not panic.
+        let result = receiver.stop();
+        assert!(
+            result.is_ok(),
+            "stop() must return Ok with full output channel"
+        );
+    }
+
+    /// S14.4 — `stop()` called from one thread while the tick loop is blocked in
+    /// `recv_from` MUST return within 500 ms (uses 200 ms read timeout inside tick loop).
+    #[test]
+    fn str0m_receiver_stop_unblocks_from_recv_within_500ms_s14_4() {
+        use std::time::{Duration, Instant};
+
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(4);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        // Give the thread a moment to enter recv_from.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let t0 = Instant::now();
+        receiver.stop().unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "stop() must return within 500 ms, took: {elapsed:?}"
+        );
+    }
 }
