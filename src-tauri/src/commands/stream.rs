@@ -133,6 +133,32 @@ struct BridgeCounters {
 pub(crate) type BuilderFn =
     Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> + Send + Sync>;
 
+// ─── BundleError — typed error returned by BuilderFn (C2) ────────────────────
+
+/// App-level error returned by the bundle factory (`BuilderFn` and
+/// `build_production_bundle`). Translated into `StartStreamError` at the
+/// command boundary (`start_stream_inner`).
+///
+/// Two variants, no more (PQ-E):
+/// - `PortInUse(u16)` — the only actionable failure; the frontend uses this
+///   to suggest "try a different port".
+/// - `Other(String)` — every other failure path: signaling init, signaling start,
+///   `Str0mVideoReceiver::new` (config validation), thread spawn, future paths.
+///
+/// `pub(crate)`: NEVER reaches IPC (NR5). Only `StartStreamError` is serialized.
+///
+/// `Send + Sync`: enforced transitively (`u16: Send + Sync`, `String: Send + Sync`).
+/// This is required because `BuilderFn`'s return type must be `Send + Sync`-bounded
+/// to satisfy the `Arc<dyn Fn(...) -> Result<_, _> + Send + Sync>` typedef.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BundleError {
+    #[error("UDP port {0} already in use")]
+    PortInUse(u16),
+
+    #[error("bundle build failed: {0}")]
+    Other(String),
+}
+
 // ─── PortRejectReason — sub-enum for StartStreamError::InvalidPort ───────────
 
 /// Why a `udp_port` value was rejected by `validate_udp_port`.
