@@ -30,7 +30,6 @@ use sm_domain::encode::EncodedPacket;
 use sm_domain::transport::{TRANSPORT_CHANNEL_CAPACITY, TransportError};
 use sm_infra::render::fmp4_muxer::{Mp4Muxer, extract_sps_pps_from_idr};
 use tauri::ipc::InvokeResponseBody;
-use tauri::Emitter;
 
 // ─── Frame discriminants ──────────────────────────────────────────────────────
 
@@ -342,7 +341,7 @@ fn mux_thread(
             // After init is emitted: feed to muxer.
             if let Some(m) = muxer.as_mut() {
                 if let Some(segment) = m.append_packet(&pkt) {
-                    emit_segment(&app, &counters, segment);
+                    emit_segment(&channel, &counters, segment);
                 }
             }
             continue;
@@ -358,7 +357,7 @@ fn mux_thread(
                 let m = Mp4Muxer::new(1920, 1080, 30, 1);
                 match m.build_init_segment(&sps, &pps) {
                     Ok(init_bytes) => {
-                        emit_init(&app, &counters, init_bytes);
+                        emit_init(&channel, &counters, init_bytes);
                         init_emitted = true;
                         // Drop pre-IDR buffer (those frames are gone — no init to attach them to).
                         pre_idr_buffer.clear();
@@ -381,19 +380,19 @@ fn mux_thread(
         // Feed the IDR to the muxer (may flush the previous GOP).
         if let Some(m) = muxer.as_mut() {
             if let Some(segment) = m.append_packet(&pkt) {
-                emit_segment(&app, &counters, segment);
+                emit_segment(&channel, &counters, segment);
             }
         }
     }
 }
 
-/// Emit an init segment via `app.emit("stream/init", bytes)`.
+/// Send an fMP4 init segment through the channel (F-fix-2).
 ///
-/// OQ-tauri-emit-1: `Vec<u8>` is JSON-serialized by Tauri 2 `emit` as
-/// `Array<number>`. The JS `toUint8Array()` helper wraps it. Acceptable for V1
-/// (4 KB init segment → ~12 KB JSON payload over LAN).
-fn emit_init(app: &tauri::AppHandle, counters: &BridgeCounters, bytes: Vec<u8>) {
-    match app.emit("stream/init", bytes) {
+/// OQ-tauri-emit-1 pivot: uses `InvokeResponseBody::Raw` with discriminant byte
+/// `FRAME_INIT` (`0x00`). No JSON encoding — binary delivery to the WebView.
+/// JS side reads `data[0]` to distinguish init from segment.
+fn emit_init(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes: Vec<u8>) {
+    match channel.send_raw(FRAME_INIT, bytes) {
         Ok(_) => {
             counters
                 .init_segments_emitted
@@ -405,12 +404,12 @@ fn emit_init(app: &tauri::AppHandle, counters: &BridgeCounters, bytes: Vec<u8>) 
     }
 }
 
-/// Emit a media segment via `app.emit("stream/segment", bytes)`.
+/// Send an fMP4 media segment through the channel (F-fix-2).
 ///
-/// Backpressure (Capability D): if emit returns an error (e.g., window closed),
-/// increment `dropped_segments` (drop-newest — we don't queue, we just drop).
-fn emit_segment(app: &tauri::AppHandle, counters: &BridgeCounters, bytes: Vec<u8>) {
-    match app.emit("stream/segment", bytes) {
+/// Backpressure (Capability D): if the channel send returns an error,
+/// increment `dropped_segments` (drop-newest — no queuing, just drop).
+fn emit_segment(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes: Vec<u8>) {
+    match channel.send_raw(FRAME_SEGMENT, bytes) {
         Ok(_) => {
             counters.fragments_emitted.fetch_add(1, Ordering::Relaxed);
         }
@@ -555,7 +554,11 @@ mod tests {
     fn emit_init_sends_init_discriminant() {
         let ch = FakeChannel::new();
         let counters = Arc::new(BridgeCounters::default());
-        emit_init(&(ch.clone() as Arc<dyn ChannelLike>), &counters, vec![0xDE, 0xAD]);
+        emit_init(
+            &(ch.clone() as Arc<dyn ChannelLike>),
+            &counters,
+            vec![0xDE, 0xAD],
+        );
         assert!(ch.has_discriminant(FRAME_INIT));
         assert_eq!(counters.init_segments_emitted.load(Ordering::Relaxed), 1);
     }
@@ -565,7 +568,11 @@ mod tests {
     fn emit_segment_sends_segment_discriminant() {
         let ch = FakeChannel::new();
         let counters = Arc::new(BridgeCounters::default());
-        emit_segment(&(ch.clone() as Arc<dyn ChannelLike>), &counters, vec![0xBE, 0xEF]);
+        emit_segment(
+            &(ch.clone() as Arc<dyn ChannelLike>),
+            &counters,
+            vec![0xBE, 0xEF],
+        );
         assert!(ch.has_discriminant(FRAME_SEGMENT));
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 1);
     }
