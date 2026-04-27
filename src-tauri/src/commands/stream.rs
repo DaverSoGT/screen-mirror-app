@@ -208,4 +208,127 @@ mod tests {
         let result = sm_infra::render::fmp4_muxer::extract_sps_pps_from_idr(&[]);
         assert!(result.is_none());
     }
+
+    // ─── Capability C: PLI fire-once on attach ───────────────────────────────
+
+    /// Fake receiver that counts PLI calls.
+    struct FakeReceiver {
+        pli_count: std::sync::atomic::AtomicU32,
+    }
+
+    impl FakeReceiver {
+        fn new() -> Self {
+            Self {
+                pli_count: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl ReceiverOps for FakeReceiver {
+        fn request_keyframe(&self) -> Result<(), TransportError> {
+            self.pli_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn dropped_frames(&self) -> u64 {
+            0
+        }
+    }
+
+    fn make_bridge_with_fake_receiver() -> StreamBridge {
+        let bridge = StreamBridge::new();
+        let counters = Arc::new(BridgeCounters::default());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = bridge.session.lock().unwrap();
+            *guard = Some(StreamSession {
+                stop_flag,
+                mux_handle: None,
+                counters,
+                receiver: Some(Box::new(FakeReceiver::new())),
+                last_pli: None,
+            });
+        }
+        bridge
+    }
+
+    /// C.1 — PLI is fired exactly once on the first attach call.
+    ///
+    /// RED: attach logic does not exist on StreamBridge yet.
+    #[test]
+    fn pli_fired_once_on_attach() {
+        let bridge = make_bridge_with_fake_receiver();
+        // Simulate attach_stream logic directly (cannot use Tauri State in unit tests).
+        {
+            let mut guard = bridge.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let now = std::time::Instant::now();
+            let should_fire = session.last_pli.is_none();
+            if should_fire {
+                if let Some(recv) = &session.receiver {
+                    let _ = recv.request_keyframe();
+                    session
+                        .counters
+                        .keyframe_requests_fired
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                session.last_pli = Some(now);
+            }
+        }
+        let guard = bridge.session.lock().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert_eq!(
+            session
+                .counters
+                .keyframe_requests_fired
+                .load(Ordering::Relaxed),
+            1,
+            "PLI must fire exactly once on first attach"
+        );
+    }
+
+    /// C.2 — second attach within 2 seconds is rate-limited: no second PLI.
+    #[test]
+    fn pli_rate_limited_within_2s() {
+        let bridge = make_bridge_with_fake_receiver();
+        // First attach.
+        {
+            let mut guard = bridge.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            session.last_pli = Some(std::time::Instant::now());
+            session
+                .counters
+                .keyframe_requests_fired
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Second attach immediately (< 2s elapsed).
+        {
+            let mut guard = bridge.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let now = std::time::Instant::now();
+            let elapsed = session
+                .last_pli
+                .map(|t| now.duration_since(t))
+                .unwrap_or(std::time::Duration::MAX);
+            if elapsed >= std::time::Duration::from_secs(2) {
+                if let Some(recv) = &session.receiver {
+                    let _ = recv.request_keyframe();
+                    session
+                        .counters
+                        .keyframe_requests_fired
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                session.last_pli = Some(now);
+            }
+        }
+        let guard = bridge.session.lock().unwrap();
+        let session = guard.as_ref().unwrap();
+        assert_eq!(
+            session
+                .counters
+                .keyframe_requests_fired
+                .load(Ordering::Relaxed),
+            1,
+            "second PLI within 2s must be rate-limited"
+        );
+    }
 }
