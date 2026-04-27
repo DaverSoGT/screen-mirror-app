@@ -393,8 +393,9 @@ fn run_sender_loop(
             match msg {
                 SenderControl::ApplyAnswer(ans) => {
                     if let Some(pending) = pre_neg.pending.take() {
-                        // Deserialise the domain SdpAnswer string to str0m's SdpAnswer.
-                        match serde_json::from_str::<str0m::change::SdpAnswer>(&ans.0) {
+                        // Parse the domain SdpAnswer (plain SDP text) to str0m's SdpAnswer.
+                        // The answer is produced by Str0mVideoReceiver using SdpAnswer::to_string().
+                        match str0m::change::SdpAnswer::from_sdp_string(&ans.0) {
                             Ok(str0m_answer) => {
                                 if let Err(e) = rtc.sdp_api().accept_answer(pending, str0m_answer) {
                                     let _ = event_tx.try_send(TransportEvent::ConnectionLost {

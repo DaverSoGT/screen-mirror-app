@@ -5,35 +5,46 @@
 //!
 //! # Thread model
 //!
-//! - `new()`: validates config; allocates shared atomics. No thread, no socket, no `Rtc`.
-//! - `start(pkt_tx, event_tx)`: binds the `UdpSocket`, creates `Rtc`, spawns one OS thread
-//!   that owns both. The thread runs the SansIO tick loop.
+//! - `new()`: creates `Rtc`; no socket, no thread.
+//! - `apply_remote_offer(&self, offer)`: accepts a remote SDP offer synchronously using
+//!   the pre-constructed `Rtc` and returns the local `SdpAnswer`. May be called before or
+//!   after `start()`.
+//! - `start(pkt_tx, event_tx)`: binds the `UdpSocket`, moves `Rtc` into one OS thread
+//!   that runs the SansIO tick loop with media demux + PLI emission.
 //! - `stop()`: sets the `AtomicBool` stop flag and joins the thread. Idempotent.
 //! - `Drop`: calls `stop()` to prevent leaked threads on panic or forgotten stop.
 //!
-//! # Batch 3 scope
+//! # Batch 4 additions vs Batch 3
 //!
-//! Adapter skeleton only: constructor, lifecycle (start/stop/Drop), SansIO pump thread.
-//! No media demuxing, no PLI emission, no offer/answer wiring — those land in Batch 4.
-//! `apply_remote_offer`, `add_remote_candidate`, `request_keyframe` return `Err(NotRunning)`
-//! as Batch 3 stubs.
+//! - `Rtc` is created in `new()` (not `start()`) so that `apply_remote_offer()` works
+//!   as a synchronous pre-thread call, mirroring how `Str0mVideoSender::create_local_offer`
+//!   is synchronous.
+//! - `apply_remote_offer` calls `rtc.sdp_api().accept_offer(offer)` → returns `SdpAnswer`.
+//! - Tick loop handles `ReceiverControl::AddCandidate` → `rtc.add_remote_candidate(c)`.
+//! - Tick loop handles `ReceiverControl::RequestKeyframe` → `rtc.writer(mid).request_keyframe(...)`.
+//! - Tick loop handles `Event::MediaData` → reconstruct Annex-B → emit `EncodedPacket`.
+//! - `Event::MediaAdded` captures the media `Mid` for subsequent PLI calls.
+//! - `recv_from` timeout capped at 200 ms so `stop()` unblocks quickly (S14.4).
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use str0m::Event;
+use str0m::media::{KeyframeRequestKind, Mid};
 use str0m::net::{Protocol, Receive};
-use str0m::{IceConnectionState, Input, Output, Rtc};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 use sm_domain::encode::EncodedPacket;
 use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer};
 use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoReceiver,
 };
+
+use crate::transport::annex_b::{contains_idr_nal, reconstruct_annex_b};
 
 // ─── Internal control message ────────────────────────────────────────────────
 
@@ -48,6 +59,18 @@ enum ReceiverControl {
     RequestKeyframe,
 }
 
+// ─── Pre-negotiation state ───────────────────────────────────────────────────
+
+/// Holds the `Rtc` instance before `start()` is called (and during the tick thread).
+///
+/// Protected by a `Mutex` so that `apply_remote_offer(&self)` can call `&mut Rtc`
+/// without requiring `&mut self` on the public API method.
+struct ReceiverPreNeg {
+    rtc: Rtc,
+    /// Media identifier captured from `Event::MediaAdded`; needed for PLI.
+    mid: Option<Mid>,
+}
+
 // ─── Shared state ────────────────────────────────────────────────────────────
 
 /// Cross-thread state shared between the caller and the SansIO tick thread.
@@ -56,6 +79,8 @@ struct ReceiverShared {
     stop: AtomicBool,
     /// Cumulative count of `EncodedPacket`s dropped due to consumer backpressure.
     dropped: AtomicU64,
+    /// Monotonically increasing sequence counter reset to 0 on `start()`.
+    seq: AtomicU64,
 }
 
 impl ReceiverShared {
@@ -63,6 +88,7 @@ impl ReceiverShared {
         Arc::new(Self {
             stop: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
+            seq: AtomicU64::new(0),
         })
     }
 }
@@ -75,12 +101,16 @@ impl ReceiverShared {
 ///
 /// # Lifecycle
 ///
-/// 1. `new(config)` — lightweight construction; no socket, no thread.
-/// 2. `start(pkt_tx, event_tx)` — binds UDP socket, spawns one OS thread.
-/// 3. `stop()` / `Drop` — sets stop flag, joins thread. Idempotent.
+/// 1. `new(config)` — creates `Rtc`; no socket, no thread.
+/// 2. `apply_remote_offer(offer)` — synchronous; can be called before or after `start()`.
+/// 3. `start(pkt_tx, event_tx)` — binds UDP socket, spawns one OS thread.
+/// 4. `stop()` / `Drop` — sets stop flag, joins thread. Idempotent.
 pub struct Str0mVideoReceiver {
     /// Original transport configuration.
     config: TransportConfig,
+    /// Pre-negotiation state: Rtc + Mid. Guarded by Mutex for `&self` access on
+    /// `apply_remote_offer`. Taken out (→ None) when `start()` moves Rtc to tick thread.
+    pre_neg: Mutex<Option<ReceiverPreNeg>>,
     /// Shared atomic state between caller and tick thread.
     state: Arc<ReceiverShared>,
     /// Control inbox: caller → tick thread. Created in `start()`.
@@ -101,22 +131,33 @@ impl std::fmt::Debug for Str0mVideoReceiver {
 // SAFETY: All shared mutable state crosses the thread boundary via
 // `Arc<ReceiverShared>` (atomics only) and `SyncSender<ReceiverControl>`
 // (Send when its element is Send). `JoinHandle<()>` is Send.
-// `TransportConfig` contains Send-only data (String, u16, u32, Copy enum).
+// `Mutex<Option<ReceiverPreNeg>>` is Send when `ReceiverPreNeg: Send`
+// (Rtc is Send per str0m guarantee).
 unsafe impl Send for Str0mVideoReceiver {}
-// SAFETY: Methods that take `&self` only read atomics or clone `SyncSender`,
-// both of which are Sync (the latter is Sync when its element is Send).
+// SAFETY: Methods that take `&self` either read atomics (Sync), clone SyncSender (Sync),
+// or acquire the Mutex<Option<ReceiverPreNeg>> (Mutex is Sync). No `&self` path reaches
+// a `!Sync` field.
 unsafe impl Sync for Str0mVideoReceiver {}
 
 impl VideoReceiver for Str0mVideoReceiver {
     /// Construct a receiver with the given configuration.
     ///
-    /// Does NOT bind a socket. Does NOT spawn a thread. Does NOT allocate `Rtc`.
+    /// Creates an `Rtc` instance synchronously so that `apply_remote_offer()` works
+    /// without a thread.
     fn new(config: TransportConfig) -> Result<Self, TransportError>
     where
         Self: Sized,
     {
+        let crypto = str0m::crypto::from_feature_flags();
+        let rtc = Rtc::builder()
+            .set_crypto_provider(Arc::new(crypto))
+            .build(Instant::now());
+
+        let pre_neg = ReceiverPreNeg { rtc, mid: None };
+
         Ok(Self {
             config,
+            pre_neg: Mutex::new(Some(pre_neg)),
             state: ReceiverShared::new(),
             control_tx: None,
             handle: None,
@@ -136,8 +177,9 @@ impl VideoReceiver for Str0mVideoReceiver {
             return Err(TransportError::AlreadyRunning);
         }
 
-        // Reset stop flag in case this receiver is restarted.
+        // Reset stop flag and sequence counter in case this receiver is restarted.
         self.state.stop.store(false, Ordering::Release);
+        self.state.seq.store(0, Ordering::Release);
 
         let bind_addr = format!("0.0.0.0:{}", self.config.udp_port);
         let udp = UdpSocket::bind(&bind_addr)
@@ -146,10 +188,26 @@ impl VideoReceiver for Str0mVideoReceiver {
             .local_addr()
             .map_err(|e| TransportError::Io(e.to_string()))?;
 
-        let crypto = str0m::crypto::from_feature_flags();
-        let rtc = Rtc::builder()
-            .set_crypto_provider(Arc::new(crypto))
-            .build(Instant::now());
+        // Take the Rtc out of pre_neg and move it into the thread.
+        let pre_neg = {
+            let mut guard = self.pre_neg.lock().unwrap();
+            guard
+                .take()
+                .ok_or_else(|| TransportError::Internal("Rtc already moved to thread".into()))?
+        };
+
+        // Add local ICE host candidate if addr is not wildcard.
+        let mut rtc_tmp = pre_neg.rtc;
+        if !local_addr.ip().is_unspecified() {
+            if let Ok(cand) = Candidate::host(local_addr, "udp") {
+                rtc_tmp.add_local_candidate(cand);
+            }
+        }
+
+        let pre_neg_with_candidate = ReceiverPreNeg {
+            rtc: rtc_tmp,
+            mid: pre_neg.mid,
+        };
 
         let (ctrl_tx, ctrl_rx) =
             std::sync::mpsc::sync_channel::<ReceiverControl>(TRANSPORT_CHANNEL_CAPACITY);
@@ -160,7 +218,15 @@ impl VideoReceiver for Str0mVideoReceiver {
         let handle = std::thread::Builder::new()
             .name("sm-transport-receiver".into())
             .spawn(move || {
-                run_receiver_loop(rtc, udp, local_addr, pkt_tx, event_tx, ctrl_rx, state);
+                run_receiver_loop(
+                    pre_neg_with_candidate,
+                    udp,
+                    local_addr,
+                    pkt_tx,
+                    event_tx,
+                    ctrl_rx,
+                    state,
+                );
             })
             .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
 
@@ -178,11 +244,45 @@ impl VideoReceiver for Str0mVideoReceiver {
         Ok(())
     }
 
-    /// Apply a remote SDP offer and return the local answer.
+    /// Accept a remote SDP offer and return the local SDP answer.
     ///
-    /// Batch 3 stub — full str0m offer/answer wiring lands in Batch 4.
-    fn apply_remote_offer(&self, _offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
-        Err(TransportError::NotRunning)
+    /// Deserialises the domain `SdpOffer` string → str0m `SdpOffer` → calls
+    /// `rtc.sdp_api().accept_offer(offer)` → serialises the resulting `SdpAnswer`
+    /// to the domain `SdpAnswer` newtype.
+    ///
+    /// Can be called before or after `start()`. Returns `Err(Internal)` if the
+    /// `Rtc` has already been moved to the tick thread (i.e., after `start()` was
+    /// called and the offer was not yet applied).
+    fn apply_remote_offer(&self, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
+        let mut guard = self
+            .pre_neg
+            .lock()
+            .map_err(|e| TransportError::Internal(format!("mutex poisoned: {e}")))?;
+
+        match guard.as_mut() {
+            None => Err(TransportError::Internal(
+                "Rtc already moved to thread; apply_remote_offer must be called before start()"
+                    .into(),
+            )),
+            Some(pn) => {
+                // Parse the domain SdpOffer (plain SDP text) to str0m's SdpOffer.
+                // The offer is produced by Str0mVideoSender using SdpOffer::to_string()
+                // (the Display impl outputs the SDP session description text).
+                let str0m_offer =
+                    str0m::change::SdpOffer::from_sdp_string(&offer.0).map_err(|e| {
+                        TransportError::Internal(format!("SDP offer parse failed: {e}"))
+                    })?;
+
+                // Accept the offer and produce an answer.
+                let str0m_answer =
+                    pn.rtc.sdp_api().accept_offer(str0m_offer).map_err(|e| {
+                        TransportError::Internal(format!("accept_offer failed: {e}"))
+                    })?;
+
+                // Serialise the str0m SdpAnswer to plain SDP text (symmetric with offer).
+                Ok(SdpAnswer(str0m_answer.to_string()))
+            }
+        }
     }
 
     /// Add a remote ICE candidate. Posts to the tick thread's control inbox.
@@ -227,22 +327,18 @@ impl Drop for Str0mVideoReceiver {
 /// SansIO tick loop for `Str0mVideoReceiver`.
 ///
 /// Runs on the dedicated OS thread spawned by `start()`.
-///
-/// # Batch 3 scope
-///
-/// This loop pumps str0m and checks the stop flag. It does NOT demux media
-/// (no `Event::MediaData` → Annex-B reconstruction → `pkt_tx.try_send`),
-/// no PLI emission, no offer/answer wiring. Those land in Batch 4.
+#[allow(clippy::too_many_arguments)]
 fn run_receiver_loop(
-    mut rtc: Rtc,
+    mut pre_neg: ReceiverPreNeg,
     udp: UdpSocket,
     local_addr: SocketAddr,
-    _pkt_tx: SyncSender<EncodedPacket>,
+    pkt_tx: SyncSender<EncodedPacket>,
     event_tx: SyncSender<TransportEvent>,
     ctrl_rx: Receiver<ReceiverControl>,
     state: Arc<ReceiverShared>,
 ) {
     let mut buf = vec![0u8; 2048];
+    let rtc = &mut pre_neg.rtc;
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -250,14 +346,23 @@ fn run_receiver_loop(
             break;
         }
 
-        // ── 2. Drain control inbox (Batch 4: candidate add + PLI emission) ─
+        // ── 2. Drain control inbox ────────────────────────────────────────
         while let Ok(msg) = ctrl_rx.try_recv() {
             match msg {
-                ReceiverControl::AddCandidate(_cand) => {
-                    // Batch 4: parse + rtc.add_remote_candidate(c)
+                ReceiverControl::AddCandidate(cand) => {
+                    // Candidates are JSON-serialised str0m::Candidate values.
+                    if let Ok(c) = serde_json::from_str::<Candidate>(&cand.0) {
+                        rtc.add_remote_candidate(c);
+                    }
+                    // Silently ignore un-parseable candidates.
                 }
                 ReceiverControl::RequestKeyframe => {
-                    // Batch 4: rtc.direct_api().request_keyframe(mid, KeyframeRequestKind::Pli)
+                    // Send a PLI to the remote sender.
+                    if let Some(mid) = pre_neg.mid {
+                        if let Some(mut writer) = rtc.writer(mid) {
+                            let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
+                        }
+                    }
                 }
             }
         }
@@ -270,7 +375,7 @@ fn run_receiver_loop(
                     let _ = udp.send_to(&t.contents, t.destination);
                 }
                 Ok(Output::Event(ev)) => {
-                    handle_receiver_event(ev, &state, &event_tx);
+                    handle_receiver_event(ev, &mut pre_neg.mid, &state, &pkt_tx, &event_tx);
                 }
                 Err(_) => {
                     let _ = event_tx.try_send(TransportEvent::ConnectionLost {
@@ -286,11 +391,14 @@ fn run_receiver_loop(
         }
 
         // ── 4. Blocking recv_from with deadline-derived timeout ──────────
+        // Cap at 200 ms so that stop() unblocks quickly (S14.4).
         let now = Instant::now();
         let remaining = deadline
             .checked_duration_since(now)
             .unwrap_or(Duration::from_millis(1));
-        let timeout = remaining.max(Duration::from_millis(1));
+        let timeout = remaining
+            .min(Duration::from_millis(200))
+            .max(Duration::from_millis(1));
 
         if let Err(e) = udp.set_read_timeout(Some(timeout)) {
             let _ = event_tx.try_send(TransportEvent::ConnectionLost {
@@ -327,15 +435,15 @@ fn run_receiver_loop(
             }
         }
     }
+    // Thread exits cleanly — socket dropped here.
 }
 
 /// Dispatch str0m events for the receiver.
-///
-/// Batch 3 only handles ICE state-change events for observability.
-/// `Event::MediaData` (RTP demux → Annex-B EncodedPacket) is wired in Batch 4.
 fn handle_receiver_event(
     ev: Event,
-    _state: &ReceiverShared,
+    mid_slot: &mut Option<Mid>,
+    state: &ReceiverShared,
+    pkt_tx: &SyncSender<EncodedPacket>,
     event_tx: &SyncSender<TransportEvent>,
 ) {
     match ev {
@@ -344,6 +452,28 @@ fn handle_receiver_event(
         }
         Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
             let _ = event_tx.try_send(TransportEvent::IceFailed);
+        }
+        Event::MediaAdded(added) => {
+            // Capture the mid so we can send PLI later.
+            *mid_slot = Some(added.mid);
+        }
+        Event::MediaData(media) => {
+            // Reconstruct Annex-B from whatever framing str0m used.
+            // str0m's H264Depacketizer with is_avc=false outputs Annex-B directly;
+            // reconstruct_annex_b detects this and passes through without double-prefix.
+            let annex_b = reconstruct_annex_b(&media.data);
+            let is_keyframe = media.is_keyframe() || contains_idr_nal(&annex_b);
+
+            let pkt = EncodedPacket {
+                data: Arc::from(annex_b.as_slice()),
+                is_keyframe,
+                timestamp: Duration::from_micros(media.time.as_micros()),
+                sequence: state.seq.fetch_add(1, Ordering::Relaxed),
+            };
+
+            if pkt_tx.try_send(pkt).is_err() {
+                state.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
         _ => {}
     }
