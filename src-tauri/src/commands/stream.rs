@@ -147,10 +147,6 @@ pub(crate) type BuilderFn =
 /// `0..=65535`; no out-of-range case exists after `Zero` and `Privileged` are
 /// handled. If a future change adds an upper-bound forbidden range (e.g. forbid
 /// 65535), add `OutOfRange { min: u16, max: u16 }` at that time.
-///
-/// `#[allow(dead_code)]`: variants first constructed by `validate_udp_port`
-/// which lands in B3. Remove this attribute when B3 lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PortRejectReason {
     /// `value == 0` — would silently corrupt the ICE candidate (Risk #1 from
@@ -215,6 +211,43 @@ pub enum StartStreamError {
     /// `build_production_bundle`. Translated at the command boundary.
     #[error("bundle build failed: {0}")]
     BundleBuildFailed(String),
+}
+
+// ─── Validation helpers (C4) ─────────────────────────────────────────────────
+
+/// Reject `udp_port` values that would corrupt the ICE candidate or require
+/// privileged binding.
+///
+/// Lives at the Tauri-shell layer, NOT inside the str0m adapter (per PQ-C,
+/// spec #287 R4.1, R4.7).
+///
+/// Rules (spec #287 R4.2–R4.3):
+/// - `0` → `Err(InvalidPort { reason: Zero })` — port 0 would silently corrupt
+///   the ICE candidate (proposal Risk #1: OS picks an ephemeral port but the
+///   ICE candidate would still advertise 0, causing silent connectivity failure).
+/// - `1..=1023` → `Err(InvalidPort { reason: Privileged })` — privileged range;
+///   cross-platform UX guard.
+/// - `1024..=65535` → `Ok(())` — valid, non-privileged range.
+///
+/// Design #288 §5.1.
+///
+/// `#[allow(dead_code)]`: first call site lands in B5 (`start_stream_inner`).
+/// Remove this attribute when B5 lands.
+#[allow(dead_code)]
+pub(crate) fn validate_udp_port(value: u16) -> Result<(), StartStreamError> {
+    if value == 0 {
+        return Err(StartStreamError::InvalidPort {
+            value,
+            reason: PortRejectReason::Zero,
+        });
+    }
+    if value < 1024 {
+        return Err(StartStreamError::InvalidPort {
+            value,
+            reason: PortRejectReason::Privileged,
+        });
+    }
+    Ok(())
 }
 
 // ─── StreamBridge — Capability A ─────────────────────────────────────────────
@@ -1985,7 +2018,9 @@ mod tests {
                 value: 0,
                 reason: PortRejectReason::Zero,
             }) => {}
-            other => panic!("expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}"),
+            other => {
+                panic!("expected Err(InvalidPort {{ value: 0, reason: Zero }}), got {other:?}")
+            }
         }
     }
 
