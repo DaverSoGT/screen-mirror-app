@@ -154,7 +154,7 @@ pub enum TransportError {
 /// Call `set_encoder(Arc<dyn VideoEncoder + Send + Sync>)` BEFORE `start()`.
 /// The encoder is held inside the tick thread for direct PLI response
 /// (call `encoder.request_keyframe()` on `Event::KeyframeRequest`).
-pub trait VideoSender: Send {
+pub trait VideoSender: Send + Sync {
     /// Construct a sender with the given configuration.
     ///
     /// Does NOT bind a socket. Does NOT spawn a thread.
@@ -210,7 +210,7 @@ pub trait VideoSender: Send {
 ///
 /// `new()` does NOT spawn a thread. `start()` spawns exactly one OS thread.
 /// `stop()` is idempotent and joins the thread.
-pub trait VideoReceiver: Send {
+pub trait VideoReceiver: Send + Sync {
     /// Construct a receiver with the given configuration.
     ///
     /// Does NOT bind a socket. Does NOT spawn a thread.

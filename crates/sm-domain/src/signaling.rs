@@ -159,7 +159,7 @@ pub enum SignalingError {
 ///
 /// - `sm_infra::signaling::MdnsSignaling` — mDNS auto-discovery + TCP control channel.
 /// - `sm_infra::signaling::LoopbackSignaling` — In-memory fixture, no networking.
-pub trait Signaling: Send {
+pub trait Signaling: Send + Sync {
     /// Construct a signaling instance with the given configuration.
     ///
     /// Does NOT connect to the network. Does NOT spawn a thread.
