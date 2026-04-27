@@ -133,6 +133,29 @@ struct BridgeCounters {
 pub(crate) type BuilderFn =
     Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> + Send + Sync>;
 
+// ─── PortRejectReason — sub-enum for StartStreamError::InvalidPort ───────────
+
+/// Why a `udp_port` value was rejected by `validate_udp_port`.
+///
+/// Serialized as a string variant (default serde enum representation) so the
+/// JS layer sees `"reason": "Privileged"` — a bare JSON string, not an object.
+///
+/// Design #288 §1.3; spec #287 R3.3.
+///
+/// NOTE: `OutOfRange` was listed as a placeholder in the PQ decisions (#285)
+/// but was DROPPED in the design phase. `u16` already bounds the value to
+/// `0..=65535`; no out-of-range case exists after `Zero` and `Privileged` are
+/// handled. If a future change adds an upper-bound forbidden range (e.g. forbid
+/// 65535), add `OutOfRange { min: u16, max: u16 }` at that time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum PortRejectReason {
+    /// `value == 0` — would silently corrupt the ICE candidate (Risk #1 from
+    /// proposal: port 0 in the ICE candidate causes silent connectivity failure).
+    Zero,
+    /// `1..=1023` — privileged port range; cross-platform UX guard (PQ-C).
+    Privileged,
+}
+
 // ─── StreamBridge — Capability A ─────────────────────────────────────────────
 
 /// Tauri managed state for an active streaming session.
