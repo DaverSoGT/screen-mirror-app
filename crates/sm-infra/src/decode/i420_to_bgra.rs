@@ -8,14 +8,14 @@
 ///
 /// # Parameters
 ///
-/// - `y`      — Y (luma) plane; must be exactly `width × height` bytes.
-/// - `u`      — U (Cb) plane; must be exactly `(width/2) × (height/2)` bytes
-///              (integer division — no padding).
-/// - `v`      — V (Cr) plane; same size as `u`.
-/// - `width`  — frame width in pixels.
+/// - `y` — Y (luma) plane; must be exactly `width × height` bytes.
+/// - `u` — U (Cb) plane; must be exactly `(width/2) × (height/2)` bytes
+///   (integer division — no padding).
+/// - `v` — V (Cr) plane; same size as `u`.
+/// - `width` — frame width in pixels.
 /// - `height` — frame height in pixels.
-/// - `dst`    — output buffer; MUST be exactly `width * height * 4` bytes.
-///              Output byte order per pixel: `[B, G, R, A]` (A = 255 opaque).
+/// - `dst` — output buffer; MUST be exactly `width * height * 4` bytes.
+///   Output byte order per pixel: `[B, G, R, A]` (A = 255 opaque).
 ///
 /// # Panics
 ///
@@ -69,8 +69,8 @@ pub fn convert(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32, dst: &mut 
             //   516 ≈ 2.018 × 256  (U → B)
             let c = 298 * (y_val - 16);
             let r = ((c + 409 * (v_val - 128) + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((c - 100 * (u_val - 128) - 208 * (v_val - 128) + 128) >> 8).clamp(0, 255)
-                as u8;
+            let g =
+                ((c - 100 * (u_val - 128) - 208 * (v_val - 128) + 128) >> 8).clamp(0, 255) as u8;
             let b = ((c + 516 * (u_val - 128) + 128) >> 8).clamp(0, 255) as u8;
 
             let px = (row * w + col) * 4;
@@ -129,7 +129,10 @@ mod tests {
             let a = dst[i * 4 + 3];
             assert!((0..=5).contains(&b), "pixel {i}: B={b} expected ~0 for red");
             assert!((0..=5).contains(&g), "pixel {i}: G={g} expected ~0 for red");
-            assert!((250..=255).contains(&r), "pixel {i}: R={r} expected ~255 for red");
+            assert!(
+                (250..=255).contains(&r),
+                "pixel {i}: R={r} expected ~255 for red"
+            );
             assert_eq!(a, 0xFF, "pixel {i}: A must be 255");
         }
     }
@@ -174,9 +177,18 @@ mod tests {
             let g = dst[i * 4 + 1];
             let r = dst[i * 4 + 2];
             let a = dst[i * 4 + 3];
-            assert!((252..=255).contains(&b), "pixel {i}: B={b} expected ~255 for white");
-            assert!((252..=255).contains(&g), "pixel {i}: G={g} expected ~255 for white");
-            assert!((252..=255).contains(&r), "pixel {i}: R={r} expected ~255 for white");
+            assert!(
+                (252..=255).contains(&b),
+                "pixel {i}: B={b} expected ~255 for white"
+            );
+            assert!(
+                (252..=255).contains(&g),
+                "pixel {i}: G={g} expected ~255 for white"
+            );
+            assert!(
+                (252..=255).contains(&r),
+                "pixel {i}: R={r} expected ~255 for white"
+            );
             assert_eq!(a, 0xFF);
         }
     }
