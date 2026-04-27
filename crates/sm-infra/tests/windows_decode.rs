@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use sm_domain::capture::PixelFormat;
 use sm_domain::decode::{DecodedFrame, DecoderConfig, PixelData, VideoDecoder};
-use sm_domain::encode::{EncoderConfig, EncodedPacket, VideoEncoder};
+use sm_domain::encode::{EncodedPacket, EncoderConfig, VideoEncoder};
 use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer};
 use sm_domain::transport::{TransportConfig, TransportError, TransportEvent, VideoReceiver};
 use sm_infra::decode::windows_openh264::WindowsOpenH264Decoder;
@@ -152,8 +152,11 @@ fn windows_decoder_decodes_synthetic_idr_to_i420_frame() {
         return;
     };
 
-    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig { width: w, height: h })
-        .expect("decoder construction should succeed");
+    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig {
+        width: w,
+        height: h,
+    })
+    .expect("decoder construction should succeed");
     let (counting, _count) = CountingReceiver::new();
     dec.set_receiver(Arc::new(counting));
 
@@ -181,7 +184,13 @@ fn windows_decoder_decodes_synthetic_idr_to_i420_frame() {
 
     let frame = decoded.expect("expected at least one DecodedFrame from real IDR");
     match &frame.data {
-        PixelData::I420 { y, u, v, width, height } => {
+        PixelData::I420 {
+            y,
+            u,
+            v,
+            width,
+            height,
+        } => {
             assert!(*width > 0, "decoded frame width must be > 0");
             assert!(*height > 0, "decoded frame height must be > 0");
             assert_eq!(y.len(), (*width as usize) * (*height as usize));
@@ -263,8 +272,11 @@ fn windows_decoder_dropped_frames_increments_when_output_full() {
         return;
     };
 
-    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig { width: w, height: h })
-        .expect("decoder construction should succeed");
+    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig {
+        width: w,
+        height: h,
+    })
+    .expect("decoder construction should succeed");
     let (counting, _count) = CountingReceiver::new();
     dec.set_receiver(Arc::new(counting));
 
@@ -365,8 +377,11 @@ fn windows_decoder_handles_p_frames_after_idr() {
     }
 
     // Now decode the collected packets.
-    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig { width: w, height: h })
-        .expect("decoder construction should succeed");
+    let mut dec = WindowsOpenH264Decoder::new(DecoderConfig {
+        width: w,
+        height: h,
+    })
+    .expect("decoder construction should succeed");
     let (counting, _count) = CountingReceiver::new();
     dec.set_receiver(Arc::new(counting));
 

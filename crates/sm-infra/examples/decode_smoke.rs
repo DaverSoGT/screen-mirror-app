@@ -82,8 +82,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dimensions come from the CaptureFrame fed at runtime.
     let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default())?;
 
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<sm_domain::CaptureFrame>(ENCODE_CHANNEL_CAPACITY);
-    let (pkt_tx, pkt_rx) = mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(ENCODE_CHANNEL_CAPACITY);
+    let (frame_tx, frame_rx) =
+        mpsc::sync_channel::<sm_domain::CaptureFrame>(ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, pkt_rx) =
+        mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(ENCODE_CHANNEL_CAPACITY);
 
     encoder.start(frame_rx, pkt_tx.clone())?;
     println!("  [1/5] encoder started");
@@ -92,7 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The decoder needs a VideoReceiver for PLI feedback. Use a minimal no-op receiver.
     struct NoopReceiver;
     impl sm_domain::transport::VideoReceiver for NoopReceiver {
-        fn new(_cfg: sm_domain::transport::TransportConfig) -> Result<Self, sm_domain::transport::TransportError>
+        fn new(
+            _cfg: sm_domain::transport::TransportConfig,
+        ) -> Result<Self, sm_domain::transport::TransportError>
         where
             Self: Sized,
         {
@@ -180,7 +184,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .expect("spawn smoke pump thread");
 
-    println!("  [3/5] pump thread started — feeding frames for {:.0}s", RUN_DURATION.as_secs_f64());
+    println!(
+        "  [3/5] pump thread started — feeding frames for {:.0}s",
+        RUN_DURATION.as_secs_f64()
+    );
 
     // ── 4. Collect decoded frames ─────────────────────────────────────────────────
     let t0 = Instant::now();
@@ -215,7 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(); // newline after dots
 
-    println!("  [4/5] collected {decoded_count} decoded frames in {:.1}s", t0.elapsed().as_secs_f64());
+    println!(
+        "  [4/5] collected {decoded_count} decoded frames in {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     // ── 5. Shutdown — order is critical (see module doc) ─────────────────────────
     // The pump thread owns `frame_tx`. Wait for it to finish (it exits after N frames).
@@ -233,7 +243,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     decoder.stop()?;
 
     let stop_elapsed = stop_t.elapsed();
-    println!("  [5/5] encoder + decoder stopped in {stop_elapsed:.1?} (must be < {STOP_TIMEOUT:?})");
+    println!(
+        "  [5/5] encoder + decoder stopped in {stop_elapsed:.1?} (must be < {STOP_TIMEOUT:?})"
+    );
 
     if stop_elapsed >= STOP_TIMEOUT {
         eprintln!("FAIL: stop took too long ({stop_elapsed:?} >= {STOP_TIMEOUT:?})");
@@ -251,7 +263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Assertion 1: at least one decoded frame.
     if decoded_count == 0 {
         eprintln!("FAIL: expected ≥1 DecodedFrame, got 0");
-        eprintln!("  (openh264 warmup may suppress the first few frames; try increasing RUN_DURATION)");
+        eprintln!(
+            "  (openh264 warmup may suppress the first few frames; try increasing RUN_DURATION)"
+        );
         std::process::exit(1);
     }
 
@@ -272,7 +286,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // openh264 may emit a frame for the t=0 packet; we relax this to just check
     // that the timestamp field propagates (could still be 0 if the first packet
     // had ts=0, which is valid).
-    println!("  first I420 frame sequence: {}", first_i420_frame.as_ref().map(|f| f.sequence).unwrap_or(u64::MAX));
+    println!(
+        "  first I420 frame sequence: {}",
+        first_i420_frame
+            .as_ref()
+            .map(|f| f.sequence)
+            .unwrap_or(u64::MAX)
+    );
 
     println!();
     println!("decoded frame received");

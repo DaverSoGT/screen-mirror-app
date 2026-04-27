@@ -116,7 +116,10 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
     // Feed IDR packets — IDR1 buffers, IDR2..IDR6 each emit a segment.
     let mut segments: Vec<Vec<u8>> = Vec::new();
     let idr1 = make_idr_packet(0, 0);
-    assert!(muxer.append_packet(&idr1).is_none(), "IDR1 must not emit yet");
+    assert!(
+        muxer.append_packet(&idr1).is_none(),
+        "IDR1 must not emit yet"
+    );
 
     for i in 1..=5u64 {
         let idr = make_idr_packet(i * 33, i);
@@ -188,7 +191,8 @@ fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
     for (idx, &seq) in seq_numbers.iter().enumerate() {
         let expected = (idx + 1) as u32;
         assert_eq!(
-            seq, expected,
+            seq,
+            expected,
             "segment {} mfhd.sequence_number must be {expected}, got {seq}",
             idx + 1
         );
@@ -312,18 +316,14 @@ fn mp4_muxer_init_segment_avcc_matches_input_sps_pps() {
     );
 
     // Find where SPS bytes appear in the init segment after avcC.
-    let sps_in_avcc = init[payload_start..]
-        .windows(SPS.len())
-        .any(|w| w == SPS);
+    let sps_in_avcc = init[payload_start..].windows(SPS.len()).any(|w| w == SPS);
     assert!(
         sps_in_avcc,
         "SPS bytes must appear verbatim in the avcC payload"
     );
 
     // Find where PPS bytes appear in the init segment after avcC.
-    let pps_in_avcc = init[payload_start..]
-        .windows(PPS.len())
-        .any(|w| w == PPS);
+    let pps_in_avcc = init[payload_start..].windows(PPS.len()).any(|w| w == PPS);
     assert!(
         pps_in_avcc,
         "PPS bytes must appear verbatim in the avcC payload"
@@ -401,6 +401,14 @@ fn mp4_muxer_annex_b_to_avcc_single_nal_length_prefix_correct() {
     // Output: [00 00 00 03 65 AB CD] (length=3, big-endian)
     let input = &[0x00u8, 0x00, 0x00, 0x01, 0x65, 0xAB, 0xCD];
     let output = annex_b_to_avcc(input).expect("must succeed");
-    assert_eq!(&output[..4], &[0x00, 0x00, 0x00, 0x03], "length prefix must be 3 in BE");
-    assert_eq!(&output[4..], &[0x65, 0xAB, 0xCD], "NAL bytes must be preserved");
+    assert_eq!(
+        &output[..4],
+        &[0x00, 0x00, 0x00, 0x03],
+        "length prefix must be 3 in BE"
+    );
+    assert_eq!(
+        &output[4..],
+        &[0x65, 0xAB, 0xCD],
+        "NAL bytes must be preserved"
+    );
 }
