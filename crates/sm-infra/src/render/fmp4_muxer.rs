@@ -11,12 +11,31 @@
 //! runtime dep, best fit for live MSE streaming. The `mp4` crate is NOT a runtime
 //! dependency.
 
+// ─── Errors ──────────────────────────────────────────────────────────────────
+
+/// Errors produced by the fMP4 muxer.
+#[derive(Debug, thiserror::Error)]
+pub enum MuxerError {
+    /// The provided SPS or PPS bytes are empty or invalid.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// An error occurred while building the avcC configuration record.
+    #[error("avcc error: {0}")]
+    AvccError(#[from] crate::render::avcc::AvccError),
+}
+
 // ─── ISO/IEC 14496-12 box framing primitive ──────────────────────────────────
 
 /// Write a single ISO base-media file format box into `out`.
 ///
 /// Layout: `[u32_BE total_size][4 ASCII type bytes][payload bytes]`.
 /// The `total_size` field is `payload.len() + 8` (4 bytes for size + 4 bytes for type).
+///
+/// # Arguments
+///
+/// * `out`      — output buffer to extend.
+/// * `box_type` — exactly 4 ASCII bytes identifying the box type (e.g. `b"ftyp"`).
+/// * `payload`  — box payload bytes (may be empty).
 pub(crate) fn write_box(out: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
     let size = (payload.len() + 8) as u32;
     out.extend_from_slice(&size.to_be_bytes());
@@ -42,6 +61,394 @@ pub(crate) fn build_ftyp() -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     write_box(&mut out, b"ftyp", &payload);
     out
+}
+
+// ─── moov hierarchy builder ──────────────────────────────────────────────────
+
+/// fMP4 timescale: 90 kHz matches RTP and `EncodedPacket::timestamp` mapping.
+const TIMESCALE: u32 = 90_000;
+
+/// Write a `u16` big-endian value into `out`.
+fn write_u16_be(out: &mut Vec<u8>, val: u16) {
+    out.extend_from_slice(&val.to_be_bytes());
+}
+
+/// Write a `u32` big-endian value into `out`.
+fn write_u32_be(out: &mut Vec<u8>, val: u32) {
+    out.extend_from_slice(&val.to_be_bytes());
+}
+
+/// Write a full-box header: 1 byte version + 3 bytes flags (big-endian u24).
+fn write_full_box_header(out: &mut Vec<u8>, version: u8, flags: u32) {
+    out.push(version);
+    out.push(((flags >> 16) & 0xFF) as u8);
+    out.push(((flags >> 8) & 0xFF) as u8);
+    out.push((flags & 0xFF) as u8);
+}
+
+/// Build the `mvhd` (movie header) box.
+fn build_mvhd() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // creation_time
+    write_u32_be(&mut payload, 0); // modification_time
+    write_u32_be(&mut payload, TIMESCALE); // timescale = 90_000
+    write_u32_be(&mut payload, 0); // duration = 0 (live/unknown)
+    write_u32_be(&mut payload, 0x0001_0000); // rate = 1.0 (16.16 fixed)
+    write_u16_be(&mut payload, 0x0100); // volume = 1.0 (8.8 fixed)
+    payload.extend_from_slice(&[0u8; 10]); // reserved (2 + 8)
+    // Unity matrix (3×3 as 9 × i32 in 2.30 fixed-point).
+    #[rustfmt::skip]
+    payload.extend_from_slice(&[
+        0x00, 0x01, 0x00, 0x00,  // a = 1.0
+        0x00, 0x00, 0x00, 0x00,  // b = 0
+        0x00, 0x00, 0x00, 0x00,  // u = 0
+        0x00, 0x00, 0x00, 0x00,  // c = 0
+        0x00, 0x01, 0x00, 0x00,  // d = 1.0
+        0x00, 0x00, 0x00, 0x00,  // v = 0
+        0x00, 0x00, 0x00, 0x00,  // tx = 0
+        0x00, 0x00, 0x00, 0x00,  // ty = 0
+        0x40, 0x00, 0x00, 0x00,  // w = 1.0 (2.30 fixed, 1 << 30)
+    ]);
+    payload.extend_from_slice(&[0u8; 24]); // pre_defined[6]
+    write_u32_be(&mut payload, 2); // next_track_id = 2
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"mvhd", &payload);
+    out
+}
+
+/// Build the `tkhd` (track header) box.
+fn build_tkhd(width: u32, height: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    // flags = 3: track_enabled (0x01) | track_in_movie (0x02)
+    write_full_box_header(&mut payload, 0, 3);
+    write_u32_be(&mut payload, 0); // creation_time
+    write_u32_be(&mut payload, 0); // modification_time
+    write_u32_be(&mut payload, 1); // track_id = 1
+    write_u32_be(&mut payload, 0); // reserved
+    write_u32_be(&mut payload, 0); // duration = 0 (live)
+    payload.extend_from_slice(&[0u8; 8]); // reserved (2 × u32)
+    write_u16_be(&mut payload, 0); // layer = 0
+    write_u16_be(&mut payload, 0); // alternate_group = 0
+    write_u16_be(&mut payload, 0); // volume = 0 (video track: muted)
+    write_u16_be(&mut payload, 0); // reserved
+    // Unity matrix
+    #[rustfmt::skip]
+    payload.extend_from_slice(&[
+        0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x40, 0x00, 0x00, 0x00,
+    ]);
+    // width and height as 16.16 fixed-point
+    write_u32_be(&mut payload, width << 16);
+    write_u32_be(&mut payload, height << 16);
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"tkhd", &payload);
+    out
+}
+
+/// Build the `mdhd` (media header) box.
+fn build_mdhd() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // creation_time
+    write_u32_be(&mut payload, 0); // modification_time
+    write_u32_be(&mut payload, TIMESCALE); // timescale = 90_000
+    write_u32_be(&mut payload, 0); // duration = 0 (live)
+    // language: 'und' packed into ISO 639-2/T 15-bit field.
+    // Each char: subtract 0x60. u=21, n=14, d=4.
+    // Packed: ((21-1) << 10) | ((14-1) << 5) | (4-1) = 0x55C3
+    write_u16_be(&mut payload, 0x55C3);
+    write_u16_be(&mut payload, 0); // pre_defined
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"mdhd", &payload);
+    out
+}
+
+/// Build the `hdlr` (handler reference) box for a video track.
+fn build_hdlr() -> Vec<u8> {
+    let name = b"Screen Mirror Video\0";
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // pre_defined
+    payload.extend_from_slice(b"vide"); // handler_type
+    payload.extend_from_slice(&[0u8; 12]); // reserved (3 × u32)
+    payload.extend_from_slice(name); // null-terminated name
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"hdlr", &payload);
+    out
+}
+
+/// Build the `vmhd` (video media header) box.
+fn build_vmhd() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 1); // flags = 0x000001 per ISO spec
+    write_u16_be(&mut payload, 0); // graphicsMode = 0
+    payload.extend_from_slice(&[0u8; 6]); // opcolor (3 × u16)
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"vmhd", &payload);
+    out
+}
+
+/// Build the `url ` (data entry URL) box — self-contained (flags = 1).
+fn build_url() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 1); // flags = 0x000001 (self-contained)
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"url ", &payload);
+    out
+}
+
+/// Build the `dref` (data reference) box containing one self-referential `url ` entry.
+fn build_dref() -> Vec<u8> {
+    let url_box = build_url();
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 1); // entry_count = 1
+    payload.extend_from_slice(&url_box);
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"dref", &payload);
+    out
+}
+
+/// Build the `dinf` (data information) box.
+fn build_dinf() -> Vec<u8> {
+    let dref = build_dref();
+    let mut out = Vec::new();
+    write_box(&mut out, b"dinf", &dref);
+    out
+}
+
+/// Build the `avc1` sample entry with an embedded `avcC` box.
+fn build_avc1(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let avcc_bytes = crate::render::avcc::build_avcc(sps_info, sps_nal, pps_nal)?;
+
+    let mut avcc_box = Vec::new();
+    write_box(&mut avcc_box, b"avcC", &avcc_bytes);
+
+    // 32-byte compressor name: 1 length byte + up to 31 chars.
+    let compressor_name: [u8; 32] = {
+        let mut arr = [0u8; 32];
+        let label = b"\x0DScreen Mirror"; // 0x0D = 13 = length of "Screen Mirror"
+        arr[..label.len()].copy_from_slice(label);
+        arr
+    };
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; 6]); // reserved
+    write_u16_be(&mut payload, 1); // data_reference_index = 1
+    payload.extend_from_slice(&[0u8; 16]); // pre_defined + reserved
+    write_u16_be(&mut payload, width as u16); // width
+    write_u16_be(&mut payload, height as u16); // height
+    write_u32_be(&mut payload, 0x0048_0000); // horizresolution = 72 dpi
+    write_u32_be(&mut payload, 0x0048_0000); // vertresolution = 72 dpi
+    write_u32_be(&mut payload, 0); // reserved
+    write_u16_be(&mut payload, 1); // frame_count = 1
+    payload.extend_from_slice(&compressor_name); // 32 bytes
+    write_u16_be(&mut payload, 0x0018); // depth = 24-bit
+    payload.extend_from_slice(&[0xFF, 0xFF]); // pre_defined = -1
+
+    payload.extend_from_slice(&avcc_box);
+
+    let mut out = Vec::new();
+    write_box(&mut out, b"avc1", &payload);
+    Ok(out)
+}
+
+/// Build the `stsd` (sample description) box.
+fn build_stsd(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let avc1 = build_avc1(width, height, sps_info, sps_nal, pps_nal)?;
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 1); // entry_count = 1
+    payload.extend_from_slice(&avc1);
+    let mut out = Vec::new();
+    write_box(&mut out, b"stsd", &payload);
+    Ok(out)
+}
+
+/// Build an empty `stts` (time-to-sample) box.
+fn build_stts() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // entry_count = 0
+    let mut out = Vec::new();
+    write_box(&mut out, b"stts", &payload);
+    out
+}
+
+/// Build an empty `stsc` (sample-to-chunk) box.
+fn build_stsc() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // entry_count = 0
+    let mut out = Vec::new();
+    write_box(&mut out, b"stsc", &payload);
+    out
+}
+
+/// Build an empty `stsz` (sample size) box.
+fn build_stsz() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // sample_size (uniform) = 0
+    write_u32_be(&mut payload, 0); // sample_count = 0
+    let mut out = Vec::new();
+    write_box(&mut out, b"stsz", &payload);
+    out
+}
+
+/// Build an empty `stco` (chunk offset) box.
+fn build_stco() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 0); // entry_count = 0
+    let mut out = Vec::new();
+    write_box(&mut out, b"stco", &payload);
+    out
+}
+
+/// Build the `stbl` (sample table) box.
+fn build_stbl(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let stsd = build_stsd(width, height, sps_info, sps_nal, pps_nal)?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&stsd);
+    payload.extend_from_slice(&build_stts());
+    payload.extend_from_slice(&build_stsc());
+    payload.extend_from_slice(&build_stsz());
+    payload.extend_from_slice(&build_stco());
+    let mut out = Vec::new();
+    write_box(&mut out, b"stbl", &payload);
+    Ok(out)
+}
+
+/// Build the `minf` (media information) box.
+fn build_minf(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&build_vmhd());
+    payload.extend_from_slice(&build_dinf());
+    payload.extend_from_slice(&build_stbl(width, height, sps_info, sps_nal, pps_nal)?);
+    let mut out = Vec::new();
+    write_box(&mut out, b"minf", &payload);
+    Ok(out)
+}
+
+/// Build the `mdia` (media) box.
+fn build_mdia(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&build_mdhd());
+    payload.extend_from_slice(&build_hdlr());
+    payload.extend_from_slice(&build_minf(width, height, sps_info, sps_nal, pps_nal)?);
+    let mut out = Vec::new();
+    write_box(&mut out, b"mdia", &payload);
+    Ok(out)
+}
+
+/// Build the `trak` (track) box.
+fn build_trak(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&build_tkhd(width, height));
+    payload.extend_from_slice(&build_mdia(width, height, sps_info, sps_nal, pps_nal)?);
+    let mut out = Vec::new();
+    write_box(&mut out, b"trak", &payload);
+    Ok(out)
+}
+
+/// Build the `trex` (track extends defaults) box.
+fn build_trex() -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_full_box_header(&mut payload, 0, 0);
+    write_u32_be(&mut payload, 1); // track_id = 1
+    write_u32_be(&mut payload, 1); // default_sample_description_index = 1
+    write_u32_be(&mut payload, 0); // default_sample_duration
+    write_u32_be(&mut payload, 0); // default_sample_size
+    write_u32_be(&mut payload, 0); // default_sample_flags
+    let mut out = Vec::new();
+    write_box(&mut out, b"trex", &payload);
+    out
+}
+
+/// Build the `mvex` (movie extends) box.
+fn build_mvex() -> Vec<u8> {
+    let trex = build_trex();
+    let mut out = Vec::new();
+    write_box(&mut out, b"mvex", &trex);
+    out
+}
+
+/// Build the complete `moov` (movie) box.
+///
+/// Contains `mvhd`, one `trak` (with full `mdia`/`minf`/`stbl`/`avc1`/`avcC` hierarchy),
+/// and `mvex`/`trex`.
+///
+/// # Arguments
+///
+/// * `width`, `height` — track dimensions in pixels.
+/// * `sps_info` — parsed SPS fields (profile, level, dimensions).
+/// * `sps_nal`, `pps_nal` — raw NAL bytes (without Annex-B start codes).
+pub(crate) fn build_moov(
+    width: u32,
+    height: u32,
+    sps_info: &crate::render::avcc::SpsInfo,
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+) -> Result<Vec<u8>, MuxerError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&build_mvhd());
+    payload.extend_from_slice(&build_trak(width, height, sps_info, sps_nal, pps_nal)?);
+    payload.extend_from_slice(&build_mvex());
+    let mut out = Vec::new();
+    write_box(&mut out, b"moov", &payload);
+    Ok(out)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -167,7 +574,6 @@ mod tests {
             .expect("build_moov should succeed");
 
         let avcc_tag_pos = find_box_tag(&moov, b"avcC").expect("avcC must be in moov");
-        // The box size field is 4 bytes before the tag.
         let avcc_box_start = avcc_tag_pos - 4;
         let avcc_size = u32::from_be_bytes([
             moov[avcc_box_start],
@@ -192,8 +598,7 @@ mod tests {
             .expect("build_moov should succeed");
 
         let mvhd_tag_pos = find_box_tag(&moov, b"mvhd").expect("mvhd must exist");
-        // mvhd box: [4 size][4 tag][4 v+f][4 ctime][4 mtime][4 timescale]
-        // tag is at mvhd_tag_pos; after tag (4 bytes) comes v+f (4), ctime (4), mtime (4), then ts.
+        // After the 4-byte tag: [4 v+f][4 ctime][4 mtime][4 timescale]
         let ts_offset = mvhd_tag_pos + 4 + 4 + 4 + 4;
         let timescale = u32::from_be_bytes([
             moov[ts_offset],
@@ -211,7 +616,7 @@ mod tests {
             .expect("build_moov should succeed");
 
         let hdlr_tag_pos = find_box_tag(&moov, b"hdlr").expect("hdlr must exist");
-        // hdlr payload: [4 v+f][4 pre_defined][4 handler_type]
+        // After the 4-byte tag: [4 v+f][4 pre_defined][4 handler_type]
         let handler_type_offset = hdlr_tag_pos + 4 + 4 + 4;
         assert_eq!(
             &moov[handler_type_offset..handler_type_offset + 4],
