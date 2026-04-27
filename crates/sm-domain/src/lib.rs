@@ -19,7 +19,6 @@
 //!   `EncoderConfig`, `EncodedPacket`, `EncoderError`, and `RateControlMode`.
 
 pub mod capture;
-pub mod decode;
 
 pub use capture::BorderPolicy;
 pub use capture::CaptureConfig;
