@@ -353,23 +353,20 @@ pub struct StreamBridge {
     /// thereafter. Cloned cheaply (one atomic increment) before each invocation so
     /// no borrow of `bridge.builder` is held during the (potentially slow) build.
     /// (Design #288 §1.4, §6; spec #287 R1.1, R1.5)
-    ///
-    /// `#[allow(dead_code)]`: field is added in B1; first read site lands in B5
-    /// (start_stream_inner). Remove this attribute when B5 lands.
-    #[allow(dead_code)]
     pub(crate) builder: BuilderFn,
 
     /// Args of the currently-active session: `Some((port, name))` while running,
-    /// `None` otherwise. Set by `start_stream` BEFORE invoking the builder; cleared
-    /// by `stop_stream_session` AFTER all threads join (design #288 §1.4, §4).
+    /// `None` otherwise. Set by `start_stream_inner` AFTER the session is stored;
+    /// cleared by `stop_stream_session` AFTER all threads join (design #288 §1.4, §4).
     ///
     /// OQ-D3 resolved: one `Mutex<Option<(u16, String)>>` — not two separate
     /// per-field mutexes. Plain `Mutex` (not `RwLock`): contention is bounded to
     /// start/stop only.
     ///
-    /// `#[allow(dead_code)]`: field is added in B1; first read site lands in B6
-    /// (double-start detection). Remove this attribute when B6 lands.
-    #[allow(dead_code)]
+    /// Lock-ordering discipline (design §4):
+    ///   start path: current_args FIRST, then session.
+    ///   stop path:  session FIRST, then current_args.
+    /// Future code MUST NOT acquire these locks in reverse order within a single path.
     pub(crate) current_args: Mutex<Option<(u16, String)>>,
 }
 
@@ -890,11 +887,23 @@ pub(crate) fn start_stream_inner(
     let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
 
     // Step 4 — Check running state.
-    // B5 intermediate: idempotent early-return (B6 will replace with AlreadyRunning
-    // carrying current_args). Anti-Scope-Creep Guard: keep this behavior in B5.
+    // B5 intermediate: idempotent early-return is REPLACED in B6-2 with the
+    // AlreadyRunning error using current_args. For B6-1, we add the current_args
+    // population logic here — the is_running() guard stays until B6-2 removes it.
+    //
+    // Lock-ordering note (design §4):
+    //   start path: acquire current_args FIRST, then session.
+    //   stop path:  acquire session FIRST, then current_args.
+    // This asymmetry is intentional — see stop_stream_session for the complementary
+    // side. The ordering must NOT be reversed in future changes.
+    //
+    // B6-2 will replace the is_running() early-return below with:
+    //   match &*args_guard { Some((p, n)) => Err(AlreadyRunning {..}), None => {} }
     if bridge.is_running() {
         return Ok(());
     }
+    // Acquire current_args lock BEFORE session lock (design §4 lock-order: current_args → session).
+    let mut args_guard = bridge.current_args.lock().unwrap();
     let mut guard = bridge.session.lock().unwrap();
 
     // Step 5 — Clone the builder Arc (cheap atomic increment) and invoke.
@@ -903,7 +912,7 @@ pub(crate) fn start_stream_inner(
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let bundle = match (builder)(resolved_port, resolved_name, stop_flag.clone()) {
+    let bundle = match (builder)(resolved_port, resolved_name.clone(), stop_flag.clone()) {
         Ok(b) => b,
         Err(e) => {
             // OQ-A1 — PortInUse substring detection shim (B5-4).
@@ -930,10 +939,16 @@ pub(crate) fn start_stream_inner(
         }
     };
 
-    *guard = Some(
-        build_stream_session(channel, bundle, stop_flag)
-            .map_err(StartStreamError::BundleBuildFailed)?,
-    );
+    let session = build_stream_session(channel, bundle, stop_flag)
+        .map_err(StartStreamError::BundleBuildFailed)?;
+    *guard = Some(session);
+
+    // Step 6 — Populate current_args AFTER session is successfully stored.
+    // Spec R6.2: "When start_stream completes successfully, current_args MUST
+    // be set to Some((resolved_port, resolved_service_name))."
+    // Lock is already held (acquired in step 4 above). Set after session store
+    // so that the visible state is always: session=Some ↔ current_args=Some.
+    *args_guard = Some((resolved_port, resolved_name));
 
     Ok(())
 }
