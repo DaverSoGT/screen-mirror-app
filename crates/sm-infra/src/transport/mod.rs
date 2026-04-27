@@ -6,6 +6,7 @@
 //!
 //! Adapters are cross-platform per PQ-9 (pure-Rust, no OS-specific gate needed).
 
+pub mod annex_b;
 pub mod str0m_receiver;
 pub mod str0m_sender;
 
