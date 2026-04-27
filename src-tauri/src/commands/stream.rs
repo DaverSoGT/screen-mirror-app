@@ -1727,4 +1727,27 @@ mod tests {
         let bridge = StreamBridge::default();
         assert!(!bridge.is_running());
     }
+
+    // ─── B2-1 RED: PortRejectReason serialization (R3.3) ────────────────────────
+
+    /// B2-1.1 — `PortRejectReason::Privileged` serializes as the bare string
+    ///           `"Privileged"` (default serde unit-variant representation).
+    ///
+    /// RED: `PortRejectReason` does not exist yet.
+    #[test]
+    fn test_port_reject_reason_serialization() {
+        let reason = PortRejectReason::Privileged;
+        let json = serde_json::to_string(&reason).expect("PortRejectReason must serialize");
+        assert_eq!(json, "\"Privileged\"");
+    }
+
+    /// B2-1.2 — `PortRejectReason::Zero` serializes as `"Zero"`.
+    ///
+    /// RED: `PortRejectReason` does not exist yet.
+    #[test]
+    fn test_port_reject_reason_zero_serialization() {
+        let reason = PortRejectReason::Zero;
+        let json = serde_json::to_string(&reason).expect("PortRejectReason::Zero must serialize");
+        assert_eq!(json, "\"Zero\"");
+    }
 }
