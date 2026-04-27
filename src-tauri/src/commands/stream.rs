@@ -588,17 +588,17 @@ pub fn start_stream(
     Ok(())
 }
 
-/// Stop the streaming session. Idempotent.
+/// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
 ///
 /// Shutdown order (caller-must-drop-tx-first invariant):
 /// 1. Set the stop flag — signals the mux thread and all drain threads.
 /// 2. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
 /// 3. Join drain threads (they check stop_flag on every 500 ms timeout).
 /// 4. Stop the signaling adapter.
-/// 5. Drop the session (receiver + signaling are dropped here — their Drop
-///    implementations call stop() so the tick threads are joined).
-#[tauri::command]
-pub fn stop_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
+/// 5. Drop the session (receiver + channel are dropped — their Drop impls call stop).
+///
+/// Idempotent: if no session is active, returns immediately.
+fn stop_stream_session(bridge: &StreamBridge) {
     let mut guard = bridge.session.lock().unwrap();
     if let Some(mut session) = guard.take() {
         // 1. Signal stop to the mux thread and all drain threads.
@@ -621,6 +621,12 @@ pub fn stop_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
 
         // 5. receiver and channel are dropped here (their Drop impls call stop).
     }
+}
+
+/// Stop the streaming session. Idempotent.
+#[tauri::command]
+pub fn stop_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
+    stop_stream_session(&bridge);
     Ok(())
 }
 
