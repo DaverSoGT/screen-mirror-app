@@ -925,7 +925,9 @@ fn transport_receiver_candidate_addr_is_none_when_no_usable_nic_s_ct_3() {
 
     let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
     let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
-    receiver.start(pkt_out_tx, event_tx).expect("receiver start");
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
 
     // Inject empty NIC list: simulates no usable LAN adapter.
     let _guard = NicOverrideGuard::new(vec![]);
@@ -935,5 +937,92 @@ fn transport_receiver_candidate_addr_is_none_when_no_usable_nic_s_ct_3() {
         "candidate_addr() must return None when no non-loopback NIC is available"
     );
 
+    receiver.stop().unwrap();
+}
+
+// ─── S-CT-4: Candidate JSON round-trip through IceCandidate ──────────────────
+
+/// S-CT-4 — The `publish_host_candidate` helper serialises a `str0m::Candidate`
+/// via `serde_json::to_string` and the resulting `IceCandidate(String)` MUST be
+/// accepted by `add_remote_candidate` on a peer adapter without error.
+///
+/// This is the regression gate for R-PROP-4 (design D-CT-3): the wire codec is
+/// `serde_json`, NOT `Candidate::to_string()` (which produces SDP-attribute text
+/// that `serde_json::from_str::<Candidate>` cannot parse).
+///
+/// The test uses `LoopbackSignaling` as the signaling channel so we can observe
+/// the `CandidateReceived` event and confirm the JSON round-trips without panic.
+///
+/// This test passes immediately after B1-GREEN because `publish_host_candidate`
+/// was implemented there. The RED commit documents the serialisation invariant.
+#[test]
+fn transport_candidate_serde_json_round_trips_through_add_remote_candidate_s_ct_4() {
+    use sm_infra::transport::publish_host_candidate;
+
+    // Use a known LAN-style address (does not need to be a real bound socket for
+    // round-trip purposes; we are testing serialisation only, not connectivity).
+    let addr: std::net::SocketAddr = "192.168.1.100:5004".parse().expect("valid addr");
+
+    // Build a sender + receiver pair to exercise the full round-trip.
+    let enc = FakeLoopbackEncoder::new();
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    // Exchange offer/answer so both adapters are in the negotiated state.
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    // Start both adapters.
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (sender_event_tx, _sender_event_rx) = sync_channel::<TransportEvent>(8);
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, sender_event_tx).expect("sender start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
+
+    // Build a LoopbackSignaling pair; use the sender side for publishing.
+    let (mut sig_a, mut sig_b) =
+        LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
+    let (sig_a_ev_tx, _sig_a_ev_rx) = sync_channel::<SignalingEvent>(4);
+    let (sig_b_ev_tx, sig_b_ev_rx) = sync_channel::<SignalingEvent>(4);
+    sig_a.start(sig_a_ev_tx).expect("sig_a start");
+    sig_b.start(sig_b_ev_tx).expect("sig_b start");
+
+    // Publish the host candidate from sig_a.
+    publish_host_candidate(&sig_a, addr).expect("publish_host_candidate must not error");
+
+    // The peer (sig_b) should receive a CandidateReceived event.
+    let event = sig_b_ev_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CandidateReceived must arrive within 5 s");
+
+    let candidate_json = match event {
+        SignalingEvent::CandidateReceived(IceCandidate(json)) => json,
+        other => panic!("Expected CandidateReceived, got {other:?}"),
+    };
+
+    // Round-trip: the JSON must be accepted by add_remote_candidate on the sender
+    // without error. This exercises the existing consume path at str0m_sender.rs:446:
+    //   serde_json::from_str::<Candidate>(&cand.0)
+    sender
+        .add_remote_candidate(IceCandidate(candidate_json))
+        .expect("add_remote_candidate must accept serde_json-encoded Candidate");
+
+    // Clean up.
+    drop(pkt_tx);
+    sender.stop().unwrap();
     receiver.stop().unwrap();
 }
