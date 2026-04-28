@@ -1318,8 +1318,24 @@ fn mux_thread(
             let sps_pps = extract_sps_pps_from_idr(&pkt.data);
 
             if let Some((sps, pps)) = sps_pps {
-                // Determine dimensions (fallback: use a default; real dims come from SPS parser).
-                let m = Mp4Muxer::new(1920, 1080, 30, 1);
+                // Parse the SPS once to read the actual stream dimensions. Hardcoding
+                // 1920x1080 lies inside `tkhd` and `avc1` boxes when the source isn't
+                // 1080p, which Chromium MSE detects as a dimension mismatch versus the
+                // SPS embedded in `avcC` and surfaces by closing the MediaSource (B11-S5).
+                // Roadmap item #4 sps-dimensions-from-init: this is the corrective fix.
+                let dims = match sm_infra::render::avcc::parse_sps(&sps) {
+                    Ok(info) => (info.width, info.height),
+                    Err(e) => {
+                        eprintln!("[sm-stream-mux] parse_sps failed; keep buffering: {e}");
+                        pre_idr_buffer.push(pkt);
+                        continue;
+                    }
+                };
+                eprintln!(
+                    "[sm-stream-mux] init segment dims: {}x{} (parsed from SPS)",
+                    dims.0, dims.1
+                );
+                let m = Mp4Muxer::new(dims.0, dims.1, 30, 1);
                 match m.build_init_segment(&sps, &pps) {
                     Ok(init_bytes) => {
                         emit_init(&channel, &counters, init_bytes);
@@ -1329,7 +1345,7 @@ fn mux_thread(
                         muxer = Some(m);
                     }
                     Err(e) => {
-                        // SPS parse failure: keep buffering until a good IDR arrives.
+                        // build_init_segment failure: keep buffering until a good IDR arrives.
                         eprintln!("[sm-stream-mux] build_init_segment failed: {e}");
                         pre_idr_buffer.push(pkt);
                         continue;
