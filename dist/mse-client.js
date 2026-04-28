@@ -8,7 +8,7 @@
 //   At 1080p30 H.264 (~500 KB/segment) this produces 1.5–2 MB of JSON per
 //   segment plus a synchronous JSON.parse on the WebView main thread — jank.
 //
-//   Resolution: frontend creates a Channel via window.__TAURI_INTERNALS__.Channel,
+//   Resolution: frontend creates a Channel via window.__TAURI__.core.Channel,
 //   passes it to Rust's start_stream as a command argument. Rust sends
 //   InvokeResponseBody::Raw(bytes) — no JSON encoding. The Channel delivers an
 //   ArrayBuffer directly to onmessage. The toUint8Array() helper is no longer needed.
@@ -17,10 +17,13 @@
 //     0x00 (FRAME_INIT)    = fMP4 init segment (moov box, one per session)
 //     0x01 (FRAME_SEGMENT) = fMP4 media segment (moof+mdat, one per GOP)
 //
-// JS binding verified:
-//   window.__TAURI_INTERNALS__.Channel is the constructor available in Tauri 2
-//   when withGlobalTauri: true is set in tauri.conf.json. invoke() is available
-//   as window.__TAURI__.core.invoke or window.__TAURI_INTERNALS__.invoke.
+// JS binding (Tauri 2.x with withGlobalTauri: true):
+//   window.__TAURI__.core.Channel — constructor for Channel<T>.
+//   window.__TAURI__.core.invoke — invoke() function.
+//   Anchor on the documented __TAURI__.core.* surface, NOT __TAURI_INTERNALS__.*.
+//   Earlier Tauri 2 versions exposed Channel under __TAURI_INTERNALS__; that
+//   binding moved to __TAURI__.core in newer 2.x releases (verified 2026-04-28
+//   via DevTools probe — see #341 spec-amendments).
 //
 // No import / require. Plain JS module. R11.7.
 
@@ -127,7 +130,7 @@ async function main() {
   // onmessage receives an ArrayBuffer. Byte 0 is the discriminant:
   //   0x00 = init segment → feed to SourceBuffer first
   //   0x01 = media segment → feed to SourceBuffer after init
-  const Channel = window.__TAURI_INTERNALS__.Channel;
+  const Channel = window.__TAURI__.core.Channel;
   const streamChannel = new Channel();
 
   streamChannel.onmessage = (payload) => {
