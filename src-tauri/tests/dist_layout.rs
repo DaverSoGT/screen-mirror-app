@@ -157,3 +157,36 @@ fn sender_html_references_sender_js() {
         "sender.html must reference sender.js"
     );
 }
+
+// ─── B11-S4 regression: codec string derived from init segment ────────────
+
+/// B11-S4 — mse-client.js MUST derive the codec string from the init
+/// segment's avcC box rather than hardcoding `avc1.42E01E` (Baseline 3.0).
+/// Hardcoding broke MSE on streams above 720p30 because the avcC level
+/// (e.g. 4.0 for 1080p) did not match the codec string, which Chromium
+/// surfaces by closing the MediaSource and removing the SourceBuffer
+/// mid-append. The fix scans for the `avcC` box and synthesises
+/// `avc1.<profile><compat><level>` at runtime.
+#[test]
+fn mse_client_derives_codec_from_init_segment_b11_s4() {
+    let dist = dist_dir();
+    let path = dist.join("mse-client.js");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read mse-client.js at {}: {}", path.display(), e));
+
+    assert!(
+        content.contains("deriveCodecFromInitSegment"),
+        "mse-client.js must define deriveCodecFromInitSegment to parse the avcC box"
+    );
+    // The function must search for the four-byte ASCII tag "avcC".
+    assert!(
+        content.contains("0x61") && content.contains("0x76") && content.contains("0x63") && content.contains("0x43"),
+        "deriveCodecFromInitSegment must scan for the 'avcC' ASCII tag (0x61 0x76 0x63 0x43)"
+    );
+    // addSourceBuffer must be called AFTER the init segment arrives, not at
+    // sourceopen time — this is what guarantees the codec string matches.
+    assert!(
+        content.contains("ms.addSourceBuffer(derived)"),
+        "addSourceBuffer must use the codec derived from the init segment"
+    );
+}
