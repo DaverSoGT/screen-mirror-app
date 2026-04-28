@@ -3538,6 +3538,40 @@ mod tests {
         );
     }
 
+    // ─── B3.T3 RED: From<TransportError> for BundleError (R2.3, R5.4) ────────────
+
+    #[test]
+    fn bundle_error_from_transport_error_addr_in_use_maps_to_port_in_use() {
+        let te = TransportError::AddrInUse { port: 7889 };
+        let be: BundleError = te.into();
+        match be {
+            BundleError::PortInUse(7889) => {}
+            other => panic!("expected BundleError::PortInUse(7889), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bundle_error_from_transport_error_other_variants_collapse_to_other() {
+        let cases: Vec<(TransportError, &'static str)> = vec![
+            (TransportError::AlreadyRunning, "transport already running"),
+            (TransportError::NotRunning, "transport not running"),
+            (TransportError::InvalidConfig("bad".into()), "invalid transport config: bad"),
+            (TransportError::Io("eio".into()), "transport I/O error: eio"),
+            (TransportError::SignalingFailed("sf".into()), "signaling failed: sf"),
+            (TransportError::Internal("oops".into()), "internal transport error: oops"),
+        ];
+        for (te, expected_display) in cases {
+            let be: BundleError = te.into();
+            match be {
+                BundleError::Other(s) => assert_eq!(
+                    s, expected_display,
+                    "expected Other({expected_display:?}), got Other({s:?})"
+                ),
+                other => panic!("expected BundleError::Other({expected_display:?}), got {other:?}"),
+            }
+        }
+    }
+
     // ─── B3.T1 RED: BundleError enum exists and displays correctly (R2.1, R2.2) ──
 
     #[test]
