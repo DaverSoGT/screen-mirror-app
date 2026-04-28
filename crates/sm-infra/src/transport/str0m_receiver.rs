@@ -194,15 +194,8 @@ impl VideoReceiver for Str0mVideoReceiver {
         self.state.seq.store(0, Ordering::Release);
 
         let bind_addr = format!("0.0.0.0:{}", self.config.udp_port);
-        let udp = UdpSocket::bind(&bind_addr).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                TransportError::AddrInUse {
-                    port: self.config.udp_port,
-                }
-            } else {
-                TransportError::Io(format!("UDP bind failed on {bind_addr}: {e}"))
-            }
-        })?;
+        let udp = UdpSocket::bind(&bind_addr)
+            .map_err(|e| classify_bind_error(e, self.config.udp_port))?;
         let local_addr = udp
             .local_addr()
             .map_err(|e| TransportError::Io(e.to_string()))?;

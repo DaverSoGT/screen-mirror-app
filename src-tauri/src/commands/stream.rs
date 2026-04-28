@@ -984,11 +984,12 @@ pub(crate) fn start_stream_inner(
 
     // Translate BundleError into StartStreamError. PortInUse carries the port from
     // the bind-site detection in str0m_receiver.rs; no string parsing.
-    let bundle = (builder)(resolved_port, resolved_name.clone(), stop_flag.clone())
-        .map_err(|e| match e {
+    let bundle = (builder)(resolved_port, resolved_name.clone(), stop_flag.clone()).map_err(
+        |e| match e {
             BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
             BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
-        })?;
+        },
+    )?;
 
     // Step 6 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
@@ -2698,7 +2699,10 @@ mod tests {
         // Compile gate: verify that `build_production_bundle` can be referred to as
         // a function with the new three-argument signature (redundant with B5-1.1
         // but explicit about the wrapper's contract).
-        fn _assert_arity(_f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>) {}
+        fn _assert_arity(
+            _f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>,
+        ) {
+        }
         _assert_arity(build_production_bundle);
     }
 
@@ -2974,7 +2978,9 @@ mod tests {
     #[test]
     fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
         let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
-            Err(BundleError::Other("some unrelated build failure".to_string()))
+            Err(BundleError::Other(
+                "some unrelated build failure".to_string(),
+            ))
         });
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
@@ -3539,7 +3545,7 @@ mod tests {
         use std::io;
         // io::Error never carries AddrInUse to build_production_bundle;
         // detection is in str0m_receiver.rs
-        let err1 = io::Error::new(io::ErrorKind::Other, "thread spawn failed");
+        let err1 = io::Error::other("thread spawn failed");
         let be1: BundleError = err1.into();
         match be1 {
             BundleError::Other(_) => {}
@@ -3553,7 +3559,9 @@ mod tests {
         // it is intercepted in str0m_receiver.rs before crossing crate boundaries.
         match be2 {
             BundleError::Other(_) => {}
-            other => panic!("expected BundleError::Other(_) for AddrInUse io::Error, got {other:?}"),
+            other => {
+                panic!("expected BundleError::Other(_) for AddrInUse io::Error, got {other:?}")
+            }
         }
     }
 
@@ -3592,10 +3600,19 @@ mod tests {
         let cases: Vec<(TransportError, &'static str)> = vec![
             (TransportError::AlreadyRunning, "transport already running"),
             (TransportError::NotRunning, "transport not running"),
-            (TransportError::InvalidConfig("bad".into()), "invalid transport config: bad"),
+            (
+                TransportError::InvalidConfig("bad".into()),
+                "invalid transport config: bad",
+            ),
             (TransportError::Io("eio".into()), "transport I/O error: eio"),
-            (TransportError::SignalingFailed("sf".into()), "signaling failed: sf"),
-            (TransportError::Internal("oops".into()), "internal transport error: oops"),
+            (
+                TransportError::SignalingFailed("sf".into()),
+                "signaling failed: sf",
+            ),
+            (
+                TransportError::Internal("oops".into()),
+                "internal transport error: oops",
+            ),
         ];
         for (te, expected_display) in cases {
             let be: BundleError = te.into();
@@ -3643,7 +3660,9 @@ mod tests {
             "found 'address already in use' substring in production code"
         );
         assert!(
-            !production.to_lowercase().contains("only one usage of each socket address"),
+            !production
+                .to_lowercase()
+                .contains("only one usage of each socket address"),
             "found Windows AddrInUse substring in production code"
         );
     }

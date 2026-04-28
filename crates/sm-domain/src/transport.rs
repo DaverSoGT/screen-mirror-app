@@ -549,7 +549,13 @@ mod tests {
     fn transport_error_addr_in_use_debug_contains_variant_name() {
         let err = TransportError::AddrInUse { port: 7889 };
         let dbg = format!("{err:?}");
-        assert!(dbg.contains("AddrInUse"), "Debug must contain 'AddrInUse', got: {dbg}");
-        assert!(dbg.contains("7889"), "Debug must contain '7889', got: {dbg}");
+        assert!(
+            dbg.contains("AddrInUse"),
+            "Debug must contain 'AddrInUse', got: {dbg}"
+        );
+        assert!(
+            dbg.contains("7889"),
+            "Debug must contain '7889', got: {dbg}"
+        );
     }
 }
