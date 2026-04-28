@@ -1318,13 +1318,16 @@ fn mux_thread(
             let sps_pps = extract_sps_pps_from_idr(&pkt.data);
 
             if let Some((sps, pps)) = sps_pps {
-                // Parse the SPS once to read the actual stream dimensions. Hardcoding
-                // 1920x1080 lies inside `tkhd` and `avc1` boxes when the source isn't
-                // 1080p, which Chromium MSE detects as a dimension mismatch versus the
-                // SPS embedded in `avcC` and surfaces by closing the MediaSource (B11-S5).
-                // Roadmap item #4 sps-dimensions-from-init: this is the corrective fix.
+                // Parse the SPS once and use the **display** dimensions (cropped) for
+                // tkhd / avc1, NOT the encoded ones. The encoded dimensions are 16-pixel
+                // aligned (e.g. 1920x1088 for a 1920x1080 source) because H.264 codes
+                // in macroblocks; the SPS carries a frame-cropping rectangle so the
+                // decoder presents the visible 1920x1080. Per ISO/IEC 14496-12 §6.2 +
+                // 14496-15 §5.2.4.1.1, tkhd and avc1 boxes MUST carry the visible
+                // dimensions; otherwise Chromium MSE detects a mismatch versus the SPS
+                // embedded in avcC and silently closes the MediaSource (B11-S5).
                 let dims = match sm_infra::render::avcc::parse_sps(&sps) {
-                    Ok(info) => (info.width, info.height),
+                    Ok(info) => info.display_dimensions(),
                     Err(e) => {
                         eprintln!("[sm-stream-mux] parse_sps failed; keep buffering: {e}");
                         pre_idr_buffer.push(pkt);
@@ -1332,7 +1335,7 @@ fn mux_thread(
                     }
                 };
                 eprintln!(
-                    "[sm-stream-mux] init segment dims: {}x{} (parsed from SPS)",
+                    "[sm-stream-mux] init segment dims: {}x{} (display, cropped from SPS)",
                     dims.0, dims.1
                 );
                 let m = Mp4Muxer::new(dims.0, dims.1, 30, 1);

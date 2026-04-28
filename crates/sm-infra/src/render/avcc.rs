@@ -47,12 +47,68 @@ pub struct SpsInfo {
     pub constraint_set_flags: u8,
     /// `level_idc`: H.264 level (e.g. 40 = Level 4.0, 30 = Level 3.0).
     pub level_idc: u8,
-    /// Frame width in pixels derived from `(pic_width_in_mbs_minus1 + 1) × 16`.
+    /// Frame width in pixels derived from `(pic_width_in_mbs_minus1 + 1) × 16`. This is the
+    /// **encoded** width (16-pixel-aligned because H.264 codes in macroblocks); the
+    /// **display** width may be smaller — see [`SpsInfo::display_dimensions`].
     pub width: u32,
     /// Frame height in pixels derived from `(2 − frame_mbs_only_flag) × (pic_height_in_map_units_minus1 + 1) × 16`.
+    /// This is the **encoded** height (16-pixel-aligned). Common case: a 1920×1080 source is
+    /// encoded as 1920×1088 with `crop_bottom = 4`, so `height = 1088` here while
+    /// `display_dimensions().1 = 1080`.
     pub height: u32,
     /// `frame_mbs_only_flag`: 1 for progressive, 0 for interlaced.
     pub frame_mbs_only_flag: bool,
+    /// `chroma_format_idc`: 0 = monochrome, 1 = 4:2:0 (default for Baseline/Main/Extended),
+    /// 2 = 4:2:2, 3 = 4:4:4. Determines `SubWidthC`/`SubHeightC` (H.264 §6.2) which scale
+    /// frame-cropping offsets into luma pixel units.
+    pub chroma_format_idc: u8,
+    /// Frame-cropping rectangle (`§7.3.2.1.1`). `None` if `frame_cropping_flag = 0` (no
+    /// cropping needed; encoded dimensions == display dimensions).
+    pub frame_cropping: Option<FrameCropping>,
+}
+
+/// Frame-cropping rectangle from the SPS — H.264 §7.3.2.1.1.
+///
+/// Offsets are stored in **`SubWidthC` / `SubHeightC` units**, NOT luma pixel units.
+/// Use [`SpsInfo::display_dimensions`] to convert to luma pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameCropping {
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub bottom: u32,
+}
+
+impl SpsInfo {
+    /// Compute the **display** dimensions of the encoded video — i.e. the encoded
+    /// dimensions ([`Self::width`], [`Self::height`]) minus the frame-cropping
+    /// rectangle, scaled by the chroma sub-sampling factors per H.264 §6.4.1.
+    ///
+    /// This is the value MP4 muxers MUST write into the `tkhd` and `avc1` boxes
+    /// (ISO/IEC 14496-12 §6.2 + 14496-15 §5.2.4.1.1). Writing the encoded
+    /// dimensions instead causes Chromium MSE to detect a mismatch versus the
+    /// SPS embedded in `avcC` and silently close the MediaSource (B11-S5).
+    pub fn display_dimensions(&self) -> (u32, u32) {
+        let (sub_w, sub_h) = match self.chroma_format_idc {
+            0 => (1, 1), // monochrome
+            1 => (2, 2), // 4:2:0
+            2 => (2, 1), // 4:2:2
+            _ => (1, 1), // 4:4:4 / unknown → conservative
+        };
+        let crop = match &self.frame_cropping {
+            Some(c) => c,
+            None => return (self.width, self.height),
+        };
+        let crop_unit_x = sub_w;
+        let crop_unit_y = sub_h * if self.frame_mbs_only_flag { 1 } else { 2 };
+        let dw = self
+            .width
+            .saturating_sub(crop_unit_x * (crop.left + crop.right));
+        let dh = self
+            .height
+            .saturating_sub(crop_unit_y * (crop.top + crop.bottom));
+        (dw, dh)
+    }
 }
 
 // ─── Capability A: Emulation prevention byte stripper ────────────────────────
@@ -206,9 +262,15 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, AvccError> {
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     );
 
+    // chroma_format_idc defaults to 1 (4:2:0) for non-high profiles per H.264
+    // §7.4.2.1.1. The default holds for Baseline / Main / Extended; only High
+    // profiles encode it explicitly.
+    let mut chroma_format_idc: u8 = 1;
+
     if is_high_profile {
-        let chroma_format_idc = r.read_ue()?;
-        if chroma_format_idc == 3 {
+        let cfi = r.read_ue()?;
+        chroma_format_idc = cfi as u8;
+        if cfi == 3 {
             let _separate_colour_plane_flag = r.read_bit()?;
         }
         let _bit_depth_luma_minus8 = r.read_ue()?;
@@ -216,7 +278,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, AvccError> {
         let _qpprime_y_zero_transform_bypass_flag = r.read_bit()?;
         let seq_scaling_matrix_present_flag = r.read_bit()?;
         if seq_scaling_matrix_present_flag {
-            let list_count: u8 = if chroma_format_idc != 3 { 8 } else { 12 };
+            let list_count: u8 = if cfi != 3 { 8 } else { 12 };
             for i in 0..list_count {
                 let present = r.read_bit()?;
                 if present {
@@ -280,6 +342,19 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, AvccError> {
     let height_factor: u32 = if frame_mbs_only_flag { 1 } else { 2 };
     let height = height_factor * (pic_height_in_map_units_minus1 + 1) * 16;
 
+    // Optional fields after frame_mbs_only_flag — order per §7.3.2.1.1:
+    //   if (!frame_mbs_only_flag) mb_adaptive_frame_field_flag u(1)
+    //   direct_8x8_inference_flag u(1)
+    //   frame_cropping_flag u(1)
+    //   if (frame_cropping_flag) { 4 × ue(v) crop offsets }
+    //   ... vui_parameters and rbsp_trailing_bits follow but we do not need them.
+    //
+    // These reads MAY hit end-of-bitstream on minimal test SPS fixtures that omit
+    // the trailing bits — treat any read failure here as "no cropping info" so
+    // the parser remains backwards-compatible. Production encoders always emit
+    // the full SPS body so the cropping offsets are recovered correctly.
+    let frame_cropping = read_frame_cropping(&mut r, frame_mbs_only_flag);
+
     Ok(SpsInfo {
         profile_idc,
         constraint_set_flags,
@@ -287,6 +362,33 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsInfo, AvccError> {
         width,
         height,
         frame_mbs_only_flag,
+        chroma_format_idc,
+        frame_cropping,
+    })
+}
+
+/// Read the post-`frame_mbs_only_flag` SPS fields (mb_adaptive,
+/// direct_8x8_inference, frame_cropping_flag + offsets) and return the cropping
+/// rectangle if present. Returns `None` if any read fails — the bitstream is
+/// either truncated (test fixture) or malformed; both cases mean "no cropping".
+fn read_frame_cropping(r: &mut BitReader<'_>, frame_mbs_only_flag: bool) -> Option<FrameCropping> {
+    if !frame_mbs_only_flag {
+        let _mb_adaptive = r.read_bit().ok()?;
+    }
+    let _direct_8x8 = r.read_bit().ok()?;
+    let cropping_flag = r.read_bit().ok()?;
+    if !cropping_flag {
+        return None;
+    }
+    let left = r.read_ue().ok()?;
+    let right = r.read_ue().ok()?;
+    let top = r.read_ue().ok()?;
+    let bottom = r.read_ue().ok()?;
+    Some(FrameCropping {
+        left,
+        right,
+        top,
+        bottom,
     })
 }
 
@@ -457,6 +559,8 @@ mod tests {
             width: 1280,
             height: 720,
             frame_mbs_only_flag: true,
+            chroma_format_idc: 1,
+            frame_cropping: None,
         }
     }
 
@@ -678,5 +782,78 @@ mod tests {
         assert_eq!(buf[3], 13, "AVCLevelIndication = 13 (Level 1.3)");
         assert_eq!(buf[4], 0xFF, "lengthSizeMinusOne = 3 → 0xFF");
         assert_eq!(buf[5], 0xE1, "numSPS = 1 → 0xE1");
+    }
+
+    // ─── B11-S5 regression: display_dimensions ──────────────────────────────
+
+    /// B11-S5: a 1920×1080 source is encoded as 1920×1088 with crop_bottom = 4
+    /// chroma units (= 8 luma pixels at 4:2:0). The display dims that go into
+    /// `tkhd` and `avc1` MUST be 1920×1080, NOT 1920×1088.
+    #[test]
+    fn display_dimensions_1080p_crop_bottom_4_chroma_units_b11_s5() {
+        let info = SpsInfo {
+            profile_idc: 66,
+            constraint_set_flags: 0xC0,
+            level_idc: 40,
+            width: 1920,
+            height: 1088,
+            frame_mbs_only_flag: true,
+            chroma_format_idc: 1, // 4:2:0
+            frame_cropping: Some(FrameCropping {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 4,
+            }),
+        };
+        assert_eq!(info.display_dimensions(), (1920, 1080));
+    }
+
+    /// `frame_cropping = None` returns the encoded dimensions unchanged.
+    #[test]
+    fn display_dimensions_no_crop_returns_encoded_b11_s5() {
+        let info = SpsInfo {
+            profile_idc: 66,
+            constraint_set_flags: 0xC0,
+            level_idc: 30,
+            width: 320,
+            height: 240,
+            frame_mbs_only_flag: true,
+            chroma_format_idc: 1,
+            frame_cropping: None,
+        };
+        assert_eq!(info.display_dimensions(), (320, 240));
+    }
+
+    /// 4:2:2 chroma format halves only the horizontal crop unit.
+    #[test]
+    fn display_dimensions_422_chroma_format_b11_s5() {
+        let info = SpsInfo {
+            profile_idc: 122, // High 4:2:2
+            constraint_set_flags: 0,
+            level_idc: 40,
+            width: 1280,
+            height: 720,
+            frame_mbs_only_flag: true,
+            chroma_format_idc: 2, // 4:2:2
+            frame_cropping: Some(FrameCropping {
+                left: 0,
+                right: 0,
+                top: 0,
+                bottom: 4,
+            }),
+        };
+        // sub_h = 1 for 4:2:2, so crop_unit_y = 1; bottom 4 chroma units = 4 luma rows.
+        assert_eq!(info.display_dimensions(), (1280, 716));
+    }
+
+    /// Existing 320×240 SPS parser path: chroma_format_idc defaults to 1,
+    /// no cropping is read (test fixture has rbsp_trailing_bits where the
+    /// cropping flag would be → graceful fallback to None).
+    #[test]
+    fn parse_sps_320x240_chroma_default_no_crop_b11_s5() {
+        let info = parse_sps(SPS_320X240).expect("should parse");
+        assert_eq!(info.chroma_format_idc, 1, "Baseline → 4:2:0 default");
+        assert_eq!(info.display_dimensions(), (320, 240));
     }
 }
