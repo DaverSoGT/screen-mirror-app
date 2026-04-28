@@ -1479,7 +1479,8 @@ mod tests {
     /// Design #288 §7.1: "build a `BuilderFn` that, when invoked, records the args
     /// into `probe` and returns a fake bundle".
     fn make_test_builder(probe: Arc<BuilderProbe>, result: Result<(), &'static str>) -> BuilderFn {
-        Arc::new(move |port, name, _stop_flag| {
+        Arc::new(move |bind_ctx: BindCtx, port, name, _stop_flag| {
+            let _ = bind_ctx; // PQ-C-1: drop the prebound socket in tests; no I/O needed.
             probe.invocations.lock().unwrap().push((port, name));
             match result {
                 Ok(()) => {
