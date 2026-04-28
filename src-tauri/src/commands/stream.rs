@@ -3813,6 +3813,80 @@ mod tests {
         check::<BindCtx>();
     }
 
+    // ─── B5 RED: grep-audit guards for TOCTOU hardening ─────────────────────
+
+    /// B5-T1 — `UdpSocket::bind` MUST NOT appear in `build_production_bundle`
+    /// after TOCTOU hardening (R5.3, R8.1, D4).
+    ///
+    /// The audit ensures that no future maintainer accidentally re-introduces a
+    /// second bind inside `build_production_bundle`. Also verifies that
+    /// `bind_probe` DOES contain `UdpSocket::bind` (makes the audit non-vacuous).
+    ///
+    /// Uses `.contains()` string matching on the production section (CRLF-safe —
+    /// we search for token substrings, not line boundaries).
+    ///
+    /// RED if `build_production_bundle` still calls `UdpSocket::bind` directly.
+    #[test]
+    fn no_udp_socket_bind_in_build_production_bundle() {
+        let src = include_str!("stream.rs");
+        // Normalize CRLF → LF so the split and search work on all platforms.
+        let src_lf = src.replace("\r\n", "\n");
+        // Exclude the test module block. Split on `\n#[cfg(test)]\nmod tests {` which
+        // is unique to the module declaration (vs. the comment reference in new_with_builder
+        // which has `#[cfg(test)]` inline without a preceding newline at start-of-line).
+        let production = src_lf
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(&src_lf);
+
+        // Locate the `fn build_production_bundle(` body up to the next top-level fn.
+        let start_idx = production
+            .find("fn build_production_bundle(")
+            .expect("build_production_bundle must exist in production code");
+        let after = &production[start_idx..];
+        // Heuristic: find the next top-level `\nfn ` or `\npub*fn ` after this fn.
+        let end_rel = after[1..]
+            .find("\nfn ")
+            .or_else(|| after[1..].find("\npub(crate) fn "))
+            .or_else(|| after[1..].find("\npub fn "))
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end_rel];
+
+        // We check for the actual CALL pattern `UdpSocket::bind(` (with opening paren),
+        // not the token `UdpSocket::bind` alone, to avoid matching comments that mention
+        // the name without calling it (e.g. "No second `UdpSocket::bind` occurs here").
+        assert!(
+            !body.contains("UdpSocket::bind("),
+            "UdpSocket::bind(...) call must NOT appear in build_production_bundle (TOCTOU re-bind guard, R5.3)"
+        );
+
+        // bind_probe IS allowed — verify it contains a UdpSocket::bind( call so the audit is meaningful.
+        let probe_idx = production
+            .find("fn bind_probe(")
+            .expect("bind_probe must exist in production code");
+        let probe_body = &production[probe_idx..probe_idx + 400];
+        assert!(
+            probe_body.contains("UdpSocket::bind("),
+            "bind_probe must contain a UdpSocket::bind(...) call — otherwise the audit is vacuous"
+        );
+    }
+
+    /// B5-T2 — `make_addr_in_use_builder` MUST be removed from the workspace (R6.2, D4).
+    ///
+    /// After TOCTOU hardening, `PortInUse` errors originate from `bind_probe`,
+    /// not from inside the builder. `make_addr_in_use_builder` is structurally dead.
+    ///
+    /// RED while `make_addr_in_use_builder` still exists in `stream.rs`.
+    #[test]
+    fn make_addr_in_use_builder_is_removed() {
+        let src = include_str!("stream.rs");
+        assert!(
+            !src.contains("make_addr_in_use_builder"),
+            "make_addr_in_use_builder must be deleted (PQ-C-1, R6.2)"
+        );
+    }
+
     // ─── B4 RED: wire bind_probe into start_stream_inner ─────────────────────
 
     /// B4-T1 — Deterministic TOCTOU regression: stealing an ephemeral port before
