@@ -159,6 +159,16 @@ pub(crate) enum BundleError {
     Other(String),
 }
 
+impl From<sm_domain::signaling::SignalingError> for BundleError {
+    fn from(e: sm_domain::signaling::SignalingError) -> Self {
+        // No variant of SignalingError is "port in use" — none touch UDP bind.
+        // mDNS uses TCP control + UDP multicast, but discovery failures are
+        // not bind-conflicts; AddrInUse for the receiver UDP socket happens
+        // exclusively in TransportError.
+        BundleError::Other(e.to_string())
+    }
+}
+
 impl From<TransportError> for BundleError {
     fn from(e: TransportError) -> Self {
         match e {
