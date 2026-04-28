@@ -8,6 +8,10 @@ use screen_mirror_lib::commands::sender::{
     SenderBridge, SenderStats, StartSenderError,
 };
 
+// B2: Verify the command symbols are importable (compile-level test).
+#[allow(unused_imports)]
+use screen_mirror_lib::commands::sender::{start_sender, stop_sender, sender_diagnostics};
+
 // ─── B1 type assertions ────────────────────────────────────────────────────────
 
 /// Compile-time assertion: SenderBridge is Send + Sync + 'static.
@@ -64,4 +68,26 @@ fn sender_stats_serializes_correctly() {
     let back: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(back["running"], false);
     assert_eq!(back["dropped_frames_encoder"], 0);
+}
+
+// ─── B2 command registration assertions ──────────────────────────────────────
+
+/// Compile-level test: start_sender, stop_sender, sender_diagnostics exist as pub items.
+/// The #[allow(unused_imports)] use at the top of this file acts as the compile-level gate.
+#[test]
+fn start_sender_stub_exists() {
+    // The import at the top verifies the symbols are accessible.
+    // This test body just runs to confirm the binary is built.
+    let _bridge = SenderBridge::new();
+    assert!(true);
+}
+
+/// SenderBridge and StreamBridge can coexist in the same scope.
+#[test]
+fn sender_bridge_managed_separately_from_stream_bridge() {
+    use screen_mirror_lib::commands::stream::StreamBridge;
+    let sender = SenderBridge::new();
+    let stream = StreamBridge::new();
+    assert!(sender.session.lock().unwrap().is_none());
+    assert!(!stream.is_running());
 }
