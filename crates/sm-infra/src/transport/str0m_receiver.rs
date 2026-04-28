@@ -535,6 +535,16 @@ fn run_receiver_loop(
             {
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
             }
+            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Windows-specific: WSAECONNRESET on a UDP socket surfaces a
+                // queued ICMP "destination unreachable" from a previous
+                // send_to. UDP is connectionless — this is advisory and the
+                // socket remains usable. Linux silently drops these.
+                eprintln!(
+                    "[sm-receiver-tick] ignoring transient ICMP-related recv_from error (WSAECONNRESET): {e}"
+                );
+                let _ = rtc.handle_input(Input::Timeout(Instant::now()));
+            }
             Err(e) => {
                 let _ = event_tx.try_send(TransportEvent::ConnectionLost {
                     reason: format!("UDP recv_from error: {e}"),
