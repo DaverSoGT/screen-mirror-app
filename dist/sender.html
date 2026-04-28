@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Screen Mirror — Sender</title>
+    <style>
+      body {
+        margin: 0;
+        background: #111;
+        color: #ddd;
+        font-family: system-ui, sans-serif;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+      }
+      .sender-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        min-width: 280px;
+      }
+      h1 {
+        font-size: 1.3rem;
+        font-weight: 600;
+        margin: 0 0 0.5rem;
+      }
+      label {
+        font-size: 0.85rem;
+        color: #999;
+        display: block;
+        margin-bottom: 0.25rem;
+      }
+      select,
+      input[type="number"] {
+        width: 100%;
+        padding: 0.4rem 0.6rem;
+        background: #1e1e1e;
+        border: 1px solid #444;
+        color: #666;
+        font-size: 0.95rem;
+        font-family: inherit;
+        border-radius: 3px;
+        cursor: not-allowed;
+        box-sizing: border-box;
+      }
+      button#start {
+        padding: 0.6rem 1.8rem;
+        font-size: 1rem;
+        font-family: inherit;
+        border: 1px solid #444;
+        background: #1e1e1e;
+        color: #555;
+        border-radius: 4px;
+        cursor: not-allowed;
+        align-self: flex-start;
+      }
+      #status {
+        font-size: 0.8rem;
+        font-family: ui-monospace, monospace;
+        color: #777;
+      }
+      .back-link {
+        font-size: 0.8rem;
+        color: #777;
+        text-decoration: underline;
+      }
+      .back-link:hover {
+        color: #aaa;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="sender-panel">
+      <h1>Sender</h1>
+
+      <div>
+        <label for="monitor">Monitor</label>
+        <!-- R4 — disabled select, placeholder option -->
+        <select id="monitor" disabled>
+          <option>Select monitor</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="fps">Frame rate (fps)</label>
+        <!-- R4 — disabled number input -->
+        <input type="number" id="fps" min="1" max="120" placeholder="30" disabled />
+      </div>
+
+      <div>
+        <label for="bitrate">Bitrate (kbps)</label>
+        <!-- R4 — disabled number input -->
+        <input type="number" id="bitrate" placeholder="kbps" disabled />
+      </div>
+
+      <!-- R4 — disabled Start button -->
+      <button id="start" disabled>Start sender</button>
+
+      <!-- R4 — Not connected status -->
+      <div id="status">Not connected</div>
+
+      <!-- R4 — back-to-landing link -->
+      <a class="back-link" href="./index.html">Change mode</a>
+    </div>
+  </body>
+</html>
