@@ -338,6 +338,7 @@ pub fn run_sender_transport_event_drain(
         match ev_rx.recv_timeout(Duration::from_millis(500)) {
             Ok(ev) => match ev {
                 TransportEvent::IceConnected => {
+                    eprintln!("[sm-sender-transport-drain] ICE connected");
                     emit_event(&channel, &SenderStatusEvent::Streaming);
                     emit_event(
                         &channel,
@@ -347,6 +348,7 @@ pub fn run_sender_transport_event_drain(
                     );
                 }
                 TransportEvent::IceFailed => {
+                    eprintln!("[sm-sender-transport-drain] ICE failed — emitting PeerLost + Restart button");
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
                     emit_event(
                         &channel,
@@ -355,7 +357,8 @@ pub fn run_sender_transport_event_drain(
                         },
                     );
                 }
-                TransportEvent::ConnectionLost { .. } => {
+                TransportEvent::ConnectionLost { reason } => {
+                    eprintln!("[sm-sender-transport-drain] connection lost: {reason} — emitting PeerLost + Restart button");
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
                     emit_event(
                         &channel,
