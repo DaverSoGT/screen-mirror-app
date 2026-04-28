@@ -3567,6 +3567,31 @@ mod tests {
         );
     }
 
+    // ─── B3.T7 RED: From<io::Error> for BundleError (R2.5) ──────────────────────
+
+    #[test]
+    fn bundle_error_from_io_error_maps_to_other() {
+        use std::io;
+        // io::Error never carries AddrInUse to build_production_bundle;
+        // detection is in str0m_receiver.rs
+        let err1 = io::Error::new(io::ErrorKind::Other, "thread spawn failed");
+        let be1: BundleError = err1.into();
+        match be1 {
+            BundleError::Other(_) => {}
+            other => panic!("expected BundleError::Other(_) for Other io::Error, got {other:?}"),
+        }
+
+        let err2 = io::Error::from(io::ErrorKind::AddrInUse);
+        let be2: BundleError = err2.into();
+        // io::Error AddrInUse ALSO maps to Other — NOT PortInUse.
+        // Risk R7: AddrInUse io::Error never reaches build_production_bundle;
+        // it is intercepted in str0m_receiver.rs before crossing crate boundaries.
+        match be2 {
+            BundleError::Other(_) => {}
+            other => panic!("expected BundleError::Other(_) for AddrInUse io::Error, got {other:?}"),
+        }
+    }
+
     // ─── B3.T5 RED: From<SignalingError> for BundleError (R2.4) ──────────────────
 
     #[test]
