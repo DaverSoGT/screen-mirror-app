@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Screen Mirror</title>
+    <style>
+      body {
+        margin: 0;
+        background: #111;
+        color: #ddd;
+        font-family: system-ui, sans-serif;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+      }
+      .landing {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1.5rem;
+      }
+      h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: 0.02em;
+      }
+      .mode-buttons {
+        display: flex;
+        gap: 1rem;
+      }
+      button {
+        padding: 0.6rem 1.8rem;
+        font-size: 1rem;
+        font-family: inherit;
+        border: 1px solid #555;
+        background: #222;
+        color: #ddd;
+        cursor: pointer;
+        border-radius: 4px;
+        transition: background 0.15s;
+      }
+      button:hover {
+        background: #333;
+      }
+      .change-mode {
+        font-size: 0.8rem;
+        color: #777;
+        cursor: pointer;
+        text-decoration: underline;
+        background: none;
+        border: none;
+        padding: 0;
+        font-family: inherit;
+      }
+      .change-mode:hover {
+        color: #aaa;
+      }
+    </style>
+    <script>
+      // R5.3 — auto-route on load if sm.lastMode is a valid value.
+      // Use location.replace() (not assign()) to avoid polluting history.
+      (function () {
+        var mode = localStorage.getItem("sm.lastMode");
+        if (mode === "viewer") {
+          location.replace("./viewer.html");
+        } else if (mode === "sender") {
+          location.replace("./sender.html");
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div class="landing">
+      <h1>Screen Mirror</h1>
+      <div class="mode-buttons">
+        <!-- R5.1 — value must be "sender" or "viewer" only.               -->
+        <!-- R5.2 — write localStorage BEFORE location.assign (write-before-nav). -->
+        <button id="btn-send" onclick="localStorage.setItem('sm.lastMode', 'sender'); location.assign('./sender.html');">
+          Send
+        </button>
+        <button id="btn-receive" onclick="localStorage.setItem('sm.lastMode', 'viewer'); location.assign('./viewer.html');">
+          Receive
+        </button>
+      </div>
+      <!-- R5.4 — "Change mode" clears sm.lastMode and stays on landing.   -->
+      <button class="change-mode" onclick="localStorage.removeItem('sm.lastMode');">
+        Change mode
+      </button>
+    </div>
+  </body>
+</html>
