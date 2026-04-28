@@ -49,7 +49,7 @@ use sm_domain::transport::{
 };
 use sm_infra::render::fmp4_muxer::{Mp4Muxer, extract_sps_pps_from_idr};
 use sm_infra::signaling::mdns::MdnsSignaling;
-use sm_infra::transport::Str0mVideoReceiver;
+use sm_infra::transport::{Str0mVideoReceiver, publish_host_candidate};
 use tauri::ipc::InvokeResponseBody;
 
 // ─── Frame discriminants ──────────────────────────────────────────────────────
@@ -891,6 +891,19 @@ fn build_production_bundle(
 
     // NEW: hand the prebound socket to the receiver — no second bind (R5.2, R5.3).
     receiver.start_with_socket(socket, pkt_tx, transport_event_tx)?;
+
+    // Trickle ICE: publish host candidate AFTER start_with_socket so the candidate
+    // is queued in the signaling inbox before the Arc<Mutex<>> wrap occurs.
+    // `signaling` is still the un-wrapped local variable here (design §3.2).
+    // If no non-loopback NIC is available, log a warning and continue — the bundle
+    // MUST NOT fail solely because no candidate was published (R-CT-5).
+    if let Some(addr) = receiver.candidate_addr() {
+        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
+            eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
+        });
+    } else {
+        eprintln!("[sm-receiver-bundle] no non-loopback NIC; skipping candidate publish");
+    }
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
     let receiver_mutex = Arc::new(Mutex::new(receiver));
