@@ -27,7 +27,14 @@
 //
 // No import / require. Plain JS module. R11.7.
 
-const CODEC = 'video/mp4; codecs="avc1.42E01E"';
+// Codec compatibility check — generic Baseline 3.0 string is enough to test
+// MSE+H.264 support; the per-stream codec string is derived from the avcC box
+// in the actual init segment (see deriveCodecFromInitSegment below). This
+// avoids the B11-S4 bug where a hardcoded `avc1.42E01E` codec string was
+// rejected by Chromium's MSE parser when the encoder produced a stream at a
+// higher level (e.g. 4.0 for 1080p), closing the MediaSource and removing
+// the SourceBuffer mid-stream.
+const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
@@ -40,37 +47,53 @@ function setStatus(msg) {
   console.log("[mse]", msg);
 }
 
+// Scan an fMP4 init segment for the `avcC` box and synthesize the matching
+// codec string. The avcC payload (after the 4-byte "avcC" tag) is:
+//   [0] configurationVersion (1)
+//   [1] AVCProfileIndication
+//   [2] profile_compatibility
+//   [3] AVCLevelIndication
+// These three bytes drive the codec string `avc1.PPCCLL`. Returns null if no
+// avcC box is found in the buffer.
+function deriveCodecFromInitSegment(buf) {
+  const view = new Uint8Array(buf);
+  for (let i = 0; i + 8 < view.length; i++) {
+    if (
+      view[i] === 0x61 && // 'a'
+      view[i + 1] === 0x76 && // 'v'
+      view[i + 2] === 0x63 && // 'c'
+      view[i + 3] === 0x43 // 'C'
+    ) {
+      const profile = view[i + 5];
+      const compat = view[i + 6];
+      const level = view[i + 7];
+      const hex = (b) => b.toString(16).padStart(2, "0").toUpperCase();
+      return 'video/mp4; codecs="avc1.' + hex(profile) + hex(compat) + hex(level) + '"';
+    }
+  }
+  return null;
+}
+
 async function main() {
-  // ── R11.2: codec compatibility check ─────────────────────────────────────
-  if (!("MediaSource" in window) || !MediaSource.isTypeSupported(CODEC)) {
+  // ── R11.2: probe MSE+H.264 support generically ───────────────────────────
+  if (!("MediaSource" in window) || !MediaSource.isTypeSupported(PROBE_CODEC)) {
     const err =
-      "FATAL: MSE / H.264 baseline 3.0 not supported. " +
+      "FATAL: MSE / H.264 not supported. " +
       "Install Media Feature Pack (Windows N/KN edition).";
     setStatus(err);
     if (STATUS_EL) STATUS_EL.style.color = "red";
     return;
   }
 
-  // ── 1. Wire <video> to a fresh MediaSource ────────────────────────────────
+  // ── 1. Wire <video> to a fresh MediaSource (sourceopen but no SourceBuffer yet) ──
+  // SourceBuffer creation is deferred until the first init segment arrives so
+  // we can derive the precise codec string from its avcC box (B11-S4 fix).
   const ms = new MediaSource();
   VIDEO_EL.src = URL.createObjectURL(ms);
 
-  let sb;
   try {
-    sb = await new Promise((resolve, reject) => {
-      ms.addEventListener(
-        "sourceopen",
-        () => {
-          try {
-            const buf = ms.addSourceBuffer(CODEC);
-            buf.mode = "segments"; // R11.4: deterministic timeline
-            resolve(buf);
-          } catch (e) {
-            reject(e);
-          }
-        },
-        { once: true }
-      );
+    await new Promise((resolve, reject) => {
+      ms.addEventListener("sourceopen", () => resolve(), { once: true });
       ms.addEventListener("error", reject, { once: true });
     });
   } catch (e) {
@@ -80,7 +103,8 @@ async function main() {
 
   setStatus("MSE ready — awaiting init segment…");
 
-  // ── 2. Sequential append queue (R11.5) ────────────────────────────────────
+  // ── 2. Sequential append queue + lazy SourceBuffer (R11.5) ────────────────
+  let sb = null;
   const pending = [];
   let initReceived = false;
 
@@ -90,7 +114,7 @@ async function main() {
   }
 
   function flushQueue() {
-    if (sb.updating || pending.length === 0) return;
+    if (!sb || sb.updating || pending.length === 0) return;
     const next = pending.shift();
     try {
       sb.appendBuffer(next);
@@ -104,32 +128,29 @@ async function main() {
     }
   }
 
-  sb.addEventListener("updateend", flushQueue);
-
   // ── 3. Buffer trim — every 5 s, keep last 30 s (R11.6, OQ-mse-trim-1) ────
   function trimSourceBuffer() {
-    if (sb.updating || !VIDEO_EL) return;
-    const cur = VIDEO_EL.currentTime;
-    const cutoff = Math.max(0, cur - 30);
-    if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
-      try {
+    if (!sb || sb.updating || !VIDEO_EL) return;
+    try {
+      const cur = VIDEO_EL.currentTime;
+      const cutoff = Math.max(0, cur - 30);
+      if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
         sb.remove(sb.buffered.start(0), cutoff);
-      } catch (e) {
-        console.warn("[mse] trim failed", e);
       }
+    } catch (e) {
+      // Buffered/remove can throw if SourceBuffer detached — log once, don't spam.
+      console.warn("[mse] trim skipped", e.name);
     }
   }
   const trimHandle = setInterval(trimSourceBuffer, 5000);
 
   // ── 4. Create a Tauri Channel<Bytes> (F-fix-3) ───────────────────────────
   //
-  // window.__TAURI_INTERNALS__.Channel is the Tauri 2 Channel constructor.
-  // The channel is passed to start_stream as a command argument; Rust clones
-  // it into the mux thread and calls channel.send(InvokeResponseBody::Raw(bytes)).
-  //
+  // window.__TAURI__.core.Channel is the Tauri 2 Channel constructor (per
+  // dual-mode-shell amendment #339).
   // onmessage receives an ArrayBuffer. Byte 0 is the discriminant:
-  //   0x00 = init segment → feed to SourceBuffer first
-  //   0x01 = media segment → feed to SourceBuffer after init
+  //   0x00 = init segment → derive codec, addSourceBuffer, append
+  //   0x01 = media segment → append after init
   const Channel = window.__TAURI__.core.Channel;
   const streamChannel = new Channel();
 
@@ -145,7 +166,32 @@ async function main() {
     const frameBytes = data.subarray(1).buffer; // strip the discriminant byte
 
     if (discriminant === FRAME_INIT) {
-      setStatus("init segment received (" + (data.length - 1) + " bytes)");
+      if (sb !== null) {
+        // Already have a SourceBuffer from a previous init — re-init not
+        // supported in v1; ignore subsequent init segments.
+        console.warn("[mse] additional init segment ignored");
+        return;
+      }
+      const derived = deriveCodecFromInitSegment(frameBytes);
+      if (!derived) {
+        setStatus("init segment missing avcC — cannot derive codec");
+        return;
+      }
+      if (!MediaSource.isTypeSupported(derived)) {
+        setStatus("FATAL: derived codec not supported: " + derived);
+        return;
+      }
+      try {
+        sb = ms.addSourceBuffer(derived);
+        sb.mode = "segments"; // R11.4: deterministic timeline
+        sb.addEventListener("updateend", flushQueue);
+      } catch (e) {
+        setStatus("addSourceBuffer failed: " + e);
+        return;
+      }
+      setStatus(
+        "init segment received (" + (data.length - 1) + " bytes), codec=" + derived
+      );
       initReceived = true;
       enqueue(frameBytes);
     } else if (discriminant === FRAME_SEGMENT) {
