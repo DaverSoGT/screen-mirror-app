@@ -3557,6 +3557,24 @@ mod tests {
         );
     }
 
+    // ─── B3.T5 RED: From<SignalingError> for BundleError (R2.4) ──────────────────
+
+    #[test]
+    fn bundle_error_from_signaling_error_all_collapse_to_other() {
+        use sm_domain::signaling::SignalingError;
+        let cases: Vec<SignalingError> = vec![
+            SignalingError::AlreadyRunning,
+            SignalingError::Io("x".into()),
+        ];
+        for se in cases {
+            let be: BundleError = se.into();
+            match be {
+                BundleError::Other(_) => {}
+                other => panic!("expected BundleError::Other(_), got {other:?}"),
+            }
+        }
+    }
+
     // ─── B3.T3 RED: From<TransportError> for BundleError (R2.3, R5.4) ────────────
 
     #[test]
