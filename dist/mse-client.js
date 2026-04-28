@@ -162,6 +162,7 @@ async function main() {
   // which the Rust CommandArg impl deserialises back into Channel<InvokeResponseBody>.
   try {
     await window.__TAURI__.core.invoke("start_stream", { channel: streamChannel });
+    window.__sm_streamActive = true; // R6 — flag set after MSE source attach + start_stream succeeds (amended R9.1)
     setStatus("start_stream invoked — waiting for first IDR…");
   } catch (e) {
     setStatus("start_stream failed: " + e);
