@@ -1,14 +1,18 @@
-mod commands;
+pub mod commands;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(commands::stream::StreamBridge::new())
+        .manage(commands::sender::SenderBridge::new())
         .invoke_handler(tauri::generate_handler![
             commands::stream::start_stream,
             commands::stream::stop_stream,
             commands::stream::attach_stream,
             commands::stream::stream_diagnostics,
+            commands::sender::start_sender,
+            commands::sender::stop_sender,
+            commands::sender::sender_diagnostics,
             smoke::smoke_com_apartment,
         ])
         .run(tauri::generate_context!())
