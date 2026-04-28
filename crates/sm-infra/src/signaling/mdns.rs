@@ -506,7 +506,9 @@ fn run_frame_loop(
                     SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
                     SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
                     SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
-                    SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
+                    SignalingFrame::Candidate { sdp } => {
+                        format!("Candidate (sdp={} bytes)", sdp.len())
+                    }
                     SignalingFrame::Bye => "Bye".to_string(),
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
@@ -542,16 +544,37 @@ fn run_frame_loop(
                 // helps identify whether we're mid-SDP-body, mid-JSON, or
                 // looking at a foreign protocol payload.
                 use std::io::BufRead;
-                let extra: Vec<u8> = reader.fill_buf().map(|b| b[..b.len().min(64)].to_vec()).unwrap_or_default();
-                let hex: String = extra.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                let extra: Vec<u8> = reader
+                    .fill_buf()
+                    .map(|b| b[..b.len().min(64)].to_vec())
+                    .unwrap_or_default();
+                let hex: String = extra
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let ascii: String = extra
                     .iter()
-                    .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
+                    .map(|b| {
+                        if (0x20..0x7f).contains(b) {
+                            *b as char
+                        } else {
+                            '.'
+                        }
+                    })
                     .collect();
                 eprintln!("[sm-signaling-frame-loop] EXIT: read error: {e}");
-                eprintln!("[sm-signaling-frame-loop] read error context: peer={peer} local={local}");
-                eprintln!("[sm-signaling-frame-loop] next {} bytes (hex)  : {hex}", extra.len());
-                eprintln!("[sm-signaling-frame-loop] next {} bytes (ascii): {ascii}", extra.len());
+                eprintln!(
+                    "[sm-signaling-frame-loop] read error context: peer={peer} local={local}"
+                );
+                eprintln!(
+                    "[sm-signaling-frame-loop] next {} bytes (hex)  : {hex}",
+                    extra.len()
+                );
+                eprintln!(
+                    "[sm-signaling-frame-loop] next {} bytes (ascii): {ascii}",
+                    extra.len()
+                );
                 emit_error(
                     &event_tx,
                     SignalingError::Protocol(format!("frame read error: {e}")),
@@ -600,9 +623,7 @@ fn read_frame_or_pending<R: Read>(
     match reader.read(&mut prefix[..1]) {
         Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed")),
         Ok(_) => {}
-        Err(e)
-            if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
-        {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock => {
             return Ok(None);
         }
         Err(e) => return Err(e),
@@ -634,9 +655,9 @@ fn read_frame_or_pending<R: Read>(
     // Read the full body, tolerating transient timeouts.
     let mut body = vec![0u8; len];
     read_exact_resilient(reader, &mut body, stop)?;
-    serde_json::from_slice(&body).map(Some).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, e)
-    })
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Like `Read::read_exact`, but retries on TimedOut / WouldBlock and
@@ -665,8 +686,7 @@ fn read_exact_resilient<R: Read>(
             }
             Ok(n) => filled += n,
             Err(e)
-                if e.kind() == io::ErrorKind::TimedOut
-                    || e.kind() == io::ErrorKind::WouldBlock =>
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
             {
                 continue;
             }
@@ -937,7 +957,7 @@ mod tests {
                     Err(io::Error::new(io::ErrorKind::TimedOut, "scripted timeout"))
                 }
                 Some(Step::Eof) => Ok(0),
-                None => Err(io::Error::new(io::ErrorKind::Other, "script exhausted")),
+                None => Err(io::Error::other("script exhausted")),
             }
         }
     }
@@ -959,8 +979,8 @@ mod tests {
         let body_len = buf.len() - 4;
         let third = body_len / 3;
         let steps = vec![
-            Step::Bytes(1),    // first byte of prefix
-            Step::Bytes(3),    // remaining 3 bytes of prefix
+            Step::Bytes(1), // first byte of prefix
+            Step::Bytes(3), // remaining 3 bytes of prefix
             Step::Bytes(third),
             Step::Timeout,
             Step::Bytes(third),
@@ -997,8 +1017,8 @@ mod tests {
             steps: vec![Step::Timeout].into_iter(),
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let result = read_frame_or_pending(&mut reader, &stop)
-            .expect("first-byte timeout must not error");
+        let result =
+            read_frame_or_pending(&mut reader, &stop).expect("first-byte timeout must not error");
         assert!(
             result.is_none(),
             "first-byte timeout must return Ok(None), got {result:?}"
@@ -1046,8 +1066,8 @@ mod tests {
             steps: vec![Step::Bytes(1), Step::Bytes(usize::MAX), Step::Eof].into_iter(),
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let err = read_frame_or_pending(&mut reader, &stop)
-            .expect_err("must error on truncated frame");
+        let err =
+            read_frame_or_pending(&mut reader, &stop).expect_err("must error on truncated frame");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

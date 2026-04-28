@@ -348,7 +348,9 @@ pub fn run_sender_transport_event_drain(
                     );
                 }
                 TransportEvent::IceFailed => {
-                    eprintln!("[sm-sender-transport-drain] ICE failed — emitting PeerLost + Restart button");
+                    eprintln!(
+                        "[sm-sender-transport-drain] ICE failed — emitting PeerLost + Restart button"
+                    );
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
                     emit_event(
                         &channel,
@@ -358,7 +360,9 @@ pub fn run_sender_transport_event_drain(
                     );
                 }
                 TransportEvent::ConnectionLost { reason } => {
-                    eprintln!("[sm-sender-transport-drain] connection lost: {reason} — emitting PeerLost + Restart button");
+                    eprintln!(
+                        "[sm-sender-transport-drain] connection lost: {reason} — emitting PeerLost + Restart button"
+                    );
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
                     emit_event(
                         &channel,
