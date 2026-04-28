@@ -1278,6 +1278,11 @@ fn mux_thread(
     // Pre-IDR buffer: accumulate non-keyframe packets until the first IDR.
     let mut pre_idr_buffer: Vec<EncodedPacket> = Vec::new();
 
+    // Latency-diagnostic timestamps (B11).
+    let mux_start = std::time::Instant::now();
+    let mut first_pkt_seen: Option<std::time::Instant> = None;
+    eprintln!("[sm-stream-mux] thread spawned; waiting for first packet…");
+
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -1288,6 +1293,16 @@ fn mux_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+
+        if first_pkt_seen.is_none() {
+            let t = std::time::Instant::now();
+            first_pkt_seen = Some(t);
+            eprintln!(
+                "[sm-stream-mux] first packet received at +{}ms (keyframe={})",
+                t.duration_since(mux_start).as_millis(),
+                pkt.is_keyframe
+            );
+        }
 
         // Fire PLI exactly once on the first packet received.
         if !pli_fired {
@@ -1335,8 +1350,12 @@ fn mux_thread(
                     }
                 };
                 eprintln!(
-                    "[sm-stream-mux] init segment dims: {}x{} (display, cropped from SPS)",
-                    dims.0, dims.1
+                    "[sm-stream-mux] init segment dims: {}x{} (display, cropped from SPS), at +{}ms from first packet",
+                    dims.0,
+                    dims.1,
+                    first_pkt_seen
+                        .map(|t| std::time::Instant::now().duration_since(t).as_millis())
+                        .unwrap_or(0)
                 );
                 let m = Mp4Muxer::new(dims.0, dims.1, 30, 1);
                 match m.build_init_segment(&sps, &pps) {

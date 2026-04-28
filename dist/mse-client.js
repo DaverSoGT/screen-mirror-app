@@ -163,7 +163,13 @@ async function main() {
     }
 
     const discriminant = data[0];
-    const frameBytes = data.subarray(1).buffer; // strip the discriminant byte
+    // B11-S7: pass the Uint8Array view directly (NOT `.buffer`). `subarray(1)`
+    // yields a typed-array view starting at byte 1, but `.buffer` returns the
+    // FULL underlying ArrayBuffer ignoring the byteOffset — so appendBuffer
+    // would receive the entire payload including byte 0 (the discriminant)
+    // and the mp4 box parser at offset 0 would read size=0x00000000 instead
+    // of size=0x00000020, closing the MediaSource on init parse failure.
+    const frameBytes = data.subarray(1);
 
     if (discriminant === FRAME_INIT) {
       if (sb !== null) {
