@@ -75,14 +75,32 @@ pub fn write_frame<W: Write>(w: &mut W, frame: &SignalingFrame) -> io::Result<()
 /// Returns `Err` with [`io::ErrorKind::InvalidData`] if the declared length
 /// exceeds [`MAX_FRAME_BYTES`] or the body is not valid [`SignalingFrame`] JSON.
 /// Returns `Err` with [`io::ErrorKind::UnexpectedEof`] on partial reads.
+///
+/// On oversize length, the error message includes the raw 4-byte prefix in
+/// hex and an ASCII rendering, so operators can identify spurious peers
+/// (port scanners, mDNS auto-probers) that connect but don't speak our
+/// protocol.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<SignalingFrame> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_BYTES {
+        let ascii: String = len_buf
+            .iter()
+            .map(|b| {
+                if (0x20..0x7f).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame too large: declared {len} bytes (max {MAX_FRAME_BYTES})"),
+            format!(
+                "frame too large: declared {len} bytes (max {MAX_FRAME_BYTES}); raw prefix bytes: {:02x} {:02x} {:02x} {:02x} (\"{ascii}\")",
+                len_buf[0], len_buf[1], len_buf[2], len_buf[3]
+            ),
         ));
     }
     let mut body = vec![0u8; len];
@@ -223,6 +241,26 @@ mod tests {
         let mut cursor = Cursor::new(bytes);
         let err = read_frame(&mut cursor).expect_err("must fail for oversize length");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Diagnostic: oversize-length error message must include the raw 4 bytes
+    /// in hex and ASCII so operators can identify spurious peers (port scanners,
+    /// mDNS auto-probers) that connect but don't speak our protocol.
+    #[test]
+    fn read_frame_oversize_error_includes_raw_bytes() {
+        // 0x2D 0x66 0x02 0x3A — the bytes observed in B11 smoke (B11-S2).
+        let prefix = [0x2D, 0x66, 0x02, 0x3A];
+        let mut cursor = Cursor::new(prefix.to_vec());
+        let err = read_frame(&mut cursor).expect_err("must fail for oversize length");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2d 66 02 3a"),
+            "error message must include hex bytes; got: {msg}"
+        );
+        assert!(
+            msg.contains("\"-f.:\""),
+            "error message must include ASCII rendering with non-printable as '.'; got: {msg}"
+        );
     }
 
     // ─── Error: malformed JSON body (S7.3) ────────────────────────────────────
