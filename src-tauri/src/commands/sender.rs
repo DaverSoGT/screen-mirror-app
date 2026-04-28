@@ -57,7 +57,7 @@ pub type SenderBuilderFn = Arc<
 /// `capture.stop()` → rx-disconnect chain (design §6 correction).
 pub struct SenderBundle {
     /// Drain thread handles (signaling drain + transport event drain).
-    pub(crate) drain_handles: Vec<JoinHandle<()>>,
+    pub drain_handles: Vec<JoinHandle<()>>,
 }
 
 impl SenderBundle {
@@ -84,9 +84,9 @@ pub struct SenderCounters {
 
 /// Stored in `SenderBridge::current_args` while a session is active.
 #[derive(Clone, Debug)]
-pub(crate) struct SenderArgs {
-    pub(crate) udp_port: u16,
-    pub(crate) service_name: String,
+pub struct SenderArgs {
+    pub udp_port: u16,
+    pub service_name: String,
 }
 
 // ─── SenderSession — active pipeline state ───────────────────────────────────
@@ -107,7 +107,7 @@ pub struct SenderSession {
 pub struct SenderBridge {
     pub session: Mutex<Option<SenderSession>>,
     pub(crate) builder: SenderBuilderFn,
-    pub(crate) current_args: Mutex<Option<SenderArgs>>,
+    pub current_args: Mutex<Option<SenderArgs>>,
 }
 
 impl SenderBridge {

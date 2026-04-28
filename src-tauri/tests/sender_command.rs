@@ -273,3 +273,82 @@ fn start_sender_already_running_returns_error() {
     );
     assert_eq!(probe.call_count(), 1, "builder must not be called a second time");
 }
+
+// ─── B4 stop_sender tests ─────────────────────────────────────────────────────
+
+use screen_mirror_lib::commands::sender::stop_sender_session;
+
+/// stop_sender with no session returns ok immediately (idempotent).
+#[test]
+fn stop_sender_with_no_session_returns_ok() {
+    let bridge = SenderBridge::new();
+    stop_sender_session(&bridge);
+    assert!(bridge.session.lock().unwrap().is_none());
+}
+
+/// stop_sender twice does not panic.
+#[test]
+fn stop_sender_twice_does_not_panic() {
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+
+    stop_sender_session(&bridge);
+    stop_sender_session(&bridge); // second call must not panic
+}
+
+/// stop_sender clears current_args after teardown.
+#[test]
+fn stop_sender_clears_current_args() {
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+
+    {
+        let guard = bridge.current_args.lock().unwrap();
+        assert!(guard.is_some(), "current_args must be Some after start");
+    }
+
+    stop_sender_session(&bridge);
+
+    {
+        let guard = bridge.current_args.lock().unwrap();
+        assert!(guard.is_none(), "current_args must be None after stop");
+    }
+}
+
+/// stop_sender with a session that has drain handles completes without blocking.
+#[test]
+fn stop_sender_fake_session_drains_handles() {
+    use std::time::{Duration, Instant};
+
+    // Build a bundle that has a real (trivial) drain thread.
+    let probe = Arc::new(SenderBuilderProbe {
+        calls: Mutex::new(vec![]),
+        result: Box::new(|| {
+            // Spawn a thread that does nothing and exits immediately.
+            let h = std::thread::spawn(|| {});
+            Ok(SenderBundle { drain_handles: vec![h] })
+        }),
+    });
+
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+
+    let start_time = Instant::now();
+    stop_sender_session(&bridge);
+    let elapsed = start_time.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "stop_sender must complete quickly (< 200ms), took {elapsed:?}"
+    );
+}
