@@ -86,3 +86,75 @@ fn mse_client_referenced_only_from_viewer() {
         referencing
     );
 }
+
+// ─── B9 sender.html shape assertions (R15) ────────────────────────────────────
+
+fn read_sender_html() -> String {
+    let path = dist_dir().join("sender.html");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read sender.html: {}", e))
+}
+
+/// sender.html must not contain disabled config inputs.
+#[test]
+fn sender_html_has_no_disabled_config_inputs() {
+    let content = read_sender_html();
+    assert!(
+        !content.contains("id=\"monitor\""),
+        "sender.html must not contain #monitor input"
+    );
+    assert!(
+        !content.contains("id=\"fps\""),
+        "sender.html must not contain #fps input"
+    );
+    assert!(
+        !content.contains("id=\"bitrate\""),
+        "sender.html must not contain #bitrate input"
+    );
+    assert!(
+        !content.contains("disabled"),
+        "sender.html must not contain any disabled attributes"
+    );
+}
+
+/// sender.html must have #start button, #status div, and #error div.
+#[test]
+fn sender_html_has_start_button_and_status_div() {
+    let content = read_sender_html();
+    assert!(
+        content.contains("id=\"start\""),
+        "sender.html must contain #start button"
+    );
+    assert!(
+        content.contains("id=\"status\""),
+        "sender.html must contain #status div"
+    );
+    assert!(
+        content.contains("id=\"error\""),
+        "sender.html must contain #error div"
+    );
+}
+
+/// sender.html must have #change-mode link and clear sm.lastMode.
+#[test]
+fn sender_html_has_change_mode_link() {
+    let content = read_sender_html();
+    assert!(
+        content.contains("id=\"change-mode\""),
+        "sender.html must contain #change-mode link"
+    );
+    assert!(
+        content.contains("sm.lastMode"),
+        "sender.html must reference sm.lastMode"
+    );
+}
+
+/// sender.html must reference sender.js.
+#[test]
+fn sender_html_references_sender_js() {
+    let content = read_sender_html();
+    assert!(
+        content.contains("sender.js"),
+        "sender.html must reference sender.js"
+    );
+}
