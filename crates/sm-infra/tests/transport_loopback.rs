@@ -1026,3 +1026,94 @@ fn transport_candidate_serde_json_round_trips_through_add_remote_candidate_s_ct_
     sender.stop().unwrap();
     receiver.stop().unwrap();
 }
+
+// ─── S-CT-1: signaling-plane candidate publish integration test ───────────────
+
+/// S-CT-1 (PRIMARY integration test) — After `start()`, calling `candidate_addr()`
+/// on the sender (with a `NicOverrideGuard` injecting a known LAN address) and then
+/// `publish_host_candidate(&signaling, addr)` MUST deliver a `CandidateReceived`
+/// event to the peer's signaling event channel within 5 seconds. The event's JSON
+/// payload MUST deserialise (via `serde_json::from_str::<Candidate>`) to a host
+/// candidate with the injected IP address.
+///
+/// This is the primary automated gate for the trickle-ICE signaling path (R-CT-4,
+/// R-CT-5, AC-CT-1). It exercises the full publish→channel→receive→add loop
+/// without requiring a real LAN or Windows-specific bundle code.
+///
+/// The test calls `publish_host_candidate` directly (not via the production bundle
+/// builder). The production-bundle gate is in B5 (sender) and B6 (receiver).
+///
+/// This test passes immediately after B1-GREEN because the helper and NicOverrideGuard
+/// were implemented there. The RED commit documents the S-CT-1 contract.
+#[test]
+fn transport_candidate_publishes_to_peer_via_loopback_signaling_s_ct_1() {
+    use sm_infra::transport::{NicOverrideGuard, publish_host_candidate};
+
+    let injected_ip = std::net::Ipv4Addr::new(192, 168, 1, 13);
+
+    // Set up sender + signaling.
+    let enc = FakeLoopbackEncoder::new();
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (sender_event_tx, _sender_event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, sender_event_tx).expect("sender start");
+
+    // Wire signaling pair.
+    let (mut sig_sender, mut sig_receiver) =
+        LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
+    let (sig_s_ev_tx, _sig_s_ev_rx) = sync_channel::<SignalingEvent>(4);
+    let (sig_r_ev_tx, sig_r_ev_rx) = sync_channel::<SignalingEvent>(4);
+    sig_sender.start(sig_s_ev_tx).expect("sig_sender start");
+    sig_receiver.start(sig_r_ev_tx).expect("sig_receiver start");
+
+    // Inject a known LAN address so candidate_addr() returns a deterministic value.
+    let _guard = NicOverrideGuard::new(vec![injected_ip]);
+
+    let cand_addr = sender
+        .candidate_addr()
+        .expect("candidate_addr() must return Some after start() with NIC override");
+
+    // Verify the substituted IP matches the injected NIC.
+    assert_eq!(
+        cand_addr.ip(),
+        std::net::IpAddr::V4(injected_ip),
+        "candidate_addr() must substitute injected NIC IP"
+    );
+
+    // Publish the candidate from the sender side.
+    publish_host_candidate(&sig_sender, cand_addr).expect("publish_host_candidate must not error");
+
+    // Drop the NIC override before draining events (no longer needed).
+    drop(_guard);
+
+    // The receiver side should see CandidateReceived within 5 s.
+    let event = sig_r_ev_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CandidateReceived must arrive on receiver's signaling channel within 5 s");
+
+    let candidate_json = match event {
+        SignalingEvent::CandidateReceived(IceCandidate(json)) => json,
+        other => panic!("Expected CandidateReceived, got {other:?}"),
+    };
+
+    // Verify the JSON deserialises to a Candidate with the injected IP.
+    let parsed: str0m::Candidate =
+        serde_json::from_str(&candidate_json).expect("Candidate JSON must be valid serde_json");
+    let expected_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(injected_ip), cand_addr.port());
+    assert_eq!(
+        parsed.addr(),
+        expected_addr,
+        "Deserialised Candidate must carry the injected IP and bound port"
+    );
+
+    // Clean up.
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
