@@ -958,15 +958,18 @@ fn build_production_bundle(
 /// `udp_port` and `service_name` accept `Option<_>` — `None` resolves to the
 /// respective default (7889 and "_screen-mirror._tcp.local." respectively).
 ///
-/// Validation order (design §3):
+/// Execution order (design §3, R4.1 post-TOCTOU-hardening):
 /// 1. Validate `udp_port` (if `Some`) — pure fn, no locks held.
 /// 2. Validate `service_name` (if `Some`) — pure fn, no locks held.
 /// 3. Resolve defaults for `None` args — static values, not validated (known-good).
-/// 4. Acquire `current_args` lock; check `Some(cur)` → `Err(AlreadyRunning)` (PQ-E).
+/// 4. `bind_probe(resolved_port)` — acquires the OS reservation; NO lock held (PQ-D-1).
+///    On `AddrInUse` → `Err(PortInUse { port })`. On other I/O error → `Err(BundleBuildFailed)`.
+/// 5. Acquire `current_args` lock; check `Some(cur)` → drop socket + `Err(AlreadyRunning)`.
 ///    Release lock before builder invocation (builder may take seconds).
-/// 5. Invoke the `BuilderFn` with resolved `(port, name, stop_flag)`.
-/// 6. Acquire session lock; store session.
-/// 7. Set `current_args = Some((port, name))`.
+/// 6. Wrap socket into `BindCtx { socket }`.
+/// 7. Invoke the `BuilderFn(BindCtx, port, name, stop_flag)` — no mutex held.
+/// 8. Acquire session lock; store session.
+/// 9. Set `current_args = Some((port, name))`.
 ///
 /// Lock-ordering discipline (design §4):
 ///   start path: `current_args` FIRST, then `session`.
@@ -1003,21 +1006,35 @@ pub(crate) fn start_stream_inner(
     let resolved_port = udp_port.unwrap_or(7889);
     let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
 
-    // Step 4 — Acquire current_args lock FIRST (design §4 lock-order: current_args → session).
+    // Step 4 — bind_probe: speculative bind BEFORE any StreamBridge mutex (PQ-D-1, R4.2).
+    //
+    // This is the TOCTOU fix (start-stream-toctou-hardening). The FD is acquired
+    // here — before the AlreadyRunning check — to close the race window between
+    // "we said yes to this port" and "we bound it at the OS level".
+    //
+    // Design D7: on AlreadyRunning, RAII drops the `socket` local when the `return`
+    // statement inside the {args_guard} block executes. No FD leak.
+    //
+    // Design D6: this step MUST precede step 5 (current_args lock). Never hold a
+    // Mutex during a syscall.
+    let socket = bind_probe(resolved_port).map_err(|e| match e {
+        BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
+        BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
+    })?;
+
+    // Step 5 — Acquire current_args lock; AlreadyRunning check (R4.3).
     //
     // Lock-ordering discipline (design §4, spec R6.6):
-    //   start path: current_args FIRST, then session.
+    //   start path: current_args FIRST (step 5), then session (step 7).
     //   stop path:  session FIRST, then current_args (see stop_stream_session).
     // This asymmetry is intentional and MUST NOT be reversed in future changes.
-    // The start path needs to atomically check-and-set both; the stop path can
-    // release session before current_args because no concurrent start will see
-    // the inconsistent state (session is the visible signal of "running").
     {
         let args_guard = bridge.current_args.lock().unwrap();
         if let Some((cur_port, cur_name)) = &*args_guard {
             // PQ-E (spec R6.4): ALWAYS return AlreadyRunning on double-start, regardless
             // of whether the new args match the current args. No silent ignore.
             // Spec R6.5: error MUST carry the CURRENT session's args, NOT the new caller's.
+            // `socket` drops here (RAII) — the FD from bind_probe is released (R4.4, D7).
             return Err(StartStreamError::AlreadyRunning {
                 current_port: *cur_port,
                 current_service_name: cur_name.clone(),
@@ -1030,40 +1047,31 @@ pub(crate) fn start_stream_inner(
         // final wiring. current_args will be set again after session is stored.
     }
 
-    // Step 5 — Clone the builder Arc (cheap atomic increment) and invoke.
-    // No borrow of bridge.builder held during the (potentially slow) build.
-    // Design §6, OQ-D1.
+    // Step 6 — Wrap socket into BindCtx and clone the builder Arc.
+    // No borrow of bridge.builder held during the (potentially slow) build (R4.3).
+    let bind_ctx = BindCtx { socket };
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // Step 4b — TEMPORARY placeholder: bind_probe wired in B4 (R4.1, PQ-D-1).
-    // B4.T3 replaces this block with the actual bind_probe call and AlreadyRunning
-    // check reorder. This stub keeps the code compilable after the BuilderFn
-    // signature flip in B3 while B4 wires the real TOCTOU fix.
-    let tmp_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{resolved_port}"))
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::AddrInUse => StartStreamError::PortInUse { port: resolved_port },
-            _ => StartStreamError::BundleBuildFailed(e.to_string()),
-        })?;
-    let bind_ctx = BindCtx { socket: tmp_socket };
-
-    // Translate BundleError into StartStreamError. PortInUse carries the port from
-    // the bind-site detection in str0m_receiver.rs; no string parsing.
+    // Step 7 — Invoke BuilderFn (no StreamBridge mutex held — R4.3).
+    // Translate BundleError into StartStreamError. PortInUse now originates from
+    // bind_probe (step 4), not the builder. The builder path can still return
+    // BundleError (e.g. signaling failure) which maps to BundleBuildFailed.
     let bundle = (builder)(bind_ctx, resolved_port, resolved_name.clone(), stop_flag.clone())
         .map_err(|e| match e {
             BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
             BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
         })?;
 
-    // Step 6 — Acquire session lock and store the new session.
+    // Step 8 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
     let session = build_stream_session(channel, bundle, stop_flag)
         .map_err(StartStreamError::BundleBuildFailed)?;
     *guard = Some(session);
     drop(guard);
 
-    // Step 7 — Populate current_args AFTER session is successfully stored.
-    // Re-acquire current_args lock (released at end of step 4 block).
+    // Step 9 — Populate current_args AFTER session is successfully stored.
+    // Re-acquire current_args lock (released at end of step 5 block).
     // Spec R6.2: "When start_stream completes successfully, current_args MUST
     // be set to Some((resolved_port, resolved_service_name))."
     *bridge.current_args.lock().unwrap() = Some((resolved_port, resolved_name));
