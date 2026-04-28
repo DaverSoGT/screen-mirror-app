@@ -207,9 +207,7 @@ pub(crate) fn bind_probe(port: u16) -> Result<std::net::UdpSocket, BundleError> 
     let bind_addr = format!("0.0.0.0:{port}");
     match std::net::UdpSocket::bind(&bind_addr) {
         Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            Err(BundleError::PortInUse(port))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(BundleError::PortInUse(port)),
         Err(e) => Err(BundleError::from(e)), // R1.3 — collapses to Other(...)
     }
 }
@@ -1057,11 +1055,16 @@ pub(crate) fn start_stream_inner(
     // Translate BundleError into StartStreamError. PortInUse now originates from
     // bind_probe (step 4), not the builder. The builder path can still return
     // BundleError (e.g. signaling failure) which maps to BundleBuildFailed.
-    let bundle = (builder)(bind_ctx, resolved_port, resolved_name.clone(), stop_flag.clone())
-        .map_err(|e| match e {
-            BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
-            BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
-        })?;
+    let bundle = (builder)(
+        bind_ctx,
+        resolved_port,
+        resolved_name.clone(),
+        stop_flag.clone(),
+    )
+    .map_err(|e| match e {
+        BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
+        BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
+    })?;
 
     // Step 8 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
@@ -2017,8 +2020,9 @@ mod tests {
 
         // Construct a bridge with a closure that panics if called — the test only
         // checks that the constructor compiles and the builder is stored.
-        let builder: BuilderFn =
-            Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| panic!("builder must not be called in this test"));
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
+            panic!("builder must not be called in this test")
+        });
         let bridge = StreamBridge::new_with_builder(builder);
         // builder field must be populated: Arc strong count is at least 1.
         assert!(Arc::strong_count(&bridge.builder) >= 1);
@@ -3725,16 +3729,13 @@ mod tests {
     /// RED until `bind_probe` is implemented (B2.T5).
     #[test]
     fn bind_probe_addr_in_use_returns_port_in_use() {
-        let _steal = std::net::UdpSocket::bind("0.0.0.0:0")
-            .expect("ephemeral bind must succeed");
+        let _steal = std::net::UdpSocket::bind("0.0.0.0:0").expect("ephemeral bind must succeed");
         let stolen_port = _steal.local_addr().expect("local_addr").port();
 
         let result = bind_probe(stolen_port);
         match result {
             Err(BundleError::PortInUse(p)) if p == stolen_port => {}
-            other => panic!(
-                "expected Err(BundleError::PortInUse({stolen_port})), got {other:?}"
-            ),
+            other => panic!("expected Err(BundleError::PortInUse({stolen_port})), got {other:?}"),
         }
     }
 
@@ -3897,10 +3898,12 @@ mod tests {
     #[test]
     fn start_stream_inner_port_in_use_deterministic_validate_then_steal() {
         // ── Step 1+2: steal an ephemeral port. ─────────────────────────────
-        let _steal = std::net::UdpSocket::bind("0.0.0.0:0")
-            .expect("ephemeral bind must succeed");
+        let _steal = std::net::UdpSocket::bind("0.0.0.0:0").expect("ephemeral bind must succeed");
         let stolen_port = _steal.local_addr().expect("local_addr").port();
-        assert!(stolen_port >= 1024, "ephemeral port must be >= 1024 (got {stolen_port})");
+        assert!(
+            stolen_port >= 1024,
+            "ephemeral port must be >= 1024 (got {stolen_port})"
+        );
 
         // ── Step 3: configure a bridge with a probe-only test builder. ─────
         // The builder will NEVER be invoked because bind_probe fails first.
@@ -3914,9 +3917,7 @@ mod tests {
 
         match result {
             Err(StartStreamError::PortInUse { port }) if port == stolen_port => {}
-            other => panic!(
-                "expected Err(PortInUse {{ port: {stolen_port} }}), got {other:?}"
-            ),
+            other => panic!("expected Err(PortInUse {{ port: {stolen_port} }}), got {other:?}"),
         }
 
         // ── Step 5: builder MUST NOT have been called (bind_probe short-circuits). ─
@@ -3945,8 +3946,7 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel1: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        start_stream_inner(&bridge, channel1, Some(7890), None)
-            .expect("first start must succeed");
+        start_stream_inner(&bridge, channel1, Some(7890), None).expect("first start must succeed");
 
         // ── Step 2: steal an ephemeral port for the second start attempt. ──
         // This lets us verify that RAII releases the FD from bind_probe.
