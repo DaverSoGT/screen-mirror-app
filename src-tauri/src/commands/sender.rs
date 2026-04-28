@@ -608,12 +608,14 @@ fn build_production_sender_bundle(
     let encoder_arc: Arc<dyn VideoEncoder + Send + Sync> = Arc::new(encoder);
     sender.set_encoder(Arc::clone(&encoder_arc));
 
-    sender
-        .start(enc_to_sender_rx, tr_ev_tx)
-        .map_err(|e| BundleError::Other(e.to_string()))?;
-
+    // Extract offer BEFORE start(): start() consumes pre_neg via guard.take(),
+    // after which create_local_offer() returns "Rtc already moved to thread".
     let offer = sender
         .create_local_offer()
+        .map_err(|e| BundleError::Other(e.to_string()))?;
+
+    sender
+        .start(enc_to_sender_rx, tr_ev_tx)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Publish offer immediately (Amendment B — buffers in inbox; written on connect).
