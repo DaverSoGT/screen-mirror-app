@@ -51,21 +51,30 @@ pub type SenderBuilderFn = Arc<
 
 /// The fully-initialised sender pipeline returned by `SenderBuilderFn`.
 ///
-/// Fields held in `SenderSession` after bring-up.
-/// `frame_tx_owned` / `enc_tx_owned` are NOT retained — both are consumed by
-/// `CaptureSource::start` / `VideoEncoder::start`. Teardown relies on
-/// `capture.stop()` → rx-disconnect chain (design §6 correction).
+/// `drain_handles` are joined by `stop_sender_session`.
+///
+/// `shutdown` owns the production resources (capture, encoder Arc, sender Arc,
+/// signaling Arc) and is invoked by `stop_sender_session` BEFORE joining drains.
+/// This guarantees the resources stay alive across the full session lifetime —
+/// fixes C1 (verify-report #362), where the previous design dropped them at the
+/// end of bundle construction and stopped the signaling thread before ICE.
+///
+/// Test bundles set `shutdown: None`.
 pub struct SenderBundle {
     /// Drain thread handles (signaling drain + transport event drain).
     pub drain_handles: Vec<JoinHandle<()>>,
+    /// Owns production-only resources whose `Drop` impls perform ordered teardown
+    /// (capture → sender Arc → encoder Arc → signaling Arc). `None` for test stubs.
+    pub shutdown: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl SenderBundle {
     /// Construct a minimal bundle suitable for unit tests.
-    /// Spawns no real threads; drain_handles is empty.
+    /// Spawns no real threads; drain_handles is empty; no production shutdown.
     pub fn test_stub() -> Self {
         Self {
             drain_handles: vec![],
+            shutdown: None,
         }
     }
 }
@@ -97,6 +106,8 @@ pub struct SenderSession {
     pub drain_handles: Vec<JoinHandle<()>>,
     pub channel: Arc<dyn ChannelLike>,
     pub counters: Arc<SenderCounters>,
+    /// Production-only ordered teardown closure (C1 fix). See [`SenderBundle::shutdown`].
+    pub shutdown: Option<Box<dyn FnOnce() + Send>>,
 }
 
 // ─── SenderBridge — Tauri managed state ──────────────────────────────────────
@@ -432,6 +443,7 @@ pub fn start_sender_inner(
         drain_handles: bundle.drain_handles,
         channel: channel.clone(),
         counters: Arc::new(SenderCounters::default()),
+        shutdown: bundle.shutdown,
     };
     *bridge.session.lock().unwrap() = Some(session);
     *bridge.current_args.lock().unwrap() = Some(SenderArgs {
@@ -449,8 +461,15 @@ pub fn start_sender_inner(
 
 /// Ordered teardown for an active sender session.
 ///
-/// Idempotent: if no session is active, returns Ok(()) immediately.
+/// Idempotent: if no session is active, returns immediately.
 /// Mirrors stream.rs stop_stream_session lock ordering: session FIRST, then current_args.
+///
+/// Teardown order (C1 fix):
+/// 1. Set stop_flag (drain threads exit on next timeout).
+/// 2. Run `shutdown` closure (drops production resources in order — capture stops
+///    input, signaling drop triggers drain disconnect, sender Drop joins tick thread).
+/// 3. Join drain handles (now ready to exit via stop_flag or tx-disconnect).
+/// 4. Emit Stopped event and release channel.
 pub fn stop_sender_session(bridge: &SenderBridge) {
     let session_opt = {
         let mut guard = bridge.session.lock().unwrap();
@@ -461,15 +480,20 @@ pub fn stop_sender_session(bridge: &SenderBridge) {
         return;
     };
 
-    // Set stop flag — signals drain threads.
+    // 1. Signal drains.
     session.stop_flag.store(true, Ordering::Relaxed);
 
-    // Join drain threads.
+    // 2. Drop production resources in order (C1 fix). No-op for test stubs.
+    if let Some(shutdown) = session.shutdown.take() {
+        shutdown();
+    }
+
+    // 3. Join drain threads.
     for h in session.drain_handles.drain(..) {
         let _ = h.join();
     }
 
-    // Emit Stopped event.
+    // 4. Emit Stopped event and release channel.
     emit_event(&session.channel, &SenderStatusEvent::Stopped);
     drop(session.channel);
 
@@ -631,16 +655,26 @@ fn build_production_sender_bundle(
         })
         .map_err(|e| BundleError::Other(format!("spawn transport drain: {e}")))?;
 
-    // Keep signaling and sender arcs alive in closures / session fields.
-    // Drop capture here — capture.stop() called by capture's Drop impl on session tear-down.
-    // The session captures these arcs to extend their lifetimes.
-    drop(capture); // Drop impl: capture thread runs until encoder rx closes.
-    drop(sender_arc); // Drop impl: Str0mVideoSender::stop() joins tick thread.
-    drop(signaling_arc); // Drop impl: MdnsSignaling::stop() joins signaling thread.
-    drop(encoder_arc); // Drop impl: WindowsOpenH264Encoder::stop() joins encoder thread.
+    // C1 fix: move production arcs into the shutdown closure so they outlive the
+    // bundle-build call and are dropped in order ONLY when stop_sender_session runs.
+    //
+    // Order inside the closure (design §6, capture → encoder → sender → signaling):
+    // - drop(capture)       stops capture thread → encoder rx Disconnected.
+    // - drop(sender_arc)    decrements (drain still holds clone via sender_ops).
+    // - drop(encoder_arc)   decrements (sender holds clone via set_encoder).
+    // - drop(signaling_arc) joins signaling thread synchronously, then sig_ev_tx
+    //   drops → sig_drain Disconnected → sender_ops drops → sender Drop joins tick
+    //   thread → encoder Drop joins encoder thread (cascade).
+    let shutdown: Box<dyn FnOnce() + Send> = Box::new(move || {
+        drop(capture);
+        drop(sender_arc);
+        drop(encoder_arc);
+        drop(signaling_arc);
+    });
 
     Ok(SenderBundle {
         drain_handles: vec![sig_drain, tr_drain],
+        shutdown: Some(shutdown),
     })
 }
 

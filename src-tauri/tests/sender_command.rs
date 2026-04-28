@@ -345,6 +345,7 @@ fn stop_sender_fake_session_drains_handles() {
             let h = std::thread::spawn(|| {});
             Ok(SenderBundle {
                 drain_handles: vec![h],
+                shutdown: None,
             })
         }),
     });
