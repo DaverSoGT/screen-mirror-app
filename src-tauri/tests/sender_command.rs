@@ -932,3 +932,60 @@ fn transport_drain_disconnected_rx_exits_cleanly() {
         "drain must exit within 1s on disconnect"
     );
 }
+
+// ─── C1 regression test — production arcs must live until stop_sender_session ─
+
+/// C1 (CRITICAL, verify-report #362): the original `build_production_sender_bundle`
+/// dropped capture/encoder/sender/signaling arcs at the end of bundle construction,
+/// which on the Windows production path stops the signaling thread before ICE
+/// negotiation can complete.
+///
+/// The fix introduces a `shutdown` closure on `SenderBundle` that takes ownership
+/// of the production resources and is invoked by `stop_sender_session`.
+///
+/// This regression test plants a `DropTracker` into the shutdown closure to
+/// assert resources stay alive between `start_sender_inner` and `stop_sender_session`.
+#[test]
+fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+    let drop_count = Arc::new(AtomicUsize::new(0));
+
+    struct DropTracker(Arc<AtomicUsize>);
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, O::SeqCst);
+        }
+    }
+
+    let dc = drop_count.clone();
+    let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder(Arc::new(
+        move |_, _, _, _| {
+            let tracker = DropTracker(dc.clone());
+            Ok(SenderBundle {
+                drain_handles: vec![],
+                shutdown: Some(Box::new(move || {
+                    drop(tracker);
+                })),
+            })
+        },
+    ));
+
+    let ch = FakeJsonChannel::new();
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start_sender_inner must succeed");
+
+    assert_eq!(
+        drop_count.load(O::SeqCst),
+        0,
+        "C1 regressed: production resources dropped before stop_sender_session"
+    );
+
+    screen_mirror_lib::commands::sender::stop_sender_session(&bridge);
+
+    assert_eq!(
+        drop_count.load(O::SeqCst),
+        1,
+        "shutdown closure must drop production resources during stop_sender_session"
+    );
+}
