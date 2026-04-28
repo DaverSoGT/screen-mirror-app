@@ -158,6 +158,37 @@ fn sender_html_references_sender_js() {
     );
 }
 
+// ─── B11-S5 regression: mux thread MUST parse dimensions from SPS ─────────
+
+/// B11-S5 — `src-tauri/src/commands/stream.rs` MUST NOT hardcode the
+/// muxer dimensions. The `Mp4Muxer::new(...)` call site for the init
+/// segment must derive width/height from the parsed SPS, otherwise the
+/// `tkhd` and `avc1` boxes contain dimensions that disagree with the SPS
+/// embedded in `avcC` and Chromium MSE rejects the init segment by
+/// closing the MediaSource — exactly the same surface symptom as the
+/// codec mismatch (B11-S4) but caused by dimensions instead.
+///
+/// The grep guard rejects the literal pattern that the predecessor
+/// shipped. A passing alternative MUST go through `parse_sps`.
+#[test]
+fn stream_rs_mux_thread_does_not_hardcode_1920x1080_b11_s5() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("commands")
+        .join("stream.rs");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read stream.rs at {}: {}", path.display(), e));
+
+    assert!(
+        !content.contains("Mp4Muxer::new(1920, 1080, 30, 1)"),
+        "stream.rs must not hardcode Mp4Muxer::new(1920, 1080, 30, 1); dimensions must be parsed from the SPS via avcc::parse_sps"
+    );
+    assert!(
+        content.contains("parse_sps"),
+        "stream.rs must call avcc::parse_sps to derive init-segment dimensions"
+    );
+}
+
 // ─── B11-S4 regression: codec string derived from init segment ────────────
 
 /// B11-S4 — mse-client.js MUST derive the codec string from the init
