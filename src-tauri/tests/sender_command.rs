@@ -406,3 +406,101 @@ fn sender_stats_running_field_reflects_session_presence() {
     let stats = sender_diagnostics_impl(&bridge2).expect("session exists = running");
     assert!(stats.running);
 }
+
+// ─── B6 start_sender_inner bring-up tests ────────────────────────────────────
+
+/// Happy path: builder OK, bridge has session, current_args set.
+#[test]
+fn start_sender_inner_happy_path_sets_current_args() {
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe.clone()));
+    let ch = FakeJsonChannel::new();
+
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None);
+    assert!(result.is_ok(), "expected Ok: {result:?}");
+    assert!(bridge.current_args.lock().unwrap().is_some());
+    assert!(bridge.session.lock().unwrap().is_some());
+    assert_eq!(probe.call_count(), 1);
+}
+
+/// Builder receives port=0 when udp_port is None (Amendment A).
+#[test]
+fn start_sender_inner_builder_receives_port_zero_when_none() {
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe.clone()));
+    let ch = FakeJsonChannel::new();
+
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("should succeed");
+
+    assert_eq!(probe.calls()[0].0, 0, "builder must receive port=0");
+}
+
+/// Builder failure: bridge stays clean.
+#[test]
+fn start_sender_inner_builder_failure_leaves_bridge_clean() {
+    use screen_mirror_lib::commands::sender::StartSenderError;
+    let probe = SenderBuilderProbe::new_err(BundleError::Other("boom".to_string()));
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None);
+    assert!(
+        matches!(result, Err(StartSenderError::BundleBuildFailed(_))),
+        "expected BundleBuildFailed: {result:?}"
+    );
+    assert!(bridge.session.lock().unwrap().is_none());
+    assert!(bridge.current_args.lock().unwrap().is_none());
+}
+
+/// Builder returns PortInUse → StartSenderError::PortInUse.
+#[test]
+fn start_sender_inner_port_in_use_error_propagates() {
+    use screen_mirror_lib::commands::sender::StartSenderError;
+    let probe = SenderBuilderProbe::new_err(BundleError::PortInUse(5004));
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None);
+    assert!(
+        matches!(result, Err(StartSenderError::PortInUse { port: 5004 })),
+        "expected PortInUse(5004): {result:?}"
+    );
+}
+
+/// Double-start: second call returns AlreadyRunning; builder called only once.
+#[test]
+fn start_sender_inner_already_running_blocks_second_start() {
+    use screen_mirror_lib::commands::sender::StartSenderError;
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe.clone()));
+    let ch = FakeJsonChannel::new();
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
+        .expect("first start must succeed");
+
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None);
+    assert!(
+        matches!(result, Err(StartSenderError::AlreadyRunning { .. })),
+        "expected AlreadyRunning: {result:?}"
+    );
+    assert_eq!(probe.call_count(), 1, "builder must not be called second time");
+}
+
+/// After start_sender_inner, channel receives a Connecting status event.
+#[test]
+fn start_sender_inner_bring_up_emits_connecting_status() {
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+
+    let messages = ch_clone.messages();
+    assert!(!messages.is_empty(), "channel must have received at least one message");
+
+    let has_connecting = messages.iter().any(|m| m.contains("\"kind\":\"connecting\""));
+    assert!(has_connecting, "expected connecting status, got: {messages:?}");
+}
