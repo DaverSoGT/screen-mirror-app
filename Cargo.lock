@@ -3989,6 +3989,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sm-domain",
+ "sm-infra",
  "str0m",
  "thiserror 2.0.18",
  "windows-capture",

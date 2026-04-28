@@ -376,6 +376,37 @@ impl Str0mVideoSender {
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
     }
+
+    /// Return the ICE host candidate address for this sender.
+    ///
+    /// Returns `Some(addr)` after a successful `start()`, where `addr.port()` matches
+    /// the bound UDP socket port and `addr.ip()` is a non-loopback IPv4 address.
+    ///
+    /// When `effective_local_addr` is a loopback address (`127.0.0.1`) — which happens
+    /// when the socket was bound to `0.0.0.0` — this method substitutes the first
+    /// non-loopback IPv4 NIC address from `enumerate_local_ipv4()`, preserving the port.
+    ///
+    /// Returns `None` in these cases:
+    /// - `start()` has not been called yet (`self.local_addr` is `None`).
+    /// - No non-loopback IPv4 NIC is available (e.g., loopback-only machine or CI).
+    ///
+    /// MUST NOT mutate `self.local_addr` — that field is used as `Input::Receive {
+    /// destination }` inside str0m's tick loop and must remain the bind address.
+    pub fn candidate_addr(&self) -> Option<std::net::SocketAddr> {
+        let local = self.local_addr?; // None before start()
+        if !local.ip().is_loopback() {
+            return Some(local); // already a routable address — use it directly
+        }
+        // local.ip() is loopback: substitute the first non-loopback IPv4 NIC,
+        // preserving the bound port so STUN reaches the correct UDP socket.
+        let nic = crate::transport::enumerate_local_ipv4()
+            .into_iter()
+            .next()?;
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(nic),
+            local.port(),
+        ))
+    }
 }
 
 // ─── Test-only helpers ────────────────────────────────────────────────────────

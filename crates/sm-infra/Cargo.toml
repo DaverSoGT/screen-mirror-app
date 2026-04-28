@@ -9,6 +9,9 @@ default = []
 # Reserved for V2 Media Foundation MFT hardware decoder adapter.
 # Empty in V1 — no code is gated behind it yet.
 hw-decoder = []
+# Exposes test-support helpers (NicOverrideGuard, enumerate_local_ipv4_raw)
+# for use in integration tests outside this crate. Never enable in production.
+test-support = []
 
 [dependencies]
 sm-domain = { path = "../sm-domain" }
@@ -31,3 +34,8 @@ openh264-sys2 = "0.9"
 
 [dev-dependencies]
 mp4 = "0.14.0"
+# Self-referential dev-dependency: activates the test-support feature for
+# integration tests in crates/sm-infra/tests/. Integration tests link against
+# the library (not the #[cfg(test)] build), so test-support is the only way to
+# expose NicOverrideGuard and enumerate_local_ipv4 to them.
+sm-infra = { path = ".", features = ["test-support"] }
