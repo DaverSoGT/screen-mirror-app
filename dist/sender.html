@@ -25,40 +25,31 @@
         font-weight: 600;
         margin: 0 0 0.5rem;
       }
-      label {
-        font-size: 0.85rem;
-        color: #999;
-        display: block;
-        margin-bottom: 0.25rem;
-      }
-      select,
-      input[type="number"] {
-        width: 100%;
-        padding: 0.4rem 0.6rem;
-        background: #1e1e1e;
-        border: 1px solid #444;
-        color: #666;
-        font-size: 0.95rem;
-        font-family: inherit;
-        border-radius: 3px;
-        cursor: not-allowed;
-        box-sizing: border-box;
-      }
       button#start {
         padding: 0.6rem 1.8rem;
         font-size: 1rem;
         font-family: inherit;
-        border: 1px solid #444;
+        border: 1px solid #555;
         background: #1e1e1e;
-        color: #555;
+        color: #ddd;
         border-radius: 4px;
-        cursor: not-allowed;
+        cursor: pointer;
         align-self: flex-start;
+      }
+      button#start:hover {
+        border-color: #888;
+        color: #fff;
       }
       #status {
         font-size: 0.8rem;
         font-family: ui-monospace, monospace;
         color: #777;
+      }
+      #error {
+        font-size: 0.8rem;
+        font-family: ui-monospace, monospace;
+        color: #e55;
+        min-height: 1.2em;
       }
       .back-link {
         font-size: 0.8rem;
@@ -74,43 +65,20 @@
     <div class="sender-panel">
       <h1>Sender</h1>
 
-      <div>
-        <label for="monitor">Monitor</label>
-        <!-- R4 — disabled select, placeholder option -->
-        <select id="monitor" disabled>
-          <option>Select monitor</option>
-        </select>
-      </div>
+      <button id="start">Start streaming</button>
 
-      <div>
-        <label for="fps">Frame rate (fps)</label>
-        <!-- R4 — disabled number input -->
-        <input type="number" id="fps" min="1" max="120" placeholder="30" disabled />
-      </div>
-
-      <div>
-        <label for="bitrate">Bitrate (kbps)</label>
-        <!-- R4 — disabled number input -->
-        <input type="number" id="bitrate" placeholder="kbps" disabled />
-      </div>
-
-      <!-- R4 — disabled Start button -->
-      <button id="start" disabled>Start sender</button>
-
-      <!-- R4 — Not connected status -->
       <div id="status">Not connected</div>
+      <div id="error"></div>
 
-      <!-- R4 — back-to-landing link.
-           R5.4 (extended) — clears sm.lastMode so the landing's auto-route
-           does not bounce the user straight back to sender.html. -->
       <a class="back-link" href="./index.html" id="change-mode">Change mode</a>
     </div>
     <script>
-      document
-        .getElementById("change-mode")
-        .addEventListener("click", function () {
-          localStorage.removeItem("sm.lastMode");
-        });
+      // Clear lastMode on change-mode click so landing page does not auto-route
+      // back to sender.html (commit 60d9ce7 / dual-mode-shell R5.4 ext).
+      document.getElementById("change-mode").addEventListener("click", function () {
+        localStorage.removeItem("sm.lastMode");
+      });
     </script>
+    <script src="./sender.js"></script>
   </body>
 </html>
