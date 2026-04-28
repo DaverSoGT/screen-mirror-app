@@ -977,4 +977,35 @@ mod tests {
             other => panic!("expected TransportError::Io(_), got {other:?}"),
         }
     }
+
+    // ─── B1 RED: start_with_socket — accepts externally-bound socket (R5.2, R5.3)
+
+    /// B1-T1 — `start_with_socket` MUST accept an externally-bound `UdpSocket` and
+    /// return `Ok(())` without attempting a second bind on the same address.
+    ///
+    /// RED until `start_with_socket` is implemented (B1.T2).
+    #[test]
+    fn start_with_socket_does_not_rebind() {
+        use std::net::UdpSocket;
+        let udp = UdpSocket::bind("0.0.0.0:0").expect("ephemeral bind must succeed");
+
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(4);
+        let (event_tx, _event_rx) = sync_channel::<sm_domain::transport::TransportEvent>(4);
+
+        // If `start_with_socket` does not exist or calls bind internally,
+        // this will fail to compile or panic with AddrInUse on the second bind.
+        let result = receiver.start_with_socket(udp, pkt_tx, event_tx);
+        assert!(
+            result.is_ok(),
+            "start_with_socket must return Ok(()) for a fresh prebound socket, got: {result:?}"
+        );
+        receiver.stop().unwrap();
+    }
 }
