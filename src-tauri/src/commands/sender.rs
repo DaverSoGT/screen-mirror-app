@@ -551,7 +551,7 @@ fn build_production_sender_bundle(
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::windows::WindowsOpenH264Encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
-    use sm_infra::transport::Str0mVideoSender;
+    use sm_infra::transport::{Str0mVideoSender, publish_host_candidate};
     use std::sync::mpsc::sync_channel;
 
     const CHANNEL_CAP: usize = 4;
@@ -629,6 +629,19 @@ fn build_production_sender_bundle(
     signaling
         .publish_local_offer(offer)
         .map_err(|e| BundleError::Other(e.to_string()))?;
+
+    // Trickle ICE: publish host candidate AFTER offer so the peer receives
+    // Offer → Candidate in FIFO order (design §3.1 revised ordering).
+    // `signaling` is still the un-wrapped local variable here (pre-Arc::new(Mutex::new)).
+    // If no non-loopback NIC is available, log a warning and continue — the bundle
+    // MUST NOT fail solely because no candidate was published (R-CT-4).
+    if let Some(addr) = sender.candidate_addr() {
+        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
+            eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
+        });
+    } else {
+        eprintln!("[sm-sender-bundle] no non-loopback NIC; skipping candidate publish");
+    }
 
     // ── 4. Wrap in Arc<Mutex<>> for drain thread sharing ──────────────────────
     let sender_arc = Arc::new(Mutex::new(sender));
