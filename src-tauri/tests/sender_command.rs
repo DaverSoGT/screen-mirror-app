@@ -504,3 +504,224 @@ fn start_sender_inner_bring_up_emits_connecting_status() {
     let has_connecting = messages.iter().any(|m| m.contains("\"kind\":\"connecting\""));
     assert!(has_connecting, "expected connecting status, got: {messages:?}");
 }
+
+// ─── B7 signaling drain tests ─────────────────────────────────────────────────
+
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
+use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
+use sm_domain::transport::TransportError;
+use screen_mirror_lib::commands::sender::{
+    SignalingSenderOps, run_sender_signaling_drain,
+};
+
+/// Fake sender that records apply_remote_answer / add_remote_candidate calls.
+struct FakeSender {
+    answer_calls: Mutex<Vec<SdpAnswer>>,
+    candidate_calls: Mutex<Vec<IceCandidate>>,
+}
+
+impl FakeSender {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answer_calls: Mutex::new(vec![]),
+            candidate_calls: Mutex::new(vec![]),
+        })
+    }
+}
+
+impl SignalingSenderOps for FakeSender {
+    fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError> {
+        self.answer_calls.lock().unwrap().push(ans);
+        Ok(())
+    }
+    fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError> {
+        self.candidate_calls.lock().unwrap().push(c);
+        Ok(())
+    }
+}
+
+/// PeerFound: log + emit Connecting; no offer publish (Amendment B).
+#[test]
+fn signaling_drain_peer_found_logs_and_emits_connecting() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender: Arc<dyn SignalingSenderOps> = FakeSender::new();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+    });
+
+    ev_tx
+        .send(SignalingEvent::PeerFound {
+            host: "127.0.0.1".to_string(),
+            port: 7889,
+        })
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let msgs = ch.messages();
+    let has_connecting = msgs.iter().any(|m| m.contains("\"kind\":\"connecting\""));
+    assert!(has_connecting, "expected connecting event, got: {msgs:?}");
+}
+
+/// AnswerReceived calls apply_remote_answer.
+#[test]
+fn signaling_drain_answer_received_calls_apply_remote_answer() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender = FakeSender::new();
+    let fake_sender_ops: Arc<dyn SignalingSenderOps> = fake_sender.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+    });
+
+    ev_tx
+        .send(SignalingEvent::AnswerReceived(SdpAnswer("test-answer".to_string())))
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let calls = fake_sender.answer_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "apply_remote_answer must be called once");
+    assert_eq!(calls[0].0, "test-answer");
+}
+
+/// CandidateReceived calls add_remote_candidate.
+#[test]
+fn signaling_drain_candidate_received_calls_add_remote_candidate() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender = FakeSender::new();
+    let fake_sender_ops: Arc<dyn SignalingSenderOps> = fake_sender.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+    });
+
+    ev_tx
+        .send(SignalingEvent::CandidateReceived(IceCandidate("test-cand".to_string())))
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let calls = fake_sender.candidate_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "add_remote_candidate must be called once");
+}
+
+/// OfferReceived is silently ignored.
+#[test]
+fn signaling_drain_offer_received_is_silently_ignored() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender = FakeSender::new();
+    let fake_sender_ops: Arc<dyn SignalingSenderOps> = fake_sender.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+    });
+
+    ev_tx
+        .send(SignalingEvent::OfferReceived(SdpOffer("test-offer".to_string())))
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    // No method called on FakeSender
+    assert!(fake_sender.answer_calls.lock().unwrap().is_empty());
+    assert!(fake_sender.candidate_calls.lock().unwrap().is_empty());
+}
+
+/// Closed event emits peer_lost and drain exits.
+#[test]
+fn signaling_drain_closed_emits_peer_lost_and_exits() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender: Arc<dyn SignalingSenderOps> = FakeSender::new();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+    });
+
+    ev_tx.send(SignalingEvent::Closed).unwrap();
+    drain
+        .join()
+        .expect("drain must exit after Closed");
+
+    let msgs = ch.messages();
+    let has_peer_lost = msgs.iter().any(|m| m.contains("\"kind\":\"peer_lost\""));
+    assert!(has_peer_lost, "expected peer_lost event, got: {msgs:?}");
+}
+
+/// Disconnected rx causes drain to exit cleanly.
+#[test]
+fn signaling_drain_disconnected_rx_exits_cleanly() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender: Arc<dyn SignalingSenderOps> = FakeSender::new();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+    });
+
+    drop(ev_tx); // disconnect
+
+    let start_time = std::time::Instant::now();
+    drain.join().expect("drain must exit on disconnect");
+    assert!(
+        start_time.elapsed() < Duration::from_secs(1),
+        "drain must exit within 1s on disconnect"
+    );
+}
+
+/// stop_flag causes drain to exit within 1s.
+#[test]
+fn signaling_drain_stop_flag_exits_loop() {
+    let (_ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(4);
+    let fake_sender: Arc<dyn SignalingSenderOps> = FakeSender::new();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+    });
+
+    stop_flag.store(true, Ordering::Relaxed);
+
+    let start_time = std::time::Instant::now();
+    drain.join().expect("drain must exit on stop_flag");
+    assert!(
+        start_time.elapsed() < Duration::from_millis(600),
+        "drain must exit within 600ms on stop_flag"
+    );
+}

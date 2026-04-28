@@ -250,7 +250,7 @@ fn emit_event(channel: &Arc<dyn ChannelLike>, event: &SenderStatusEvent) {
 // ─── SignalingSenderOps — abstraction for signaling drain ─────────────────────
 
 /// Operations the signaling drain thread needs on the sender transport.
-pub(crate) trait SignalingSenderOps: Send + Sync {
+pub trait SignalingSenderOps: Send + Sync {
     fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError>;
     fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError>;
 }
@@ -263,7 +263,7 @@ pub(crate) trait SignalingSenderOps: Send + Sync {
 /// `PeerFound` is log-only (no publish here).
 ///
 /// Exits when stop_flag is set, the channel disconnects, or `Closed` arrives.
-pub(crate) fn run_sender_signaling_drain(
+pub fn run_sender_signaling_drain(
     ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
     sender: Arc<dyn SignalingSenderOps>,
     stop_flag: Arc<AtomicBool>,
@@ -320,7 +320,7 @@ pub(crate) fn run_sender_signaling_drain(
 ///
 /// Emits JSON status events to the frontend channel.
 /// Increments `SenderCounters::keyframe_requests_received` on `KeyframeRequested`.
-pub(crate) fn run_sender_transport_event_drain(
+pub fn run_sender_transport_event_drain(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
     channel: Arc<dyn ChannelLike>,
