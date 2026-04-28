@@ -131,7 +131,7 @@ struct BridgeCounters {
 ///   Send + Sync`; the underlying `Fn` (not `FnMut`) makes concurrent calls safe.
 /// - OQ-D7: builder does NOT see the `Channel`; returns just `ReceiverBundle`.
 pub(crate) type BuilderFn =
-    Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> + Send + Sync>;
+    Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> + Send + Sync>;
 
 // ─── BundleError — typed error returned by BuilderFn (C2) ────────────────────
 
@@ -818,16 +818,13 @@ fn build_production_bundle(
     udp_port: u16,
     service_name: String,
     stop_flag: Arc<AtomicBool>,
-) -> Result<ReceiverBundle, String> {
+) -> Result<ReceiverBundle, BundleError> {
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
     let sig_config = build_signaling_config_for_receiver(udp_port, service_name);
-    let mut signaling =
-        MdnsSignaling::new(sig_config).map_err(|e| format!("MdnsSignaling::new failed: {e}"))?;
+    let mut signaling = MdnsSignaling::new(sig_config)?;
 
     let (sig_event_tx, sig_event_rx) = sync_channel::<SignalingEvent>(TRANSPORT_CHANNEL_CAPACITY);
-    signaling
-        .start(sig_event_tx)
-        .map_err(|e| format!("MdnsSignaling::start failed: {e}"))?;
+    signaling.start(sig_event_tx)?;
 
     // ── 2. Build Str0mVideoReceiver (Receiver role) ────────────────────────
     let transport_config = TransportConfig {
@@ -835,16 +832,13 @@ fn build_production_bundle(
         role: TransportRole::Receiver,
         ..TransportConfig::default()
     };
-    let mut receiver = Str0mVideoReceiver::new(transport_config)
-        .map_err(|e| format!("Str0mVideoReceiver::new failed: {e}"))?;
+    let mut receiver = Str0mVideoReceiver::new(transport_config)?;
 
     let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
     let (transport_event_tx, transport_event_rx) =
         sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
 
-    receiver
-        .start(pkt_tx, transport_event_tx)
-        .map_err(|e| format!("Str0mVideoReceiver::start failed: {e}"))?;
+    receiver.start(pkt_tx, transport_event_tx)?;
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
     let receiver_mutex = Arc::new(Mutex::new(receiver));
@@ -867,8 +861,7 @@ fn build_production_bundle(
         .name("sm-transport-event-drain".into())
         .spawn(move || {
             run_transport_event_drain(transport_event_rx, stop_flag_t);
-        })
-        .map_err(|e| format!("failed to spawn transport-event drain: {e}"))?;
+        })?;
 
     // ── 5. Spawn signaling-event drain thread (W2-fix-B) ──────────────────
     let stop_flag_s = stop_flag.clone();
@@ -881,8 +874,7 @@ fn build_production_bundle(
                 sig_publish_for_drain,
                 stop_flag_s,
             );
-        })
-        .map_err(|e| format!("failed to spawn signaling-event drain: {e}"))?;
+        })?;
 
     // ── 6. Build SignalingOps for stop_stream ─────────────────────────────
     struct MdnsStopOps(Arc<Mutex<MdnsSignaling>>);
@@ -990,32 +982,13 @@ pub(crate) fn start_stream_inner(
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let bundle = match (builder)(resolved_port, resolved_name.clone(), stop_flag.clone()) {
-        Ok(b) => b,
-        Err(e) => {
-            // OQ-A1 — PortInUse substring detection shim (B5-4).
-            //
-            // `build_production_bundle` wraps `std::io::Error` via `format!("...: {e}")`.
-            // The OS-level `AddrInUse` message differs per platform:
-            //   Linux/macOS : "address already in use"
-            //   Windows     : "only one usage of each socket address ..."
-            //
-            // We lowercase-compare to tolerate capitalisation differences (e.g. macOS
-            // `Error { kind: AddrInUse, message: "Address already in use" }`).
-            //
-            // FIXME(V1.2): replace string-match with typed bundle errors once
-            // `build_production_bundle` returns a typed error enum.
-            let e_lower = e.to_lowercase();
-            if e_lower.contains("address already in use")
-                || e_lower.contains("only one usage of each socket address")
-            {
-                return Err(StartStreamError::PortInUse {
-                    port: resolved_port,
-                });
-            }
-            return Err(StartStreamError::BundleBuildFailed(e));
-        }
-    };
+    // Translate BundleError into StartStreamError. PortInUse carries the port from
+    // the bind-site detection in str0m_receiver.rs; no string parsing.
+    let bundle = (builder)(resolved_port, resolved_name.clone(), stop_flag.clone())
+        .map_err(|e| match e {
+            BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
+            BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
+        })?;
 
     // Step 6 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
@@ -1474,9 +1447,15 @@ mod tests {
                         _drain_senders: Vec::new(),
                     })
                 }
-                Err(msg) => Err(msg.to_string()),
+                Err(msg) => Err(BundleError::Other(msg.to_string())),
             }
         })
+    }
+
+    /// Build a `BuilderFn` that returns `Err(BundleError::PortInUse(port))` on every
+    /// invocation. Used by tests that exercise the typed-AddrInUse path post-B5.
+    fn make_addr_in_use_builder(port: u16) -> BuilderFn {
+        Arc::new(move |_port, _name, _stop_flag| Err(BundleError::PortInUse(port)))
     }
 
     // ─── Helper: build a StreamBridge with an active session ─────────────────
@@ -2699,7 +2678,7 @@ mod tests {
         //
         // We use a function-pointer coercion to verify the signature at compile time
         // without executing the function.
-        let _: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String> =
+        let _: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> =
             build_production_bundle;
     }
 
@@ -2719,7 +2698,7 @@ mod tests {
         // Compile gate: verify that `build_production_bundle` can be referred to as
         // a function with the new three-argument signature (redundant with B5-1.1
         // but explicit about the wrapper's contract).
-        fn _assert_arity(_f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, String>) {}
+        fn _assert_arity(_f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>) {}
         _assert_arity(build_production_bundle);
     }
 
@@ -2969,7 +2948,7 @@ mod tests {
     #[test]
     fn test_start_stream_inner_builder_addr_in_use_returns_port_in_use() {
         let builder: BuilderFn =
-            Arc::new(|_port, _name, _stop_flag| Err("address already in use".to_string()));
+            Arc::new(|_port, _name, _stop_flag| Err(BundleError::PortInUse(7900)));
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -2991,7 +2970,7 @@ mod tests {
     #[test]
     fn test_start_stream_inner_builder_windows_addr_in_use_returns_port_in_use() {
         let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
-            Err("only one usage of each socket address (protocol/network address/port) is normally permitted.".to_string())
+            Err(BundleError::PortInUse(7889))
         });
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
@@ -3017,8 +2996,9 @@ mod tests {
     /// must still be returned for non-AddrInUse errors.
     #[test]
     fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
-        let builder: BuilderFn =
-            Arc::new(|_port, _name, _stop_flag| Err("some unrelated build failure".to_string()));
+        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+            Err(BundleError::Other("some unrelated build failure".to_string()))
+        });
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
