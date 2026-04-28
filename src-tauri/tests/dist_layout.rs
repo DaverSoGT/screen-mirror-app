@@ -91,8 +91,7 @@ fn mse_client_referenced_only_from_viewer() {
 
 fn read_sender_html() -> String {
     let path = dist_dir().join("sender.html");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read sender.html: {}", e))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read sender.html: {}", e))
 }
 
 /// sender.html must not contain disabled config inputs.

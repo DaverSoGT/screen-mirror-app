@@ -113,11 +113,9 @@ pub struct SenderBridge {
 impl SenderBridge {
     /// Create a bridge using the production `build_production_sender_bundle` factory.
     pub fn new() -> Self {
-        Self::new_with_builder(Arc::new(
-            |udp_port, service_name, stop_flag, channel| {
-                build_production_sender_bundle(udp_port, service_name, stop_flag, channel)
-            },
-        ))
+        Self::new_with_builder(Arc::new(|udp_port, service_name, stop_flag, channel| {
+            build_production_sender_bundle(udp_port, service_name, stop_flag, channel)
+        }))
     }
 
     /// Create a bridge with a custom builder factory (test seam, R17).
@@ -192,9 +190,13 @@ enum SenderStatusEvent {
     PeerLost,
     Stopped,
     #[serde(rename = "button")]
-    Button { label: String },
+    Button {
+        label: String,
+    },
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 // ─── Validation helpers ───────────────────────────────────────────────────────
@@ -207,10 +209,8 @@ enum SenderStatusEvent {
 /// - 0        → Ok(()) — OS-assigned ephemeral port
 /// - 1..=1023 → Err(InvalidPort { reason: Privileged })
 /// - 1024..   → Ok(())
-pub(crate) fn validate_udp_port_for_sender(
-    value: u16,
-) -> Result<(), StartSenderError> {
-    if value >= 1 && value < 1024 {
+pub(crate) fn validate_udp_port_for_sender(value: u16) -> Result<(), StartSenderError> {
+    if (1..1024).contains(&value) {
         return Err(StartSenderError::InvalidPort {
             value,
             reason: PortRejectReason::Privileged,
@@ -222,9 +222,7 @@ pub(crate) fn validate_udp_port_for_sender(
 /// Validate `service_name` for the sender.
 /// Delegates to the shared `validate_service_name` from stream.rs and adapts
 /// the error type to `StartSenderError`.
-pub(crate) fn validate_service_name_for_sender(
-    s: &str,
-) -> Result<(), StartSenderError> {
+pub(crate) fn validate_service_name_for_sender(s: &str) -> Result<(), StartSenderError> {
     crate::commands::stream::validate_service_name(s).map_err(|e| match e {
         crate::commands::stream::StartStreamError::InvalidServiceName { value, reason } => {
             StartSenderError::InvalidServiceName { value, reason }
@@ -281,9 +279,7 @@ pub fn run_sender_signaling_drain(
                 }
                 SignalingEvent::AnswerReceived(ans) => {
                     if let Err(e) = sender.apply_remote_answer(ans) {
-                        eprintln!(
-                            "[sm-sender-signaling-drain] apply_remote_answer failed: {e}"
-                        );
+                        eprintln!("[sm-sender-signaling-drain] apply_remote_answer failed: {e}");
                         emit_event(
                             &channel,
                             &SenderStatusEvent::Error {
@@ -294,9 +290,7 @@ pub fn run_sender_signaling_drain(
                 }
                 SignalingEvent::CandidateReceived(c) => {
                     if let Err(e) = sender.add_remote_candidate(c) {
-                        eprintln!(
-                            "[sm-sender-signaling-drain] add_remote_candidate failed: {e}"
-                        );
+                        eprintln!("[sm-sender-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
                 SignalingEvent::OfferReceived(_) => {
@@ -403,8 +397,7 @@ pub fn start_sender_inner(
 
     // Step 3 — resolve defaults (Amendment A: port 0 = ephemeral).
     let resolved_port = udp_port.unwrap_or(0);
-    let resolved_name =
-        service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
+    let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
 
     // Step 4 — AlreadyRunning check.
     {
@@ -487,21 +480,13 @@ pub fn stop_sender_session(bridge: &SenderBridge) {
 // ─── sender_diagnostics_impl ──────────────────────────────────────────────────
 
 /// Core of `sender_diagnostics` — extracted for unit testing.
-pub fn sender_diagnostics_impl(
-    bridge: &SenderBridge,
-) -> Result<SenderStats, String> {
+pub fn sender_diagnostics_impl(bridge: &SenderBridge) -> Result<SenderStats, String> {
     let guard = bridge.session.lock().unwrap();
     match guard.as_ref() {
         None => Err("not running".to_string()),
         Some(s) => Ok(SenderStats {
-            dropped_frames_encoder: s
-                .counters
-                .dropped_frames_encoder
-                .load(Ordering::Relaxed),
-            dropped_frames_transport: s
-                .counters
-                .dropped_frames_transport
-                .load(Ordering::Relaxed),
+            dropped_frames_encoder: s.counters.dropped_frames_encoder.load(Ordering::Relaxed),
+            dropped_frames_transport: s.counters.dropped_frames_transport.load(Ordering::Relaxed),
             keyframe_requests_received: s
                 .counters
                 .keyframe_requests_received
@@ -530,9 +515,7 @@ fn build_production_sender_bundle(
 ) -> Result<SenderBundle, BundleError> {
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
-    use sm_domain::{
-        CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder,
-    };
+    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder};
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::windows::WindowsOpenH264Encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
@@ -558,8 +541,8 @@ fn build_production_sender_bundle(
         max_fps: Some(30),
         ..CaptureConfig::default()
     };
-    let mut capture = WindowsCaptureSource::new(capture_config)
-        .map_err(|e| BundleError::Other(e.to_string()))?;
+    let mut capture =
+        WindowsCaptureSource::new(capture_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     let encoder_config = EncoderConfig::default();
     let mut encoder = WindowsOpenH264Encoder::new(encoder_config)
@@ -570,8 +553,8 @@ fn build_production_sender_bundle(
         role: TransportRole::Sender,
         ..TransportConfig::default()
     };
-    let mut sender = Str0mVideoSender::new(transport_config)
-        .map_err(|e| BundleError::Other(e.to_string()))?;
+    let mut sender =
+        Str0mVideoSender::new(transport_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     // ── 2. Channels ───────────────────────────────────────────────────────────
     let (capture_to_enc_tx, capture_to_enc_rx) = sync_channel(CHANNEL_CAP);
@@ -622,8 +605,7 @@ fn build_production_sender_bundle(
         }
     }
 
-    let sender_ops: Arc<dyn SignalingSenderOps> =
-        Arc::new(Str0mSenderOpsImpl(sender_arc.clone()));
+    let sender_ops: Arc<dyn SignalingSenderOps> = Arc::new(Str0mSenderOpsImpl(sender_arc.clone()));
 
     let counters = Arc::new(SenderCounters::default());
 
@@ -700,9 +682,7 @@ pub fn stop_sender(bridge: tauri::State<SenderBridge>) -> Result<(), String> {
 
 /// Return diagnostics for the active sender session.
 #[tauri::command]
-pub fn sender_diagnostics(
-    bridge: tauri::State<SenderBridge>,
-) -> Result<SenderStats, String> {
+pub fn sender_diagnostics(bridge: tauri::State<SenderBridge>) -> Result<SenderStats, String> {
     sender_diagnostics_impl(&bridge)
 }
 

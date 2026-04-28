@@ -4,13 +4,11 @@
 // ALL tests in this file are cross-platform — no real adapters.
 // Windows-only tests must be marked #[ignore] (not yet present in this file).
 
-use screen_mirror_lib::commands::sender::{
-    SenderBridge, SenderStats, StartSenderError,
-};
+use screen_mirror_lib::commands::sender::{SenderBridge, SenderStats, StartSenderError};
 
 // B2: Verify the command symbols are importable (compile-level test).
 #[allow(unused_imports)]
-use screen_mirror_lib::commands::sender::{start_sender, stop_sender, sender_diagnostics};
+use screen_mirror_lib::commands::sender::{sender_diagnostics, start_sender, stop_sender};
 
 // ─── B1 type assertions ────────────────────────────────────────────────────────
 
@@ -78,8 +76,11 @@ fn sender_stats_serializes_correctly() {
 fn start_sender_stub_exists() {
     // The import at the top verifies the symbols are accessible.
     // This test body just runs to confirm the binary is built.
-    let _bridge = SenderBridge::new();
-    assert!(true);
+    let bridge = SenderBridge::new();
+    assert!(
+        bridge.session.lock().unwrap().is_none(),
+        "bridge must start with no session"
+    );
 }
 
 /// SenderBridge and StreamBridge can coexist in the same scope.
@@ -97,11 +98,11 @@ fn sender_bridge_managed_separately_from_stream_bridge() {
 // SenderBuilderProbe is defined here (integration test cannot access stream.rs's
 // BuilderProbe which is #[cfg(test)] and in a different crate unit).
 
+use screen_mirror_lib::commands::sender::{
+    BundleError, ChannelLike, SenderBundle, start_sender_inner,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use screen_mirror_lib::commands::sender::{
-    BundleError, ChannelLike, SenderBundle, SenderBuilderFn, start_sender_inner,
-};
 
 /// Fake channel that captures JSON messages sent via send_raw(0, bytes).
 struct FakeJsonChannel {
@@ -166,10 +167,12 @@ impl SenderBuilderProbe {
 fn make_sender_test_builder(
     probe: Arc<SenderBuilderProbe>,
 ) -> screen_mirror_lib::commands::sender::SenderBuilderFn {
-    Arc::new(move |port: u16, name: String, _stop: Arc<AtomicBool>, _ch: Arc<dyn ChannelLike>| {
-        probe.calls.lock().unwrap().push((port, name));
-        (probe.result)()
-    })
+    Arc::new(
+        move |port: u16, name: String, _stop: Arc<AtomicBool>, _ch: Arc<dyn ChannelLike>| {
+            probe.calls.lock().unwrap().push((port, name));
+            (probe.result)()
+        },
+    )
 }
 
 /// Invalid service name returns error before builder is called.
@@ -187,27 +190,35 @@ fn start_sender_invalid_service_name_returns_error() {
         None,
         Some("bogus".to_string()),
     );
-    assert!(matches!(result, Err(StartSenderError::InvalidServiceName { .. })));
-    assert_eq!(probe.call_count(), 0, "builder must not be called on validation error");
+    assert!(matches!(
+        result,
+        Err(StartSenderError::InvalidServiceName { .. })
+    ));
+    assert_eq!(
+        probe.call_count(),
+        0,
+        "builder must not be called on validation error"
+    );
 }
 
 /// Privileged port returns InvalidPort error.
 #[test]
 fn start_sender_privileged_port_returns_invalid_port() {
-    use screen_mirror_lib::commands::sender::{StartSenderError, PortRejectReason};
+    use screen_mirror_lib::commands::sender::{PortRejectReason, StartSenderError};
     let probe = SenderBuilderProbe::new_ok();
     let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder(
         make_sender_test_builder(probe.clone()),
     );
     let ch = FakeJsonChannel::new();
-    let result = start_sender_inner(
-        &bridge,
-        ch as Arc<dyn ChannelLike>,
-        Some(80),
-        None,
-    );
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, Some(80), None);
     assert!(
-        matches!(result, Err(StartSenderError::InvalidPort { reason: PortRejectReason::Privileged, .. })),
+        matches!(
+            result,
+            Err(StartSenderError::InvalidPort {
+                reason: PortRejectReason::Privileged,
+                ..
+            })
+        ),
         "expected InvalidPort::Privileged, got: {result:?}"
     );
     assert_eq!(probe.call_count(), 0);
@@ -221,12 +232,7 @@ fn start_sender_port_zero_is_allowed() {
         make_sender_test_builder(probe.clone()),
     );
     let ch = FakeJsonChannel::new();
-    let result = start_sender_inner(
-        &bridge,
-        ch as Arc<dyn ChannelLike>,
-        Some(0),
-        None,
-    );
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, Some(0), None);
     assert!(result.is_ok(), "port 0 must be accepted: {result:?}");
     assert_eq!(probe.call_count(), 1);
     assert_eq!(probe.calls()[0].0, 0, "builder must receive port 0");
@@ -240,15 +246,14 @@ fn start_sender_port_none_defaults_to_ephemeral() {
         make_sender_test_builder(probe.clone()),
     );
     let ch = FakeJsonChannel::new();
-    let result = start_sender_inner(
-        &bridge,
-        ch as Arc<dyn ChannelLike>,
-        None,
-        None,
-    );
+    let result = start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None);
     assert!(result.is_ok(), "None port must default to 0: {result:?}");
     assert_eq!(probe.call_count(), 1);
-    assert_eq!(probe.calls()[0].0, 0, "builder must receive port 0 when None");
+    assert_eq!(
+        probe.calls()[0].0,
+        0,
+        "builder must receive port 0 when None"
+    );
 }
 
 /// Double-start returns AlreadyRunning.
@@ -271,7 +276,11 @@ fn start_sender_already_running_returns_error() {
         matches!(result, Err(StartSenderError::AlreadyRunning { .. })),
         "expected AlreadyRunning, got: {result:?}"
     );
-    assert_eq!(probe.call_count(), 1, "builder must not be called a second time");
+    assert_eq!(
+        probe.call_count(),
+        1,
+        "builder must not be called a second time"
+    );
 }
 
 // ─── B4 stop_sender tests ─────────────────────────────────────────────────────
@@ -334,7 +343,9 @@ fn stop_sender_fake_session_drains_handles() {
         result: Box::new(|| {
             // Spawn a thread that does nothing and exits immediately.
             let h = std::thread::spawn(|| {});
-            Ok(SenderBundle { drain_handles: vec![h] })
+            Ok(SenderBundle {
+                drain_handles: vec![h],
+            })
         }),
     });
 
@@ -370,7 +381,6 @@ fn sender_diagnostics_no_session_returns_err_not_running() {
 #[test]
 fn sender_diagnostics_with_fake_session_returns_stats() {
     use std::sync::atomic::Ordering;
-    use screen_mirror_lib::commands::sender::SenderCounters;
 
     let probe = SenderBuilderProbe::new_ok();
     let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
@@ -382,7 +392,9 @@ fn sender_diagnostics_with_fake_session_returns_stats() {
     {
         let guard = bridge.session.lock().unwrap();
         if let Some(s) = guard.as_ref() {
-            s.counters.dropped_frames_encoder.store(3, Ordering::Relaxed);
+            s.counters
+                .dropped_frames_encoder
+                .store(3, Ordering::Relaxed);
         }
     }
 
@@ -430,8 +442,7 @@ fn start_sender_inner_builder_receives_port_zero_when_none() {
     let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe.clone()));
     let ch = FakeJsonChannel::new();
 
-    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
-        .expect("should succeed");
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None).expect("should succeed");
 
     assert_eq!(probe.calls()[0].0, 0, "builder must receive port=0");
 }
@@ -484,7 +495,11 @@ fn start_sender_inner_already_running_blocks_second_start() {
         matches!(result, Err(StartSenderError::AlreadyRunning { .. })),
         "expected AlreadyRunning: {result:?}"
     );
-    assert_eq!(probe.call_count(), 1, "builder must not be called second time");
+    assert_eq!(
+        probe.call_count(),
+        1,
+        "builder must not be called second time"
+    );
 }
 
 /// After start_sender_inner, channel receives a Connecting status event.
@@ -499,22 +514,28 @@ fn start_sender_inner_bring_up_emits_connecting_status() {
         .expect("start must succeed");
 
     let messages = ch_clone.messages();
-    assert!(!messages.is_empty(), "channel must have received at least one message");
+    assert!(
+        !messages.is_empty(),
+        "channel must have received at least one message"
+    );
 
-    let has_connecting = messages.iter().any(|m| m.contains("\"kind\":\"connecting\""));
-    assert!(has_connecting, "expected connecting status, got: {messages:?}");
+    let has_connecting = messages
+        .iter()
+        .any(|m| m.contains("\"kind\":\"connecting\""));
+    assert!(
+        has_connecting,
+        "expected connecting status, got: {messages:?}"
+    );
 }
 
 // ─── B7 signaling drain tests ─────────────────────────────────────────────────
 
+use screen_mirror_lib::commands::sender::{SignalingSenderOps, run_sender_signaling_drain};
+use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
+use sm_domain::transport::TransportError;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
-use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
-use sm_domain::transport::TransportError;
-use screen_mirror_lib::commands::sender::{
-    SignalingSenderOps, run_sender_signaling_drain,
-};
 
 /// Fake sender that records apply_remote_answer / add_remote_candidate calls.
 struct FakeSender {
@@ -588,7 +609,9 @@ fn signaling_drain_answer_received_calls_apply_remote_answer() {
     });
 
     ev_tx
-        .send(SignalingEvent::AnswerReceived(SdpAnswer("test-answer".to_string())))
+        .send(SignalingEvent::AnswerReceived(SdpAnswer(
+            "test-answer".to_string(),
+        )))
         .unwrap();
 
     thread::sleep(Duration::from_millis(50));
@@ -616,7 +639,9 @@ fn signaling_drain_candidate_received_calls_add_remote_candidate() {
     });
 
     ev_tx
-        .send(SignalingEvent::CandidateReceived(IceCandidate("test-cand".to_string())))
+        .send(SignalingEvent::CandidateReceived(IceCandidate(
+            "test-cand".to_string(),
+        )))
         .unwrap();
 
     thread::sleep(Duration::from_millis(50));
@@ -643,7 +668,9 @@ fn signaling_drain_offer_received_is_silently_ignored() {
     });
 
     ev_tx
-        .send(SignalingEvent::OfferReceived(SdpOffer("test-offer".to_string())))
+        .send(SignalingEvent::OfferReceived(SdpOffer(
+            "test-offer".to_string(),
+        )))
         .unwrap();
 
     thread::sleep(Duration::from_millis(50));
@@ -671,9 +698,7 @@ fn signaling_drain_closed_emits_peer_lost_and_exits() {
     });
 
     ev_tx.send(SignalingEvent::Closed).unwrap();
-    drain
-        .join()
-        .expect("drain must exit after Closed");
+    drain.join().expect("drain must exit after Closed");
 
     let msgs = ch.messages();
     let has_peer_lost = msgs.iter().any(|m| m.contains("\"kind\":\"peer_lost\""));
@@ -728,8 +753,8 @@ fn signaling_drain_stop_flag_exits_loop() {
 
 // ─── B8 transport event drain tests ──────────────────────────────────────────
 
+use screen_mirror_lib::commands::sender::{SenderCounters, run_sender_transport_event_drain};
 use sm_domain::transport::TransportEvent;
-use screen_mirror_lib::commands::sender::{run_sender_transport_event_drain, SenderCounters};
 
 /// IceConnected emits streaming + "Stop streaming" button.
 #[test]
