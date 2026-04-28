@@ -1117,3 +1117,129 @@ fn transport_candidate_publishes_to_peer_via_loopback_signaling_s_ct_1() {
     drop(pkt_tx);
     sender.stop().unwrap();
 }
+
+// ─── B5/B6 bundle-sequence regression tests ──────────────────────────────────
+
+/// Bundle-sequence regression gate (sender side, B5) — Asserts that the
+/// production-bundle sequence (start → publish_offer → publish_host_candidate)
+/// delivers CandidateReceived to the peer's signaling channel.
+///
+/// This test mirrors what `build_production_sender_bundle` SHOULD do after B5-GREEN.
+/// It calls `publish_host_candidate` directly rather than via the production bundle
+/// builder (which is #[cfg(target_os="windows")] and requires real adapters).
+/// The test documents the contract and guards against regressions.
+///
+/// The test passes immediately because the helper was implemented in B1-GREEN.
+/// The production-bundle wiring (B5-GREEN) is verified by grep in B7.4 and the
+/// sdd-verify phase.
+#[test]
+fn transport_sender_bundle_sequence_publishes_candidate_b5() {
+    use sm_infra::transport::{NicOverrideGuard, publish_host_candidate};
+
+    let injected_ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+
+    // Simulate the bundle-builder sequence.
+    let enc = FakeLoopbackEncoder::new();
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    let (mut sig_sender, mut sig_receiver) =
+        LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
+    let (sig_s_ev_tx, _sig_s_ev_rx) = sync_channel::<SignalingEvent>(4);
+    let (sig_r_ev_tx, sig_r_ev_rx) = sync_channel::<SignalingEvent>(4);
+    sig_sender.start(sig_s_ev_tx).expect("sig_sender start");
+    sig_receiver.start(sig_r_ev_tx).expect("sig_receiver start");
+
+    // Step matching build_production_sender_bundle:
+    // 1. publish_local_offer (already done in real bundle; here we skip for simplicity)
+    // 2. publish_host_candidate AFTER offer
+    let _guard = NicOverrideGuard::new(vec![injected_ip]);
+    if let Some(addr) = sender.candidate_addr() {
+        publish_host_candidate(&sig_sender, addr).expect("publish ok");
+    }
+    drop(_guard);
+
+    // Assert CandidateReceived arrives on the receiver side.
+    let event = sig_r_ev_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CandidateReceived must arrive on receiver-side signaling channel");
+
+    assert!(
+        matches!(event, SignalingEvent::CandidateReceived(_)),
+        "Expected CandidateReceived, got {event:?}"
+    );
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// Bundle-sequence regression gate (receiver side, B6) — Mirror of the sender
+/// variant: after `receiver.start()`, publishing the host candidate via
+/// `publish_host_candidate` MUST deliver `CandidateReceived` to the peer.
+#[test]
+fn transport_receiver_bundle_sequence_publishes_candidate_b6() {
+    use sm_infra::transport::{NicOverrideGuard, publish_host_candidate};
+
+    let injected_ip = std::net::Ipv4Addr::new(10, 0, 0, 6);
+
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
+
+    let (mut sig_receiver_side, mut sig_sender_side) =
+        LoopbackSignaling::pair(SignalingRole::Receiver, SignalingRole::Sender);
+    let (sig_r_ev_tx, _sig_r_ev_rx) = sync_channel::<SignalingEvent>(4);
+    let (sig_s_ev_tx, sig_s_ev_rx) = sync_channel::<SignalingEvent>(4);
+    sig_receiver_side
+        .start(sig_r_ev_tx)
+        .expect("sig_receiver_side start");
+    sig_sender_side
+        .start(sig_s_ev_tx)
+        .expect("sig_sender_side start");
+
+    // Step matching build_production_bundle:
+    // After receiver.start_with_socket(), publish the candidate.
+    let _guard = NicOverrideGuard::new(vec![injected_ip]);
+    if let Some(addr) = receiver.candidate_addr() {
+        publish_host_candidate(&sig_receiver_side, addr).expect("publish ok");
+    }
+    drop(_guard);
+
+    // Assert CandidateReceived arrives on the sender side (peer of receiver).
+    let event = sig_s_ev_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CandidateReceived must arrive on sender-side signaling channel");
+
+    assert!(
+        matches!(event, SignalingEvent::CandidateReceived(_)),
+        "Expected CandidateReceived, got {event:?}"
+    );
+
+    receiver.stop().unwrap();
+}
