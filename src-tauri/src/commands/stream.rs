@@ -167,6 +167,50 @@ impl From<std::io::Error> for BundleError {
     }
 }
 
+// ─── BindCtx — carries the prebound UDP socket from bind_probe to BuilderFn ──
+
+/// Carrier for an OS-reserved UDP socket from `bind_probe` to the bundle builder.
+///
+/// Exists as a struct (PQ-B-2) — not a positional `UdpSocket` arg — so future
+/// fields (e.g. `effective_addr`) can be added without churning the `BuilderFn`
+/// signature again.
+///
+/// `pub(crate)` (R2.4): never crosses the IPC boundary and is not re-exported.
+/// No `Clone`/`Copy`/`Default` derives (R2.2): a `UdpSocket` is a unique OS
+/// resource; duplicating or defaulting it has no safe meaning here.
+/// Implements `Send` automatically from `UdpSocket: Send` (R2.3).
+pub(crate) struct BindCtx {
+    pub(crate) socket: std::net::UdpSocket,
+}
+
+// ─── bind_probe — pre-acquire the UDP socket before any StreamBridge lock ────
+
+/// Pre-acquire the UDP port that `start_stream_inner` is about to authorise.
+///
+/// Attempts to bind `"0.0.0.0:{port}"` — matching the format used in
+/// `str0m_receiver.rs` (R1.1). Returns the bound `UdpSocket` on success (R1.4).
+///
+/// On `AddrInUse`, returns `Err(BundleError::PortInUse(port))` with the
+/// caller-supplied port value — NOT a value read from the OS (R1.2).
+///
+/// On any other `io::Error`, delegates to the existing `From<io::Error> for
+/// BundleError` impl which collapses to `BundleError::Other(...)` (R1.3).
+/// IMPORTANT: the explicit `if e.kind() == AddrInUse` branch precedes the
+/// `From::from(e)` delegation because the `From` impl maps ALL io errors to
+/// `Other` — we need a typed `PortInUse` for the AddrInUse case (R1.2 + R1.3).
+///
+/// MUST be called BEFORE acquiring any `StreamBridge` mutex (R1.5, PQ-D-1).
+pub(crate) fn bind_probe(port: u16) -> Result<std::net::UdpSocket, BundleError> {
+    let bind_addr = format!("0.0.0.0:{port}");
+    match std::net::UdpSocket::bind(&bind_addr) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(BundleError::PortInUse(port))
+        }
+        Err(e) => Err(BundleError::from(e)), // R1.3 — collapses to Other(...)
+    }
+}
+
 impl From<sm_domain::signaling::SignalingError> for BundleError {
     fn from(e: sm_domain::signaling::SignalingError) -> Self {
         // No variant of SignalingError is "port in use" — none touch UDP bind.
