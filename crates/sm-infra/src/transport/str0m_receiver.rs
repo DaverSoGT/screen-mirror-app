@@ -196,63 +196,8 @@ impl VideoReceiver for Str0mVideoReceiver {
         let bind_addr = format!("0.0.0.0:{}", self.config.udp_port);
         let udp = UdpSocket::bind(&bind_addr)
             .map_err(|e| classify_bind_error(e, self.config.udp_port))?;
-        let local_addr = udp
-            .local_addr()
-            .map_err(|e| TransportError::Io(e.to_string()))?;
 
-        // Take the Rtc out of pre_neg and move it into the thread.
-        let pre_neg = {
-            let mut guard = self.pre_neg.lock().unwrap();
-            guard
-                .take()
-                .ok_or_else(|| TransportError::Internal("Rtc already moved to thread".into()))?
-        };
-
-        // Compute the effective local address for ICE candidate registration and
-        // for the `Input::Receive { destination }` field in the tick loop.
-        // When bound to the wildcard address (0.0.0.0), fall back to 127.0.0.1
-        // with the actual bound port.
-        let effective_local_addr: std::net::SocketAddr = if local_addr.ip().is_unspecified() {
-            format!("127.0.0.1:{}", local_addr.port()).parse().unwrap()
-        } else {
-            local_addr
-        };
-
-        let mut rtc_tmp = pre_neg.rtc;
-        if let Ok(cand) = Candidate::host(effective_local_addr, "udp") {
-            rtc_tmp.add_local_candidate(cand);
-        }
-
-        let pre_neg_with_candidate = ReceiverPreNeg {
-            rtc: rtc_tmp,
-            mid: pre_neg.mid,
-        };
-
-        let (ctrl_tx, ctrl_rx) =
-            std::sync::mpsc::sync_channel::<ReceiverControl>(TRANSPORT_CHANNEL_CAPACITY);
-        self.control_tx = Some(ctrl_tx);
-
-        let state = Arc::clone(&self.state);
-
-        let handle = std::thread::Builder::new()
-            .name("sm-transport-receiver".into())
-            .spawn(move || {
-                run_receiver_loop(
-                    pre_neg_with_candidate,
-                    udp,
-                    effective_local_addr,
-                    pkt_tx,
-                    event_tx,
-                    ctrl_rx,
-                    state,
-                );
-            })
-            .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
-
-        self.handle = Some(handle);
-        // Store the effective local address so callers can retrieve it for candidate exchange.
-        self.local_addr = Some(effective_local_addr);
-        Ok(())
+        self.start_from_socket(udp, pkt_tx, event_tx)
     }
 
     /// Stop the receiver. Idempotent. Sets the stop flag and joins the thread.
@@ -358,6 +303,103 @@ impl Str0mVideoReceiver {
     /// signaling adapters to discover the bound ephemeral port for ICE candidate exchange.
     pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
         self.local_addr
+    }
+
+    /// Begin receiving with an externally-bound `UdpSocket`. Mirrors `start()` but
+    /// skips the internal `UdpSocket::bind`.
+    ///
+    /// Used by the Tauri shell's TOCTOU-hardened path (`build_production_bundle`)
+    /// where the socket is acquired up-front by `bind_probe` and threaded here
+    /// through `BindCtx`. The trait `start()` remains for callers that bind
+    /// ephemeral ports (port 0 in tests/examples).
+    ///
+    /// Returns `Err(AlreadyRunning)` if called while a previous run is active.
+    pub fn start_with_socket(
+        &mut self,
+        udp: UdpSocket,
+        pkt_tx: SyncSender<EncodedPacket>,
+        event_tx: SyncSender<TransportEvent>,
+    ) -> Result<(), TransportError> {
+        if self.handle.is_some() {
+            return Err(TransportError::AlreadyRunning);
+        }
+
+        // Reset stop flag and sequence counter — matches start() reset path.
+        self.state.stop.store(false, Ordering::Release);
+        self.state.seq.store(0, Ordering::Release);
+
+        self.start_from_socket(udp, pkt_tx, event_tx)
+    }
+
+    /// Post-bind setup: extract the `Rtc`, compute the effective local address,
+    /// add the local ICE candidate, spawn the tick thread, and store the handle.
+    ///
+    /// Called by both `start()` (after its own `UdpSocket::bind`) and
+    /// `start_with_socket()` (with a prebound socket from `bind_probe`).
+    /// This is the SINGLE source of truth for post-bind initialization.
+    fn start_from_socket(
+        &mut self,
+        udp: UdpSocket,
+        pkt_tx: SyncSender<EncodedPacket>,
+        event_tx: SyncSender<TransportEvent>,
+    ) -> Result<(), TransportError> {
+        let local_addr = udp
+            .local_addr()
+            .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        // Take the Rtc out of pre_neg and move it into the thread.
+        let pre_neg = {
+            let mut guard = self.pre_neg.lock().unwrap();
+            guard
+                .take()
+                .ok_or_else(|| TransportError::Internal("Rtc already moved to thread".into()))?
+        };
+
+        // Compute the effective local address for ICE candidate registration and
+        // for the `Input::Receive { destination }` field in the tick loop.
+        // When bound to the wildcard address (0.0.0.0), fall back to 127.0.0.1
+        // with the actual bound port.
+        let effective_local_addr: std::net::SocketAddr = if local_addr.ip().is_unspecified() {
+            format!("127.0.0.1:{}", local_addr.port()).parse().unwrap()
+        } else {
+            local_addr
+        };
+
+        let mut rtc_tmp = pre_neg.rtc;
+        if let Ok(cand) = Candidate::host(effective_local_addr, "udp") {
+            rtc_tmp.add_local_candidate(cand);
+        }
+
+        let pre_neg_with_candidate = ReceiverPreNeg {
+            rtc: rtc_tmp,
+            mid: pre_neg.mid,
+        };
+
+        let (ctrl_tx, ctrl_rx) =
+            std::sync::mpsc::sync_channel::<ReceiverControl>(TRANSPORT_CHANNEL_CAPACITY);
+        self.control_tx = Some(ctrl_tx);
+
+        let state = Arc::clone(&self.state);
+
+        let handle = std::thread::Builder::new()
+            .name("sm-transport-receiver".into())
+            .spawn(move || {
+                run_receiver_loop(
+                    pre_neg_with_candidate,
+                    udp,
+                    effective_local_addr,
+                    pkt_tx,
+                    event_tx,
+                    ctrl_rx,
+                    state,
+                );
+            })
+            .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
+
+        self.handle = Some(handle);
+        // Store the effective local address so callers can retrieve it for candidate exchange.
+        self.local_addr = Some(effective_local_addr);
+        Ok(())
     }
 }
 
