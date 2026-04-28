@@ -819,3 +819,38 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
          check that both tick loops process STUN binding requests correctly"
     );
 }
+
+// ─── S-CT-2: candidate_addr() returns None before start() ────────────────────
+
+/// S-CT-2 (sender variant) — `candidate_addr()` MUST return `None` before
+/// `start()` is called. R-CT-1 pre-condition.
+#[test]
+fn transport_sender_candidate_addr_is_none_pre_start_s_ct_2() {
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    assert!(
+        sender.candidate_addr().is_none(),
+        "candidate_addr() must return None before start() is called"
+    );
+}
+
+/// S-CT-2 (receiver variant) — `candidate_addr()` MUST return `None` before
+/// `start_with_socket()` is called. R-CT-2 pre-condition.
+#[test]
+fn transport_receiver_candidate_addr_is_none_pre_start_s_ct_2() {
+    let receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    assert!(
+        receiver.candidate_addr().is_none(),
+        "candidate_addr() must return None before start_with_socket() is called"
+    );
+}
