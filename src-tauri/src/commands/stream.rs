@@ -130,8 +130,11 @@ struct BridgeCounters {
 /// - OQ-D1: plain `Arc<dyn Fn>` — no `Mutex` wrapper. The `Arc` is `Clone +
 ///   Send + Sync`; the underlying `Fn` (not `FnMut`) makes concurrent calls safe.
 /// - OQ-D7: builder does NOT see the `Channel`; returns just `ReceiverBundle`.
-pub(crate) type BuilderFn =
-    Arc<dyn Fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> + Send + Sync>;
+pub(crate) type BuilderFn = Arc<
+    dyn Fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>
+        + Send
+        + Sync,
+>;
 
 // ─── BundleError — typed error returned by BuilderFn (C2) ────────────────────
 
@@ -483,8 +486,8 @@ impl StreamBridge {
         // Direct delegation: BuilderFn(port, name, stop_flag) →
         // build_production_bundle(port, name, stop_flag).
         // B5 removes the prior `|_port, _name, stop_flag|` shim.
-        Self::new_with_builder(Arc::new(|port, name, stop_flag| {
-            build_production_bundle(port, name, stop_flag)
+        Self::new_with_builder(Arc::new(|bind_ctx, port, name, stop_flag| {
+            build_production_bundle(bind_ctx, port, name, stop_flag)
         }))
     }
 
@@ -859,10 +862,16 @@ pub(crate) fn build_signaling_config_for_receiver(
 /// Spec R2.5: BuilderFn receives the resolved (port, service_name, stop_flag) tuple.
 /// Design §1 Glossary; Delta-spec table (prior: hardcoded 7889, new: parameterized).
 fn build_production_bundle(
+    bind_ctx: BindCtx,
     udp_port: u16,
     service_name: String,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<ReceiverBundle, BundleError> {
+    // Extract the prebound socket from BindCtx (R5.1, D3).
+    // The socket was acquired by `bind_probe` in `start_stream_inner` BEFORE any
+    // StreamBridge mutex was held (PQ-D-1). No second `UdpSocket::bind` occurs here.
+    let BindCtx { socket } = bind_ctx;
+
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
     let sig_config = build_signaling_config_for_receiver(udp_port, service_name);
     let mut signaling = MdnsSignaling::new(sig_config)?;
@@ -882,7 +891,8 @@ fn build_production_bundle(
     let (transport_event_tx, transport_event_rx) =
         sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
 
-    receiver.start(pkt_tx, transport_event_tx)?;
+    // NEW: hand the prebound socket to the receiver — no second bind (R5.2, R5.3).
+    receiver.start_with_socket(socket, pkt_tx, transport_event_tx)?;
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
     let receiver_mutex = Arc::new(Mutex::new(receiver));
@@ -1026,14 +1036,24 @@ pub(crate) fn start_stream_inner(
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    // Step 4b — TEMPORARY placeholder: bind_probe wired in B4 (R4.1, PQ-D-1).
+    // B4.T3 replaces this block with the actual bind_probe call and AlreadyRunning
+    // check reorder. This stub keeps the code compilable after the BuilderFn
+    // signature flip in B3 while B4 wires the real TOCTOU fix.
+    let tmp_socket = std::net::UdpSocket::bind(format!("0.0.0.0:{resolved_port}"))
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => StartStreamError::PortInUse { port: resolved_port },
+            _ => StartStreamError::BundleBuildFailed(e.to_string()),
+        })?;
+    let bind_ctx = BindCtx { socket: tmp_socket };
+
     // Translate BundleError into StartStreamError. PortInUse carries the port from
     // the bind-site detection in str0m_receiver.rs; no string parsing.
-    let bundle = (builder)(resolved_port, resolved_name.clone(), stop_flag.clone()).map_err(
-        |e| match e {
+    let bundle = (builder)(bind_ctx, resolved_port, resolved_name.clone(), stop_flag.clone())
+        .map_err(|e| match e {
             BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
             BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
-        },
-    )?;
+        })?;
 
     // Step 6 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
@@ -1501,7 +1521,7 @@ mod tests {
     /// Build a `BuilderFn` that returns `Err(BundleError::PortInUse(port))` on every
     /// invocation. Used by tests that exercise the typed-AddrInUse path post-B5.
     fn make_addr_in_use_builder(port: u16) -> BuilderFn {
-        Arc::new(move |_port, _name, _stop_flag| Err(BundleError::PortInUse(port)))
+        Arc::new(move |_bind_ctx: BindCtx, _port, _name, _stop_flag| Err(BundleError::PortInUse(port)))
     }
 
     // ─── Helper: build a StreamBridge with an active session ─────────────────
@@ -1991,7 +2011,7 @@ mod tests {
         // Construct a bridge with a closure that panics if called — the test only
         // checks that the constructor compiles and the builder is stored.
         let builder: BuilderFn =
-            Arc::new(|_port, _name, _stop_flag| panic!("builder must not be called in this test"));
+            Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| panic!("builder must not be called in this test"));
         let bridge = StreamBridge::new_with_builder(builder);
         // builder field must be populated: Arc strong count is at least 1.
         assert!(Arc::strong_count(&bridge.builder) >= 1);
@@ -2724,28 +2744,23 @@ mod tests {
         //
         // We use a function-pointer coercion to verify the signature at compile time
         // without executing the function.
-        let _: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> =
+        // Updated for TOCTOU hardening (B3): build_production_bundle now accepts
+        // BindCtx as its first argument (R5.1, D2).
+        let _: fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> =
             build_production_bundle;
     }
 
     /// B5-1.2 — `StreamBridge::new()` wrapper closure passes udp_port and service_name
     ///           through to `build_production_bundle` instead of ignoring them.
     ///
-    /// RED: `new()` currently wraps with `|_port, _name, stop_flag|` (ignoring port/name).
-    /// After GREEN the wrapper must be `|port, name, stop_flag| build_production_bundle(port, name, stop_flag)`.
-    ///
-    /// We verify this indirectly: the wrapper is `BuilderFn` — we call it via a
-    /// probe that intercepts the port argument. Because `build_production_bundle`
-    /// actually binds sockets, we cannot call `new()` production wrapper in unit tests.
-    /// This test is therefore a COMPILE gate only — the signature coercion in B5-1.1
-    /// is the meaningful RED assert. This test documents the requirement.
+    /// Updated for TOCTOU hardening (B3): `build_production_bundle` now accepts `BindCtx`
+    /// as its first argument. The compile-gate below verifies the new 4-arg signature.
     #[test]
     fn test_new_wrapper_closure_passes_port_and_name_to_build_production_bundle() {
         // Compile gate: verify that `build_production_bundle` can be referred to as
-        // a function with the new three-argument signature (redundant with B5-1.1
-        // but explicit about the wrapper's contract).
+        // a function with the new four-argument signature (BindCtx, u16, String, Arc<AtomicBool>).
         fn _assert_arity(
-            _f: fn(u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>,
+            _f: fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>,
         ) {
         }
         _assert_arity(build_production_bundle);
@@ -2766,7 +2781,7 @@ mod tests {
     fn test_start_stream_inner_exists_and_returns_ok_for_valid_args() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
             probe_clone.lock().unwrap().push((port, name));
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
@@ -2797,7 +2812,7 @@ mod tests {
     /// RED: `start_stream_inner` does not exist.
     #[test]
     fn test_start_stream_inner_sets_session_on_success() {
-        let builder: BuilderFn = Arc::new(move |_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -2831,7 +2846,7 @@ mod tests {
     #[test]
     fn test_start_stream_inner_invalid_port_zero_rejects_before_builder() {
         // Builder panics if called — ensures validator short-circuits before builder.
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             panic!("builder must NOT be called when port validation fails")
         });
         let bridge = StreamBridge::new_with_builder(builder);
@@ -2857,7 +2872,7 @@ mod tests {
     /// RED: validators not yet wired.
     #[test]
     fn test_start_stream_inner_invalid_port_privileged_rejects_before_builder() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             panic!("builder must NOT be called when port validation fails")
         });
         let bridge = StreamBridge::new_with_builder(builder);
@@ -2882,7 +2897,7 @@ mod tests {
     /// RED: validators not yet wired.
     #[test]
     fn test_start_stream_inner_invalid_service_name_rejects_before_builder() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             panic!("builder must NOT be called when service-name validation fails")
         });
         let bridge = StreamBridge::new_with_builder(builder);
@@ -2912,7 +2927,7 @@ mod tests {
     fn test_start_stream_inner_none_args_resolve_to_defaults_in_builder() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
             probe_clone.lock().unwrap().push((port, name));
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
@@ -2952,7 +2967,7 @@ mod tests {
     fn test_start_stream_inner_custom_args_reach_builder() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |port, name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
             probe_clone.lock().unwrap().push((port, name));
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
@@ -3022,7 +3037,7 @@ mod tests {
     /// must still be returned for non-AddrInUse errors.
     #[test]
     fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             Err(BundleError::Other(
                 "some unrelated build failure".to_string(),
             ))
@@ -3087,7 +3102,7 @@ mod tests {
     /// RED: `start_stream_inner` currently does NOT write to `current_args`.
     #[test]
     fn test_current_args_set_on_successful_start_custom_args() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -3125,7 +3140,7 @@ mod tests {
     /// RED: `start_stream_inner` currently does NOT write to `current_args`.
     #[test]
     fn test_current_args_set_on_successful_start_default_args() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -3162,7 +3177,7 @@ mod tests {
     /// guard). B6-2 GREEN replaces that with the AlreadyRunning error.
     #[test]
     fn test_double_start_same_args_returns_already_running() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -3215,7 +3230,7 @@ mod tests {
     /// RED: `start_stream_inner` currently returns `Ok(())` on double-start.
     #[test]
     fn test_double_start_different_args_returns_already_running_with_current_args() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -3274,7 +3289,7 @@ mod tests {
     /// return `Err(AlreadyRunning)` instead of `Ok(())`.
     #[test]
     fn test_stop_clears_current_args_and_second_start_succeeds() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
@@ -3549,7 +3564,7 @@ mod tests {
     /// RED: `stop_stream_session` does not clear `current_args`.
     #[test]
     fn test_stop_stream_session_clears_current_args() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
+        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
             let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
             Ok(ReceiverBundle {
                 receiver: Box::new(FakeReceiver::new()),
