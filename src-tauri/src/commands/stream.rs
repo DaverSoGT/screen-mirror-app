@@ -2934,21 +2934,21 @@ mod tests {
         );
     }
 
-    // ─── B5-4 RED: PortInUse substring detection shim (OQ-A1) ───────────────
+    // ─── B5 typed: OS-agnostic PortInUse typed test (R5.1, R5.2) ────────────────
 
-    /// B5-4.1 — When the builder returns `Err("address already in use")`,
-    ///           `start_stream_inner` must return `Err(PortInUse { port: <resolved> })`
-    ///           NOT `Err(BundleBuildFailed(...))`.
+    /// B5-4 (post-typed-error) — When the builder returns `Err(BundleError::PortInUse(port))`,
+    ///                          `start_stream_inner` MUST return `Err(StartStreamError::PortInUse { port })`.
     ///
-    /// Design §3 step 7 + §10 OQ-A1: substring-match on "address already in use"
-    /// (Linux/macOS OS message, lowercase-compared).
+    /// Replaces the prior B5-4.1 (Linux/macOS substring) and B5-4.2 (Windows substring) tests.
+    /// The detection mechanism is now type-based (BundleError::PortInUse variant), so a single
+    /// OS-agnostic test suffices. Cross-platform coverage is delegated to the bind-site
+    /// detection in `Str0mVideoReceiver::start` which uses `io::ErrorKind::AddrInUse`
+    /// (stdlib-mapped from EADDRINUSE / WSAEADDRINUSE).
     ///
-    /// RED: `start_stream_inner` currently returns `BundleBuildFailed` for all
-    /// builder errors — the substring-detection shim is not yet implemented.
+    /// Spec R5.1, R5.2.
     #[test]
-    fn test_start_stream_inner_builder_addr_in_use_returns_port_in_use() {
-        let builder: BuilderFn =
-            Arc::new(|_port, _name, _stop_flag| Err(BundleError::PortInUse(7900)));
+    fn test_start_stream_inner_typed_addr_in_use_returns_port_in_use() {
+        let builder = make_addr_in_use_builder(7900);
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -2957,29 +2957,6 @@ mod tests {
         match result {
             Err(StartStreamError::PortInUse { port: 7900 }) => {}
             other => panic!("expected Err(PortInUse {{ port: 7900 }}), got {other:?}"),
-        }
-    }
-
-    /// B5-4.2 — Windows variant: builder returns
-    ///           `Err("only one usage of each socket address")` →
-    ///           `start_stream_inner` returns `Err(PortInUse { port })`.
-    ///
-    /// Design §10 OQ-A1: match BOTH substrings for cross-platform coverage.
-    ///
-    /// RED: shim not yet implemented.
-    #[test]
-    fn test_start_stream_inner_builder_windows_addr_in_use_returns_port_in_use() {
-        let builder: BuilderFn = Arc::new(|_port, _name, _stop_flag| {
-            Err(BundleError::PortInUse(7889))
-        });
-        let bridge = StreamBridge::new_with_builder(builder);
-        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
-
-        let result = start_stream_inner(&bridge, channel, None, None);
-
-        match result {
-            Err(StartStreamError::PortInUse { port: 7889 }) => {}
-            other => panic!("expected Err(PortInUse {{ port: 7889 }}), got {other:?}"),
         }
     }
 
@@ -3647,6 +3624,27 @@ mod tests {
             format!("{other_err}"),
             "bundle build failed: fail",
             "Other Display must be 'bundle build failed: fail'"
+        );
+    }
+
+    // ─── B5.T4: grep-audit test — no substring detection in production code ──────
+
+    /// Permanent CI guard: ensures "address already in use" and Windows AddrInUse
+    /// substrings never re-appear in production code paths after this change.
+    ///
+    /// Spec R3.4, R5.5, S-No-Substring-Production.
+    #[test]
+    fn no_addr_in_use_substring_in_production_code() {
+        let src = include_str!("stream.rs");
+        // Strip test block to exclude test comments and test string literals.
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !production.to_lowercase().contains("address already in use"),
+            "found 'address already in use' substring in production code"
+        );
+        assert!(
+            !production.to_lowercase().contains("only one usage of each socket address"),
+            "found Windows AddrInUse substring in production code"
         );
     }
 }
