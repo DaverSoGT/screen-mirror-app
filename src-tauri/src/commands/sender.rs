@@ -537,6 +537,7 @@ fn build_production_sender_bundle(
     _stop_flag: Arc<AtomicBool>,
     _channel: Arc<dyn ChannelLike>,
 ) -> Result<SenderBundle, BundleError> {
+    use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder};
@@ -560,9 +561,14 @@ fn build_production_sender_bundle(
     let mut signaling =
         MdnsSignaling::new(sig_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
+    // PQ-ST-5 hardcoded defaults: Primary monitor, 30 fps, border explicitly off.
+    // Spec said "BorderPolicy::Hidden" — domain enum is named AlwaysOff (same intent:
+    // always attempt to hide the yellow capture border, fallback to OS default on
+    // unsupported builds). Explicit > implicit `Auto` to match spec R5 intent (W2 fix).
     let capture_config = CaptureConfig {
         monitor: MonitorSelector::Primary,
         max_fps: Some(30),
+        border: BorderPolicy::AlwaysOff,
         ..CaptureConfig::default()
     };
     let mut capture =
