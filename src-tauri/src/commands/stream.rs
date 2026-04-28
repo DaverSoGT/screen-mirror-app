@@ -65,7 +65,7 @@ pub(crate) const FRAME_SEGMENT: u8 = 0x01;
 ///
 /// Production impl wraps `tauri::ipc::Channel<InvokeResponseBody>` (Clone,
 /// Send + Sync). Test impl (`FakeChannel`) captures bytes in a `Mutex<Vec<_>>`.
-pub(crate) trait ChannelLike: Send + Sync {
+pub trait ChannelLike: Send + Sync {
     /// Send a raw frame. `discriminant` is byte 0 (`FRAME_INIT` or `FRAME_SEGMENT`).
     fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String>;
 }
@@ -154,7 +154,7 @@ pub(crate) type BuilderFn = Arc<
 /// This is required because `BuilderFn`'s return type must be `Send + Sync`-bounded
 /// to satisfy the `Arc<dyn Fn(...) -> Result<_, _> + Send + Sync>` typedef.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BundleError {
+pub enum BundleError {
     #[error("UDP port {0} already in use")]
     PortInUse(u16),
 

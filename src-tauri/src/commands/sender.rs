@@ -29,7 +29,7 @@ use sm_domain::signaling::{IceCandidate, SdpAnswer, SignalingEvent};
 use sm_domain::transport::{TransportError, TransportEvent};
 use tauri::ipc::InvokeResponseBody;
 
-use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
+pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 
 // ─── SenderBuilderFn — injectable seam for SenderBundle construction ──────────
 
@@ -41,7 +41,7 @@ use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 ///
 /// Production: wraps `build_production_sender_bundle` (Windows-only).
 /// Tests inject a closure returning a fake bundle with cross-platform fake adapters.
-pub(crate) type SenderBuilderFn = Arc<
+pub type SenderBuilderFn = Arc<
     dyn Fn(u16, String, Arc<AtomicBool>, Arc<dyn ChannelLike>) -> Result<SenderBundle, BundleError>
         + Send
         + Sync,
@@ -121,7 +121,7 @@ impl SenderBridge {
     }
 
     /// Create a bridge with a custom builder factory (test seam, R17).
-    pub(crate) fn new_with_builder(builder: SenderBuilderFn) -> Self {
+    pub fn new_with_builder(builder: SenderBuilderFn) -> Self {
         Self {
             session: Mutex::new(None),
             builder,
@@ -385,7 +385,7 @@ pub(crate) fn run_sender_transport_event_drain(
 /// 6. Invoke builder(port, name, stop_flag, channel).
 /// 7. Store SenderSession + current_args.
 /// 8. Emit Connecting status.
-pub(crate) fn start_sender_inner(
+pub fn start_sender_inner(
     bridge: &SenderBridge,
     channel: Arc<dyn ChannelLike>,
     udp_port: Option<u16>,
@@ -458,7 +458,7 @@ pub(crate) fn start_sender_inner(
 ///
 /// Idempotent: if no session is active, returns Ok(()) immediately.
 /// Mirrors stream.rs stop_stream_session lock ordering: session FIRST, then current_args.
-pub(crate) fn stop_sender_session(bridge: &SenderBridge) {
+pub fn stop_sender_session(bridge: &SenderBridge) {
     let session_opt = {
         let mut guard = bridge.session.lock().unwrap();
         guard.take()
@@ -487,7 +487,7 @@ pub(crate) fn stop_sender_session(bridge: &SenderBridge) {
 // ─── sender_diagnostics_impl ──────────────────────────────────────────────────
 
 /// Core of `sender_diagnostics` — extracted for unit testing.
-pub(crate) fn sender_diagnostics_impl(
+pub fn sender_diagnostics_impl(
     bridge: &SenderBridge,
 ) -> Result<SenderStats, String> {
     let guard = bridge.session.lock().unwrap();
