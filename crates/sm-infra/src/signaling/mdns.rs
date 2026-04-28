@@ -459,12 +459,14 @@ fn run_frame_loop(
             proto: "v1".to_string(),
         },
     ) {
+        eprintln!("[sm-signaling-frame-loop] EXIT: hello write failed: {e}");
         emit_error(&event_tx, SignalingError::Io(e.to_string()));
         return;
     }
 
     loop {
         if stop.load(Ordering::Acquire) {
+            eprintln!("[sm-signaling-frame-loop] EXIT: stop flag set, sending Bye");
             let _ = write_frame(&mut writer, &SignalingFrame::Bye);
             break;
         }
@@ -510,6 +512,7 @@ fn run_frame_loop(
                 eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
                 match frame_to_event(frame) {
                     Some(SignalingEvent::Closed) => {
+                        eprintln!("[sm-signaling-frame-loop] EXIT: peer sent Bye → emit Closed");
                         let _ = emit(&event_tx, SignalingEvent::Closed);
                         break;
                     }
@@ -524,11 +527,13 @@ fn run_frame_loop(
                 continue;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("[sm-signaling-frame-loop] EXIT: peer closed (EOF) → emit Closed");
                 let _ = emit(&event_tx, SignalingEvent::Closed);
                 break;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 // Stop flag was set during a partial read.
+                eprintln!("[sm-signaling-frame-loop] EXIT: stop flag set during partial read");
                 break;
             }
             Err(e) => {
@@ -543,6 +548,7 @@ fn run_frame_loop(
                     .iter()
                     .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
                     .collect();
+                eprintln!("[sm-signaling-frame-loop] EXIT: read error: {e}");
                 eprintln!("[sm-signaling-frame-loop] read error context: peer={peer} local={local}");
                 eprintln!("[sm-signaling-frame-loop] next {} bytes (hex)  : {hex}", extra.len());
                 eprintln!("[sm-signaling-frame-loop] next {} bytes (ascii): {ascii}", extra.len());
