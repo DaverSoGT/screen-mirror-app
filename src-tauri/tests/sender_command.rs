@@ -352,3 +352,57 @@ fn stop_sender_fake_session_drains_handles() {
         "stop_sender must complete quickly (< 200ms), took {elapsed:?}"
     );
 }
+
+// ─── B5 sender_diagnostics tests ─────────────────────────────────────────────
+
+use screen_mirror_lib::commands::sender::sender_diagnostics_impl;
+
+/// No session → Err("not running").
+#[test]
+fn sender_diagnostics_no_session_returns_err_not_running() {
+    let bridge = SenderBridge::new();
+    let result = sender_diagnostics_impl(&bridge);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "not running");
+}
+
+/// Session present → Ok(SenderStats) with correct counter values.
+#[test]
+fn sender_diagnostics_with_fake_session_returns_stats() {
+    use std::sync::atomic::Ordering;
+    use screen_mirror_lib::commands::sender::SenderCounters;
+
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+    start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+
+    // Set counters on the live session.
+    {
+        let guard = bridge.session.lock().unwrap();
+        if let Some(s) = guard.as_ref() {
+            s.counters.dropped_frames_encoder.store(3, Ordering::Relaxed);
+        }
+    }
+
+    let stats = sender_diagnostics_impl(&bridge).expect("should return stats");
+    assert_eq!(stats.dropped_frames_encoder, 3);
+    assert!(stats.running);
+}
+
+/// running field reflects session presence.
+#[test]
+fn sender_stats_running_field_reflects_session_presence() {
+    let bridge = SenderBridge::new();
+    let result = sender_diagnostics_impl(&bridge);
+    assert!(result.is_err(), "no session = not running");
+
+    let probe = SenderBuilderProbe::new_ok();
+    let bridge2 = SenderBridge::new_with_builder(make_sender_test_builder(probe));
+    let ch = FakeJsonChannel::new();
+    start_sender_inner(&bridge2, ch as Arc<dyn ChannelLike>, None, None)
+        .expect("start must succeed");
+    let stats = sender_diagnostics_impl(&bridge2).expect("session exists = running");
+    assert!(stats.running);
+}

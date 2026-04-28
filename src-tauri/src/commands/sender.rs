@@ -93,10 +93,10 @@ pub struct SenderArgs {
 
 /// Holds all resources for one active sender session.
 pub struct SenderSession {
-    pub(crate) stop_flag: Arc<AtomicBool>,
-    pub(crate) drain_handles: Vec<JoinHandle<()>>,
-    pub(crate) channel: Arc<dyn ChannelLike>,
-    pub(crate) counters: Arc<SenderCounters>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub drain_handles: Vec<JoinHandle<()>>,
+    pub channel: Arc<dyn ChannelLike>,
+    pub counters: Arc<SenderCounters>,
 }
 
 // ─── SenderBridge — Tauri managed state ──────────────────────────────────────
