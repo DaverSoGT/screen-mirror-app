@@ -854,3 +854,86 @@ fn transport_receiver_candidate_addr_is_none_pre_start_s_ct_2() {
         "candidate_addr() must return None before start_with_socket() is called"
     );
 }
+
+// ─── S-CT-3: candidate_addr() returns None when no non-loopback NIC ──────────
+
+/// S-CT-3 (sender variant) — `candidate_addr()` MUST return `None` when the NIC
+/// enumeration returns an empty list (simulating a machine with no usable LAN
+/// adapter). R-CT-3 / R-CT-8: no panic, no TransportError.
+///
+/// The NicOverrideGuard injects an empty NIC list for this thread only. Even
+/// though the sender is started and `local_addr` is `Some(127.0.0.1:port)` (the
+/// loopback-fallback effective_local_addr), `enumerate_local_ipv4()` returns `[]`
+/// so `candidate_addr()` short-circuits to `None`.
+///
+/// This test passes immediately after B1-GREEN because B1 already implements the
+/// correct NIC substitution path. The RED commit documents the invariant and guards
+/// against future regressions.
+#[test]
+fn transport_sender_candidate_addr_is_none_when_no_usable_nic_s_ct_3() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let enc = FakeLoopbackEncoder::new();
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    // Inject empty NIC list: simulates no usable LAN adapter.
+    // The guard restores the default on drop at end of scope.
+    let _guard = NicOverrideGuard::new(vec![]);
+
+    assert!(
+        sender.candidate_addr().is_none(),
+        "candidate_addr() must return None when no non-loopback NIC is available"
+    );
+
+    // Clean up (guard drops here, restoring the override to None).
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// S-CT-3 (receiver variant) — `candidate_addr()` MUST return `None` when the NIC
+/// enumeration returns an empty list after `start()`. Mirror of the sender variant.
+#[test]
+fn transport_receiver_candidate_addr_is_none_when_no_usable_nic_s_ct_3() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    // Exchange offer/answer to allow start() to succeed on the receiver.
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver.start(pkt_out_tx, event_tx).expect("receiver start");
+
+    // Inject empty NIC list: simulates no usable LAN adapter.
+    let _guard = NicOverrideGuard::new(vec![]);
+
+    assert!(
+        receiver.candidate_addr().is_none(),
+        "candidate_addr() must return None when no non-loopback NIC is available"
+    );
+
+    receiver.stop().unwrap();
+}
