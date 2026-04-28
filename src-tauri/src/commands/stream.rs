@@ -159,6 +159,25 @@ pub(crate) enum BundleError {
     Other(String),
 }
 
+impl From<TransportError> for BundleError {
+    fn from(e: TransportError) -> Self {
+        match e {
+            TransportError::AddrInUse { port } => BundleError::PortInUse(port),
+            // All other variants (AlreadyRunning, NotRunning, InvalidConfig,
+            // Io, SignalingFailed, Internal) collapse to Other via Display.
+            //
+            // Display strings:
+            //   AlreadyRunning            -> "transport already running"
+            //   NotRunning                -> "transport not running"
+            //   InvalidConfig(s)          -> "invalid transport config: {s}"
+            //   Io(s)                     -> "transport I/O error: {s}"
+            //   SignalingFailed(s)        -> "signaling failed: {s}"
+            //   Internal(s)               -> "internal transport error: {s}"
+            other => BundleError::Other(other.to_string()),
+        }
+    }
+}
+
 // ─── PortRejectReason — sub-enum for StartStreamError::InvalidPort ───────────
 
 /// Why a `udp_port` value was rejected by `validate_udp_port`.
