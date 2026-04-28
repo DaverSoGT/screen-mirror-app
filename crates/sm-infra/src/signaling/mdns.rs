@@ -464,7 +464,16 @@ fn run_frame_loop(
                 MdnsControl::Answer(a) => SignalingFrame::Answer { sdp: a.0 },
                 MdnsControl::Candidate(c) => SignalingFrame::Candidate { sdp: c.0 },
             };
+            let kind = match &frame {
+                SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
+                SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
+                SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
+                SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
+                SignalingFrame::Bye => "Bye".to_string(),
+            };
+            eprintln!("[sm-signaling-frame-loop] OUT → {kind}");
             if let Err(e) = write_frame(&mut writer, &frame) {
+                eprintln!("[sm-signaling-frame-loop] write_frame error: {e}");
                 emit_error(&event_tx, SignalingError::Io(e.to_string()));
                 return;
             }
@@ -472,16 +481,26 @@ fn run_frame_loop(
 
         // Read one inbound frame (with timeout).
         match read_frame(&mut reader) {
-            Ok(frame) => match frame_to_event(frame) {
-                Some(SignalingEvent::Closed) => {
-                    let _ = emit(&event_tx, SignalingEvent::Closed);
-                    break;
+            Ok(frame) => {
+                let kind = match &frame {
+                    SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
+                    SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
+                    SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
+                    SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
+                    SignalingFrame::Bye => "Bye".to_string(),
+                };
+                eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
+                match frame_to_event(frame) {
+                    Some(SignalingEvent::Closed) => {
+                        let _ = emit(&event_tx, SignalingEvent::Closed);
+                        break;
+                    }
+                    Some(ev) => {
+                        let _ = emit(&event_tx, ev);
+                    }
+                    None => {} // Hello — absorbed silently
                 }
-                Some(ev) => {
-                    let _ = emit(&event_tx, ev);
-                }
-                None => {} // Hello — absorbed silently
-            },
+            }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::TimedOut
                     || e.kind() == std::io::ErrorKind::WouldBlock =>
