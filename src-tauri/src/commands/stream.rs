@@ -159,6 +159,14 @@ pub(crate) enum BundleError {
     Other(String),
 }
 
+impl From<std::io::Error> for BundleError {
+    fn from(e: std::io::Error) -> Self {
+        // Thread-spawn io::Error only; AddrInUse is intercepted in str0m_receiver.rs
+        // before crossing crate boundaries.
+        BundleError::Other(e.to_string())
+    }
+}
+
 impl From<sm_domain::signaling::SignalingError> for BundleError {
     fn from(e: sm_domain::signaling::SignalingError) -> Self {
         // No variant of SignalingError is "port in use" — none touch UDP bind.
