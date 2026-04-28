@@ -172,6 +172,19 @@ async function main() {
         console.warn("[mse] additional init segment ignored");
         return;
       }
+      // B11 diagnostic: dump the first 128 bytes of the init segment in hex
+      // so we can validate the box structure (ftyp magic, moov, tkhd dims,
+      // avcC bytes) when MSE rejects appendBuffer with the SourceBuffer
+      // "removed from parent media source" error.
+      const initBytes = new Uint8Array(frameBytes);
+      const previewLen = Math.min(128, initBytes.length);
+      const hex = Array.from(initBytes.subarray(0, previewLen))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(" ");
+      console.log(
+        "[mse] init segment hex (first " + previewLen + "/" + initBytes.length + " bytes):\n" + hex
+      );
+
       const derived = deriveCodecFromInitSegment(frameBytes);
       if (!derived) {
         setStatus("init segment missing avcC — cannot derive codec");
@@ -189,6 +202,19 @@ async function main() {
         setStatus("addSourceBuffer failed: " + e);
         return;
       }
+      // Surface SourceBuffer error and updateend events so MSE failures are visible.
+      sb.addEventListener("error", (e) => {
+        console.error("[mse] SourceBuffer error event", e);
+      });
+      sb.addEventListener("abort", () => {
+        console.warn("[mse] SourceBuffer abort event");
+      });
+      ms.addEventListener("sourceended", () => {
+        console.warn("[mse] MediaSource sourceended");
+      });
+      ms.addEventListener("sourceclose", () => {
+        console.warn("[mse] MediaSource sourceclose — readyState=" + ms.readyState);
+      });
       setStatus(
         "init segment received (" + (data.length - 1) + " bytes), codec=" + derived
       );
