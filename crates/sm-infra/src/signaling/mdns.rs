@@ -31,7 +31,7 @@
 //! sig.stop().unwrap();
 //! ```
 
-use std::io::{BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -46,7 +46,7 @@ use sm_domain::signaling::{
     SignalingRole,
 };
 
-use crate::signaling::wire::{SignalingFrame, read_frame, write_frame};
+use crate::signaling::wire::{MAX_FRAME_BYTES, SignalingFrame, write_frame};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -492,9 +492,14 @@ fn run_frame_loop(
             }
         }
 
-        // Read one inbound frame (with timeout).
-        match read_frame(&mut reader) {
-            Ok(frame) => {
+        // Read one inbound frame. read_frame_or_pending returns Ok(None) when
+        // no data is available (so the caller can drain inbox + check stop),
+        // and retries internally on transient TimedOut/WouldBlock once a frame
+        // has begun arriving — preventing the buffer-desync bug where
+        // BufReader::read_exact silently consumes partial body bytes on
+        // timeout, causing subsequent reads to start mid-frame.
+        match read_frame_or_pending(&mut reader, &stop) {
+            Ok(Some(frame)) => {
                 let kind = match &frame {
                     SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
                     SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
@@ -514,15 +519,16 @@ fn run_frame_loop(
                     None => {} // Hello — absorbed silently
                 }
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                // Timeout — loop to re-check stop flag and drain inbox.
+            Ok(None) => {
+                // No data available right now — loop to drain inbox + re-check stop.
                 continue;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 let _ = emit(&event_tx, SignalingEvent::Closed);
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Stop flag was set during a partial read.
                 break;
             }
             Err(e) => {
@@ -548,6 +554,120 @@ fn run_frame_loop(
             }
         }
     }
+}
+
+// ─── Resilient frame reader ──────────────────────────────────────────────────
+//
+// The TCP stream has a short read timeout (READ_TIMEOUT) so the frame loop
+// can periodically check the stop flag and drain the outbound inbox. The
+// previous implementation called wire::read_frame, which uses
+// `Read::read_exact` internally. read_exact has the bad property that on
+// TimedOut it CONSUMES partial bytes from the BufReader and discards them;
+// the caller can only re-call read_exact with a fresh buffer, so any bytes
+// already consumed are lost from the wire. For small frames (Hello = 33
+// bytes, almost always a single TCP segment) this rarely fires, but for the
+// SDP answer/offer (~4.6 KB across multiple segments with inter-segment
+// gaps) the timeout commonly fires partway through the body, leaving the
+// reader pointed mid-body. The next loop iteration's read_frame then reads
+// 4 mid-SDP bytes as a length prefix and trips MAX_FRAME_BYTES — the
+// "frame too large" / "na=r" symptom seen in B11 smoke.
+//
+// `read_frame_or_pending` fixes this by:
+// - Returning Ok(None) when NO bytes have been consumed yet and the read
+//   times out, so the loop keeps draining the inbox and checking stop.
+// - Once any byte has been consumed, retrying transparently on
+//   TimedOut/WouldBlock until the full prefix and body are read, ensuring
+//   the wire stays aligned. Stop flag is checked between retries to keep
+//   the loop interruptible.
+
+/// Read a complete signaling frame, or return `Ok(None)` if no data is
+/// currently available on the reader. Internally retries on TimedOut /
+/// WouldBlock once a partial read has begun.
+fn read_frame_or_pending<R: Read>(
+    reader: &mut R,
+    stop: &Arc<AtomicBool>,
+) -> io::Result<Option<SignalingFrame>> {
+    let mut prefix = [0u8; 4];
+    // First-byte probe: if no data is available, return Ok(None) so the
+    // caller can drain inbox + check stop. Once we read at least 1 byte we
+    // are committed to completing this frame.
+    match reader.read(&mut prefix[..1]) {
+        Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed")),
+        Ok(_) => {}
+        Err(e)
+            if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    }
+
+    // Complete the prefix with retry-on-timeout.
+    read_exact_resilient(reader, &mut prefix[1..], stop)?;
+    let len = u32::from_be_bytes(prefix) as usize;
+    if len > MAX_FRAME_BYTES {
+        let ascii: String = prefix
+            .iter()
+            .map(|b| {
+                if (0x20..0x7f).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame too large: declared {len} bytes (max {MAX_FRAME_BYTES}); raw prefix bytes: {:02x} {:02x} {:02x} {:02x} (\"{ascii}\")",
+                prefix[0], prefix[1], prefix[2], prefix[3]
+            ),
+        ));
+    }
+
+    // Read the full body, tolerating transient timeouts.
+    let mut body = vec![0u8; len];
+    read_exact_resilient(reader, &mut body, stop)?;
+    serde_json::from_slice(&body).map(Some).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    })
+}
+
+/// Like `Read::read_exact`, but retries on TimedOut / WouldBlock and
+/// honours `stop` (returning `Interrupted`) between attempts. Bytes
+/// consumed across timeouts are accumulated in `buf`, so callers never
+/// observe lost-byte desync.
+fn read_exact_resilient<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        if stop.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "stop flag set during read",
+            ));
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed mid-frame",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -767,5 +887,161 @@ mod tests {
             matches!(result, Err(SignalingError::NotRunning)),
             "publish before start must return NotRunning, got {result:?}"
         );
+    }
+
+    // ─── B11-S2 regression: resilient frame reader ──────────────────────────────
+
+    use std::io::{self, Read};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::signaling::mdns::read_frame_or_pending;
+    use crate::signaling::wire::{SignalingFrame, write_frame};
+
+    /// A test reader that simulates a TCP stream with arbitrary partial-read
+    /// + transient-timeout behaviour. Each entry in `script` is either:
+    /// - `Ok(n)` — return up to `n` bytes from the pending buffer.
+    /// - `Err(kind)` — return that error kind.
+    enum Step {
+        /// Deliver up to N bytes (or fewer if the buffer is shorter).
+        Bytes(usize),
+        /// Return a transient error (TimedOut or WouldBlock).
+        Timeout,
+        /// Return Ok(0) to signal EOF.
+        Eof,
+    }
+
+    struct ScriptedReader {
+        data: Vec<u8>,
+        cursor: usize,
+        steps: std::vec::IntoIter<Step>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            match self.steps.next() {
+                Some(Step::Bytes(n)) => {
+                    let avail = self.data.len() - self.cursor;
+                    let want = n.min(out.len()).min(avail);
+                    out[..want].copy_from_slice(&self.data[self.cursor..self.cursor + want]);
+                    self.cursor += want;
+                    Ok(want)
+                }
+                Some(Step::Timeout) => {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "scripted timeout"))
+                }
+                Some(Step::Eof) => Ok(0),
+                None => Err(io::Error::new(io::ErrorKind::Other, "script exhausted")),
+            }
+        }
+    }
+
+    /// B11-S2 regression: the body read MUST NOT lose bytes when the underlying
+    /// reader returns transient TimedOut between segments. read_frame_or_pending
+    /// should accumulate partial reads and parse the complete frame.
+    #[test]
+    fn read_frame_or_pending_survives_timeout_mid_body() {
+        // Construct a real Answer frame on the wire.
+        let frame = SignalingFrame::Answer {
+            sdp: "v=0\r\no=test 1 1 IN IP4 0.0.0.0\r\na=rtcp-fb:127 nack pli\r\na=fmtp:127 level-asymmetry-allowed=1\r\n".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).expect("write_frame must succeed");
+
+        // Simulate: deliver prefix in two chunks (1 then 3), then body in
+        // three chunks with TimedOut between each chunk.
+        let body_len = buf.len() - 4;
+        let third = body_len / 3;
+        let steps = vec![
+            Step::Bytes(1),    // first byte of prefix
+            Step::Bytes(3),    // remaining 3 bytes of prefix
+            Step::Bytes(third),
+            Step::Timeout,
+            Step::Bytes(third),
+            Step::Timeout,
+            Step::Bytes(body_len), // remainder
+        ];
+        let mut reader = ScriptedReader {
+            data: buf,
+            cursor: 0,
+            steps: steps.into_iter(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let result = read_frame_or_pending(&mut reader, &stop)
+            .expect("read must succeed despite mid-body timeouts")
+            .expect("must return Some(frame)");
+
+        match result {
+            SignalingFrame::Answer { sdp } => assert!(
+                sdp.contains("rtcp-fb:127 nack pli"),
+                "frame body must round-trip without byte loss"
+            ),
+            other => panic!("expected Answer, got {other:?}"),
+        }
+    }
+
+    /// First-byte timeout MUST return Ok(None) so the caller can drain the
+    /// outbound inbox + check the stop flag, NOT consume any bytes.
+    #[test]
+    fn read_frame_or_pending_first_byte_timeout_returns_none() {
+        let mut reader = ScriptedReader {
+            data: Vec::new(),
+            cursor: 0,
+            steps: vec![Step::Timeout].into_iter(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = read_frame_or_pending(&mut reader, &stop)
+            .expect("first-byte timeout must not error");
+        assert!(
+            result.is_none(),
+            "first-byte timeout must return Ok(None), got {result:?}"
+        );
+    }
+
+    /// Stop flag set during a partial read MUST surface as Interrupted.
+    #[test]
+    fn read_frame_or_pending_stop_flag_returns_interrupted() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        // First read returns 1 byte (commits to the frame); we set stop
+        // before the next attempt.
+        let mut reader = ScriptedReader {
+            data: vec![0u8; 4],
+            cursor: 0,
+            steps: vec![Step::Bytes(1), Step::Timeout, Step::Timeout].into_iter(),
+        };
+        // Set stop AFTER constructing reader. The retry loop will see it.
+        stop_clone.store(true, std::sync::atomic::Ordering::Release);
+        let err = read_frame_or_pending(&mut reader, &stop)
+            .expect_err("must return Err when stop is set during retry");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::Interrupted,
+            "stop flag must produce Interrupted, got {err:?}"
+        );
+    }
+
+    /// Mid-frame EOF (peer closed after sending partial body) MUST surface
+    /// as UnexpectedEof.
+    #[test]
+    fn read_frame_or_pending_mid_frame_eof_returns_unexpected_eof() {
+        let frame = SignalingFrame::Hello {
+            proto: "v1".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        // Truncate the body so EOF arrives mid-body.
+        buf.truncate(buf.len() - 5);
+        let mut reader = ScriptedReader {
+            data: buf,
+            cursor: 0,
+            // First-byte then everything we have (which is short), then EOF.
+            steps: vec![Step::Bytes(1), Step::Bytes(usize::MAX), Step::Eof].into_iter(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let err = read_frame_or_pending(&mut reader, &stop)
+            .expect_err("must error on truncated frame");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
