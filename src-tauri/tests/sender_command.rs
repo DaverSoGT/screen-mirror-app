@@ -725,3 +725,185 @@ fn signaling_drain_stop_flag_exits_loop() {
         "drain must exit within 600ms on stop_flag"
     );
 }
+
+// ─── B8 transport event drain tests ──────────────────────────────────────────
+
+use sm_domain::transport::TransportEvent;
+use screen_mirror_lib::commands::sender::{run_sender_transport_event_drain, SenderCounters};
+
+/// IceConnected emits streaming + "Stop streaming" button.
+#[test]
+fn transport_drain_ice_connected_emits_streaming_and_button() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch_clone, counters);
+    });
+
+    ev_tx.send(TransportEvent::IceConnected).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let msgs = ch.messages();
+    assert!(
+        msgs.iter().any(|m| m.contains("\"kind\":\"streaming\"")),
+        "expected streaming event, got: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Stop streaming")),
+        "expected Stop streaming button, got: {msgs:?}"
+    );
+}
+
+/// IceFailed emits peer_lost + Restart button.
+#[test]
+fn transport_drain_ice_failed_emits_disconnected_and_restart_button() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch_clone, counters);
+    });
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let msgs = ch.messages();
+    assert!(
+        msgs.iter().any(|m| m.contains("\"kind\":\"peer_lost\"")),
+        "expected peer_lost event, got: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Restart")),
+        "expected Restart button, got: {msgs:?}"
+    );
+}
+
+/// ConnectionLost emits peer_lost + Restart button.
+#[test]
+fn transport_drain_connection_lost_emits_disconnected_and_restart_button() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch_clone, counters);
+    });
+
+    ev_tx
+        .send(TransportEvent::ConnectionLost {
+            reason: "test-disconnect".to_string(),
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    let msgs = ch.messages();
+    assert!(
+        msgs.iter().any(|m| m.contains("\"kind\":\"peer_lost\"")),
+        "expected peer_lost event, got: {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("Restart")),
+        "expected Restart button, got: {msgs:?}"
+    );
+}
+
+/// KeyframeRequested increments counter; no channel message.
+#[test]
+fn transport_drain_keyframe_requested_increments_counter() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let counters = Arc::new(SenderCounters::default());
+    let counters_clone = counters.clone();
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch_clone, counters_clone);
+    });
+
+    ev_tx.send(TransportEvent::KeyframeRequested).unwrap();
+    thread::sleep(Duration::from_millis(50));
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+
+    assert_eq!(
+        counters.keyframe_requests_received.load(Ordering::Relaxed),
+        1,
+        "keyframe counter must be 1"
+    );
+    // No channel messages expected for KeyframeRequested.
+    let msgs = ch.messages();
+    assert!(
+        msgs.is_empty(),
+        "no channel messages expected for KeyframeRequested, got: {msgs:?}"
+    );
+}
+
+/// stop_flag causes drain to exit within 600ms.
+#[test]
+fn transport_drain_stop_flag_exits() {
+    let (_ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch, counters);
+    });
+
+    stop_flag.store(true, Ordering::Relaxed);
+
+    let start_time = std::time::Instant::now();
+    drain.join().expect("drain must exit on stop_flag");
+    assert!(
+        start_time.elapsed() < Duration::from_millis(600),
+        "drain must exit within 600ms"
+    );
+}
+
+/// Disconnected rx causes drain to exit cleanly.
+#[test]
+fn transport_drain_disconnected_rx_exits_cleanly() {
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch, counters);
+    });
+
+    drop(ev_tx);
+
+    let start_time = std::time::Instant::now();
+    drain.join().expect("drain must exit on disconnect");
+    assert!(
+        start_time.elapsed() < Duration::from_secs(1),
+        "drain must exit within 1s on disconnect"
+    );
+}
