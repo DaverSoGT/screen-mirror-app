@@ -100,8 +100,17 @@
       <!-- R4 — Not connected status -->
       <div id="status">Not connected</div>
 
-      <!-- R4 — back-to-landing link -->
-      <a class="back-link" href="./index.html">Change mode</a>
+      <!-- R4 — back-to-landing link.
+           R5.4 (extended) — clears sm.lastMode so the landing's auto-route
+           does not bounce the user straight back to sender.html. -->
+      <a class="back-link" href="./index.html" id="change-mode">Change mode</a>
     </div>
+    <script>
+      document
+        .getElementById("change-mode")
+        .addEventListener("click", function () {
+          localStorage.removeItem("sm.lastMode");
+        });
+    </script>
   </body>
 </html>
