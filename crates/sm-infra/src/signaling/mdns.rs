@@ -422,6 +422,19 @@ fn run_frame_loop(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
 ) {
+    // Diagnostic: log the actual TCP endpoints so loopback/dup-connect can be
+    // distinguished from cross-host. Should always be peer != local; equal
+    // would indicate the writer is feeding the reader on the same machine.
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|e| format!("<peer_addr err: {e}>"));
+    let local = stream
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|e| format!("<local_addr err: {e}>"));
+    eprintln!("[sm-signaling-frame-loop] connection up: local={local} peer={peer}");
+
     // Set read timeout so the loop can check the stop flag and drain the inbox.
     if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
         emit_error(&event_tx, SignalingError::Io(e.to_string()));
@@ -513,6 +526,20 @@ fn run_frame_loop(
                 break;
             }
             Err(e) => {
+                // Diagnostic: dump up to 64 more bytes from the reader so we can
+                // see what content surrounded the oversize length prefix. This
+                // helps identify whether we're mid-SDP-body, mid-JSON, or
+                // looking at a foreign protocol payload.
+                use std::io::BufRead;
+                let extra: Vec<u8> = reader.fill_buf().map(|b| b[..b.len().min(64)].to_vec()).unwrap_or_default();
+                let hex: String = extra.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                let ascii: String = extra
+                    .iter()
+                    .map(|b| if (0x20..0x7f).contains(b) { *b as char } else { '.' })
+                    .collect();
+                eprintln!("[sm-signaling-frame-loop] read error context: peer={peer} local={local}");
+                eprintln!("[sm-signaling-frame-loop] next {} bytes (hex)  : {hex}", extra.len());
+                eprintln!("[sm-signaling-frame-loop] next {} bytes (ascii): {ascii}", extra.len());
                 emit_error(
                     &event_tx,
                     SignalingError::Protocol(format!("frame read error: {e}")),
