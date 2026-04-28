@@ -54,6 +54,59 @@
     <!-- Status line for MSE state -->
     <div id="status">starting…</div>
 
+    <!-- R6/R7 — Change mode link: nav-guarded by inline script below -->
+    <a id="change-mode" href="./index.html" style="position:fixed;bottom:8px;right:8px;font-size:12px;color:#777;font-family:ui-monospace,monospace;text-decoration:underline;">Change mode</a>
+
+    <!-- R6/R7 inline guard — must execute BEFORE mse-client.js module so  -->
+    <!-- the flag exists on window when mse-client sets it to true.         -->
+    <script>
+      // R6 — initialize flag to false; mse-client.js sets it true after
+      // start_stream succeeds (amended R9.1 / #339).
+      window.__sm_streamActive = false;
+
+      // R7.1 / R7.3 — beforeunload: surface native dialog on window-close
+      // while streaming. Cannot truly await async work here (browser unloads
+      // synchronously). The explicit nav path (click handler below) is the
+      // load-bearing block for stop_stream; this handler covers window-close
+      // via orphan-cleanup fallback per R7.3.
+      window.addEventListener("beforeunload", function (event) {
+        if (window.__sm_streamActive === true) {
+          event.preventDefault();
+          event.returnValue = "Streaming will be stopped.";
+        }
+      });
+
+      // R7.2 — click handler on the change-mode link.
+      // If a stream is active: confirm → await stop_stream → clear flag →
+      // clear localStorage preference → navigate.
+      // If stream is not active: navigate directly (no confirm needed).
+      // On cancel: prevent navigation.
+      document.addEventListener("DOMContentLoaded", function () {
+        var link = document.getElementById("change-mode");
+        if (!link) return;
+        link.addEventListener("click", function (e) {
+          if (!window.__sm_streamActive) return; // not streaming — allow default nav
+
+          e.preventDefault();
+          var ok = confirm("Stop streaming and leave this page?");
+          if (!ok) return; // R7.2(c) — cancel: abort navigation
+
+          // R7.2(b) — confirm: stop stream, clear flag, clear mode, navigate.
+          // invoke() is provided by Tauri's withGlobalTauri: true binding.
+          var invoke = window.__TAURI__?.core?.invoke;
+          (invoke ? invoke("stop_stream") : Promise.resolve())
+            .catch(function (err) {
+              console.warn("[viewer] stop_stream error during nav:", err);
+            })
+            .finally(function () {
+              window.__sm_streamActive = false;
+              localStorage.removeItem("sm.lastMode");
+              window.location.assign("./index.html");
+            });
+        });
+      });
+    </script>
+
     <!-- R11.7: no import / require — plain module script -->
     <script type="module" src="./mse-client.js"></script>
 
