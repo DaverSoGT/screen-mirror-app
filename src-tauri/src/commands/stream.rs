@@ -3666,4 +3666,82 @@ mod tests {
             "found Windows AddrInUse substring in production code"
         );
     }
+
+    // ─── B2 RED: bind_probe + BindCtx unit tests ─────────────────────────────
+
+    /// B2-T1 — `bind_probe` MUST return `Err(BundleError::PortInUse(port))` when
+    /// the port is already in use (R1.1, R1.2, D1, D7).
+    ///
+    /// RED until `bind_probe` is implemented (B2.T5).
+    #[test]
+    fn bind_probe_addr_in_use_returns_port_in_use() {
+        let _steal = std::net::UdpSocket::bind("0.0.0.0:0")
+            .expect("ephemeral bind must succeed");
+        let stolen_port = _steal.local_addr().expect("local_addr").port();
+
+        let result = bind_probe(stolen_port);
+        match result {
+            Err(BundleError::PortInUse(p)) if p == stolen_port => {}
+            other => panic!(
+                "expected Err(BundleError::PortInUse({stolen_port})), got {other:?}"
+            ),
+        }
+    }
+
+    /// B2-T2 — `bind_probe` MUST return `Ok(socket)` with a valid bound address
+    /// on a free port (R1.1, R1.4).
+    ///
+    /// RED until `bind_probe` is implemented (B2.T5).
+    #[test]
+    fn bind_probe_free_port_returns_socket() {
+        let result = bind_probe(0);
+        match result {
+            Ok(socket) => {
+                assert!(
+                    socket.local_addr().is_ok(),
+                    "returned socket must have a valid local_addr"
+                );
+            }
+            Err(e) => panic!("expected Ok(socket) for ephemeral port, got Err({e:?})"),
+        }
+    }
+
+    /// B2-T3 — `bind_probe` catch-all arm returns `Err(BundleError::Other(...))` for
+    /// non-AddrInUse io::Error (R1.3).
+    ///
+    /// Structural-only: the code path is exercised by code inspection + the
+    /// `From<io::Error> for BundleError` predecessor test. A deterministic OS-level
+    /// non-AddrInUse bind error (e.g. EACCES on port 1) is not reliable across CI
+    /// environments, so this test is marked `#[ignore]` with justification.
+    ///
+    /// Coverage is maintained by: (a) the existing `From<io::Error> for BundleError`
+    /// impl (predecessor R2.5) which is exercised by T7.8 (builder-other-error test),
+    /// and (b) code inspection of `bind_probe`'s catch-all `Err(e) => Err(BundleError::from(e))`.
+    #[test]
+    #[ignore = "OS-dependent: triggering a non-AddrInUse bind error deterministically \
+                requires root or a kernel-specific privileged-port enforcement that \
+                is not guaranteed in CI. Structural coverage provided by \
+                From<io::Error> for BundleError + code inspection."]
+    fn bind_probe_other_error_is_other_bundle_error() {
+        // On Linux/macOS, binding port 1 without CAP_NET_BIND_SERVICE → EACCES.
+        // On Windows, the same port → WSAEACCES. Not guaranteed in all CI environments.
+        let result = bind_probe(1);
+        match result {
+            Err(BundleError::Other(_)) => {}
+            Err(BundleError::PortInUse(_)) => {
+                panic!("port 1 returned PortInUse instead of Other — unexpected")
+            }
+            Ok(_) => panic!("bind on port 1 succeeded without privilege — unexpected in CI"),
+        }
+    }
+
+    /// B2-T4 — `BindCtx` MUST implement `Send` (R2.3).
+    ///
+    /// Compile-time assertion: if `BindCtx` is not `Send`, this function body
+    /// will fail to compile. RED until `BindCtx` is defined (B2.T5).
+    #[allow(dead_code)]
+    fn _assert_bindctx_send() {
+        fn check<T: Send>() {}
+        check::<BindCtx>();
+    }
 }
