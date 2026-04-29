@@ -5,3 +5,8 @@ target/
 # Tauri generated files — platform-specific, never committed
 src-tauri/gen/**/local.properties
 src-tauri/gen/**/build/
+
+# JavaScript test harness
+node_modules/
+coverage/
+.vitest-cache/

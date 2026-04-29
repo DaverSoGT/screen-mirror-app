@@ -1,0 +1,21 @@
+{
+  "name": "screen-mirror-app-js-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.29.2",
+  "description": "JavaScript unit-test harness for dist/sender.js and dist/mse-client.js. Devtime only — never shipped.",
+  "scripts": {
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "happy-dom": "^15.7.0"
+  },
+  "pnpm": {
+    "ignoredBuiltDependencies": ["esbuild"]
+  }
+}
