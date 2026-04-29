@@ -459,7 +459,6 @@ fn apply_offer_to_rtc(rtc: &mut Rtc, offer: SdpOffer) -> Result<SdpAnswer, Trans
 /// SansIO tick loop for `Str0mVideoReceiver`.
 ///
 /// Runs on the dedicated OS thread spawned by `start()`.
-#[allow(clippy::too_many_arguments)]
 fn run_receiver_loop(
     mut pre_neg: ReceiverPreNeg,
     udp: UdpSocket,
