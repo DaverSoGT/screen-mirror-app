@@ -1462,17 +1462,12 @@ fn emit_segment(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes
     let len = bytes.len();
     match channel.send_raw(FRAME_SEGMENT, bytes) {
         Ok(_) => {
-            let n = counters
-                .fragments_emitted
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
+            let n = counters.fragments_emitted.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!("[sm-stream-mux] FRAME_SEGMENT #{n} sent to channel ({len} bytes)");
         }
         Err(e) => {
             counters.dropped_segments.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "[sm-stream-mux] FRAME_SEGMENT send dropped ({len} bytes): {e}"
-            );
+            eprintln!("[sm-stream-mux] FRAME_SEGMENT send dropped ({len} bytes): {e}");
         }
     }
 }

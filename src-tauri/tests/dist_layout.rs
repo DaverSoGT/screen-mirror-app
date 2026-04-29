@@ -211,7 +211,10 @@ fn mse_client_derives_codec_from_init_segment_b11_s4() {
     );
     // The function must search for the four-byte ASCII tag "avcC".
     assert!(
-        content.contains("0x61") && content.contains("0x76") && content.contains("0x63") && content.contains("0x43"),
+        content.contains("0x61")
+            && content.contains("0x76")
+            && content.contains("0x63")
+            && content.contains("0x43"),
         "deriveCodecFromInitSegment must scan for the 'avcC' ASCII tag (0x61 0x76 0x63 0x43)"
     );
     // addSourceBuffer must be called AFTER the init segment arrives, not at

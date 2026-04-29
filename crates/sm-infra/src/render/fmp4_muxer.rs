@@ -1265,7 +1265,10 @@ mod tests {
     #[test]
     fn media_segment_tfdt_base_decode_time_reflects_first_sample_timestamp() {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-        // IDR at t=1000ms = 90_000 ticks
+        // IDR at t=1000ms (encoder-absolute). Per B11-S11 the muxer rebases
+        // timestamps so the very first packet ever appended becomes the
+        // origin (rebased dts = 0). IDR1 is that first packet, so the
+        // tfdt of the segment that flushes IDR1's GOP must be 0.
         let idr1 = make_packet(true, 1000, 200);
         muxer.append_packet(&idr1);
         let idr2 = make_packet(true, 2000, 200);
@@ -1292,10 +1295,9 @@ mod tests {
             segment[tfdt_pos + 14],
             segment[tfdt_pos + 15],
         ]);
-        // IDR1 was at 1000ms → 90_000 ticks
         assert_eq!(
-            dts, 90_000,
-            "tfdt.base_media_decode_time must be 90_000 (1000ms at 90kHz)"
+            dts, 0,
+            "tfdt.base_media_decode_time of the first GOP segment must be 0 — that GOP starts at the rebase origin (B11-S11)"
         );
     }
 
@@ -1760,7 +1762,10 @@ mod tests {
             moov[dur_offset + 2],
             moov[dur_offset + 3],
         ]);
-        assert_eq!(dur, 3000, "trex.default_sample_duration must match the supplied 30 fps tick value");
+        assert_eq!(
+            dur, 3000,
+            "trex.default_sample_duration must match the supplied 30 fps tick value"
+        );
     }
 
     /// B11-S11: Mp4Muxer must rebase its DTS so MSE buffered ranges start near
@@ -1769,19 +1774,25 @@ mod tests {
     /// and ≈ 3000 (= 30 fps tick) on the rebased timeline.
     #[test]
     fn append_packet_rebases_first_dts_to_zero_b11_s11() {
+        use std::sync::Arc;
+
         use sm_domain::encode::EncodedPacket;
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         // Synthesise an SPS+IDR pair only enough to satisfy is_keyframe; we only
         // care about the first_dts_offset behaviour, not the segment bytes.
         let pkt1 = EncodedPacket {
-            data: vec![0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0],
+            data: Arc::from(
+                vec![0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0].into_boxed_slice(),
+            ),
             timestamp: std::time::Duration::from_micros(17_005_000_000),
             is_keyframe: true,
+            sequence: 0,
         };
         let pkt2 = EncodedPacket {
-            data: vec![0, 0, 0, 1, 0x65, 0x88], // IDR-tagged second packet (we just want to flush)
+            data: Arc::from(vec![0, 0, 0, 1, 0x65, 0x88].into_boxed_slice()),
             timestamp: std::time::Duration::from_micros(17_005_033_333),
             is_keyframe: true,
+            sequence: 1,
         };
         // first_dts_offset is set on the first append.
         let _ = muxer.append_packet(&pkt1);
