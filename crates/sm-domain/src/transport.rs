@@ -467,11 +467,12 @@ mod tests {
         // stop on never-started sender
         sender.stop().unwrap();
         // start + stop + stop
-        let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
         let (event_tx, _event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
         sender.started.store(false, Ordering::Release);
         sender.stopped.store(false, Ordering::Release);
         sender.start(pkt_rx, event_tx).unwrap();
+        drop(pkt_tx); // unblock worker before stop() — matches lifecycle_s1_2
         sender.stop().unwrap();
         sender.stop().unwrap(); // second stop must not panic
     }
