@@ -1,0 +1,6 @@
+# Strict TDD RED gate for fix-fake-video-sender-stop-idempotent-deadlock.
+# Bounds the previously-deadlocking test at 5s so CI fails fast instead of
+# hanging for 12 minutes. Stays in tree as a regression backstop.
+[[profile.default.overrides]]
+filter = 'test(=fake_video_sender_stop_idempotent_s1_3)'
+slow-timeout = { period = "5s", terminate-after = 1 }
