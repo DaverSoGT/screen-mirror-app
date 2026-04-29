@@ -2938,8 +2938,9 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        // RED: start_stream_inner does not exist yet.
-        let result = start_stream_inner(&bridge, channel, None, None);
+        // Use a free ephemeral UDP port to avoid CI collisions on 7889.
+        let picked_port = pick_free_udp_port();
+        let result = start_stream_inner(&bridge, channel, Some(picked_port), None);
         assert!(
             result.is_ok(),
             "start_stream_inner must return Ok(()) for default args: {result:?}"
@@ -2968,7 +2969,7 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        start_stream_inner(&bridge, channel, None, None).unwrap();
+        start_stream_inner(&bridge, channel, Some(pick_free_udp_port()), None).unwrap();
 
         // Session must be populated.
         assert!(
@@ -3084,15 +3085,19 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        start_stream_inner(&bridge, channel, None, None).unwrap();
+        // Use a free ephemeral UDP port to avoid CI collisions on 7889.
+        let picked_port = pick_free_udp_port();
+        start_stream_inner(&bridge, channel, Some(picked_port), None).unwrap();
 
         let calls = probe.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        // Spec R2.2: None → 7889. Spec R2.3: None → "_screen-mirror._tcp.local.".
+        // Spec R2.2/R2.3: verify arg plumbing — builder receives what start_stream_inner resolved.
+        // NOTE: the "default resolves to 7889" literal assertion lives in
+        // `test_default_udp_port_resolves_to_7889_constant` (see B4).
         assert_eq!(
             calls[0],
-            (7889u16, "_screen-mirror._tcp.local.".to_string()),
-            "default args must be (7889, \"_screen-mirror._tcp.local.\") when None is passed"
+            (picked_port, "_screen-mirror._tcp.local.".to_string()),
+            "builder must receive the port passed in and the default service name"
         );
     }
 
@@ -3171,7 +3176,7 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        let result = start_stream_inner(&bridge, channel, None, None);
+        let result = start_stream_inner(&bridge, channel, Some(pick_free_udp_port()), None);
 
         match result {
             Err(StartStreamError::BundleBuildFailed(msg)) => {
@@ -3279,14 +3284,16 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        start_stream_inner(&bridge, channel, None, None)
+        // Use a free ephemeral UDP port to avoid CI collisions on 7889.
+        let picked_port = pick_free_udp_port();
+        start_stream_inner(&bridge, channel, Some(picked_port), None)
             .expect("start_stream_inner must succeed with default args");
 
         let args = bridge.current_args.lock().unwrap();
         assert_eq!(
             *args,
-            Some((7889u16, "_screen-mirror._tcp.local.".to_string())),
-            "current_args must be Some((7889, \"_screen-mirror._tcp.local.\")) after successful default start"
+            Some((picked_port, "_screen-mirror._tcp.local.".to_string())),
+            "current_args must be Some((picked_port, \"_screen-mirror._tcp.local.\")) after successful start"
         );
     }
 
