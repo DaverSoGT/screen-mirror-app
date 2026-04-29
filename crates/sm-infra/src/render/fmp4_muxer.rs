@@ -404,13 +404,19 @@ fn build_trak(
 }
 
 /// Build the `trex` (track extends defaults) box.
-fn build_trex() -> Vec<u8> {
+///
+/// `default_sample_duration` is in TIMESCALE units (90 kHz here). For 30 fps
+/// that's 3000 ticks per frame. With duration=0 (the previous default), MSE
+/// reports each appended sample as a zero-duration buffered range
+/// `[t→t]` and `<video>.currentTime` cannot advance — observed in B11 as a
+/// black `<video>` despite segments being appended.
+fn build_trex(default_sample_duration: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     write_full_box_header(&mut payload, 0, 0);
     write_u32_be(&mut payload, 1); // track_id = 1
     write_u32_be(&mut payload, 1); // default_sample_description_index = 1
-    write_u32_be(&mut payload, 0); // default_sample_duration
-    write_u32_be(&mut payload, 0); // default_sample_size
+    write_u32_be(&mut payload, default_sample_duration); // default_sample_duration (TIMESCALE units)
+    write_u32_be(&mut payload, 0); // default_sample_size (varies → trun reports per-sample)
     write_u32_be(&mut payload, 0); // default_sample_flags
     let mut out = Vec::new();
     write_box(&mut out, b"trex", &payload);
@@ -418,8 +424,8 @@ fn build_trex() -> Vec<u8> {
 }
 
 /// Build the `mvex` (movie extends) box.
-fn build_mvex() -> Vec<u8> {
-    let trex = build_trex();
+fn build_mvex(default_sample_duration: u32) -> Vec<u8> {
+    let trex = build_trex(default_sample_duration);
     let mut out = Vec::new();
     write_box(&mut out, b"mvex", &trex);
     out
@@ -435,17 +441,20 @@ fn build_mvex() -> Vec<u8> {
 /// * `width`, `height` — track dimensions in pixels.
 /// * `sps_info` — parsed SPS fields (profile, level, dimensions).
 /// * `sps_nal`, `pps_nal` — raw NAL bytes (without Annex-B start codes).
+/// * `default_sample_duration` — per-sample duration in TIMESCALE units (90 kHz).
+///   Computed from the muxer's nominal frame rate (TIMESCALE * fps_den / fps_num).
 pub(crate) fn build_moov(
     width: u32,
     height: u32,
     sps_info: &crate::render::avcc::SpsInfo,
     sps_nal: &[u8],
     pps_nal: &[u8],
+    default_sample_duration: u32,
 ) -> Result<Vec<u8>, MuxerError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&build_mvhd());
     payload.extend_from_slice(&build_trak(width, height, sps_info, sps_nal, pps_nal)?);
-    payload.extend_from_slice(&build_mvex());
+    payload.extend_from_slice(&build_mvex(default_sample_duration));
     let mut out = Vec::new();
     write_box(&mut out, b"moov", &payload);
     Ok(out)
@@ -724,15 +733,21 @@ pub struct Mp4Muxer {
     /// Frame height in pixels (pre-validated from the SPS or caller-supplied).
     height: u32,
     /// Frame rate numerator (e.g. 30 for 30 fps).
-    #[allow(dead_code)]
     fps_num: u32,
     /// Frame rate denominator (e.g. 1 for 30 fps).
-    #[allow(dead_code)]
     fps_den: u32,
     /// Monotonically increasing fragment sequence number for `mfhd`.
     fragment_seq: u32,
     /// Samples accumulated for the current pending fragment.
     pending: Vec<PendingSample>,
+    /// DTS of the very first packet ever appended, in TIMESCALE units. Set on
+    /// the first `append_packet` call so subsequent samples can be re-based to
+    /// start at zero on the MSE timeline regardless of what wall-clock /
+    /// RTP-derived timestamps the encoder emits. Without this, str0m's RTP
+    /// timestamps (which can be 17 000+ s into the wall-clock epoch) would
+    /// place every buffered range far in the future of `<video>.currentTime=0`
+    /// and the player would never reach them — observed in B11.
+    first_dts_offset: Option<u64>,
 }
 
 impl Mp4Muxer {
@@ -751,6 +766,8 @@ impl Mp4Muxer {
     pub fn new(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Self {
         assert!(width > 0, "Mp4Muxer: width must be > 0");
         assert!(height > 0, "Mp4Muxer: height must be > 0");
+        assert!(fps_num > 0, "Mp4Muxer: fps_num must be > 0");
+        assert!(fps_den > 0, "Mp4Muxer: fps_den must be > 0");
         Self {
             width,
             height,
@@ -758,7 +775,14 @@ impl Mp4Muxer {
             fps_den,
             fragment_seq: 0,
             pending: Vec::new(),
+            first_dts_offset: None,
         }
+    }
+
+    /// Default per-sample duration in TIMESCALE (90 kHz) units, derived from
+    /// the muxer's nominal frame rate. For 30 fps: 90 000 / 30 = 3000.
+    fn default_sample_duration_ticks(&self) -> u32 {
+        ((TIMESCALE as u64 * self.fps_den as u64) / self.fps_num as u64) as u32
     }
 
     /// Build the fMP4 init segment from the first SPS and PPS NAL bytes.
@@ -785,7 +809,14 @@ impl Mp4Muxer {
         let sps_info = crate::render::avcc::parse_sps(sps_nal)?;
 
         let ftyp = build_ftyp();
-        let moov = build_moov(self.width, self.height, &sps_info, sps_nal, pps_nal)?;
+        let moov = build_moov(
+            self.width,
+            self.height,
+            &sps_info,
+            sps_nal,
+            pps_nal,
+            self.default_sample_duration_ticks(),
+        )?;
 
         let mut out = Vec::with_capacity(ftyp.len() + moov.len());
         out.extend_from_slice(&ftyp);
@@ -811,7 +842,12 @@ impl Mp4Muxer {
         // Convert Annex-B payload to AVCC-framed bytes.
         // If conversion fails (e.g., empty data), skip this packet silently.
         let avcc = annex_b_to_avcc(&packet.data).ok()?;
-        let dts = crate::transport::annex_b::duration_to_90khz(packet.timestamp);
+        let raw_dts = crate::transport::annex_b::duration_to_90khz(packet.timestamp);
+        // Re-base timestamps so the MSE timeline starts at zero (B11). The
+        // first packet seen by this muxer instance defines the offset; every
+        // subsequent packet's DTS is reported relative to it.
+        let offset = *self.first_dts_offset.get_or_insert(raw_dts);
+        let dts = raw_dts.saturating_sub(offset);
 
         if packet.is_keyframe && !self.pending.is_empty() {
             // Flush the current accumulated GOP as a media segment.
@@ -1645,7 +1681,7 @@ mod tests {
     #[test]
     fn build_moov_contains_all_required_box_tags() {
         let sps_info = parse_sps(SPS_320X240).expect("should parse 320x240 SPS");
-        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS)
+        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS, 3000)
             .expect("build_moov should succeed");
 
         let required_tags: &[&[u8; 4]] = &[
@@ -1667,7 +1703,7 @@ mod tests {
     fn build_moov_avcc_bytes_match_build_avcc_output() {
         use crate::render::avcc::build_avcc;
         let sps_info = parse_sps(SPS_320X240).expect("should parse 320x240 SPS");
-        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS)
+        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS, 3000)
             .expect("build_moov should succeed");
 
         let avcc_tag_pos = find_box_tag(&moov, b"avcC").expect("avcC must be in moov");
@@ -1691,7 +1727,7 @@ mod tests {
     #[test]
     fn build_moov_mvhd_timescale_is_90000() {
         let sps_info = parse_sps(SPS_320X240).expect("should parse");
-        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS)
+        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS, 3000)
             .expect("build_moov should succeed");
 
         let mvhd_tag_pos = find_box_tag(&moov, b"mvhd").expect("mvhd must exist");
@@ -1706,10 +1742,71 @@ mod tests {
         assert_eq!(timescale, 90_000, "mvhd.timescale must be 90_000");
     }
 
+    /// B11-S11: trex.default_sample_duration MUST equal TIMESCALE * fps_den / fps_num,
+    /// so MSE buffered ranges report a positive duration per sample. The previous
+    /// hardcoded 0 made every sample a zero-duration point on the timeline and
+    /// `<video>.currentTime` could not advance.
+    #[test]
+    fn build_moov_trex_default_sample_duration_b11_s11() {
+        let sps_info = parse_sps(SPS_320X240).expect("should parse");
+        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS, 3000)
+            .expect("build_moov should succeed");
+        let trex_pos = find_box_tag(&moov, b"trex").expect("trex must exist");
+        // After the 4-byte tag: [4 v+f][4 track_id][4 default_sample_description_index][4 default_sample_duration]
+        let dur_offset = trex_pos + 4 + 4 + 4 + 4;
+        let dur = u32::from_be_bytes([
+            moov[dur_offset],
+            moov[dur_offset + 1],
+            moov[dur_offset + 2],
+            moov[dur_offset + 3],
+        ]);
+        assert_eq!(dur, 3000, "trex.default_sample_duration must match the supplied 30 fps tick value");
+    }
+
+    /// B11-S11: Mp4Muxer must rebase its DTS so MSE buffered ranges start near
+    /// zero, regardless of the wall-clock-style timestamps the encoder emits.
+    /// Two packets at t = 17005 s and 17005.033 s must yield base_dts ≈ 0
+    /// and ≈ 3000 (= 30 fps tick) on the rebased timeline.
+    #[test]
+    fn append_packet_rebases_first_dts_to_zero_b11_s11() {
+        use sm_domain::encode::EncodedPacket;
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // Synthesise an SPS+IDR pair only enough to satisfy is_keyframe; we only
+        // care about the first_dts_offset behaviour, not the segment bytes.
+        let pkt1 = EncodedPacket {
+            data: vec![0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0],
+            timestamp: std::time::Duration::from_micros(17_005_000_000),
+            is_keyframe: true,
+        };
+        let pkt2 = EncodedPacket {
+            data: vec![0, 0, 0, 1, 0x65, 0x88], // IDR-tagged second packet (we just want to flush)
+            timestamp: std::time::Duration::from_micros(17_005_033_333),
+            is_keyframe: true,
+        };
+        // first_dts_offset is set on the first append.
+        let _ = muxer.append_packet(&pkt1);
+        assert!(
+            muxer.first_dts_offset.is_some(),
+            "first_dts_offset must be set on first append"
+        );
+        let offset = muxer.first_dts_offset.unwrap();
+        assert!(
+            offset > 1_000_000_000,
+            "expected absolute encoder DTS in 90 kHz, got {offset}"
+        );
+        // Second packet rebased: should be small (≈ 3000 ticks for 33 ms at 90 kHz).
+        let _ = muxer.append_packet(&pkt2);
+        let last_rebased = muxer.pending.last().expect("pkt2 stored").dts_90khz;
+        assert!(
+            last_rebased < 10_000,
+            "rebased dts must be near zero, got {last_rebased}"
+        );
+    }
+
     #[test]
     fn build_moov_hdlr_handler_type_is_vide() {
         let sps_info = parse_sps(SPS_320X240).expect("should parse");
-        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS)
+        let moov = build_moov(320, 240, &sps_info, SPS_320X240, MINIMAL_PPS, 3000)
             .expect("build_moov should succeed");
 
         let hdlr_tag_pos = find_box_tag(&moov, b"hdlr").expect("hdlr must exist");
