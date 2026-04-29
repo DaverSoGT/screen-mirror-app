@@ -246,19 +246,34 @@ async function main() {
     window.__sm_streamActive = true; // R6 — flag set after MSE source attach + start_stream succeeds (amended R9.1)
     setStatus("start_stream invoked — waiting for first IDR…");
 
-    // B11-S8: fire PLI immediately so the sender's encoder produces an IDR
-    // on demand instead of waiting for its periodic GOP boundary. Without
-    // this kick, OpenH264's default GOP can stretch to minutes after the
-    // initial start-up IDR (which is typically lost — the receiver wasn't
-    // listening when it was emitted), so the viewer remains black until the
-    // next periodic IDR. attach_stream is rate-limited to 1 PLI per 2 s on
-    // the Rust side, so this single call is safe.
-    try {
-      await window.__TAURI__.core.invoke("attach_stream");
-      console.log("[mse] attach_stream invoked — PLI fired toward sender");
-    } catch (e) {
-      console.warn("[mse] attach_stream failed:", e);
-    }
+    // B11-S8 / B11-S9: fire PLI to force the sender's encoder to produce
+    // an IDR on demand. OpenH264 in screen-content mode keeps GOPs very
+    // long (relies on scene-change detection) so the receiver is otherwise
+    // stuck waiting for the next natural keyframe — observed B11 latency:
+    // 100s+. The first attach_stream call typically races the ICE
+    // handshake and lands before str0m has a remote peer, so the
+    // RequestKeyframe is queued and effectively lost. We retry every 2 s
+    // (matching the Rust-side rate limit) until the init segment arrives
+    // — at which point the mux thread has decoded an IDR and rendering
+    // can begin. The retry loop self-cancels via `initReceived` and a hard
+    // 30 s timeout.
+    const FIRE_PLI = async () => {
+      try {
+        await window.__TAURI__.core.invoke("attach_stream");
+        console.log("[mse] attach_stream invoked — PLI fired toward sender");
+      } catch (e) {
+        console.warn("[mse] attach_stream failed:", e);
+      }
+    };
+    FIRE_PLI(); // first fire — likely pre-ICE, may be wasted
+    const pliRetryDeadline = Date.now() + 30_000;
+    const pliInterval = setInterval(() => {
+      if (initReceived || Date.now() > pliRetryDeadline) {
+        clearInterval(pliInterval);
+        return;
+      }
+      FIRE_PLI();
+    }, 2_000);
   } catch (e) {
     setStatus("start_stream failed: " + e);
     clearInterval(trimHandle);
