@@ -336,3 +336,11 @@ async function main() {
 }
 
 main().catch((e) => setStatus("startup failed: " + e));
+
+// TEST EXPORT SEAM — do not remove. See tests/js/setup.test.js for rationale.
+// In the production webview, globalThis.__SCREEN_MIRROR_TEST_EXPORTS__ is
+// undefined → the `if` short-circuits and this block is a byte-equivalent
+// no-op (zero parser/runtime cost; no observable behavior change).
+if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
+  Object.assign(globalThis.__SCREEN_MIRROR_TEST_EXPORTS__, { deriveCodecFromInitSegment });
+}
