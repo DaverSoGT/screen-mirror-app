@@ -3323,17 +3323,22 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
+        // IMPORTANT: pick_free_udp_port() called ONCE and reused for BOTH calls.
+        // Inlining Some(pick_free_udp_port()) at each site would silently test
+        // "different-args double-start" instead of "same-args double-start" (ADR-D4).
+        let picked_port = pick_free_udp_port();
+
         // First start — must succeed.
         start_stream_inner(
             &bridge,
             channel.clone(),
-            Some(7889),
+            Some(picked_port),
             None, // resolves to "_screen-mirror._tcp.local."
         )
         .expect("first start must succeed");
 
         // Second start with the SAME args — must return AlreadyRunning.
-        let err = start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+        let err = start_stream_inner(&bridge, channel.clone(), Some(picked_port), None)
             .expect_err("second start must return AlreadyRunning, not Ok(())");
 
         match err {
@@ -3342,8 +3347,8 @@ mod tests {
                 current_service_name,
             } => {
                 assert_eq!(
-                    current_port, 7889,
-                    "AlreadyRunning must carry the CURRENT port (7889)"
+                    current_port, picked_port,
+                    "AlreadyRunning must carry the CURRENT port (picked_port)"
                 );
                 assert_eq!(
                     current_service_name, "_screen-mirror._tcp.local.",
