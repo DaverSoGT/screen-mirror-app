@@ -429,7 +429,14 @@ impl Str0mVideoSender {
 /// SansIO tick loop for `Str0mVideoSender`.
 ///
 /// Runs on the dedicated OS thread spawned by `start()`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SansIO tick loop owns 8 distinct, non-aggregatable resources \
+              (pre-neg state, UDP socket, local addr, packet receiver, event \
+              sender, control receiver, shared state, optional encoder); \
+              bundling them into a struct adds indirection without simplifying \
+              the loop's responsibilities"
+)]
 fn run_sender_loop(
     mut pre_neg: PreNegState,
     udp: UdpSocket,
