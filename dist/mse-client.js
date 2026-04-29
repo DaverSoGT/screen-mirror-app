@@ -245,6 +245,20 @@ async function main() {
     await window.__TAURI__.core.invoke("start_stream", { channel: streamChannel });
     window.__sm_streamActive = true; // R6 — flag set after MSE source attach + start_stream succeeds (amended R9.1)
     setStatus("start_stream invoked — waiting for first IDR…");
+
+    // B11-S8: fire PLI immediately so the sender's encoder produces an IDR
+    // on demand instead of waiting for its periodic GOP boundary. Without
+    // this kick, OpenH264's default GOP can stretch to minutes after the
+    // initial start-up IDR (which is typically lost — the receiver wasn't
+    // listening when it was emitted), so the viewer remains black until the
+    // next periodic IDR. attach_stream is rate-limited to 1 PLI per 2 s on
+    // the Rust side, so this single call is safe.
+    try {
+      await window.__TAURI__.core.invoke("attach_stream");
+      console.log("[mse] attach_stream invoked — PLI fired toward sender");
+    } catch (e) {
+      console.warn("[mse] attach_stream failed:", e);
+    }
   } catch (e) {
     setStatus("start_stream failed: " + e);
     clearInterval(trimHandle);
