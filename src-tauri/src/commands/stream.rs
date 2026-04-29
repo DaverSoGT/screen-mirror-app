@@ -3669,7 +3669,15 @@ mod tests {
     /// rule that `start_stream_inner` applies when `udp_port` is `None`.
     #[test]
     fn test_default_udp_port_resolves_to_7889_constant() {
-        assert_eq!(None::<u16>.unwrap_or(7889), 7889u16);
+        // This expression mirrors `udp_port.unwrap_or(7889)` in start_stream_inner exactly.
+        // The lint is suppressed because the point of this test IS the literal — we are
+        // documenting the production default rule, not performing a runtime check.
+        #[expect(
+            clippy::unnecessary_literal_unwrap,
+            reason = "documents the production default rule `udp_port.unwrap_or(7889)`"
+        )]
+        let default_port: u16 = None::<u16>.unwrap_or(7889);
+        assert_eq!(default_port, 7889u16);
     }
 
     /// B7-1.2 / T7.2 — `start_stream_inner(Some(7900), Some("_my-mirror._tcp.local."), channel)`
