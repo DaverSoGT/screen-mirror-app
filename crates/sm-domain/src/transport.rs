@@ -155,10 +155,15 @@ pub enum TransportError {
 /// # Thread model
 ///
 /// `new()` does NOT spawn a thread. `start()` spawns exactly one OS thread.
-/// `stop()` is idempotent and joins the thread.
+/// `stop()` is idempotent and bounded: implementations MUST guarantee `stop()`
+/// returns within a bounded time independent of caller channel discipline.
 ///
-/// CALLER MUST DROP the input `Sender<EncodedPacket>` BEFORE calling `stop()`
-/// so the thread's `rx.recv()` unblocks naturally.
+/// Dropping the input `Sender<EncodedPacket>` before `stop()` is a performance
+/// hint that allows the worker to exit at the next channel observation;
+/// it is NOT a correctness requirement. Implementations achieve bounded stop
+/// either by polling with a short timeout (`FakeVideoSender`, 5 ms) or by
+/// capping the blocking syscall via socket read timeout (`Str0mVideoSender`,
+/// 200 ms cap on `recv_from`).
 ///
 /// # Encoder injection
 ///
