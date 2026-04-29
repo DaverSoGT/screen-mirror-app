@@ -10,6 +10,13 @@ use sm_domain::CaptureFrame;
 /// Layout: `[Y plane (width×height) | U plane (width/2 × height/2) | V plane (width/2 × height/2)]`
 ///
 /// `buf` is pre-allocated and reused across frames to avoid per-frame heap allocation.
+#[cfg_attr(
+    not(target_os = "windows"),
+    expect(
+        dead_code,
+        reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+    )
+)]
 pub(crate) struct I420 {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -19,6 +26,13 @@ pub(crate) struct I420 {
 
 impl I420 {
     /// Create a new zero-initialised I420 buffer sized for `width × height`.
+    #[cfg_attr(
+        not(target_os = "windows"),
+        expect(
+            dead_code,
+            reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+        )
+    )]
     pub(crate) fn new(width: u32, height: u32) -> Self {
         let y_size = (width as usize) * (height as usize);
         let uv_size = (width as usize).div_ceil(2) * (height as usize).div_ceil(2);
@@ -32,18 +46,39 @@ impl I420 {
 
     /// Byte offset into `buf` where the Y plane starts.
     #[inline]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        expect(
+            dead_code,
+            reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+        )
+    )]
     pub(crate) fn y_offset(&self) -> usize {
         0
     }
 
     /// Byte offset into `buf` where the U plane starts.
     #[inline]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        expect(
+            dead_code,
+            reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+        )
+    )]
     pub(crate) fn u_offset(&self) -> usize {
         (self.width as usize) * (self.height as usize)
     }
 
     /// Byte offset into `buf` where the V plane starts.
     #[inline]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        expect(
+            dead_code,
+            reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+        )
+    )]
     pub(crate) fn v_offset(&self) -> usize {
         let y_size = (self.width as usize) * (self.height as usize);
         let uv_size = (self.width as usize).div_ceil(2) * (self.height as usize).div_ceil(2);
@@ -77,6 +112,13 @@ impl I420 {
 /// - Y  = clip( 0.257·R + 0.504·G + 0.098·B + 16  )
 /// - Cb = clip(-0.148·R - 0.291·G + 0.439·B + 128 )
 /// - Cr = clip( 0.439·R - 0.368·G - 0.071·B + 128 )
+#[cfg_attr(
+    not(target_os = "windows"),
+    expect(
+        dead_code,
+        reason = "Production caller (encode/windows.rs) is cfg-gated to Windows; items are exercised via cross-platform tests."
+    )
+)]
 pub(crate) fn convert(frame: &CaptureFrame, out: &mut I420) {
     let w = frame.width as usize;
     let h = frame.height as usize;
