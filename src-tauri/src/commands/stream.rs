@@ -3376,8 +3376,10 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        // First start with port 7889 and default name.
-        start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+        // Use a free ephemeral UDP port to avoid CI collisions on 7889.
+        let picked_port = pick_free_udp_port();
+        // First start with picked_port and default name.
+        start_stream_inner(&bridge, channel.clone(), Some(picked_port), None)
             .expect("first start must succeed");
 
         // Second start with DIFFERENT port (7900) and different name.
@@ -3394,10 +3396,10 @@ mod tests {
                 current_port,
                 current_service_name,
             } => {
-                // CRITICAL: must carry CURRENT args (7889 / default name), NOT new args (7900).
+                // CRITICAL: must carry CURRENT args (picked_port / default name), NOT new args (7900).
                 assert_eq!(
-                    current_port, 7889,
-                    "AlreadyRunning must carry the CURRENT port (7889), not the new caller's port (7900)"
+                    current_port, picked_port,
+                    "AlreadyRunning must carry the CURRENT port (picked_port), not the new caller's port (7900)"
                 );
                 assert_eq!(
                     current_service_name, "_screen-mirror._tcp.local.",
@@ -3435,8 +3437,13 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        // Step 1: start with port 7889.
-        start_stream_inner(&bridge, channel.clone(), Some(7889), None)
+        // Use two distinct free ephemeral ports to avoid CI collisions on 7889/7900.
+        let port_a = pick_free_udp_port();
+        let port_b = pick_free_udp_port();
+        assert_ne!(port_a, port_b, "test requires two distinct ports");
+
+        // Step 1: start with port_a.
+        start_stream_inner(&bridge, channel.clone(), Some(port_a), None)
             .expect("first start must succeed");
 
         // Step 2: stop.
@@ -3450,12 +3457,12 @@ mod tests {
         );
         drop(args);
 
-        // Step 4: start with DIFFERENT args (7900).
+        // Step 4: start with DIFFERENT args (port_b).
         // Must return Ok(()) — stop cleared the state so no AlreadyRunning.
         start_stream_inner(
             &bridge,
             channel.clone(),
-            Some(7900),
+            Some(port_b),
             Some("_other-service._tcp.local.".to_string()),
         )
         .expect("second start with different args must succeed after stop");
@@ -3464,7 +3471,7 @@ mod tests {
         let args = bridge.current_args.lock().unwrap();
         assert_eq!(
             *args,
-            Some((7900u16, "_other-service._tcp.local.".to_string())),
+            Some((port_b, "_other-service._tcp.local.".to_string())),
             "current_args must reflect the new args after the second successful start"
         );
     }
@@ -3710,8 +3717,8 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        // Start to populate current_args.
-        start_stream_inner(&bridge, channel, Some(7889), None)
+        // Start to populate current_args; use ephemeral port to avoid CI collisions on 7889.
+        start_stream_inner(&bridge, channel, Some(pick_free_udp_port()), None)
             .expect("start must succeed to populate current_args");
 
         // Verify current_args is populated before stop.
