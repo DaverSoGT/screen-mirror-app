@@ -30,7 +30,16 @@ export default defineConfig({
     pool: 'forks',
     coverage: {
       provider: 'v8',
-      include: ['dist/sender.js', 'dist/mse-client.js'],
+      // ** prefix required on Windows: vitest resolves config.root to a POSIX-style
+      // path (forward slashes), but fileURLToPath() returns Windows backslash paths.
+      // path.relative('C:/...', 'C:\\...') silently misbehaves, so test-exclude's
+      // relative-path glob match always fails for dynamically-loaded dist files.
+      // allowExternal: true sets relativePath: false in test-exclude, enabling
+      // full-path glob matching instead — which works correctly across both
+      // slash styles. The ** prefix ensures the pattern matches the full path.
+      include: ['**/dist/sender.js', '**/dist/mse-client.js'],
+      allowExternal: true,
+      all: true,
       reporter: ['text', 'lcov'],
       reportsDirectory: './coverage',
       // PQ-4 LOCKED A: track-only, no thresholds gate this change.
