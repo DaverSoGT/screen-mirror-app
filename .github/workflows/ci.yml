@@ -48,6 +48,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +70,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest
+          # Pinned per sdd/ci-ubuntu-nextest-flake-investigation — review on bump.
+          # Bare `nextest` (no version) caused a 2/3 hang flake on ubuntu-latest.
+          tool: nextest@0.9.132
+      - name: cargo-nextest version
+        run: cargo nextest --version
       - name: cargo nextest run
         # --no-tests=warn: treat "no tests found" as a warning rather than an
         # error. The scaffold ships with zero tests; later changes will add them.
