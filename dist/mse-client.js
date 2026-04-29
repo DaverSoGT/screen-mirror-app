@@ -289,17 +289,20 @@ async function main() {
     window.__sm_streamActive = true; // R6 — flag set after MSE source attach + start_stream succeeds (amended R9.1)
     setStatus("start_stream invoked — waiting for first IDR…");
 
-    // B11-S8 / B11-S9: fire PLI to force the sender's encoder to produce
-    // an IDR on demand. OpenH264 in screen-content mode keeps GOPs very
-    // long (relies on scene-change detection) so the receiver is otherwise
-    // stuck waiting for the next natural keyframe — observed B11 latency:
-    // 100s+. The first attach_stream call typically races the ICE
-    // handshake and lands before str0m has a remote peer, so the
-    // RequestKeyframe is queued and effectively lost. We retry every 2 s
-    // (matching the Rust-side rate limit) until the init segment arrives
-    // — at which point the mux thread has decoded an IDR and rendering
-    // can begin. The retry loop self-cancels via `initReceived` and a hard
-    // 30 s timeout.
+    // B11-S8 / B11-S9 / B11-S10: fire PLI on a permanent 2 s cadence.
+    //
+    // S8 added the call. S9 retried it until init arrived. S10 keeps
+    // retrying FOREVER while the session is alive because the fMP4 muxer
+    // only flushes a media segment on the NEXT keyframe — it accumulates
+    // P-frames until then. OpenH264 in screen-content mode (used for the
+    // sender pipeline) only emits IDRs on scene changes by default, so a
+    // static or slowly-changing desktop produces a single startup IDR and
+    // then nothing. Without periodic PLIs the SourceBuffer receives the
+    // init segment and zero media segments — exactly the 'black rectangle
+    // with buffered=<none>' symptom observed in B11. attach_stream is
+    // rate-limited to 1 PLI per 2 s on the Rust side so this single
+    // cadence drives one IDR every ~2 s, giving v1 demo a steady ~2 s
+    // worst-case latency between captured frame and visible frame.
     const FIRE_PLI = async () => {
       try {
         await window.__TAURI__.core.invoke("attach_stream");
@@ -309,14 +312,7 @@ async function main() {
       }
     };
     FIRE_PLI(); // first fire — likely pre-ICE, may be wasted
-    const pliRetryDeadline = Date.now() + 30_000;
-    const pliInterval = setInterval(() => {
-      if (initReceived || Date.now() > pliRetryDeadline) {
-        clearInterval(pliInterval);
-        return;
-      }
-      FIRE_PLI();
-    }, 2_000);
+    setInterval(FIRE_PLI, 2_000); // permanent cadence — drives periodic IDRs
   } catch (e) {
     setStatus("start_stream failed: " + e);
     clearInterval(trimHandle);
