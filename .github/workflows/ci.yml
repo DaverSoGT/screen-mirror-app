@@ -76,15 +76,23 @@ jobs:
         run: cargo nextest run --workspace --no-tests=warn
 
   # ---------------------------------------------------------------------------
-  # clippy — lint the workspace. Runs on ubuntu only; clippy output is
-  # platform-independent for this codebase (no OS-specific lint triggers).
+  # clippy — lint the workspace on all three target platforms. Cross-target
+  # lint divergence is real in this codebase: see bgra_to_i420.rs, where items
+  # are dead_code on Linux/macOS lib targets but live on Windows. Running
+  # Clippy on the full matrix catches such divergence on the OS where it
+  # actually fires, instead of by accident via apt-deps changes (memory #434).
   # ---------------------------------------------------------------------------
   clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Tauri v2 Linux deps
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
