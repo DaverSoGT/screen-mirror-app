@@ -1544,6 +1544,37 @@ mod tests {
         }
     }
 
+    // ─── pick_free_udp_port — ephemeral-port helper for port-collision-hardening ─
+
+    /// Reserves and immediately releases an OS-assigned UDP port for use by tests.
+    ///
+    /// Single-shot: the kernel assigns a free port via `bind("0.0.0.0:0")`, we capture
+    /// the port number, and drop the socket. There is a TOCTOU window between drop and
+    /// the caller's subsequent `bind` — accepted in test context, identical to the
+    /// existing inline pattern at `bind_probe_addr_in_use_returns_port_in_use` (line 3833)
+    /// and `start_stream_inner_port_in_use_deterministic_validate_then_steal` (line 4002).
+    fn pick_free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .expect("OS must be able to assign an ephemeral UDP port")
+            .local_addr()
+            .expect("local_addr must be available after a successful bind")
+            .port()
+    }
+
+    /// B0 smoke test — confirms `pick_free_udp_port` returns a bindable, non-zero port.
+    ///
+    /// Presence of this test in the compiled binary verifies that the helper compiles
+    /// and is reachable inside `#[cfg(test)] mod tests`.
+    #[test]
+    fn pick_free_udp_port_returns_bindable_nonzero_port() {
+        let port = pick_free_udp_port();
+        assert!(port > 0, "pick_free_udp_port must return a non-zero port");
+        assert!(
+            std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok(),
+            "pick_free_udp_port must return a port that is bindable at the moment of the call"
+        );
+    }
+
     // ─── BuilderProbe + make_test_builder — C7 test-double infrastructure ────
     //
     // Design #288 §7: `BuilderProbe` records every `(port, name)` pair the
