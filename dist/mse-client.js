@@ -91,6 +91,48 @@ async function main() {
   const ms = new MediaSource();
   VIDEO_EL.src = URL.createObjectURL(ms);
 
+  // Holder for the (lazy) SourceBuffer so the diagnostic heartbeat can read
+  // the latest reference once it's been created on init-segment arrival.
+  const sbRef = { sb: null };
+
+  // B11 diagnostic: surface video-element lifecycle so we can tell whether
+  // segments reach the decoder and whether playback starts. Without these,
+  // a "black <video>" is ambiguous between "no data appended", "decoder
+  // rejects data", "<video> never starts playing", and "<video> plays but
+  // every frame is black".
+  ["loadedmetadata", "loadeddata", "canplay", "playing", "stalled", "waiting", "error", "emptied"].forEach((ev) => {
+    VIDEO_EL.addEventListener(ev, () => {
+      console.log(
+        "[video]",
+        ev,
+        "readyState=" + VIDEO_EL.readyState,
+        "networkState=" + VIDEO_EL.networkState,
+        "currentTime=" + VIDEO_EL.currentTime.toFixed(3),
+        "paused=" + VIDEO_EL.paused,
+        "videoWidth=" + VIDEO_EL.videoWidth,
+        "videoHeight=" + VIDEO_EL.videoHeight,
+        VIDEO_EL.error ? "error.code=" + VIDEO_EL.error.code + " msg=" + VIDEO_EL.error.message : ""
+      );
+    });
+  });
+  // Heartbeat: report buffered ranges + currentTime every 2 s while a SB exists.
+  setInterval(() => {
+    if (!sbRef.sb) return;
+    const ranges = [];
+    try {
+      const buf = sbRef.sb.buffered;
+      for (let i = 0; i < buf.length; i++) {
+        ranges.push("[" + buf.start(i).toFixed(3) + "→" + buf.end(i).toFixed(3) + "]");
+      }
+    } catch (_) {}
+    console.log(
+      "[video.tick] currentTime=" + VIDEO_EL.currentTime.toFixed(3),
+      "paused=" + VIDEO_EL.paused,
+      "buffered=" + (ranges.join(",") || "<none>"),
+      "ms.readyState=" + ms.readyState
+    );
+  }, 2000);
+
   try {
     await new Promise((resolve, reject) => {
       ms.addEventListener("sourceopen", () => resolve(), { once: true });
@@ -204,6 +246,7 @@ async function main() {
         sb = ms.addSourceBuffer(derived);
         sb.mode = "segments"; // R11.4: deterministic timeline
         sb.addEventListener("updateend", flushQueue);
+        sbRef.sb = sb; // expose to the diagnostic heartbeat (B11)
       } catch (e) {
         setStatus("addSourceBuffer failed: " + e);
         return;
