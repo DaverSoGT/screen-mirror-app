@@ -3500,8 +3500,9 @@ mod tests {
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
-        // Use valid args (port=7889, default name) so validation does NOT reject.
-        let err = start_stream_inner(&bridge, channel, None, None)
+        // Use a free ephemeral UDP port to avoid CI collisions on 7889.
+        let picked_port = pick_free_udp_port();
+        let err = start_stream_inner(&bridge, channel, Some(picked_port), None)
             .expect_err("T7.8: builder error must cause start_stream_inner to return Err");
 
         match err {
