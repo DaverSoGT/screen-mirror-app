@@ -262,7 +262,7 @@ pub trait VideoReceiver: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::{SyncSender, sync_channel};
+    use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
     use std::time::Duration;
 
     // ─── Trait bound assertions: VideoSender / VideoReceiver are Send + Sync ────
@@ -339,9 +339,12 @@ mod tests {
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    match rx.recv() {
+                    // matches FakeVideoReceiver poll cadence (5 ms) — bounds stop()
+                    // regardless of whether the caller dropped the input Sender
+                    match rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(_pkt) => {}
-                        Err(_) => break,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
                     }
                     let _ = dropped.load(Ordering::Relaxed);
                 }
