@@ -1294,6 +1294,9 @@ fn mux_thread(
     // Latency-diagnostic timestamps (B11).
     let mux_start = std::time::Instant::now();
     let mut first_pkt_seen: Option<std::time::Instant> = None;
+    let mut packet_count: u64 = 0;
+    let mut keyframe_count: u64 = 0;
+    let mut last_summary = std::time::Instant::now();
     eprintln!("[sm-stream-mux] thread spawned; waiting for first packet…");
 
     loop {
@@ -1316,6 +1319,17 @@ fn mux_thread(
                 pkt.is_keyframe
             );
         }
+        packet_count += 1;
+        if pkt.is_keyframe {
+            keyframe_count += 1;
+        }
+        if last_summary.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "[sm-stream-mux] tick summary: packets={} keyframes={} init_emitted={}",
+                packet_count, keyframe_count, init_emitted
+            );
+            last_summary = std::time::Instant::now();
+        }
 
         // Fire PLI exactly once on the first packet received.
         if !pli_fired {
@@ -1334,11 +1348,20 @@ fn mux_thread(
             // After init is emitted: feed to muxer.
             if let Some(m) = muxer.as_mut() {
                 if let Some(segment) = m.append_packet(&pkt) {
+                    eprintln!(
+                        "[sm-stream-mux] segment flushed ({} bytes) on P-frame trigger (unexpected)",
+                        segment.len()
+                    );
                     emit_segment(&channel, &counters, segment);
                 }
             }
             continue;
         }
+        eprintln!(
+            "[sm-stream-mux] keyframe packet seen ({} bytes) — init_emitted={}",
+            pkt.data.len(),
+            init_emitted
+        );
 
         // This is an IDR (keyframe) packet.
         if !init_emitted {
@@ -1395,8 +1418,19 @@ fn mux_thread(
 
         // Feed the IDR to the muxer (may flush the previous GOP).
         if let Some(m) = muxer.as_mut() {
-            if let Some(segment) = m.append_packet(&pkt) {
-                emit_segment(&channel, &counters, segment);
+            match m.append_packet(&pkt) {
+                Some(segment) => {
+                    eprintln!(
+                        "[sm-stream-mux] segment flushed ({} bytes) on IDR — sending to channel",
+                        segment.len()
+                    );
+                    emit_segment(&channel, &counters, segment);
+                }
+                None => {
+                    eprintln!(
+                        "[sm-stream-mux] IDR ingested into muxer; pending GOP not yet flushed (first IDR or empty pending)"
+                    );
+                }
             }
         }
     }
@@ -1425,12 +1459,20 @@ fn emit_init(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes: V
 /// Backpressure (Capability D): if the channel send returns an error,
 /// increment `dropped_segments` (drop-newest — no queuing, just drop).
 fn emit_segment(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes: Vec<u8>) {
+    let len = bytes.len();
     match channel.send_raw(FRAME_SEGMENT, bytes) {
         Ok(_) => {
-            counters.fragments_emitted.fetch_add(1, Ordering::Relaxed);
+            let n = counters
+                .fragments_emitted
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            eprintln!("[sm-stream-mux] FRAME_SEGMENT #{n} sent to channel ({len} bytes)");
         }
-        Err(_) => {
+        Err(e) => {
             counters.dropped_segments.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[sm-stream-mux] FRAME_SEGMENT send dropped ({len} bytes): {e}"
+            );
         }
     }
 }

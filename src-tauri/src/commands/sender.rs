@@ -372,9 +372,13 @@ pub fn run_sender_transport_event_drain(
                     );
                 }
                 TransportEvent::KeyframeRequested => {
-                    counters
+                    let n = counters
                         .keyframe_requests_received
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    eprintln!(
+                        "[sm-sender-transport-drain] KeyframeRequested #{n} — encoder.request_keyframe() will fire next frame"
+                    );
                 }
                 _ => {}
             },
