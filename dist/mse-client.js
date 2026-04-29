@@ -244,7 +244,23 @@ async function main() {
       }
       try {
         sb = ms.addSourceBuffer(derived);
-        sb.mode = "segments"; // R11.4: deterministic timeline
+        // B11-S12: 'sequence' instead of 'segments'.
+        //
+        // 'segments' honours each segment's tfdt absolute timestamp on the
+        // MSE timeline. With a screen-capture pipeline whose effective frame
+        // rate fluctuates (Windows Graphics Capture only emits a frame on
+        // visible-content change → 1-5 fps on a static desktop, 30 fps on a
+        // moving one) the muxer produces non-contiguous buffered ranges
+        // ([0→0.1], gap, [2.8→2.95], gap, …) and the <video> element stalls
+        // at the first gap with readyState=HAVE_CURRENT_DATA waiting for
+        // contiguous data that never arrives.
+        //
+        // 'sequence' tells MSE to append each segment immediately after the
+        // last in append order, ignoring per-segment tfdt. Playback stays
+        // continuous regardless of capture-rate variability — exactly what
+        // a live screen mirror wants. Latency is unchanged (~2 s, driven by
+        // the IDR cadence).
+        sb.mode = "sequence";
         sb.addEventListener("updateend", flushQueue);
         sbRef.sb = sb; // expose to the diagnostic heartbeat (B11)
       } catch (e) {
