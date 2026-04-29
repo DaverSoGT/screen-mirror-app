@@ -1205,23 +1205,36 @@ pub fn stop_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
 /// Rate-limited to 1 PLI per 2-second window.
 #[tauri::command]
 pub fn attach_stream(bridge: tauri::State<StreamBridge>) -> Result<(), String> {
+    eprintln!("[attach_stream] invoked from frontend");
     let mut guard = bridge.session.lock().unwrap();
-    if let Some(session) = guard.as_mut() {
-        let now = Instant::now();
-        let should_fire = session
-            .last_pli
-            .map(|t| now.duration_since(t) >= Duration::from_secs(2))
-            .unwrap_or(true);
-
-        if should_fire {
-            if let Some(recv) = &session.receiver {
-                let _ = recv.request_keyframe();
-                session
-                    .counters
-                    .keyframe_requests_fired
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+    let Some(session) = guard.as_mut() else {
+        eprintln!("[attach_stream] no active session — PLI skipped");
+        return Ok(());
+    };
+    let now = Instant::now();
+    let should_fire = session
+        .last_pli
+        .map(|t| now.duration_since(t) >= Duration::from_secs(2))
+        .unwrap_or(true);
+    if !should_fire {
+        eprintln!("[attach_stream] rate-limited (last PLI < 2s ago) — skipped");
+        return Ok(());
+    }
+    let Some(recv) = session.receiver.as_ref() else {
+        eprintln!("[attach_stream] session has no receiver — PLI skipped");
+        return Ok(());
+    };
+    match recv.request_keyframe() {
+        Ok(_) => {
+            session
+                .counters
+                .keyframe_requests_fired
+                .fetch_add(1, Ordering::Relaxed);
             session.last_pli = Some(now);
+            eprintln!("[attach_stream] PLI fired toward sender");
+        }
+        Err(e) => {
+            eprintln!("[attach_stream] request_keyframe failed: {e}");
         }
     }
     Ok(())
