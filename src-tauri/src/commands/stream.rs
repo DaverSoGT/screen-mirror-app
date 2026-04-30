@@ -249,6 +249,18 @@ pub type BuilderFn = Arc<
         + Sync,
 >;
 
+// ─── ProbeFn — injectable bind_probe for testing retry logic ─────────────────
+
+/// Injectable bind-probe function for testing the retry loop in
+/// `make_stream_rebuild_hook`.
+///
+/// `None` in production → the real `bind_probe` is called.
+/// `Some(f)` in tests → `f` is called instead, allowing tests to simulate
+/// `PortInUse` failures and controlled recovery without holding a real socket.
+///
+/// Must be `Send + Sync` so the Arc can be captured by the worker thread.
+pub type ProbeFn = Arc<dyn Fn(u16) -> Result<std::net::UdpSocket, BundleError> + Send + Sync>;
+
 // ─── BundleError — typed error returned by BuilderFn (C2) ────────────────────
 
 /// App-level error returned by the bundle factory (`BuilderFn` and
@@ -1490,7 +1502,8 @@ fn build_production_bundle(
             _bridge_cache.clone(),
             _bridge_session.clone(),
             stop_flag.clone(),
-            1, // attempt — supervisor attempt counter; 1 as default for production hook
+            1,    // attempt — supervisor attempt counter; 1 as default for production hook
+            None, // probe_fn — use real bind_probe in production
         ),
         initiate_mdns_reset: Arc::new(move || {
             // MdnsSignaling::reset() consumes self. Since we hold Arc<Mutex<>>,
@@ -1572,6 +1585,8 @@ fn build_production_bundle(
 /// - `bridge_session`: Arc to the bridge's `session` field — swapped by the worker under lock.
 /// - `old_stop_flag`: The OLD session's `stop_flag` — used as the cancel signal (Gates A–D).
 /// - `attempt`: Reconnect attempt number — embedded in the worker thread name for diagnostics.
+/// - `probe_fn`: Optional injectable bind-probe for testing the retry loop. `None` in
+///   production → the real `bind_probe` is called. `Some(f)` in tests → `f` replaces it.
 ///
 /// # Asymmetry vs sender
 ///
@@ -1589,6 +1604,10 @@ pub fn make_stream_rebuild_hook(
     bridge_session: Arc<Mutex<Option<StreamSession>>>,
     old_stop_flag: Arc<std::sync::atomic::AtomicBool>,
     attempt: u32,
+    // probe_fn: Optional injectable bind-probe for tests. `None` → real `bind_probe`.
+    // `Some(f)` → call `f(port)` instead, allowing tests to simulate PortInUse
+    // failures and controlled recovery (design §6, AC-R5 retry loop).
+    probe_fn: Option<ProbeFn>,
 ) -> Arc<dyn Fn(std::sync::mpsc::SyncSender<SupervisorSignal>) + Send + Sync> {
     Arc::new(
         move |signal_tx: std::sync::mpsc::SyncSender<SupervisorSignal>| {
@@ -1596,6 +1615,7 @@ pub fn make_stream_rebuild_hook(
             let bridge_cache = bridge_cache.clone();
             let bridge_session = bridge_session.clone();
             let old_stop_flag = old_stop_flag.clone();
+            let probe_fn = probe_fn.clone();
             let signal_tx_for_err = signal_tx.clone();
 
             let spawn_result = std::thread::Builder::new()
@@ -1661,16 +1681,51 @@ pub fn make_stream_rebuild_hook(
                     // drain_handles intentionally NOT joined — see INVARIANT above.
                 }
 
-                // Step 7 (receiver-only): bind_probe — acquire the UDP socket AFTER
-                // the OLD receiver has been torn down (mux_handle joined above,
-                // which releases the socket FD).
-                // bind_probe is the canary: if the OS hasn't reclaimed the port yet,
-                // signal RebuildFailed so the supervisor retries with backoff.
-                let socket = match bind_probe(cache.udp_port) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-                        return;
+                // Step 7 (receiver-only): bind_probe with bounded retry — acquire
+                // the UDP socket AFTER the OLD receiver has been torn down (mux_handle
+                // joined above, which releases the socket FD).
+                //
+                // Retry rationale (design §6): the OS kernel may take a scheduler
+                // cycle to fully reclaim the FD after the tick-thread join. We allow
+                // up to 3 attempts with 100ms sleep between attempts. If all 3 fail
+                // with PortInUse, signal RebuildFailed and let the supervisor retry
+                // with its own backoff schedule.
+                //
+                // Non-PortInUse errors (Other) are not retried — they indicate a
+                // different OS failure (e.g. permissions) that won't resolve by waiting.
+                //
+                // `probe_fn`: in tests an injectable closure replaces the real
+                // `bind_probe` so the retry loop can be exercised deterministically
+                // without holding real OS resources. `None` → real `bind_probe`.
+                const MAX_PROBE_ATTEMPTS: u32 = 3;
+                const PROBE_RETRY_SLEEP_MS: u64 = 100;
+                let socket = {
+                    let do_probe = |port: u16| -> Result<std::net::UdpSocket, BundleError> {
+                        if let Some(ref f) = probe_fn {
+                            f(port)
+                        } else {
+                            bind_probe(port)
+                        }
+                    };
+                    let mut result = do_probe(cache.udp_port);
+                    for _ in 1..MAX_PROBE_ATTEMPTS {
+                        match result {
+                            Ok(_) => break,
+                            Err(BundleError::PortInUse(_)) => {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    PROBE_RETRY_SLEEP_MS,
+                                ));
+                                result = do_probe(cache.udp_port);
+                            }
+                            Err(BundleError::Other(_)) => break, // non-retriable
+                        }
+                    }
+                    match result {
+                        Ok(s) => s,
+                        Err(_) => {
+                            let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                            return;
+                        }
                     }
                 };
                 let bind_ctx = BindCtx { socket };

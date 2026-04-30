@@ -24,8 +24,8 @@ use std::sync::atomic::Ordering;
 
 use screen_mirror_lib::commands::sender::ChannelLike;
 use screen_mirror_lib::commands::stream::{
-    ReceiverBundle, StreamBridge, StreamCoordinatorHooks, make_stream_rebuild_hook,
-    run_stream_transport_event_drain_with_supervisor_custom,
+    BundleError, ProbeFn, ReceiverBundle, StreamBridge, StreamCoordinatorHooks,
+    make_stream_rebuild_hook, run_stream_transport_event_drain_with_supervisor_custom,
     run_stream_transport_event_drain_with_supervisor_custom_and_hooks, start_stream_inner,
     stop_stream_session, stop_stream_session_internal,
 };
@@ -527,7 +527,8 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 cache_for_builder.clone(),
                 session_for_builder.clone(),
                 stop_flag.clone(),
-                1, // attempt — fixed at 1 for this helper
+                1,    // attempt — fixed at 1 for this helper
+                None, // probe_fn — use real bind_probe
             );
 
             let hooks = StreamCoordinatorHooks {
@@ -709,6 +710,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 session_clone.clone(),
                 stop_flag.clone(),
                 1,
+                None, // probe_fn — use real bind_probe
             );
 
             let hooks = StreamCoordinatorHooks {
@@ -1006,6 +1008,7 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                     hook_session,
                     stop_flag.clone(),
                     generation + 1,
+                    None, // probe_fn — use real bind_probe
                 );
 
                 let hooks = StreamCoordinatorHooks {
@@ -1183,4 +1186,178 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
              is NOT passing real arcs to make_stream_rebuild_hook inner call (Batch 2 bug repeated)."
         );
     }
+}
+
+// ─── Batch 4 — bind_probe retry (stream rebuild, AC-R5) ──────────────────────
+
+/// T4.1 (AC-R5): Stream rebuild worker retries `bind_probe` up to 3× on
+/// `PortInUse` before signaling `RebuildFailed`.
+///
+/// Design §6: "bind_probe with retries: 3 attempts × 100ms sleep between attempts.
+/// If all 3 retries return Err(BundleError::PortInUse(_)), signal RebuildFailed."
+///
+/// This test injects a `ProbeFn` that always returns `PortInUse` so the supervisor
+/// will observe `RebuildFailed`. It exercises the RETRY COUNT in one worker invocation,
+/// not the success path (the success path is exercised by the ack-timeout chain tests).
+///
+/// RED evidence (MAX_PROBE_ATTEMPTS = 1, no retry loop):
+///   - probe called exactly 1 time per worker invocation
+///   - assertion `probe_call_count == 3` fails (got 1)
+///
+/// GREEN after T4.2 (MAX_PROBE_ATTEMPTS = 3, retry loop):
+///   - probe called 3 times per worker: attempts 0, 1, 2 all return PortInUse
+///   - retry loop runs twice (for calls 1 and 2) with 100ms sleep each
+///   - RebuildFailed is signaled after all 3 attempts exhausted
+///   - `probe_call_count == 3` passes
+///
+/// The test uses `ack_timeout=300ms` so the supervisor fires `InitiateMdnsReset` →
+/// Rebuilding automatically, without requiring a PeerAck (whose nonce would not match
+/// the drain's randomly-generated `my_nonce` anyway).
+#[test]
+fn rebuild_releases_udp_port_before_rebind() {
+    use std::sync::atomic::AtomicU32;
+
+    // probe_fn: always returns PortInUse — exercises the retry counter.
+    let probe_call_count = Arc::new(AtomicU32::new(0));
+    let probe_count_for_fn = probe_call_count.clone();
+
+    let probe_fn: ProbeFn = Arc::new(move |port| {
+        probe_count_for_fn.fetch_add(1, Ordering::Relaxed);
+        Err(BundleError::PortInUse(port))
+    });
+
+    // Build a bridge where the rebuild hook uses the injectable probe_fn.
+    let ch = FakeBinaryChannel::new();
+    let ch_for_caller = ch.clone();
+
+    let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
+    let ev_rx_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+        Arc::new(Mutex::new(Some(ev_rx)));
+    let ev_rx_slot_clone = ev_rx_slot.clone();
+
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let sup_tx_for_drain = sup_tx.clone();
+
+    let session_arc: Arc<Mutex<Option<screen_mirror_lib::commands::stream::StreamSession>>> =
+        Arc::new(Mutex::new(None));
+    let restart_cache_arc: Arc<
+        Mutex<Option<screen_mirror_lib::commands::stream::StreamRestartCache>>,
+    > = Arc::new(Mutex::new(None));
+
+    let session_for_builder = session_arc.clone();
+    let cache_for_builder = restart_cache_arc.clone();
+
+    // Policy with max_attempts=1: supervisor fires ONE rebuild attempt and then Dead.
+    // This isolates the retry count to a single worker invocation — if the probe is
+    // called 3 times, the retry loop ran 3 times IN THE SAME WORKER.
+    //
+    // Without retry (MAX_PROBE_ATTEMPTS=1): probe called 1×, RebuildFailed → Dead.
+    //   calls == 1 → assertion `>= 3` FAILS (RED).
+    // With retry (MAX_PROBE_ATTEMPTS=3): probe called 3× in ONE worker, RebuildFailed → Dead.
+    //   calls == 3 → assertion `>= 3` PASSES (GREEN).
+    let policy = ReconnectPolicy {
+        max_attempts: std::num::NonZeroU8::new(1).unwrap(),
+        backoff: fast_policy().backoff,
+    };
+    let ack_timeout = Duration::from_millis(300);
+    let probe_fn_for_builder = probe_fn.clone();
+
+    let bridge = screen_mirror_lib::commands::stream::StreamBridge::new_with_builder_and_arcs(
+        Arc::new(move |_bind_ctx, _port, _name, stop_flag, channel| {
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
+            let st = sup_tx_for_drain.clone();
+            let p = policy.clone();
+            let t = ack_timeout;
+
+            let rebuild_hook = make_stream_rebuild_hook(
+                // Inner builder: always fails — we only test the probe retry count.
+                Arc::new(|_, _, _, _, _| {
+                    Err(BundleError::Other(
+                        "intentional builder failure for probe retry test".to_string(),
+                    ))
+                }),
+                cache_for_builder.clone(),
+                session_for_builder.clone(),
+                stop_flag.clone(),
+                1,
+                Some(probe_fn_for_builder.clone()), // inject the always-PortInUse probe
+            );
+
+            let hooks = StreamCoordinatorHooks {
+                publish_reconnect_request: Arc::new(|_, _| {}),
+                publish_reconnect_ack: Arc::new(|_, _| {}),
+                initiate_rebuild: rebuild_hook,
+                initiate_mdns_reset: Arc::new(|| {}),
+            };
+
+            let (_pkt_tx, pkt_rx) = sync_channel::<sm_domain::encode::EncodedPacket>(1);
+            let h = thread::Builder::new()
+                .name("retry-probe-stream-drain".into())
+                .spawn(move || {
+                    run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                    );
+                })
+                .expect("spawn stream drain");
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiverOps),
+                pkt_rx,
+                signaling: None,
+                drain_handles: vec![h],
+                _drain_senders: vec![],
+            })
+        }),
+        session_arc,
+        restart_cache_arc,
+        sup_tx,
+    );
+
+    // Start bridge on an arbitrary port (probe_fn ignores the port value).
+    start_stream_inner(
+        &bridge,
+        ch_for_caller.clone() as Arc<dyn ChannelLike>,
+        Some(9944),
+        Some("_sm-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Trigger reconnect cycle → supervisor enters AwaitingAck(1).
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got_reconnecting =
+        ch_for_caller.wait_for_status_containing("reconnecting", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting status, got: {:?}",
+        ch_for_caller.status_messages()
+    );
+
+    // Wait for the supervisor to auto-fire Rebuilding after ack_timeout (300ms),
+    // then for the worker to complete its retry loop (~3 × 100ms = 300ms).
+    // Total: ~600ms. We wait up to 1500ms to be safe on slow CI.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        let calls = probe_call_count.load(Ordering::Relaxed);
+        if calls >= 3 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Primary assertion: the retry loop must exhaust all MAX_PROBE_ATTEMPTS (3) attempts
+    // before signaling RebuildFailed. With no retry (MAX_PROBE_ATTEMPTS=1), calls == 1.
+    let calls = probe_call_count.load(Ordering::Relaxed);
+    assert!(
+        calls >= 3,
+        "bind_probe must be called at least MAX_PROBE_ATTEMPTS (3) times per worker \
+         invocation (design §6: retry loop). Got {calls} calls — retry loop is missing."
+    );
+
+    stop_stream_session(&bridge);
 }
