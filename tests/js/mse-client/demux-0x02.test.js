@@ -124,13 +124,16 @@ describe('mse-client — 0x02 JSON status frame demuxer (T8.2)', () => {
     expect(warnCalls.length).toBeGreaterThanOrEqual(1);
   });
 
-  it('SC-T8-3: 0x01 segment after a 0x02 frame is still appended normally', async () => {
+  it('SC-T8-3: 0x01 segment after a non-lifecycle 0x02 frame is still appended normally', async () => {
     const ch = tauri.lastChannel();
     const ms = MockMediaSourceCtor._lastInstance;
     const sb = ms?._sb;
 
-    // Send a 0x02 status frame first
-    const statusFrame = makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 });
+    // Send a 0x02 status frame with a kind that does NOT trigger MSE teardown.
+    // 'connecting' falls through to the default log-only case in handleStatus,
+    // so the SourceBuffer and initReceived flag are untouched.
+    // (Note: 'reconnecting'/'dead' now invoke tearDownMse by design — see T10.1 tests.)
+    const statusFrame = makeStatusFrame({ kind: 'connecting' });
     ch._dispatch(statusFrame.buffer);
     await Promise.resolve();
     await Promise.resolve();
