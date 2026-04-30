@@ -350,8 +350,7 @@ fn coordinator_calls_publish_reconnect_ack_hook_on_outcome() {
     // observed IceFailed and is now in AwaitingAck. Polling the hook counter is
     // more robust than waiting on the JSON channel under heavy nextest concurrency.
     let req_deadline = std::time::Instant::now() + Duration::from_millis(2000);
-    while publish_req_count.load(Ordering::Relaxed) == 0
-        && std::time::Instant::now() < req_deadline
+    while publish_req_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < req_deadline
     {
         thread::sleep(Duration::from_millis(2));
     }
