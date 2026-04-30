@@ -158,6 +158,75 @@ fn sender_html_references_sender_js() {
     );
 }
 
+// ─── CRITICAL-1: Retry/Cancel button elements (AC-7, AC-8, AC-9) ─────────────
+
+/// CRITICAL-1: sender.html MUST have id="retry" button element.
+///
+/// sender.js uses `document.getElementById("retry")` to show/hide the Retry
+/// button on dead events. Without this element the button never appears and
+/// retry_session is never invoked. Spec §5.4.
+#[test]
+fn sender_html_has_retry_button() {
+    let content = read_sender_html();
+    assert!(
+        content.contains("id=\"retry\""),
+        "sender.html must contain a button with id=\"retry\" (spec §5.4, AC-7)"
+    );
+}
+
+/// CRITICAL-1: sender.html MUST have id="cancel" button element.
+///
+/// sender.js uses `document.getElementById("cancel")` to show/hide the Cancel
+/// button on dead events. Without this element cancel/stop_sender is never
+/// callable. Spec §5.4.
+#[test]
+fn sender_html_has_cancel_button() {
+    let content = read_sender_html();
+    assert!(
+        content.contains("id=\"cancel\""),
+        "sender.html must contain a button with id=\"cancel\" (spec §5.4, AC-9)"
+    );
+}
+
+/// CRITICAL-1: viewer.html MUST have a reconnecting-overlay element.
+///
+/// mse-client.js handleStatus("reconnecting") should show the overlay
+/// so the user sees feedback during MSE teardown. Spec §5.4.
+#[test]
+fn viewer_html_has_reconnecting_overlay() {
+    let dist = dist_dir();
+    let path = dist.join("viewer.html");
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read viewer.html: {}", e));
+    assert!(
+        content.contains("id=\"reconnecting-overlay\""),
+        "viewer.html must contain id=\"reconnecting-overlay\" element (spec §5.4)"
+    );
+}
+
+/// CRITICAL-1: viewer.html MUST have a dead-session modal with receiver-retry button.
+///
+/// The mse-client.js handleStatus("dead") should show this modal. Spec §5.4.
+#[test]
+fn viewer_html_has_dead_modal_with_retry_and_cancel() {
+    let dist = dist_dir();
+    let path = dist.join("viewer.html");
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read viewer.html: {}", e));
+    assert!(
+        content.contains("id=\"dead-modal\""),
+        "viewer.html must contain id=\"dead-modal\" element (spec §5.4)"
+    );
+    assert!(
+        content.contains("id=\"receiver-retry\""),
+        "viewer.html must contain id=\"receiver-retry\" button (spec §5.4)"
+    );
+    assert!(
+        content.contains("id=\"receiver-cancel\""),
+        "viewer.html must contain id=\"receiver-cancel\" button (spec §5.4)"
+    );
+}
+
 // ─── B11-S5 regression: mux thread MUST parse dimensions from SPS ─────────
 
 /// B11-S5 — `src-tauri/src/commands/stream.rs` MUST NOT hardcode the

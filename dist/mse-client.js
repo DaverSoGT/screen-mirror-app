@@ -133,7 +133,46 @@ function setUpMse() {
 // ── handleStatus ─────────────────────────────────────────────────────────────
 // Handle a decoded 0x02 JSON status payload from the Rust reconnect supervisor.
 // Spec §5.2, T10.1: routes reconnecting/dead/streaming lifecycle events to
-// tearDownMse / setUpMse. Other events are logged for diagnostics.
+// tearDownMse / setUpMse and shows/hides the viewer overlay/modal.
+//
+// Phase 9 (Batch 6 CRITICAL-1): also shows/hides the reconnecting-overlay and
+// dead-modal elements added to viewer.html (spec §5.4).
+
+const reconnectingOverlay = document.getElementById("reconnecting-overlay");
+const deadModal = document.getElementById("dead-modal");
+const deadReasonEl = document.getElementById("dead-reason");
+const receiverRetryBtn = document.getElementById("receiver-retry");
+const receiverCancelBtn = document.getElementById("receiver-cancel");
+
+// Retry: stop current session (if any) then restart via start_stream with
+// cached channel. Per spec §4.2: receiver retry is stop_stream + start_stream
+// with the same parameters — the JS side re-invokes main() which creates a
+// fresh Channel. Simplest V1 implementation: reload the page to re-run main().
+if (receiverRetryBtn) {
+  receiverRetryBtn.addEventListener("click", async function () {
+    if (deadModal) deadModal.hidden = true;
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      try { await invoke("stop_stream"); } catch (_) {}
+    }
+    // Re-run main() by reloading the page (fresh Channel, fresh MSE session).
+    window.location.reload();
+  });
+}
+
+// Cancel: stop the stream and return to idle (no reload).
+if (receiverCancelBtn) {
+  receiverCancelBtn.addEventListener("click", async function () {
+    if (deadModal) deadModal.hidden = true;
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      try { await invoke("stop_stream"); } catch (_) {}
+    }
+    window.__sm_streamActive = false;
+    setStatus("Stopped");
+  });
+}
+
 function handleStatus(payload) {
   console.log("[mse-client] status:", payload.kind, payload);
   switch (payload.kind) {
@@ -142,17 +181,33 @@ function handleStatus(payload) {
       // The receiver will emit FRAME_INIT again after the bundle is rebuilt.
       setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…");
       tearDownMse();
+      // Show reconnecting overlay; hide dead modal (in case a previous dead was shown).
+      if (reconnectingOverlay) {
+        reconnectingOverlay.textContent =
+          "Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…";
+        reconnectingOverlay.hidden = false;
+      }
+      if (deadModal) deadModal.hidden = true;
       break;
     case "dead":
-      // All reconnect attempts exhausted — freeze the last frame by ending the stream.
-      // The JS dead-session modal (sender.js / index.html) will show Retry/Cancel.
+      // All reconnect attempts exhausted — show dead-session modal with Retry/Cancel.
       setStatus("Disconnected — session lost");
       tearDownMse();
+      window.__sm_streamActive = false;
+      if (reconnectingOverlay) reconnectingOverlay.hidden = true;
+      if (deadModal) {
+        if (deadReasonEl) {
+          deadReasonEl.textContent =
+            "Connection lost: " + (payload.reason || "unknown");
+        }
+        deadModal.hidden = false;
+      }
       break;
     case "streaming":
       // Reconnect supervisor reports the rebuild succeeded. Prepare a fresh MSE
       // session so the next FRAME_INIT can re-initialize the SourceBuffer.
-      // Use .catch to log but not rethrow — failures are non-fatal for the status handler.
+      if (reconnectingOverlay) reconnectingOverlay.hidden = true;
+      if (deadModal) deadModal.hidden = true;
       setUpMse().catch((e) => {
         console.error("[mse-client] setUpMse failed after reconnect:", e);
       });
