@@ -359,13 +359,11 @@ fn t7_2_three_rebuild_failures_emit_dead_0x02() {
     // Trigger first failure.
     ev_tx.send(TransportEvent::IceFailed).unwrap();
 
-    // After ack_timeout, supervisor proceeds to rebuild. Simulate each rebuild failing
-    // by sending IceFailed again for attempts 2 and 3.
-    thread::sleep(Duration::from_millis(150));
-    ev_tx.send(TransportEvent::IceFailed).unwrap();
-    thread::sleep(Duration::from_millis(150));
-    ev_tx.send(TransportEvent::IceFailed).unwrap();
-
+    // The supervisor now drives rebuild attempts internally: the noop initiate_rebuild
+    // hook immediately signals RebuildFailed, so all 3 attempts exhaust without the
+    // test needing to inject more IceFailed events. Just wait for the dead 0x02 frame.
+    // (The old approach of sending more IceFailed was needed before the hook was wired;
+    //  with the hook in place the coordinator exits before those sends can land anyway.)
     let got = ch.wait_for_status_containing("dead", Duration::from_secs(5));
     assert!(got, "0x02 dead frame must be emitted after 3 failures");
 

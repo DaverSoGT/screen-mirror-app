@@ -122,6 +122,38 @@ struct BridgeCounters {
     keyframe_requests_fired: AtomicU64,
 }
 
+// ─── StreamCoordinatorHooks — production wiring seam ─────────────────────────
+
+/// Callbacks invoked by the stream supervisor coordinator when the supervisor
+/// emits outcomes that require side-effects beyond 0x02 status frame emission.
+///
+/// Mirrors `SenderCoordinatorHooks` from sender.rs.
+pub struct StreamCoordinatorHooks {
+    /// Called when supervisor emits `PublishReconnectRequest`.
+    pub publish_reconnect_request: Arc<dyn Fn(u8, u64) + Send + Sync>,
+    /// Called when supervisor emits `PublishReconnectAck`.
+    pub publish_reconnect_ack: Arc<dyn Fn(u8, u64) + Send + Sync>,
+    /// Called when supervisor emits `InitiateRebuild`.
+    /// Receives a clone of `signal_tx` to feed back `RebuildSucceeded`/`RebuildFailed`.
+    pub initiate_rebuild: Arc<dyn Fn(SyncSender<SupervisorSignal>) + Send + Sync>,
+    /// Called when supervisor emits `InitiateMdnsReset`.
+    pub initiate_mdns_reset: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl StreamCoordinatorHooks {
+    /// No-op hooks — used by existing drain functions (event emission only).
+    pub fn noop() -> Self {
+        Self {
+            publish_reconnect_request: Arc::new(|_, _| {}),
+            publish_reconnect_ack: Arc::new(|_, _| {}),
+            initiate_rebuild: Arc::new(|signal_tx| {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+            }),
+            initiate_mdns_reset: Arc::new(|| {}),
+        }
+    }
+}
+
 // ─── StreamStatusEvent — JSON events for 0x02 reconnect status frames ────────
 
 /// JSON payload for receiver-side 0x02 status frames.
@@ -841,14 +873,8 @@ fn run_transport_event_drain(
 
 /// Transport-event drain loop — WITH reconnect supervisor wiring AND custom policy/ack_timeout.
 ///
-/// Mirrors `run_sender_transport_event_drain_with_supervisor_custom` from sender.rs.
-/// On `IceFailed` or `ConnectionLost`, enters supervisor mode which emits 0x02 status
-/// frames (`FRAME_STATUS`) on the binary ChannelLike for the JS demuxer (decision #477).
-///
-/// **0x02 ordering contract**: status frames are emitted by the coordinator BETWEEN
-/// transport events; they never interleave inside a fragmented MP4 segment because the
-/// mux thread drains `pkt_rx` independently and only the transport-event drain emits
-/// 0x02 frames on the same `channel`.
+/// Uses no-op coordinator hooks (0x02 status frames only). For production coordinator
+/// wiring, use `run_stream_transport_event_drain_with_supervisor_custom_and_hooks`.
 ///
 /// Tests use this variant with a fast policy (millisecond-scale backoff) to drive all
 /// 3 attempts without waiting for the production 3s/9s/27s delays.
@@ -859,6 +885,30 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+) {
+    run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+        ev_rx,
+        stop_flag,
+        channel,
+        supervisor_signal_tx,
+        policy,
+        ack_timeout,
+        StreamCoordinatorHooks::noop(),
+    );
+}
+
+/// Transport-event drain loop — WITH supervisor wiring AND explicit coordinator hooks.
+///
+/// This is the primary drain function for production coordinator wiring (CRITICAL-2).
+/// `hooks` receives the coordinator actions (rebuild, signaling publish, mDNS reset).
+pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+    ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
+    stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    policy: ReconnectPolicy,
+    ack_timeout: Duration,
+    hooks: StreamCoordinatorHooks,
 ) {
     let session_nonce: u64 = rand::random();
 
@@ -884,6 +934,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        hooks,
                     );
                     break 'drain;
                 }
@@ -900,6 +951,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        hooks,
                     );
                     break 'drain;
                 }
@@ -914,6 +966,8 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
 /// Transport-event drain loop — WITH supervisor wiring AND production defaults.
 ///
 /// Uses `ReconnectPolicy::v1_default()` and `ack_timeout = 2s`.
+/// Kept for reference; production path now uses `_and_hooks` variant directly.
+#[allow(dead_code)]
 fn run_stream_transport_event_drain_with_supervisor(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -934,6 +988,7 @@ fn run_stream_transport_event_drain_with_supervisor(
 ///
 /// Mirrors `enter_supervisor_mode` from sender.rs. Emits 0x02 (`FRAME_STATUS`)
 /// status frames instead of JSON events (receiver uses binary channel — decision #477).
+/// Production coordinator actions are dispatched via `hooks` (CRITICAL-2 wiring).
 #[allow(clippy::too_many_arguments)]
 fn enter_stream_supervisor_mode(
     initial_trigger: ReconnectTrigger,
@@ -944,6 +999,7 @@ fn enter_stream_supervisor_mode(
     supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    hooks: StreamCoordinatorHooks,
 ) {
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
     let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
@@ -975,7 +1031,7 @@ fn enter_stream_supervisor_mode(
         loop {
             match outcome_rx.try_recv() {
                 Ok(outcome) => {
-                    handle_stream_supervisor_outcome(&outcome, channel);
+                    handle_stream_supervisor_outcome(&outcome, channel, &signal_tx, &hooks);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1007,8 +1063,14 @@ fn enter_stream_supervisor_mode(
     let _ = sup_join.join();
 }
 
-/// Handle a single `SupervisorOutcome` by emitting the appropriate 0x02 status frame.
-fn handle_stream_supervisor_outcome(outcome: &SupervisorOutcome, channel: &Arc<dyn ChannelLike>) {
+/// Handle a single `SupervisorOutcome` — emits 0x02 status frames AND dispatches
+/// production coordinator actions via `hooks` (CRITICAL-2 wiring).
+fn handle_stream_supervisor_outcome(
+    outcome: &SupervisorOutcome,
+    channel: &Arc<dyn ChannelLike>,
+    signal_tx: &SyncSender<SupervisorSignal>,
+    hooks: &StreamCoordinatorHooks,
+) {
     match outcome {
         SupervisorOutcome::StateChanged(SessionState::Reconnecting { attempt, max }) => {
             emit_stream_status(
@@ -1043,7 +1105,8 @@ fn handle_stream_supervisor_outcome(outcome: &SupervisorOutcome, channel: &Arc<d
             eprintln!(
                 "[sm-stream-sup-coord] publish ReconnectRequest attempt={attempt} nonce={session_nonce}"
             );
-            // TODO Phase 7 production: call MdnsSignaling::publish_reconnect_request()
+            // CRITICAL-2: call production hook (MdnsSignaling::publish_reconnect_request).
+            (hooks.publish_reconnect_request)(*attempt, *session_nonce);
         }
         SupervisorOutcome::PublishReconnectAck {
             attempt,
@@ -1052,19 +1115,18 @@ fn handle_stream_supervisor_outcome(outcome: &SupervisorOutcome, channel: &Arc<d
             eprintln!(
                 "[sm-stream-sup-coord] publish ReconnectAck attempt={attempt} nonce={session_nonce}"
             );
-            // TODO Phase 7 production: call MdnsSignaling::publish_reconnect_ack()
+            // CRITICAL-2: call production hook (MdnsSignaling::publish_reconnect_ack).
+            (hooks.publish_reconnect_ack)(*attempt, *session_nonce);
         }
         SupervisorOutcome::InitiateRebuild => {
-            eprintln!(
-                "[sm-stream-sup-coord] InitiateRebuild — bundle rebuild TODO (Phase 7 production)"
-            );
-            // TODO Phase 7 production: teardown old bundle, call builder again
+            eprintln!("[sm-stream-sup-coord] InitiateRebuild — invoking rebuild hook");
+            // CRITICAL-2: call production hook. Hook receives signal_tx to report result.
+            (hooks.initiate_rebuild)(signal_tx.clone());
         }
         SupervisorOutcome::InitiateMdnsReset => {
-            eprintln!(
-                "[sm-stream-sup-coord] InitiateMdnsReset — mDNS reset TODO (Phase 7 production)"
-            );
-            // TODO Phase 7 production: call MdnsSignaling::reset()
+            eprintln!("[sm-stream-sup-coord] InitiateMdnsReset — invoking mDNS reset hook");
+            // CRITICAL-2: call production hook.
+            (hooks.initiate_mdns_reset)();
         }
         SupervisorOutcome::Stopped => {
             eprintln!("[sm-stream-sup-coord] supervisor stopped");
@@ -1270,21 +1332,79 @@ fn build_production_bundle(
         Arc::new(Str0mReceiverOps(receiver_mutex));
 
     let sig_ops_for_stop: Arc<Mutex<MdnsSignaling>> = signaling_mutex.clone();
+    // Clone for production coordinator hooks BEFORE moving into MdnsSignalingOps.
+    // Both `signaling_for_hooks` and `sig_publish_for_drain` are independent Arc
+    // clones pointing to the same Mutex<MdnsSignaling> — correct lifecycle.
+    let signaling_for_hooks = signaling_mutex.clone();
     let sig_publish_for_drain: Arc<dyn SignalingPublishOps> =
         Arc::new(MdnsSignalingOps(signaling_mutex));
 
-    // ── 4. Spawn transport-event drain thread with reconnect supervisor ──
-    // Phase 7: uses supervisor-aware drain so 0x02 status frames are emitted
-    // on IceFailed/ConnectionLost (design §3, decision #477).
+    // ── 4a. Build production coordinator hooks (CRITICAL-2) ───────────────
+    // Closures close over `signaling_for_hooks` (Arc<Mutex<MdnsSignaling>>).
+    // Uses SignalingRole::Receiver for publish_reconnect_request.
+    let sig_for_req = signaling_for_hooks.clone();
+    let sig_for_ack = signaling_for_hooks.clone();
+    let sig_for_reset = signaling_for_hooks.clone();
+
+    let coordinator_hooks = StreamCoordinatorHooks {
+        publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
+            let sig = sig_for_req.lock().unwrap();
+            if let Err(e) = sig.publish_reconnect_request(
+                attempt,
+                sm_domain::signaling::SignalingRole::Receiver,
+                session_nonce,
+            ) {
+                eprintln!("[sm-stream-coord] publish_reconnect_request failed: {e}");
+            }
+        }),
+        publish_reconnect_ack: Arc::new(move |attempt, session_nonce| {
+            let sig = sig_for_ack.lock().unwrap();
+            if let Err(e) = sig.publish_reconnect_ack(attempt, session_nonce) {
+                eprintln!("[sm-stream-coord] publish_reconnect_ack failed: {e}");
+            }
+        }),
+        initiate_rebuild: Arc::new(move |signal_tx| {
+            // V1 limitation: full bundle rebuild from drain thread would deadlock
+            // on StreamBridge session lock. Signal RebuildFailed so supervisor
+            // exhausts attempts → Dead → user-initiated retry via retry_session.
+            // TODO V2: implement full bundle rebuild via a dedicated rebuild channel.
+            eprintln!(
+                "[sm-stream-coord] InitiateRebuild — signaling RebuildFailed (V1: rebuild via retry_session)"
+            );
+            let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+        }),
+        initiate_mdns_reset: Arc::new(move || {
+            // MdnsSignaling::reset() consumes self. Since we hold Arc<Mutex<>>,
+            // call stop() in-place then start() again to re-engage discovery.
+            eprintln!(
+                "[sm-stream-coord] InitiateMdnsReset — calling MdnsSignaling::stop() + re-engaging discovery"
+            );
+            let mut sig = sig_for_reset.lock().unwrap();
+            if let Err(e) = sig.stop() {
+                eprintln!("[sm-stream-coord] MdnsSignaling::stop() failed: {e}");
+            }
+            let (sig_ev_tx, _sig_ev_rx) = std::sync::mpsc::sync_channel(4);
+            if let Err(e) = sig.start(sig_ev_tx) {
+                eprintln!("[sm-stream-coord] MdnsSignaling::start() after reset failed: {e}");
+            }
+        }),
+    };
+
+    // ── 4b. Spawn transport-event drain thread with reconnect supervisor ──
+    // CRITICAL-2: uses _and_hooks variant with real production coordinator hooks
+    // so reconnect request/ack/mDNS-reset are wired to MdnsSignaling (decision #477).
     let stop_flag_t = stop_flag.clone();
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
         .spawn(move || {
-            run_stream_transport_event_drain_with_supervisor(
+            run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                 transport_event_rx,
                 stop_flag_t,
                 channel,
                 supervisor_signal_tx,
+                ReconnectPolicy::v1_default(),
+                Duration::from_secs(2),
+                coordinator_hooks,
             );
         })?;
 
