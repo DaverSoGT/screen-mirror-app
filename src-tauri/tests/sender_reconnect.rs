@@ -1708,8 +1708,7 @@ fn stop_after_successful_rebuild_completes_cleanly() {
 fn t12_2_sender_rebuild_succeeds_on_attempt1() {
     // Use a short ack_timeout so the supervisor advances to InitiateRebuild quickly.
     let ack_timeout = Duration::from_millis(50);
-    let (bridge, ev_tx, ch) =
-        make_supervised_bridge_with_rebuild_hook(fast_policy(), ack_timeout);
+    let (bridge, ev_tx, ch) = make_supervised_bridge_with_rebuild_hook(fast_policy(), ack_timeout);
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
 
