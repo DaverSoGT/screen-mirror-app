@@ -1654,3 +1654,70 @@ fn stop_after_successful_stream_rebuild_completes_cleanly() {
         "bridge.current_args must be None after stop"
     );
 }
+
+// ─── Batch 7 (T7.2) — AC-6 end-to-end: auto-rebuild on attempt 1 (T12.2 Escenario 1) ──
+
+/// T7.2 (AC-6): End-to-end auto-rebuild on attempt 1 without manual PeerAck.
+///
+/// Models T12.2 Escenario 1 (peer crash) for the StreamBridge: the peer is gone,
+/// so no `PeerAck` arrives.  The supervisor's `ack_timeout` expires → supervisor emits
+/// `InitiateMdnsReset` (no-op) then `InitiateRebuild { attempt: 1 }` → worker
+/// constructs a fresh `ReceiverBundle` → signals `RebuildSucceeded` → coordinator
+/// emits a `"streaming"` 0x02 status frame.
+///
+/// PASS criterion: `"streaming"` 0x02 frame is received within 5s WITHOUT the test
+/// sending any `SupervisorSignal` manually (stream resumes without user clicking Retry).
+///
+/// RED against V1: V1 stub always signals `RebuildFailed`; drain eventually reaches
+/// Dead after 3 attempts and emits `"dead"` — no `"streaming"` ever appears.
+#[test]
+fn t12_2_stream_rebuild_succeeds_on_attempt1() {
+    // Use a short ack_timeout so the supervisor advances to InitiateRebuild quickly.
+    let ack_timeout = Duration::from_millis(50);
+    let (bridge, ev_tx, ch) =
+        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), ack_timeout);
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(9962),
+        Some("_sm-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Trigger: ICE failure (models peer crash / connection loss).
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+
+    // Expect reconnecting overlay — supervisor enters AwaitingAck.
+    let got_reconnecting =
+        ch.wait_for_status_containing("reconnecting", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting status after IceFailed, got: {:?}",
+        ch.status_messages()
+    );
+
+    // Do NOT send PeerAck.  The ack_timeout (50ms) expires → supervisor emits
+    // InitiateMdnsReset (no-op hook) then InitiateRebuild → worker rebuilds →
+    // signals RebuildSucceeded → coordinator emits StateChanged(Connected) → "streaming".
+    //
+    // Wait up to 5s for streaming (well within T12.2 ≤30s pass criterion).
+    let got_streaming = ch.wait_for_status_containing("streaming", Duration::from_millis(5000));
+    assert!(
+        got_streaming,
+        "AC-6 FAIL: expected streaming after auto-rebuild on attempt 1 (no manual Retry), \
+         got: {:?}",
+        ch.status_messages()
+    );
+
+    // Confirm no "dead" was emitted (stream recovered before Dead).
+    let status_messages = ch.status_messages();
+    let has_dead = status_messages.iter().any(|m| m.contains("dead"));
+    assert!(
+        !has_dead,
+        "AC-6 FAIL: Dead event must NOT appear when rebuild succeeds on attempt 1, \
+         got: {status_messages:?}"
+    );
+
+    stop_stream_session(&bridge);
+}

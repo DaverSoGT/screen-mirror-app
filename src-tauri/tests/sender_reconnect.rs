@@ -1689,3 +1689,64 @@ fn stop_after_successful_rebuild_completes_cleanly() {
         "bridge.current_args must be None after stop"
     );
 }
+
+// ─── Batch 7 (T7.1) — AC-5 end-to-end: auto-rebuild on attempt 1 (T12.2 Escenario 1) ──
+
+/// T7.1 (AC-5): End-to-end auto-rebuild on attempt 1 without manual PeerAck.
+///
+/// Models T12.2 Escenario 1 (peer crash): the peer is gone, so no `PeerAck` arrives.
+/// The supervisor's `ack_timeout` expires → supervisor emits `InitiateMdnsReset` (no-op)
+/// then `InitiateRebuild { attempt: 1 }` → rebuild worker constructs a fresh
+/// `SenderBundle` → signals `RebuildSucceeded` → coordinator emits `"streaming"`.
+///
+/// PASS criterion: `"streaming"` status is emitted within 5s WITHOUT the test
+/// sending any `SupervisorSignal` manually (stream resumes without user clicking Retry).
+///
+/// RED against V1: V1 stub always signals `RebuildFailed`; drain eventually reaches
+/// Dead after 3 attempts and emits `"dead"` — no `"streaming"` ever appears.
+#[test]
+fn t12_2_sender_rebuild_succeeds_on_attempt1() {
+    // Use a short ack_timeout so the supervisor advances to InitiateRebuild quickly.
+    let ack_timeout = Duration::from_millis(50);
+    let (bridge, ev_tx, ch) =
+        make_supervised_bridge_with_rebuild_hook(fast_policy(), ack_timeout);
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
+
+    // Trigger: ICE failure (models peer crash / connection loss).
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+
+    // Expect reconnecting overlay — supervisor enters AwaitingAck.
+    let got_reconnecting =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting event after IceFailed, got: {:?}",
+        ch.messages()
+    );
+
+    // Do NOT send PeerAck.  The ack_timeout (50ms) expires → supervisor emits
+    // InitiateMdnsReset (no-op hook) then InitiateRebuild → worker rebuilds →
+    // signals RebuildSucceeded → coordinator emits StateChanged(Connected) → "streaming".
+    //
+    // Wait up to 5s for streaming (well within T12.2 ≤30s pass criterion).
+    let got_streaming =
+        ch.wait_for_message_containing("\"kind\":\"streaming\"", Duration::from_millis(5000));
+    assert!(
+        got_streaming,
+        "AC-5 FAIL: expected streaming after auto-rebuild on attempt 1 (no manual Retry), \
+         got: {:?}",
+        ch.messages()
+    );
+
+    // Confirm no "dead" was emitted (stream recovered before Dead).
+    let messages = ch.messages();
+    let has_dead = messages.iter().any(|m| m.contains("\"kind\":\"dead\""));
+    assert!(
+        !has_dead,
+        "AC-5 FAIL: Dead event must NOT appear when rebuild succeeds on attempt 1, \
+         got: {messages:?}"
+    );
+
+    stop_sender_session(&bridge);
+}
