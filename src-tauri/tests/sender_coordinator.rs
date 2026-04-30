@@ -102,9 +102,20 @@ fn wait_for_sup_tx(bridge: &SenderBridge, timeout: Duration) -> SyncSender<Super
 
 /// Build a `SenderBridge` with custom coordinator hooks (counters) and a fast policy.
 ///
+/// `ack_timeout` is parametrized because tests have conflicting needs:
+///   - Tests that drive the supervisor through PeerAck/PeerRequest before the
+///     timeout fires want a generous timeout (2s) so that multi-step setup
+///     (reading nonce + waiting for sup_tx + dispatching the signal) finishes
+///     while the supervisor is still in AwaitingAck.
+///   - Tests that exercise the ack-timeout branch itself (InitiateMdnsReset)
+///     need a short timeout (200ms) so the timeout actually fires within the
+///     test deadline.
+///
 /// Returns `(bridge, ev_tx, ch, rebuild_count, publish_req_count, publish_ack_count, reset_count)`.
 #[allow(clippy::type_complexity)]
-fn make_bridge_with_counting_hooks() -> (
+fn make_bridge_with_counting_hooks(
+    ack_timeout: Duration,
+) -> (
     SenderBridge,
     std::sync::mpsc::SyncSender<TransportEvent>,
     Arc<FakeJsonChannel>,
@@ -135,7 +146,6 @@ fn make_bridge_with_counting_hooks() -> (
     let sup_tx_for_drain = sup_tx.clone();
 
     let policy = fast_policy();
-    let ack_timeout = Duration::from_millis(200);
 
     let bridge = SenderBridge::new_with_builder_and_sup_tx(
         Arc::new(move |_, _, stop_flag, channel| {
@@ -206,7 +216,8 @@ fn make_bridge_with_counting_hooks() -> (
 /// should receive InitiateRebuild from supervisor → hooks.initiate_rebuild called.
 #[test]
 fn coordinator_invokes_builder_on_initiate_rebuild() {
-    let (bridge, ev_tx, ch, rebuild_count, _pr, _pa, _re) = make_bridge_with_counting_hooks();
+    let (bridge, ev_tx, ch, rebuild_count, _pr, _pa, _re) =
+        make_bridge_with_counting_hooks(Duration::from_millis(200));
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -259,7 +270,8 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
 /// The hook should be invoked before any PeerAck arrives.
 #[test]
 fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
-    let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) = make_bridge_with_counting_hooks();
+    let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) =
+        make_bridge_with_counting_hooks(Duration::from_millis(200));
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -288,7 +300,8 @@ fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
 /// InitiateMdnsReset (TCP fallback path, ack_timeout = 200ms).
 #[test]
 fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
-    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) = make_bridge_with_counting_hooks();
+    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) =
+        make_bridge_with_counting_hooks(Duration::from_millis(200));
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -323,41 +336,55 @@ fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
 /// emits PublishReconnectAck for the losing side.
 #[test]
 fn coordinator_calls_publish_reconnect_ack_hook_on_outcome() {
-    let (bridge, ev_tx, ch, _rb, _pr, publish_ack_count, _re) = make_bridge_with_counting_hooks();
+    // ack_timeout = 2s — production value. Setup races below the timeout in <50ms.
+    let (bridge, ev_tx, ch, _rb, publish_req_count, publish_ack_count, _re) =
+        make_bridge_with_counting_hooks(Duration::from_millis(2000));
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
 
-    // Trigger reconnect first so supervisor enters AwaitingAck state.
+    // Trigger reconnect so supervisor enters AwaitingAck state.
     ev_tx.send(TransportEvent::IceFailed).unwrap();
-    let got =
-        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
-    assert!(got, "expected reconnecting event");
 
-    let nonce = bridge
-        .restart_cache
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|c| c.session_nonce)
-        .unwrap_or(1);
+    // Wait for publish_reconnect_request hook to fire — confirms the supervisor
+    // observed IceFailed and is now in AwaitingAck. Polling the hook counter is
+    // more robust than waiting on the JSON channel under heavy nextest concurrency.
+    let req_deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    while publish_req_count.load(Ordering::Relaxed) == 0
+        && std::time::Instant::now() < req_deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        publish_req_count.load(Ordering::Relaxed) >= 1,
+        "publish_reconnect_request must fire before peer race injection (supervisor not in AwaitingAck)"
+    );
 
-    let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(500));
+    // sup_tx is populated by the drain thread once the supervisor exists.
+    let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(1000));
 
-    // Simulate a peer request with a LOWER nonce — we become the loser and should
-    // emit a PublishReconnectAck.
-    let peer_nonce = nonce.saturating_sub(1); // always lower
+    // Use peer_nonce = 0 to deterministically lose the race: the supervisor's
+    // own nonce is generated via rand::random::<u64>() inside the drain thread
+    // (sender.rs line 655) and is NOT the same as restart_cache.session_nonce
+    // (sender.rs line 933 — start_sender_inner generates an independent nonce
+    // for the cache). Since rand::random::<u64>() returns 0 with probability
+    // 2^-64, peer_nonce=0 is virtually always strictly less than the
+    // supervisor's nonce, so the supervisor will deterministically take the
+    // "peer wins" branch and emit PublishReconnectAck. Use blocking send so
+    // the signal is not silently dropped if the supervisor's signal channel
+    // buffer is momentarily full.
+    let peer_nonce: u64 = 0;
     sup_tx
-        .try_send(SupervisorSignal::PeerRequest {
+        .send(SupervisorSignal::PeerRequest {
             peer_nonce,
             attempt: 1,
         })
-        .ok();
+        .expect("supervisor signal channel must accept PeerRequest");
 
     // Wait for ack hook to fire.
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + Duration::from_millis(2000);
     while publish_ack_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(2));
     }
 
     assert!(
