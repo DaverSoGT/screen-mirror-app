@@ -1150,8 +1150,8 @@ pub fn stop_sender_session(bridge: &SenderBridge) {
 ///
 /// # Cancel gates
 ///
-/// Gate A (before teardown) is implemented here. Gates B/C/D are deferred to Batch 5.
-/// Gate A is load-bearing for the zombie-drain correctness invariant.
+/// All four cancel gates (A/B/C/D) are implemented. Gate A is load-bearing for the
+/// zombie-drain correctness invariant; B/C/D handle progressively later stop points.
 ///
 /// # INVARIANT — do NOT join `bridge_session.drain_handles`
 ///
@@ -1230,6 +1230,13 @@ pub fn make_sender_rebuild_hook(
                     // We drop s here, which detaches any remaining JoinHandle.
                 }
 
+                // Gate B: abort after teardown, before builder invocation.
+                // Stop arrived during the ~150ms shutdown closure execution window.
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
                 // Step 9: invoke cached builder with a fresh stop_flag.
                 let fresh_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let new_bundle = match (builder)(
@@ -1245,6 +1252,20 @@ pub fn make_sender_rebuild_hook(
                     }
                 };
 
+                // Gate C: abort after build, before swap — stop arrived during the
+                // ~300ms builder execution window. The freshly-built bundle must be
+                // torn down so no orphan threads are left running.
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    // Set the fresh bundle's stop_flag so its drain threads exit.
+                    fresh_stop_flag.store(true, Ordering::Relaxed);
+                    // Dropping the bundle here detaches any JoinHandles; the drain
+                    // threads exit via stop_flag on their next poll iteration.
+                    // The shutdown closure runs any production-resource teardown.
+                    drop(new_bundle);
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
                 // Step 11: acquire bridge.session and swap to the new session.
                 {
                     let mut g = bridge_session.lock().unwrap();
@@ -1255,6 +1276,32 @@ pub fn make_sender_rebuild_hook(
                         counters: Arc::new(SenderCounters::default()),
                         shutdown: new_bundle.shutdown,
                     });
+                }
+
+                // Gate D: abort after swap — stop arrived between Gate C and swap
+                // completion. Tear down the newly-installed session using the available
+                // bridge_session arc (equivalent to stop_sender_session_internal but
+                // without the bridge reference; the worker IS its own thread — safe).
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    // Take and tear down the new session we just swapped in.
+                    let new_session_opt = bridge_session.lock().unwrap().take();
+                    if let Some(mut new_session) = new_session_opt {
+                        // Signal new drain threads to exit.
+                        new_session.stop_flag.store(true, Ordering::Relaxed);
+                        // Run the production shutdown closure (no-op for test stubs).
+                        if let Some(sd) = new_session.shutdown.take() {
+                            sd();
+                        }
+                        // Join the NEW drain threads — these are NOT our own thread;
+                        // the new bundle's drain threads are distinct from the drain
+                        // that spawned us. Joining is safe here.
+                        for h in new_session.drain_handles.drain(..) {
+                            let _ = h.join();
+                        }
+                        // channel and counters are dropped here.
+                    }
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
                 }
 
                 // Step 13: signal success — supervisor wakes from recv_timeout,

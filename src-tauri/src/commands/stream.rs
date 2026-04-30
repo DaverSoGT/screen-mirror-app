@@ -1782,6 +1782,34 @@ pub fn make_stream_rebuild_hook(
                     *g = Some(new_session);
                 }
 
+                // Gate D: abort after swap — stop arrived between Gate C and swap
+                // completion. Tear down the newly-installed session using the available
+                // bridge_session arc (equivalent to stop_stream_session_internal but
+                // without the bridge reference; the worker is on its own thread — safe).
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    let new_session_opt = bridge_session.lock().unwrap().take();
+                    if let Some(mut new_session) = new_session_opt {
+                        // Signal new drain/mux threads to exit.
+                        new_session.stop_flag.store(true, Ordering::Relaxed);
+                        // Join the mux thread (it exits promptly when stop_flag=true).
+                        if let Some(mux) = new_session.mux_handle.take() {
+                            let _ = mux.join();
+                        }
+                        // Join the new drain threads — these are the NEW bundle's drains,
+                        // NOT the drain thread that spawned us. Safe to join.
+                        for h in new_session.drain_handles.drain(..) {
+                            let _ = h.join();
+                        }
+                        // Stop signaling adapter if present.
+                        if let Some(mut sig) = new_session.signaling.take() {
+                            let _ = sig.stop();
+                        }
+                        // receiver and channel are dropped here.
+                    }
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
                 // Step 13: signal success — supervisor wakes from recv_timeout,
                 // transitions Rebuilding → Connected, and emits StateChanged(Connected).
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
