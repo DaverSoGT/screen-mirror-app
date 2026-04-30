@@ -167,8 +167,18 @@ impl StreamCoordinatorHooks {
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StreamStatusEvent {
-    Reconnecting { attempt: u8, max: u8 },
-    Dead { reason: String },
+    Reconnecting {
+        attempt: u8,
+        max: u8,
+    },
+    Dead {
+        reason: String,
+    },
+    /// Emitted when a rebuild succeeds: supervisor transitions to Connected and
+    /// signals the frontend that the stream has resumed (parallel to sender's
+    /// `SenderStatusEvent::Streaming`). The fMP4 init segment arrives shortly
+    /// after from the new mux thread.
+    Streaming,
 }
 
 /// Encode a `StreamStatusEvent` to JSON bytes and send as a 0x02 frame.
@@ -227,7 +237,7 @@ pub struct StreamRestartCache {
 ///   `.manage()` happy and prevents infra types from leaking into `lib.rs`.
 /// - PQ-B: args flow EXPLICITLY; no capture.
 /// - OQ-D1: plain `Arc<dyn Fn>` — no `Mutex` wrapper.
-pub(crate) type BuilderFn = Arc<
+pub type BuilderFn = Arc<
     dyn Fn(
             BindCtx,
             u16,
@@ -556,7 +566,12 @@ pub struct StreamBridge {
     /// Active session state; `None` when no session is running.
     /// Exposed as `pub` so integration tests can assert post-teardown state
     /// (mirrors `SenderBridge::session` which is also `pub`).
-    pub session: Mutex<Option<StreamSession>>,
+    ///
+    /// Promoted to `Arc<Mutex<>>` (from plain `Mutex<>`) so the rebuild worker
+    /// thread can capture it without a circular Arc dependency. All `.lock()`
+    /// call sites are syntactically unchanged — `Arc<Mutex<T>>` derefs to
+    /// `Mutex<T>`. Matches SenderBridge.session promotion in Batch 2.
+    pub session: Arc<Mutex<Option<StreamSession>>>,
 
     /// Factory closure used by `start_stream` to build the `ReceiverBundle`.
     /// Plain `Arc<dyn Fn>` — no `Mutex`. Set once in `new_with_builder`; read-only
@@ -584,7 +599,11 @@ pub struct StreamBridge {
 
     /// Cached construction params + session nonce; populated by `start_stream_inner`;
     /// cleared by `stop_stream_session`; read by `retry_session` (Phase 11).
-    pub restart_cache: Mutex<Option<StreamRestartCache>>,
+    ///
+    /// Promoted to `Arc<Mutex<>>` so the rebuild worker can read it without
+    /// holding a reference to the bridge. Matches SenderBridge.restart_cache
+    /// promotion in Batch 2.
+    pub restart_cache: Arc<Mutex<Option<StreamRestartCache>>>,
 
     /// Signal channel to the reconnect supervisor, if one is active.
     ///
@@ -601,11 +620,22 @@ impl StreamBridge {
     /// Phase 7: adds `channel` to the BuilderFn so the drain thread can emit
     /// 0x02 status frames over the same binary ChannelLike as fMP4.
     pub fn new() -> Self {
+        // Pre-allocate session and restart_cache arcs so the production builder
+        // closure can capture and forward them to make_stream_rebuild_hook.
+        // Without this, each new bundle's hook would hold dummy arcs → ZOMBIE
+        // sessions after the first auto-rebuild (Batch 2 lesson, Batch 3 symmetric).
+        let session_arc: Arc<Mutex<Option<StreamSession>>> = Arc::new(Mutex::new(None));
+        let cache_arc: Arc<Mutex<Option<StreamRestartCache>>> = Arc::new(Mutex::new(None));
+
         // supervisor_signal_tx is created here and shared into the builder closure
         // so the production drain can register the supervisor sender.
         let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+
         let sup_tx_for_builder = sup_tx.clone();
-        Self::new_with_builder_and_sup_tx(
+        let session_for_builder = session_arc.clone();
+        let cache_for_builder = cache_arc.clone();
+
+        Self::new_with_builder_and_arcs(
             Arc::new(move |bind_ctx, port, name, stop_flag, channel| {
                 build_production_bundle(
                     bind_ctx,
@@ -614,8 +644,12 @@ impl StreamBridge {
                     stop_flag,
                     channel,
                     sup_tx_for_builder.clone(),
+                    session_for_builder.clone(),
+                    cache_for_builder.clone(),
                 )
             }),
+            session_arc,
+            cache_arc,
             sup_tx,
         )
     }
@@ -628,10 +662,10 @@ impl StreamBridge {
     #[allow(dead_code)]
     pub(crate) fn new_with_builder(builder: BuilderFn) -> Self {
         Self {
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
             builder,
             current_args: Mutex::new(None),
-            restart_cache: Mutex::new(None),
+            restart_cache: Arc::new(Mutex::new(None)),
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -646,10 +680,32 @@ impl StreamBridge {
         supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     ) -> Self {
         Self {
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
             builder,
             current_args: Mutex::new(None),
-            restart_cache: Mutex::new(None),
+            restart_cache: Arc::new(Mutex::new(None)),
+            supervisor_signal_tx,
+        }
+    }
+
+    /// Create a bridge with pre-provisioned session, restart_cache, and supervisor_signal_tx Arcs.
+    ///
+    /// Used in tests where the builder closure must capture the SAME session and
+    /// restart_cache arcs that the bridge owns, so `make_stream_rebuild_hook` can
+    /// swap sessions using the bridge's actual state.
+    ///
+    /// Mirrors `SenderBridge::new_with_builder_and_arcs` (Batch 2).
+    pub fn new_with_builder_and_arcs(
+        builder: BuilderFn,
+        session: Arc<Mutex<Option<StreamSession>>>,
+        restart_cache: Arc<Mutex<Option<StreamRestartCache>>>,
+        supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    ) -> Self {
+        Self {
+            session,
+            builder,
+            current_args: Mutex::new(None),
+            restart_cache,
             supervisor_signal_tx,
         }
     }
@@ -686,7 +742,9 @@ impl Default for StreamBridge {
 /// (mirrors `SenderSession` which is also `pub`).
 pub struct StreamSession {
     /// Stop flag shared with the mux thread. Set by `stop_stream`.
-    stop_flag: Arc<AtomicBool>,
+    /// Made `pub` so integration tests can assert Arc identity after rebuild
+    /// (mirrors `SenderSession::stop_flag` which is also `pub`).
+    pub stop_flag: Arc<AtomicBool>,
     /// Join handle for the `sm-stream-mux` thread.
     mux_handle: Option<JoinHandle<()>>,
     /// Shared counters observable via `stream_diagnostics`.
@@ -1032,12 +1090,17 @@ fn enter_stream_supervisor_mode(
         .expect("supervisor thread spawn must not fail");
 
     // Coordinator loop: interleave reading outcomes and transport events.
+    //
+    // CRITICAL ordering: drain outcomes BEFORE checking stop_flag.
+    //
+    // WHY outcomes first: the rebuild worker sets old_stop_flag = true (step 14)
+    // AFTER sending RebuildSucceeded. The supervisor emits StateChanged(Connected)
+    // into outcome_rx. If we checked stop_flag BEFORE draining outcomes, the
+    // coordinator would exit before processing StateChanged(Connected) and the
+    // "streaming" 0x02 status frame would never reach the frontend.
+    // Mirrors the sender's enter_supervisor_mode fix (Batch 2).
     'coord: loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            break 'coord;
-        }
-
-        // Drain all available outcomes (non-blocking).
+        // Drain all available outcomes BEFORE checking stop_flag.
         loop {
             match outcome_rx.try_recv() {
                 Ok(outcome) => {
@@ -1048,6 +1111,13 @@ fn enter_stream_supervisor_mode(
                     break 'coord;
                 }
             }
+        }
+
+        // Check stop_flag AFTER processing pending outcomes.
+        // This ensures StateChanged(Connected) from a successful rebuild is
+        // always emitted before the coordinator exits.
+        if stop_flag.load(Ordering::Relaxed) {
+            break 'coord;
         }
 
         // Read transport events with short timeout to stay responsive.
@@ -1100,9 +1170,11 @@ fn handle_stream_supervisor_outcome(
             );
         }
         SupervisorOutcome::StateChanged(SessionState::Connected) => {
-            // Reconnect succeeded — JS will receive a streaming event when
-            // the first fMP4 init segment arrives (Phase 10).
-            eprintln!("[sm-stream-sup-coord] reconnect succeeded — awaiting init segment");
+            // Reconnect succeeded — emit streaming status so the frontend can
+            // remove the Reconnecting overlay immediately. The fMP4 init segment
+            // arrives shortly after (mux thread is already running on the new bundle).
+            eprintln!("[sm-stream-sup-coord] reconnect succeeded — emitting streaming status");
+            emit_stream_status(channel, &StreamStatusEvent::Streaming);
         }
         SupervisorOutcome::Dead(reason) => {
             // Already emitted via StateChanged(Dead) above.
@@ -1282,6 +1354,7 @@ pub(crate) fn build_signaling_config_for_receiver(
 ///
 /// Spec R2.5: BuilderFn receives the resolved (port, service_name, stop_flag) tuple.
 /// Design §1 Glossary; Delta-spec table (prior: hardcoded 7889, new: parameterized).
+#[allow(clippy::too_many_arguments)]
 fn build_production_bundle(
     bind_ctx: BindCtx,
     udp_port: u16,
@@ -1289,6 +1362,8 @@ fn build_production_bundle(
     stop_flag: Arc<AtomicBool>,
     channel: Arc<dyn ChannelLike>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    _bridge_session: Arc<Mutex<Option<StreamSession>>>,
+    _bridge_cache: Arc<Mutex<Option<StreamRestartCache>>>,
 ) -> Result<ReceiverBundle, BundleError> {
     // Extract the prebound socket from BindCtx (R5.1, D3).
     // The socket was acquired by `bind_probe` in `start_stream_inner` BEFORE any
@@ -1356,6 +1431,14 @@ fn build_production_bundle(
     let sig_for_ack = signaling_for_hooks.clone();
     let sig_for_reset = signaling_for_hooks.clone();
 
+    // V2: wire the real rebuild hook (make_stream_rebuild_hook) to replace the V1 stub.
+    //
+    // FIX (mirrors Batch 2 fix for sender): the inner builder closure MUST capture and
+    // forward the REAL `_bridge_session` / `_bridge_cache` arcs to every recursive call
+    // of `build_production_bundle`. Passing `Arc::new(Mutex::new(None))` here would
+    // replicate the ZOMBIE session bug found in Batch 2: the newly-built bundle's own
+    // hook would hold dummy arcs that nobody observes, so a second-generation failure
+    // swaps into the void rather than into `bridge.session`.
     let coordinator_hooks = StreamCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
             let sig = sig_for_req.lock().unwrap();
@@ -1373,16 +1456,42 @@ fn build_production_bundle(
                 eprintln!("[sm-stream-coord] publish_reconnect_ack failed: {e}");
             }
         }),
-        initiate_rebuild: Arc::new(move |signal_tx| {
-            // V1 limitation: full bundle rebuild from drain thread would deadlock
-            // on StreamBridge session lock. Signal RebuildFailed so supervisor
-            // exhausts attempts → Dead → user-initiated retry via retry_session.
-            // TODO V2: implement full bundle rebuild via a dedicated rebuild channel.
-            eprintln!(
-                "[sm-stream-coord] InitiateRebuild — signaling RebuildFailed (V1: rebuild via retry_session)"
-            );
-            let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-        }),
+        // V2: spawn a worker thread that rebuilds the bundle without blocking the drain.
+        // The worker uses `_bridge_session` and `_bridge_cache` arcs (passed in alongside
+        // the regular builder args) so it can swap the session under a brief lock.
+        // `stop_flag` is the OLD session's stop_flag — used as the cancel signal.
+        //
+        // FIX (Batch 3): the inner builder closure MUST capture and forward the REAL
+        // `_bridge_session` / `_bridge_cache` arcs to every recursive call of
+        // `build_production_bundle`. Passing dummy Arcs here would be the stream-side
+        // equivalent of the Batch 2 ZOMBIE bug (AC-5/AC-6 violated after 1st auto-rebuild).
+        initiate_rebuild: make_stream_rebuild_hook(
+            // Pass the REAL bridge arcs through so every generation's hook can swap
+            // into the same `bridge.session` field the supervisor observes.
+            {
+                let session_for_inner = _bridge_session.clone();
+                let cache_for_inner = _bridge_cache.clone();
+                let sup_tx_for_inner = supervisor_signal_tx.clone();
+                Arc::new(
+                    move |bind_ctx, udp_port, service_name, stop_flag, channel| {
+                        build_production_bundle(
+                            bind_ctx,
+                            udp_port,
+                            service_name,
+                            stop_flag,
+                            channel,
+                            sup_tx_for_inner.clone(),
+                            session_for_inner.clone(), // REAL arc
+                            cache_for_inner.clone(),   // REAL arc
+                        )
+                    },
+                )
+            },
+            _bridge_cache.clone(),
+            _bridge_session.clone(),
+            stop_flag.clone(),
+            1, // attempt — supervisor attempt counter; 1 as default for production hook
+        ),
         initiate_mdns_reset: Arc::new(move || {
             // MdnsSignaling::reset() consumes self. Since we hold Arc<Mutex<>>,
             // call stop() in-place then start() again to re-engage discovery.
@@ -1446,6 +1555,209 @@ fn build_production_bundle(
         drain_handles: vec![transport_drain, sig_drain],
         _drain_senders: vec![],
     })
+}
+
+// ─── Stream rebuild worker hook factory ──────────────────────────────────────
+
+/// Build the V2 `initiate_rebuild` hook for the stream (receiver) coordinator.
+///
+/// Returns an `Arc<dyn Fn(SyncSender<SupervisorSignal>) + Send + Sync>` that:
+/// - Returns within ≤10ms (spawns a worker thread for the actual rebuild).
+/// - Has the worker perform OLD session teardown, `bind_probe`, builder invocation,
+///   and atomic session swap, then signals `RebuildSucceeded` or `RebuildFailed`.
+///
+/// # Parameters
+/// - `builder`: The bridge's `BuilderFn` — called by the worker to build the new bundle.
+/// - `bridge_cache`: Arc to the bridge's `restart_cache` field — read for construction params.
+/// - `bridge_session`: Arc to the bridge's `session` field — swapped by the worker under lock.
+/// - `old_stop_flag`: The OLD session's `stop_flag` — used as the cancel signal (Gates A–D).
+/// - `attempt`: Reconnect attempt number — embedded in the worker thread name for diagnostics.
+///
+/// # Asymmetry vs sender
+///
+/// The stream worker calls `bind_probe(udp_port)` between teardown and builder invocation
+/// (design §9: receiver-only). The `BindCtx` is passed as the first arg to `BuilderFn`.
+///
+/// # INVARIANT
+///
+/// The worker MUST NOT join `session.drain_handles`. Those handles include the drain thread
+/// that spawned the worker — joining would deadlock. The OLD drain exits naturally when it
+/// polls `stop_flag = true` (step 14: set after `RebuildSucceeded`).
+pub fn make_stream_rebuild_hook(
+    builder: BuilderFn,
+    bridge_cache: Arc<Mutex<Option<StreamRestartCache>>>,
+    bridge_session: Arc<Mutex<Option<StreamSession>>>,
+    old_stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    attempt: u32,
+) -> Arc<dyn Fn(std::sync::mpsc::SyncSender<SupervisorSignal>) + Send + Sync> {
+    Arc::new(
+        move |signal_tx: std::sync::mpsc::SyncSender<SupervisorSignal>| {
+            let builder = builder.clone();
+            let bridge_cache = bridge_cache.clone();
+            let bridge_session = bridge_session.clone();
+            let old_stop_flag = old_stop_flag.clone();
+            let signal_tx_for_err = signal_tx.clone();
+
+            let spawn_result = std::thread::Builder::new()
+            .name(format!("sm-rebuild-worker-stream-{attempt}"))
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+
+                // Gate A: abort if stop already arrived before we started any work.
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
+                // Step 4: read RestartCache snapshot.
+                let cache = {
+                    let g = bridge_cache.lock().unwrap();
+                    match g.clone() {
+                        None => {
+                            // RestartCache cleared by a concurrent stop — abort.
+                            let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                            return;
+                        }
+                        Some(c) => c,
+                    }
+                };
+
+                // Step 6: tear down the OLD session's production resources.
+                //
+                // INVARIANT: do NOT set `s.stop_flag` here. That Arc is the SAME Arc
+                // as `old_stop_flag` (both cloned from the stop_flag passed to the
+                // outer builder). Setting it true would cause Gate B to fire immediately
+                // after teardown — aborting a rebuild that should succeed.
+                // The stop_flag is set in step 14 (zombie-drain exit) AFTER signaling
+                // RebuildSucceeded, so the coordinator has processed StateChanged(Connected).
+                //
+                // INVARIANT: do NOT join `session.drain_handles`. Those handles include
+                // the drain thread that spawned us — joining would deadlock.
+                // The OLD drain exits naturally when it polls `stop_flag = true` (step 14).
+                //
+                // The mux thread IS safe to join: it exits when `pkt_rx` becomes
+                // Disconnected (the sender side is held by the receiver; dropping the
+                // receiver here causes the channel to disconnect → mux exits promptly).
+                let old_session = { bridge_session.lock().unwrap().take() };
+                if let Some(mut s) = old_session {
+                    // Drop the receiver first — this disconnects the `pkt_tx` side,
+                    // which causes the mux thread's `pkt_rx.recv_timeout()` to return
+                    // `Disconnected` → mux thread exits on the next iteration.
+                    // The receiver's Drop impl stops the tick thread, releasing the
+                    // UDP socket FD (so bind_probe at step 7 can succeed).
+                    drop(s.receiver.take());
+
+                    // Join the mux thread AFTER dropping the receiver (so pkt_tx is
+                    // gone and the mux exits quickly via Disconnected, not via timeout).
+                    if let Some(mux) = s.mux_handle.take() {
+                        let _ = mux.join();
+                    }
+
+                    // Stop the signaling adapter (releases mDNS resources).
+                    if let Some(mut sig) = s.signaling.take() {
+                        let _ = sig.stop();
+                    }
+                    // channel dropped here (Arc clone; no blocking side effect).
+                    // drain_handles intentionally NOT joined — see INVARIANT above.
+                }
+
+                // Step 7 (receiver-only): bind_probe — acquire the UDP socket AFTER
+                // the OLD receiver has been torn down (mux_handle joined above,
+                // which releases the socket FD).
+                // bind_probe is the canary: if the OS hasn't reclaimed the port yet,
+                // signal RebuildFailed so the supervisor retries with backoff.
+                let socket = match bind_probe(cache.udp_port) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                        return;
+                    }
+                };
+                let bind_ctx = BindCtx { socket };
+
+                // Gate B: abort after teardown, before builder invocation.
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
+                // Step 9: invoke cached builder with a fresh stop_flag.
+                let fresh_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let new_bundle = match (builder)(
+                    bind_ctx,
+                    cache.udp_port,
+                    cache.service_name.clone(),
+                    fresh_stop_flag.clone(),
+                    cache.channel.clone(),
+                ) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                        return;
+                    }
+                };
+
+                // Gate C: abort after build, before swap — tear down the freshly-built
+                // bundle if stop arrived during builder execution.
+                if old_stop_flag.load(Ordering::Relaxed) {
+                    // Signal the fresh bundle's stop_flag so its drain threads exit.
+                    fresh_stop_flag.store(true, Ordering::Relaxed);
+                    // Drop the bundle — this disconnects the pkt_tx/receiver,
+                    // mux and drain threads exit via natural Disconnected paths.
+                    drop(new_bundle);
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    return;
+                }
+
+                // Step 11: acquire bridge.session and swap to the new session.
+                // build_stream_session spawns the mux thread as part of session construction.
+                let new_session =
+                    match build_stream_session(cache.channel.clone(), new_bundle, fresh_stop_flag)
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[sm-rebuild-worker-stream-{attempt}] build_stream_session failed: {e}");
+                            let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                            return;
+                        }
+                    };
+
+                {
+                    let mut g = bridge_session.lock().unwrap();
+                    *g = Some(new_session);
+                }
+
+                // Step 13: signal success — supervisor wakes from recv_timeout,
+                // transitions Rebuilding → Connected, and emits StateChanged(Connected).
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
+
+                // Step 14 (zombie-drain exit): stop the OLD supervisor so the coordinator
+                // loop exits via the natural `outcome_rx` Disconnected path.
+                //
+                // We send Stop AFTER RebuildSucceeded. The supervisor processes them in
+                // FIFO order: first RebuildSucceeded (→ Connected, emit StateChanged),
+                // then Stop (→ Stopped, return None → outcome_rx disconnects).
+                // The coordinator drains both outcomes before exiting. This avoids the
+                // race where setting `old_stop_flag = true` causes the coordinator to
+                // exit BEFORE processing StateChanged(Connected).
+                //
+                // The NEW bundle's NEW drain thread (spawned inside the builder at step 9)
+                // is now the live coordinator, listening on the NEW `tr_ev_rx`.
+                let _ = signal_tx.try_send(SupervisorSignal::Stop);
+
+                // Also set old_stop_flag so the OLD drain's transport-event loop
+                // (which runs before entering supervisor mode) exits if the worker
+                // fires during a non-supervisor iteration. Belt-and-suspenders.
+                old_stop_flag.store(true, Ordering::Relaxed);
+            });
+
+            if spawn_result.is_err() {
+                // Thread spawn failed — signal failure immediately so supervisor doesn't block.
+                let _ = signal_tx_for_err.try_send(SupervisorSignal::RebuildFailed);
+            }
+            // Worker thread is detached (JoinHandle dropped). It exits after signaling.
+        },
+    )
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
@@ -3430,9 +3742,13 @@ mod tests {
     /// channel and supervisor_signal_tx. The compile-gate verifies the new 6-arg signature.
     #[test]
     fn test_new_wrapper_closure_passes_port_and_name_to_build_production_bundle() {
-        // Compile gate: verify build_production_bundle is callable with 6 args.
-        // The type alias avoids the `type_complexity` clippy lint.
+        // Compile gate: verify build_production_bundle is callable with 8 args.
+        // Updated for Batch 3: `build_production_bundle` now accepts 8 args — the two
+        // additional Arc parameters (`_bridge_session` and `_bridge_cache`) enable the
+        // V2 rebuild hook to capture and forward REAL arcs (Batch 2 lesson, Batch 3 mirror).
         type SupTx = Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>;
+        type SessionArc = Arc<Mutex<Option<StreamSession>>>;
+        type CacheArc = Arc<Mutex<Option<StreamRestartCache>>>;
         #[allow(clippy::type_complexity)]
         fn _assert_arity(
             _f: fn(
@@ -3442,6 +3758,8 @@ mod tests {
                 Arc<AtomicBool>,
                 Arc<dyn ChannelLike>,
                 SupTx,
+                SessionArc,
+                CacheArc,
             ) -> Result<ReceiverBundle, BundleError>,
         ) {
         }
