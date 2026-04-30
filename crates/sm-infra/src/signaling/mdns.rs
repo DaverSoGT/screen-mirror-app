@@ -45,8 +45,15 @@ use sm_domain::signaling::{
     IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError, SignalingEvent,
     SignalingRole,
 };
+use sm_domain::supervisor::SupervisorSignal;
 
 use crate::signaling::wire::{MAX_FRAME_BYTES, SignalingFrame, write_frame};
+
+/// Write timeout for `publish_reconnect_request` / `publish_reconnect_ack`.
+///
+/// Per design §3 (TCP reuse heuristic): if the write does not complete within 2s,
+/// the caller should fall back to the mDNS reset path.
+const RECONNECT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -73,6 +80,19 @@ enum MdnsControl {
     Answer(SdpAnswer),
     /// ICE candidate to be forwarded to the connected peer.
     Candidate(IceCandidate),
+    /// Reconnect request to be forwarded to the connected peer.
+    ///
+    /// Published when local `IceFailed` or `ConnectionLost` is detected.
+    ReconnectRequest {
+        attempt: u8,
+        requester_role: SignalingRole,
+        session_nonce: u64,
+    },
+    /// Reconnect acknowledgment to be forwarded to the connected peer.
+    ///
+    /// Published by the losing side in a simultaneous-detect race, or the
+    /// responding side in a one-sided detect.
+    ReconnectAck { attempt: u8, session_nonce: u64 },
 }
 
 // ─── MdnsSignaling ────────────────────────────────────────────────────────────
@@ -101,6 +121,12 @@ pub struct MdnsSignaling {
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     /// Thread handle (None before `start()` and after `stop()`).
     handle: Option<JoinHandle<()>>,
+    /// Supervisor signal channel — used by the frame loop to route incoming
+    /// `ReconnectRequest` and `ReconnectAck` frames to the reconnect supervisor.
+    ///
+    /// `None` until `set_supervisor_signal_tx` is called. When `None`, reconnect
+    /// frames are silently consumed (backward-compatible — frame_to_event returns None).
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -111,6 +137,7 @@ impl Signaling for MdnsSignaling {
             stop: Arc::new(AtomicBool::new(false)),
             inbox: Arc::new(Mutex::new(Vec::new())),
             handle: None,
+            supervisor_signal_tx: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -126,11 +153,12 @@ impl Signaling for MdnsSignaling {
         let config = self.config.clone();
         let stop = Arc::clone(&self.stop);
         let inbox = Arc::clone(&self.inbox);
+        let supervisor_signal_tx = Arc::clone(&self.supervisor_signal_tx);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
             .spawn(move || {
-                run_signaling_thread(config, stop, inbox, event_tx);
+                run_signaling_thread(config, stop, inbox, event_tx, supervisor_signal_tx);
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
 
@@ -184,6 +212,87 @@ impl Signaling for MdnsSignaling {
     }
 }
 
+impl MdnsSignaling {
+    /// Register a supervisor signal channel so incoming `ReconnectRequest` and
+    /// `ReconnectAck` frames are forwarded to the reconnect supervisor instead of
+    /// being silently consumed.
+    ///
+    /// Call this BEFORE `start()` to ensure no frames are missed. Calling after
+    /// `start()` is safe but may miss frames that arrive before the channel is set.
+    pub fn set_supervisor_signal_tx(&self, tx: SyncSender<SupervisorSignal>) {
+        *self.supervisor_signal_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
+    ///
+    /// Uses the existing inbox mechanism — the frame loop writes it on the next
+    /// inbox drain. Returns `Err(NotRunning)` if `start()` has not been called.
+    ///
+    /// Per design §3 TCP reuse heuristic: the TCP stream has a write timeout set to
+    /// [`RECONNECT_WRITE_TIMEOUT`] (2s). If the write does not complete, the caller
+    /// should invoke `reset()` for full mDNS rediscovery.
+    pub fn publish_reconnect_request(
+        &self,
+        attempt: u8,
+        requester_role: SignalingRole,
+        session_nonce: u64,
+    ) -> Result<(), SignalingError> {
+        if self.handle.is_none() {
+            return Err(SignalingError::NotRunning);
+        }
+        self.inbox
+            .lock()
+            .unwrap()
+            .push(MdnsControl::ReconnectRequest {
+                attempt,
+                requester_role,
+                session_nonce,
+            });
+        Ok(())
+    }
+
+    /// Queue a `ReconnectAck` frame to be written on the TCP channel.
+    ///
+    /// Returns `Err(NotRunning)` if `start()` has not been called.
+    pub fn publish_reconnect_ack(
+        &self,
+        attempt: u8,
+        session_nonce: u64,
+    ) -> Result<(), SignalingError> {
+        if self.handle.is_none() {
+            return Err(SignalingError::NotRunning);
+        }
+        self.inbox.lock().unwrap().push(MdnsControl::ReconnectAck {
+            attempt,
+            session_nonce,
+        });
+        Ok(())
+    }
+
+    /// Perform a full mDNS reset: stop the current signaling instance and rebuild
+    /// a new one with the same configuration.
+    ///
+    /// This is the TCP failure fallback path (design §3): when `publish_reconnect_request`
+    /// fails or no `ReconnectAck` arrives within 2s, the supervisor calls `reset()` to
+    /// tear down the stale TCP connection and rediscover the peer via mDNS.
+    ///
+    /// After `reset()`, callers MUST call `start(event_tx)` again with a fresh event channel.
+    ///
+    /// # Lifecycle
+    ///
+    /// The returned `MdnsSignaling` is in the same pre-start state as `new()`. The caller
+    /// is responsible for re-registering the supervisor signal channel via
+    /// `set_supervisor_signal_tx()` before calling `start()`.
+    pub fn reset(self) -> Result<MdnsSignaling, SignalingError> {
+        // `self` is consumed (moved), which calls Drop and stops the thread.
+        // Construct a fresh instance with the same config.
+        let config = self.config.clone();
+        // Drop `self` — this calls `Stop::drop` which calls `stop()`.
+        drop(self);
+        MdnsSignaling::new(config)
+    }
+}
+
 impl Drop for MdnsSignaling {
     /// Ensures the signaling thread is stopped when `MdnsSignaling` is dropped.
     fn drop(&mut self) {
@@ -196,11 +305,15 @@ impl Drop for MdnsSignaling {
 /// Convert an inbound [`SignalingFrame`] into the matching [`SignalingEvent`].
 ///
 /// Returns `None` for `Hello` — consumed silently as a protocol-version handshake.
-/// Returns `None` for `ReconnectRequest`/`ReconnectAck` — handled by the reconnect
-/// supervisor which reads directly from the TCP stream; these frames do NOT become
-/// `SignalingEvent`s in the current signaling event loop (Phase 5 wires them).
+/// Returns `None` for `ReconnectRequest`/`ReconnectAck` — these frames are forwarded
+/// to the reconnect supervisor via `supervisor_signal_tx` (if set) instead of producing
+/// a `SignalingEvent`. When `supervisor_signal_tx` is `None`, reconnect frames are
+/// silently consumed (Phase 3 backward-compatible behavior).
 /// All other variants map 1-to-1 to `SignalingEvent`.
-pub(crate) fn frame_to_event(frame: SignalingFrame) -> Option<SignalingEvent> {
+pub(crate) fn frame_to_event(
+    frame: SignalingFrame,
+    supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+) -> Option<SignalingEvent> {
     match frame {
         SignalingFrame::Hello { proto: _ } => None,
         SignalingFrame::Offer { sdp } => Some(SignalingEvent::OfferReceived(SdpOffer(sdp))),
@@ -209,11 +322,34 @@ pub(crate) fn frame_to_event(frame: SignalingFrame) -> Option<SignalingEvent> {
             Some(SignalingEvent::CandidateReceived(IceCandidate(sdp)))
         }
         SignalingFrame::Bye => Some(SignalingEvent::Closed),
-        // Reconnect frames are handled by the supervisor (Phase 5).
-        // The frame-loop emits None so they are silently consumed here.
-        // TODO(#session-reconnect-policy): route to supervisor channel in Phase 5.
-        SignalingFrame::ReconnectRequest { .. } => None,
-        SignalingFrame::ReconnectAck { .. } => None,
+        SignalingFrame::ReconnectRequest {
+            attempt,
+            requester_role: _,
+            session_nonce,
+        } => {
+            // Route to supervisor channel; do NOT produce a SignalingEvent.
+            // `session_nonce` from the peer acts as the peer's nonce for tie-breaking.
+            if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
+                let _ = tx.try_send(SupervisorSignal::PeerRequest {
+                    peer_nonce: session_nonce,
+                    attempt,
+                });
+            }
+            None
+        }
+        SignalingFrame::ReconnectAck {
+            attempt,
+            session_nonce,
+        } => {
+            // Route to supervisor channel; do NOT produce a SignalingEvent.
+            if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
+                let _ = tx.try_send(SupervisorSignal::PeerAck {
+                    session_nonce,
+                    attempt,
+                });
+            }
+            None
+        }
     }
 }
 
@@ -225,10 +361,15 @@ fn run_signaling_thread(
     stop: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     match config.role {
-        SignalingRole::Sender => run_sender_thread(config, stop, inbox, event_tx),
-        SignalingRole::Receiver => run_receiver_thread(config, stop, inbox, event_tx),
+        SignalingRole::Sender => {
+            run_sender_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
+        }
+        SignalingRole::Receiver => {
+            run_receiver_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
+        }
     }
 }
 
@@ -239,6 +380,7 @@ fn run_sender_thread(
     stop: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     let port = config.control_port;
 
@@ -329,7 +471,7 @@ fn run_sender_thread(
     };
 
     let _ = mdns.shutdown();
-    run_frame_loop(stream, stop, inbox, event_tx);
+    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
 }
 
 // ─── Receiver thread ──────────────────────────────────────────────────────────
@@ -339,6 +481,7 @@ fn run_receiver_thread(
     stop: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -416,7 +559,7 @@ fn run_receiver_thread(
         }
     };
 
-    run_frame_loop(stream, stop, inbox, event_tx);
+    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
 }
 
 // ─── Shared TCP frame loop ────────────────────────────────────────────────────
@@ -429,6 +572,7 @@ fn run_frame_loop(
     stop: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     // Diagnostic: log the actual TCP endpoints so loopback/dup-connect can be
     // distinguished from cross-host. Should always be peer != local; equal
@@ -456,6 +600,16 @@ fn run_frame_loop(
             return;
         }
     };
+
+    // Set write timeout on the cloned stream so reconnect frame writes do not
+    // block indefinitely on a half-open TCP connection (design §3, AC-6).
+    // Note: on Windows (Winsock), write timeout via SO_SNDTIMEO may not always
+    // fire reliably on half-open sockets; the 2s ack-timeout in the supervisor
+    // is the primary guard against hanging.
+    if let Err(e) = write_stream.set_write_timeout(Some(RECONNECT_WRITE_TIMEOUT)) {
+        eprintln!("[sm-signaling-frame-loop] WARN: set_write_timeout failed: {e}");
+        // Non-fatal: continue without write timeout.
+    }
 
     let mut writer = BufWriter::new(write_stream);
     let mut reader = BufReader::new(stream);
@@ -486,6 +640,22 @@ fn run_frame_loop(
                 MdnsControl::Offer(o) => SignalingFrame::Offer { sdp: o.0 },
                 MdnsControl::Answer(a) => SignalingFrame::Answer { sdp: a.0 },
                 MdnsControl::Candidate(c) => SignalingFrame::Candidate { sdp: c.0 },
+                MdnsControl::ReconnectRequest {
+                    attempt,
+                    requester_role,
+                    session_nonce,
+                } => SignalingFrame::ReconnectRequest {
+                    attempt,
+                    requester_role,
+                    session_nonce,
+                },
+                MdnsControl::ReconnectAck {
+                    attempt,
+                    session_nonce,
+                } => SignalingFrame::ReconnectAck {
+                    attempt,
+                    session_nonce,
+                },
             };
             let kind = match &frame {
                 SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
@@ -538,7 +708,7 @@ fn run_frame_loop(
                     } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
-                match frame_to_event(frame) {
+                match frame_to_event(frame, &supervisor_signal_tx) {
                     Some(SignalingEvent::Closed) => {
                         eprintln!("[sm-signaling-frame-loop] EXIT: peer sent Bye → emit Closed");
                         let _ = emit(&event_tx, SignalingEvent::Closed);
@@ -547,7 +717,7 @@ fn run_frame_loop(
                     Some(ev) => {
                         let _ = emit(&event_tx, ev);
                     }
-                    None => {} // Hello — absorbed silently
+                    None => {} // Hello or reconnect frame — absorbed / routed to supervisor
                 }
             }
             Ok(None) => {
@@ -837,6 +1007,15 @@ mod tests {
 
     // ─── frame_to_event mapping (unit, no network) ───────────────────────────
 
+    use std::sync::Mutex;
+    use std::sync::mpsc::sync_channel as sc;
+
+    fn no_supervisor() -> std::sync::Arc<
+        Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
+    > {
+        std::sync::Arc::new(Mutex::new(None))
+    }
+
     /// S7.2 — frame_to_event maps Offer frame to OfferReceived.
     #[test]
     fn frame_to_event_offer_maps_correctly() {
@@ -846,7 +1025,7 @@ mod tests {
         let frame = SignalingFrame::Offer {
             sdp: "v=0".to_string(),
         };
-        let event = frame_to_event(frame).expect("Offer must produce an event");
+        let event = frame_to_event(frame, &no_supervisor()).expect("Offer must produce an event");
         assert!(
             matches!(event, SignalingEvent::OfferReceived(SdpOffer(ref s)) if s == "v=0"),
             "Offer frame must map to OfferReceived with exact SDP"
@@ -862,7 +1041,7 @@ mod tests {
         let frame = SignalingFrame::Answer {
             sdp: "v=0\r\nm=video".to_string(),
         };
-        let event = frame_to_event(frame).expect("Answer must produce an event");
+        let event = frame_to_event(frame, &no_supervisor()).expect("Answer must produce an event");
         assert!(matches!(event, SignalingEvent::AnswerReceived(_)));
     }
 
@@ -875,7 +1054,8 @@ mod tests {
         let frame = SignalingFrame::Candidate {
             sdp: "candidate:1 1 udp 2130706431 127.0.0.1 9 typ host".to_string(),
         };
-        let event = frame_to_event(frame).expect("Candidate must produce an event");
+        let event =
+            frame_to_event(frame, &no_supervisor()).expect("Candidate must produce an event");
         assert!(matches!(event, SignalingEvent::CandidateReceived(_)));
     }
 
@@ -885,9 +1065,12 @@ mod tests {
         use crate::signaling::mdns::frame_to_event;
         use crate::signaling::wire::SignalingFrame;
 
-        let event = frame_to_event(SignalingFrame::Hello {
-            proto: "v1".to_string(),
-        });
+        let event = frame_to_event(
+            SignalingFrame::Hello {
+                proto: "v1".to_string(),
+            },
+            &no_supervisor(),
+        );
         assert!(
             event.is_none(),
             "Hello frame must not produce a SignalingEvent"
@@ -900,10 +1083,142 @@ mod tests {
         use crate::signaling::mdns::frame_to_event;
         use crate::signaling::wire::SignalingFrame;
 
-        let event = frame_to_event(SignalingFrame::Bye).expect("Bye must produce Closed");
+        let event =
+            frame_to_event(SignalingFrame::Bye, &no_supervisor()).expect("Bye must produce Closed");
         assert!(
             matches!(event, SignalingEvent::Closed),
             "Bye frame must map to SignalingEvent::Closed"
+        );
+    }
+
+    // ─── T5.1: frame_to_event routes reconnect frames to supervisor channel ──
+
+    /// T5.1 / AC-5 — `ReconnectRequest` frame is routed to the supervisor channel
+    /// as `SupervisorSignal::PeerRequest` when a supervisor_signal_tx is registered.
+    #[test]
+    fn frame_to_event_reconnect_request_routes_to_supervisor_channel() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(8);
+        let supervisor_signal_tx = std::sync::Arc::new(Mutex::new(Some(sup_tx)));
+
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 2,
+            requester_role: SignalingRole::Sender,
+            session_nonce: 42_000,
+        };
+
+        let result = frame_to_event(frame, &supervisor_signal_tx);
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must not produce a SignalingEvent (routed to supervisor)"
+        );
+
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("supervisor channel must receive PeerRequest within 100ms");
+        assert_eq!(
+            signal,
+            SupervisorSignal::PeerRequest {
+                peer_nonce: 42_000,
+                attempt: 2,
+            }
+        );
+    }
+
+    /// T5.1 / AC-6 — `ReconnectAck` frame is routed to the supervisor channel
+    /// as `SupervisorSignal::PeerAck` when a supervisor_signal_tx is registered.
+    #[test]
+    fn frame_to_event_reconnect_ack_routes_to_supervisor_channel() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(8);
+        let supervisor_signal_tx = std::sync::Arc::new(Mutex::new(Some(sup_tx)));
+
+        let frame = SignalingFrame::ReconnectAck {
+            attempt: 1,
+            session_nonce: 99,
+        };
+
+        let result = frame_to_event(frame, &supervisor_signal_tx);
+        assert!(
+            result.is_none(),
+            "ReconnectAck must not produce a SignalingEvent (routed to supervisor)"
+        );
+
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("supervisor channel must receive PeerAck within 100ms");
+        assert_eq!(
+            signal,
+            SupervisorSignal::PeerAck {
+                session_nonce: 99,
+                attempt: 1,
+            }
+        );
+    }
+
+    /// T5.1 — `ReconnectRequest` returns None silently when no supervisor channel is set.
+    #[test]
+    fn frame_to_event_reconnect_request_returns_none_without_supervisor() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Receiver,
+            session_nonce: 1234,
+        };
+
+        let result = frame_to_event(frame, &no_supervisor());
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must return None (no supervisor registered)"
+        );
+    }
+
+    // ─── T5.1: publish_reconnect_request / publish_reconnect_ack API ─────────
+
+    /// T5.1 — `publish_reconnect_request` returns NotRunning before start().
+    #[test]
+    fn publish_reconnect_request_before_start_returns_not_running() {
+        let sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
+        let result = sig.publish_reconnect_request(1, SignalingRole::Sender, 42);
+        assert!(
+            matches!(result, Err(SignalingError::NotRunning)),
+            "publish_reconnect_request before start must return NotRunning, got {result:?}"
+        );
+    }
+
+    /// T5.1 — `publish_reconnect_ack` returns NotRunning before start().
+    #[test]
+    fn publish_reconnect_ack_before_start_returns_not_running() {
+        let sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
+        let result = sig.publish_reconnect_ack(1, 42);
+        assert!(
+            matches!(result, Err(SignalingError::NotRunning)),
+            "publish_reconnect_ack before start must return NotRunning, got {result:?}"
+        );
+    }
+
+    // ─── T5.2: reset() rebuilds a fresh MdnsSignaling ────────────────────────
+
+    /// T5.2 — `reset()` on a stopped instance returns a new instance in pre-start state.
+    #[test]
+    fn mdns_signaling_reset_returns_fresh_instance() {
+        let sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
+        let fresh = sig.reset().expect("reset must succeed");
+        // Fresh instance must be in pre-start state: publish returns NotRunning.
+        let result = fresh.publish_local_offer(SdpOffer("v=0".to_string()));
+        assert!(
+            matches!(result, Err(SignalingError::NotRunning)),
+            "after reset(), new instance must be in pre-start state; got {result:?}"
         );
     }
 
