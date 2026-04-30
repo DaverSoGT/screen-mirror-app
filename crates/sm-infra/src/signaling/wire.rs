@@ -16,12 +16,17 @@
 //! The JSON schema uses a tagged enum with `"type"` as the discriminant:
 //!
 //! ```json
-//! { "type": "Offer",     "sdp": "v=0 ..." }
-//! { "type": "Answer",    "sdp": "v=0 ..." }
-//! { "type": "Candidate", "sdp": "candidate:..." }
-//! { "type": "Hello",     "proto": "v1" }
+//! { "type": "Offer",          "sdp": "v=0 ..." }
+//! { "type": "Answer",         "sdp": "v=0 ..." }
+//! { "type": "Candidate",      "sdp": "candidate:..." }
+//! { "type": "Hello",          "proto": "v1" }
 //! { "type": "Bye" }
+//! { "type": "ReconnectRequest", "attempt": 1, "requester_role": "Sender", "session_nonce": 12345678 }
+//! { "type": "ReconnectAck",     "attempt": 1, "session_nonce": 12345678 }
 //! ```
+//!
+//! Unknown `"type"` values are REJECTED with `InvalidData` (no `serde(other)` catch-all).
+//! Both peers in a session MUST run the same build (V1 same-binary LAN deployment).
 //!
 //! Max frame body is 64 KiB. Frames larger than this return
 //! [`io::ErrorKind::InvalidData`].
@@ -29,6 +34,7 @@
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
+use sm_domain::signaling::SignalingRole;
 
 /// Maximum allowed frame body size in bytes (64 KiB).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -37,6 +43,11 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 ///
 /// Serialised as a JSON tagged enum with `"type"` as the discriminant field.
 /// The `sdp` fields carry **plain SDP text** — NOT JSON-wrapped strings.
+///
+/// # Strict reject policy
+///
+/// Unknown `"type"` values return `Err(InvalidData)`. There is no `serde(other)` catch-all.
+/// Both peers MUST be the same build (V1 same-binary LAN deployment — spec §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalingFrame {
@@ -50,6 +61,27 @@ pub enum SignalingFrame {
     Candidate { sdp: String },
     /// Graceful close — both sides stop the TCP session after this frame.
     Bye,
+    /// Reconnect request from the detecting side.
+    ///
+    /// Published when `IceFailed` or `ConnectionLost` is detected. The
+    /// `session_nonce` is used for tie-breaking when both sides detect
+    /// simultaneously (lower nonce wins — spec §3.2).
+    ReconnectRequest {
+        /// Current attempt number (1-indexed, matches supervisor attempt counter).
+        attempt: u8,
+        /// Role of the side publishing this request.
+        requester_role: SignalingRole,
+        /// Nonce generated once per session lifetime; used for race resolution.
+        session_nonce: u64,
+    },
+    /// Acknowledgment from the losing side in a simultaneous-detect race, or
+    /// from the responding side in a one-sided detect.
+    ReconnectAck {
+        /// Echo of the attempt number from the `ReconnectRequest` being acknowledged.
+        attempt: u8,
+        /// Echo of the winner's `session_nonce`.
+        session_nonce: u64,
+    },
 }
 
 /// Serialise `frame` and write it with a 4-byte big-endian length prefix.
@@ -315,5 +347,98 @@ mod tests {
             !json_str.contains("\\\"v\\\""),
             "SDP must NOT be JSON-wrapped inside the frame"
         );
+    }
+
+    // ─── T3.1: ReconnectRequest and ReconnectAck round-trips ─────────────────
+
+    /// AC-5 / AC-10 / T3.1 — `ReconnectRequest` survives write_frame/read_frame round-trip.
+    #[test]
+    fn reconnect_request_frame_round_trip() {
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Sender,
+            session_nonce: 12_345_678,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).expect("write_frame must not fail for ReconnectRequest");
+        let decoded = read_frame(&mut Cursor::new(buf)).expect("read_frame must not fail");
+        assert_eq!(decoded, frame);
+    }
+
+    /// Verify `ReconnectRequest` JSON discriminant is `"ReconnectRequest"` (spec §3.1).
+    #[test]
+    fn reconnect_request_frame_json_discriminant() {
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Sender,
+            session_nonce: 12_345_678,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            json.contains(r#""type":"ReconnectRequest""#),
+            "ReconnectRequest must have type discriminant; got: {json}"
+        );
+        assert!(
+            json.contains(r#""session_nonce":12345678"#),
+            "ReconnectRequest must include session_nonce; got: {json}"
+        );
+    }
+
+    /// AC-6 / T3.1 — `ReconnectAck` survives write_frame/read_frame round-trip.
+    #[test]
+    fn reconnect_ack_frame_round_trip() {
+        let frame = SignalingFrame::ReconnectAck {
+            attempt: 1,
+            session_nonce: 12_345_678,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).expect("write_frame must not fail for ReconnectAck");
+        let decoded = read_frame(&mut Cursor::new(buf)).expect("read_frame must not fail");
+        assert_eq!(decoded, frame);
+    }
+
+    /// Verify `ReconnectAck` JSON discriminant is `"ReconnectAck"` (spec §3.1).
+    #[test]
+    fn reconnect_ack_frame_json_discriminant() {
+        let frame = SignalingFrame::ReconnectAck {
+            attempt: 2,
+            session_nonce: 99,
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            json.contains(r#""type":"ReconnectAck""#),
+            "ReconnectAck must have type discriminant; got: {json}"
+        );
+        assert!(
+            json.contains(r#""session_nonce":99"#),
+            "ReconnectAck must include session_nonce; got: {json}"
+        );
+    }
+
+    /// T3.1 — `ReconnectRequest` with `Receiver` role round-trips.
+    #[test]
+    fn reconnect_request_receiver_role_round_trip() {
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 2,
+            requester_role: SignalingRole::Receiver,
+            session_nonce: 42,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        let decoded = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    /// T3.1 — Existing strict-reject behavior is preserved for `ReconnectRequest` and `ReconnectAck`
+    /// being new known types. Unknown types still return `InvalidData`.
+    /// Verifies spec §3.3 (no catch-all).
+    #[test]
+    fn read_frame_still_rejects_unknown_type_after_adding_reconnect_variants() {
+        let body = br#"{"type":"UnknownType","value":"x"}"#;
+        let mut bytes = (body.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        let err = read_frame(&mut Cursor::new(bytes))
+            .expect_err("must still reject unknown frame types after adding reconnect variants");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

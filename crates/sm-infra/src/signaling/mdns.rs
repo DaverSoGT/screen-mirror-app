@@ -196,6 +196,9 @@ impl Drop for MdnsSignaling {
 /// Convert an inbound [`SignalingFrame`] into the matching [`SignalingEvent`].
 ///
 /// Returns `None` for `Hello` — consumed silently as a protocol-version handshake.
+/// Returns `None` for `ReconnectRequest`/`ReconnectAck` — handled by the reconnect
+/// supervisor which reads directly from the TCP stream; these frames do NOT become
+/// `SignalingEvent`s in the current signaling event loop (Phase 5 wires them).
 /// All other variants map 1-to-1 to `SignalingEvent`.
 pub(crate) fn frame_to_event(frame: SignalingFrame) -> Option<SignalingEvent> {
     match frame {
@@ -206,6 +209,11 @@ pub(crate) fn frame_to_event(frame: SignalingFrame) -> Option<SignalingEvent> {
             Some(SignalingEvent::CandidateReceived(IceCandidate(sdp)))
         }
         SignalingFrame::Bye => Some(SignalingEvent::Closed),
+        // Reconnect frames are handled by the supervisor (Phase 5).
+        // The frame-loop emits None so they are silently consumed here.
+        // TODO(#session-reconnect-policy): route to supervisor channel in Phase 5.
+        SignalingFrame::ReconnectRequest { .. } => None,
+        SignalingFrame::ReconnectAck { .. } => None,
     }
 }
 
@@ -485,6 +493,15 @@ fn run_frame_loop(
                 SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
                 SignalingFrame::Bye => "Bye".to_string(),
+                SignalingFrame::ReconnectRequest {
+                    attempt,
+                    session_nonce,
+                    ..
+                } => format!("ReconnectRequest (attempt={attempt}, nonce={session_nonce})"),
+                SignalingFrame::ReconnectAck {
+                    attempt,
+                    session_nonce,
+                } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
             };
             eprintln!("[sm-signaling-frame-loop] OUT → {kind}");
             if let Err(e) = write_frame(&mut writer, &frame) {
@@ -510,6 +527,15 @@ fn run_frame_loop(
                         format!("Candidate (sdp={} bytes)", sdp.len())
                     }
                     SignalingFrame::Bye => "Bye".to_string(),
+                    SignalingFrame::ReconnectRequest {
+                        attempt,
+                        session_nonce,
+                        ..
+                    } => format!("ReconnectRequest (attempt={attempt}, nonce={session_nonce})"),
+                    SignalingFrame::ReconnectAck {
+                        attempt,
+                        session_nonce,
+                    } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
                 match frame_to_event(frame) {
