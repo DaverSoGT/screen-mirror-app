@@ -48,4 +48,5 @@ pub use decode::VideoDecoder;
 pub mod error;
 pub mod session;
 pub mod signaling;
+pub mod supervisor;
 pub mod transport;
