@@ -1523,22 +1523,30 @@ fn build_production_sender_bundle(
         // The worker uses `bridge_session` and `bridge_cache` arcs (passed in alongside
         // the regular builder args) so it can swap the session under a brief lock.
         // `_stop_flag` is the OLD session's stop_flag — used as the cancel signal.
+        //
+        // FIX (Batch 2 bugfix): the inner builder closure MUST capture and forward the
+        // REAL `_bridge_session` / `_bridge_cache` arcs to every recursive call of
+        // `build_production_sender_bundle`.  Passing `Arc::new(Mutex::new(None))` here
+        // was the bug: the newly-built bundle's own hook held dummy arcs that nobody
+        // observed, so a second-generation failure swapped into the void rather than into
+        // `bridge.session`, causing a ZOMBIE after the first auto-rebuild (AC-5 violated).
         initiate_rebuild: make_sender_rebuild_hook(
-            // Clone the production builder so the worker can call it to build a new bundle.
-            // The builder is already an Arc<dyn Fn + Send + Sync> so clone is cheap.
-            Arc::new(move |udp_port, service_name, stop_flag, channel| {
-                build_production_sender_bundle(
-                    udp_port,
-                    service_name,
-                    stop_flag,
-                    channel,
-                    // For the inner rebuild call we pass dummy arcs — the worker
-                    // doesn't need the rebuildable arcs for the newly built sub-bundle;
-                    // those arcs are only used by make_sender_rebuild_hook itself.
-                    Arc::new(Mutex::new(None)),
-                    Arc::new(Mutex::new(None)),
-                )
-            }),
+            // Pass the REAL bridge arcs through so every generation's hook can swap
+            // into the same `bridge.session` field the supervisor observes.
+            {
+                let session_for_inner = _bridge_session.clone();
+                let cache_for_inner = _bridge_cache.clone();
+                Arc::new(move |udp_port, service_name, stop_flag, channel| {
+                    build_production_sender_bundle(
+                        udp_port,
+                        service_name,
+                        stop_flag,
+                        channel,
+                        session_for_inner.clone(),
+                        cache_for_inner.clone(),
+                    )
+                })
+            },
             _bridge_cache.clone(),
             _bridge_session.clone(),
             _stop_flag.clone(),

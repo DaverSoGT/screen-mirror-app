@@ -1056,3 +1056,321 @@ fn rebuild_swaps_session_new_stop_flag_differs_from_old() {
 
     stop_sender_session(&bridge);
 }
+
+// ─── Batch 2 fix — two-generation rebuild chain (AC-5 regression guard) ─────────
+
+/// Regression test: after TWO consecutive rebuilds, `bridge.session` holds the
+/// second-generation (B2) session — not the first-generation (B1) or the original.
+///
+/// Bug: Batch 2 commit a4d0dae passed dummy `Arc::new(Mutex::new(None))` for
+/// `bridge_session` / `bridge_cache` when `build_production_sender_bundle` was
+/// called from inside its own builder closure.  The NEW bundle's hook held dummy
+/// arcs that nobody observed; a second rebuild swapped into the void → real
+/// `bridge.session` retained the broken B1 bundle → ZOMBIE.
+///
+/// This test directly verifies the bug mechanism: when `make_sender_rebuild_hook`
+/// is called with DUMMY arcs for `bridge_session`/`bridge_cache`, the second-
+/// generation worker's swap goes to the dummy arc and bridge.session is NOT updated.
+///
+/// Structure: build a bridge backed by REAL arcs, wire B0 with a hook that uses
+/// DUMMY arcs (mimicking the bug), trigger first rebuild → bridge.session is
+/// updated (B0's hook itself uses real arcs — only B1's inner hook uses dummies).
+/// Then call B1's hook directly (simulating B1's supervisor → InitiateRebuild)
+/// and verify the result: bridge.session remains unchanged (bug) vs updated (fix).
+///
+/// The test is split into two sub-cases via a `use_real_arcs` flag so both the
+/// RED (dummy) and GREEN (real) behaviors can be asserted in a single test run.
+/// The final assertion checks that only the REAL arcs path correctly updates
+/// bridge.session on the second rebuild.
+///
+/// RED (before fix in build_production_sender_bundle): dummy arcs cause the second
+/// rebuild to swap into nobody-observed storage → bridge.session stays on B1.
+///
+/// GREEN (after fix): real arcs passed through → bridge.session updated to B2.
+///
+/// AC-5: Only one auto-rebuild per process lifetime worked before this fix.
+#[test]
+fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
+    use screen_mirror_lib::commands::sender::SenderBuilderFn;
+    use std::sync::atomic::AtomicU32;
+
+    /// Inner helper: run a two-generation rebuild chain.
+    /// `use_real_arcs`: if true, B1's hook uses the real bridge arcs (the fix).
+    ///                  if false, B1's hook uses dummy arcs (the bug).
+    /// Returns `(b1_ptr, b2_ptr)` — the stop_flag Arc pointers after each rebuild.
+    fn run_chain(
+        use_real_arcs: bool,
+    ) -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        let session_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
+            Arc::new(Mutex::new(None));
+        let cache_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::RestartCache>>> =
+            Arc::new(Mutex::new(None));
+
+        let ch = FakeJsonChannel::new();
+
+        // Two generations of ev_rx + sup_tx.
+        let (ev_tx_b0, ev_rx0) = std::sync::mpsc::sync_channel::<TransportEvent>(8);
+        let (ev_tx_b1, ev_rx1) = std::sync::mpsc::sync_channel::<TransportEvent>(8);
+        let (_ev_tx_b2, ev_rx2) = std::sync::mpsc::sync_channel::<TransportEvent>(8);
+
+        let ev_rx0_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+            Arc::new(Mutex::new(Some(ev_rx0)));
+        let ev_rx1_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+            Arc::new(Mutex::new(Some(ev_rx1)));
+        let ev_rx2_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+            Arc::new(Mutex::new(Some(ev_rx2)));
+
+        let build_count = Arc::new(AtomicU32::new(0));
+        let build_count_b = build_count.clone();
+
+        let sup_tx_b0: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let sup_tx_b1: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let sup_tx_b2: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Self-referencing builder slot (used when use_real_arcs == true).
+        let builder_slot: Arc<Mutex<Option<SenderBuilderFn>>> = Arc::new(Mutex::new(None));
+
+        let session_b = session_arc.clone();
+        let cache_b = cache_arc.clone();
+        let sup_b0_b = sup_tx_b0.clone();
+        let sup_b1_b = sup_tx_b1.clone();
+        let sup_b2_b = sup_tx_b2.clone();
+        let builder_slot_b = builder_slot.clone();
+        let session_b2 = session_arc.clone();
+
+        let policy = fast_policy();
+        let ack_timeout = Duration::from_millis(500);
+
+        let the_builder: SenderBuilderFn =
+            Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+                let generation = build_count_b.fetch_add(1, Ordering::Relaxed);
+
+                let ev_rx = match generation {
+                    0 => ev_rx0_slot.lock().unwrap().take().expect("ev_rx0"),
+                    1 => ev_rx1_slot.lock().unwrap().take().expect("ev_rx1"),
+                    _ => ev_rx2_slot.lock().unwrap().take().expect("ev_rx2"),
+                };
+
+                let sup_tx_slot = match generation {
+                    0 => sup_b0_b.clone(),
+                    1 => sup_b1_b.clone(),
+                    _ => sup_b2_b.clone(),
+                };
+
+                // Inner builder for the hook: use the self-referencing builder so
+                // each generation spawns a proper supervised drain when rebuilt.
+                let inner_builder: SenderBuilderFn = builder_slot_b
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("builder_slot populated");
+
+                // Bridge arcs for the hook — the property under test.
+                //
+                // B0's hook ALWAYS uses real arcs so the first rebuild (B0→B1) succeeds.
+                // B1's hook is where the bug manifests:
+                //   BUGGY (use_real_arcs=false): B1's hook gets dummy arcs — worker reads
+                //     cache=None → RebuildFailed → bridge.session stays on B1.
+                //   FIXED (use_real_arcs=true): B1's hook gets real arcs — worker reads
+                //     real cache → builds B2 → swaps into bridge.session.
+                let (hook_session, hook_cache) = if generation == 0 || use_real_arcs {
+                    // B0 always uses real arcs; higher generations use real arcs if fixed.
+                    (session_b.clone(), cache_b.clone())
+                } else {
+                    // Simulate build_production_sender_bundle pre-fix for generation >= 1:
+                    // the inner recursive call got dummy arcs (Arc::new(Mutex::new(None))).
+                    (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)))
+                };
+
+                let rebuild_hook = make_sender_rebuild_hook(
+                    inner_builder,
+                    hook_cache,
+                    hook_session,
+                    stop_flag.clone(),
+                    generation + 1,
+                );
+
+                let hooks = SenderCoordinatorHooks {
+                    publish_reconnect_request: Arc::new(|_, _| {}),
+                    publish_reconnect_ack: Arc::new(|_, _| {}),
+                    initiate_rebuild: rebuild_hook,
+                    initiate_mdns_reset: Arc::new(|| {}),
+                };
+
+                let p = policy.clone();
+                let t = ack_timeout;
+                let h = thread::Builder::new()
+                    .name(format!("chain-g{generation}-drain"))
+                    .spawn(move || {
+                        run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                            ev_rx,
+                            stop_flag,
+                            channel,
+                            sup_tx_slot,
+                            p,
+                            t,
+                            hooks,
+                        );
+                    })
+                    .expect("spawn drain");
+
+                Ok(SenderBundle {
+                    drain_handles: vec![h],
+                    shutdown: None,
+                })
+            });
+
+        *builder_slot.lock().unwrap() = Some(the_builder.clone());
+
+        let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
+            the_builder,
+            session_arc.clone(),
+            cache_arc.clone(),
+            sup_tx_b0.clone(),
+        );
+
+        // Phase 0: start B0.
+        start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
+
+        // Phase 1: first rebuild B0 → B1.
+        ev_tx_b0.send(TransportEvent::IceFailed).unwrap();
+        let got_rc1 =
+            ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+        assert!(got_rc1, "phase1 reconnecting missing");
+
+        // Do NOT send PeerAck — supervisor uses its own internal nonce which is
+        // independent of restart_cache.session_nonce (both are rand::random()).
+        // Let AwaitingAck time out → supervisor fires InitiateRebuild naturally.
+        // With ack_timeout=500ms this takes ~500ms.
+
+        let got_streaming1 =
+            ch.wait_for_message_containing("\"kind\":\"streaming\"", Duration::from_millis(3000));
+        assert!(
+            got_streaming1,
+            "phase1 streaming missing, messages: {:?}",
+            ch.messages()
+        );
+
+        let b1_stop_flag = session_b2
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.stop_flag.clone())
+            .expect("B1 session after first rebuild");
+
+        // Phase 2: second rebuild B1 → B2.
+        let streaming_before = ch
+            .messages()
+            .iter()
+            .filter(|m| m.contains("\"kind\":\"streaming\""))
+            .count();
+        let reconnecting_before = ch
+            .messages()
+            .iter()
+            .filter(|m| m.contains("\"kind\":\"reconnecting\""))
+            .count();
+
+        ev_tx_b1.send(TransportEvent::IceFailed).unwrap();
+
+        // Wait for a NEW reconnecting event (B1's supervisor entered AwaitingAck).
+        let got_rc2 = {
+            let dl = std::time::Instant::now() + Duration::from_millis(1000);
+            loop {
+                let cnt = ch
+                    .messages()
+                    .iter()
+                    .filter(|m| m.contains("\"kind\":\"reconnecting\""))
+                    .count();
+                if cnt > reconnecting_before {
+                    break true;
+                }
+                if std::time::Instant::now() >= dl {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(got_rc2, "phase2 reconnecting missing");
+
+        // Wait for B1's rebuild attempts to resolve:
+        //   - REAL arcs: rebuild succeeds → "streaming"
+        //   - DUMMY arcs: rebuild fails (cache=None) → 3 attempts → "dead"
+        // In both cases we wait for a terminal message that appears AFTER the rebuild.
+        let resolved = {
+            let dl = std::time::Instant::now() + Duration::from_millis(4000);
+            loop {
+                let msgs = ch.messages();
+                let new_streaming = msgs
+                    .iter()
+                    .filter(|m| m.contains("\"kind\":\"streaming\""))
+                    .count()
+                    > streaming_before;
+                let dead = msgs.iter().any(|m| m.contains("\"kind\":\"dead\""));
+                if new_streaming || dead {
+                    break true;
+                }
+                if std::time::Instant::now() >= dl {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(
+            resolved,
+            "phase2 did not resolve within 4s, messages: {:?}",
+            ch.messages()
+        );
+
+        // Small yield to let the worker finish the swap (step 11 happens before step 13).
+        thread::sleep(Duration::from_millis(50));
+
+        // Read bridge.session AFTER rebuild resolves.
+        // DUMMY: bridge.session still holds B1's stop_flag (worker swapped into dummy).
+        // REAL:  bridge.session holds B2's stop_flag (worker swapped into real arc).
+        let b2_stop_flag = session_b2
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.stop_flag.clone());
+
+        stop_sender_session(&bridge);
+
+        (b1_stop_flag, b2_stop_flag)
+    }
+
+    // ── RED check: dummy arcs (simulates the pre-fix bug) ─────────────────────
+    // With dummy arcs for B1's hook, the worker reads cache=None → RebuildFailed
+    // immediately, without touching bridge.session.
+    // bridge.session still holds B1's stop_flag after the second rebuild attempt.
+    {
+        let (b1, b2_opt) = run_chain(false /* dummy arcs = pre-fix bug */);
+        // b2_opt is Some(B1's stop_flag) — the session was never updated to B2.
+        let b2 = b2_opt.expect("bridge.session must be Some even with dummy arcs (still holds B1)");
+        assert!(
+            Arc::ptr_eq(&b1, &b2),
+            "DUMMY arcs: expected bridge.session still holds B1 after second rebuild \
+             (worker read cache=None from dummy arc → RebuildFailed without touching session). \
+             Got different Arcs — test setup is incorrect."
+        );
+    }
+
+    // ── GREEN check: real arcs (the fix) ──────────────────────────────────────
+    // With real arcs for B1's hook, the worker reads the actual cache, builds B2,
+    // and swaps it into bridge.session → b2_stop_flag is a NEW Arc distinct from B1.
+    {
+        let (b1, b2_opt) = run_chain(true /* real arcs = post-fix */);
+        let b2 = b2_opt.expect("bridge.session must be Some after successful second rebuild");
+        assert!(
+            !Arc::ptr_eq(&b1, &b2),
+            "after two rebuilds with real arcs, bridge.session must hold B2's stop_flag \
+             (distinct Arc from B1). Dummy arcs in B1's hook break AC-5 for 2+ generation \
+             failure cycles."
+        );
+    }
+}
