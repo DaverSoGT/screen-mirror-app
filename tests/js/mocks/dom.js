@@ -1,5 +1,6 @@
 // Idempotent installer: removes any prior fragment, then installs the
-// 5 elements the SUTs query at module-parse time.
+// elements the SUTs query at module-parse time.
+// Phase 9 adds #retry and #cancel (hidden by default) for the dead-session UI.
 export function installDom() {
   removeDom();
   document.body.innerHTML = `
@@ -8,6 +9,8 @@ export function installDom() {
     <button id="start">Start streaming</button>
     <div id="error"></div>
     <a id="change-mode" href="#"></a>
+    <button id="retry" style="display:none">Retry</button>
+    <button id="cancel" style="display:none">Cancel</button>
   `;
 }
 
