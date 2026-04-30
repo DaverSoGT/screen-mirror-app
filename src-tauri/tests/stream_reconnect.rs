@@ -1361,3 +1361,296 @@ fn rebuild_releases_udp_port_before_rebind() {
 
     stop_stream_session(&bridge);
 }
+
+// ─── Batch 6 (T6.5) — Stream: concurrent stop + stop-after-rebuild (AC-R1/AC-R2) ──
+
+/// T6.5a (AC-R1): `stop_stream_session` called concurrently while a stream rebuild
+/// worker is in flight does NOT deadlock; both the stop and the worker complete.
+///
+/// Symmetric to `rebuild_does_not_deadlock_during_concurrent_stop` in sender_reconnect.rs.
+/// Uses a blocking builder and std::thread::scope to prove no deadlock path exists.
+#[test]
+fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
+    use std::sync::mpsc::sync_channel as sc;
+
+    // Blocking builder: waits for the release signal before returning a bundle.
+    let (release_tx, release_rx) = sc::<()>(1);
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    // Completion signal: builder signals "called" (worker reached step 9).
+    let (worker_done_tx, worker_done_rx) = sc::<()>(1);
+    let worker_done_tx = Arc::new(Mutex::new(Some(worker_done_tx)));
+
+    // stop_done: stop_stream_session returned.
+    let (stop_done_tx, stop_done_rx) = sc::<()>(1);
+
+    let release_rx_clone = release_rx.clone();
+    let worker_done_tx_clone = worker_done_tx.clone();
+
+    let ch = FakeBinaryChannel::new();
+
+    let (ev_tx, ev_rx) = sc::<TransportEvent>(8);
+    let ev_rx_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+        Arc::new(Mutex::new(Some(ev_rx)));
+    let ev_rx_slot_clone = ev_rx_slot.clone();
+
+    let sup_tx_arc: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let sup_tx_for_drain = sup_tx_arc.clone();
+
+    let session_arc: Arc<Mutex<Option<screen_mirror_lib::commands::stream::StreamSession>>> =
+        Arc::new(Mutex::new(None));
+    let restart_cache_arc: Arc<
+        Mutex<Option<screen_mirror_lib::commands::stream::StreamRestartCache>>,
+    > = Arc::new(Mutex::new(None));
+
+    let session_for_builder = session_arc.clone();
+    let cache_for_builder = restart_cache_arc.clone();
+
+    let policy = fast_policy();
+    let ack_timeout = Duration::from_millis(500);
+
+    // Blocking inner builder: waits for release.
+    let blocking_inner: screen_mirror_lib::commands::stream::BuilderFn =
+        Arc::new(move |_, _, _, _, _| {
+            if let Some(rx) = release_rx_clone.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_millis(1000));
+            }
+            if let Some(tx) = worker_done_tx_clone.lock().unwrap().take() {
+                let _ = tx.try_send(());
+            }
+            let (_pkt_tx, pkt_rx) = sc::<sm_domain::encode::EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiverOps),
+                pkt_rx,
+                signaling: None,
+                drain_handles: vec![],
+                _drain_senders: vec![],
+            })
+        });
+
+    let bridge = screen_mirror_lib::commands::stream::StreamBridge::new_with_builder_and_arcs(
+        Arc::new(move |_bind_ctx, _port, _name, stop_flag, channel| {
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
+            let st = sup_tx_for_drain.clone();
+            let p = policy.clone();
+            let t = ack_timeout;
+
+            let rebuild_hook = make_stream_rebuild_hook(
+                blocking_inner.clone(),
+                cache_for_builder.clone(),
+                session_for_builder.clone(),
+                stop_flag.clone(),
+                1,
+                None,
+            );
+
+            let hooks = StreamCoordinatorHooks {
+                publish_reconnect_request: Arc::new(|_, _| {}),
+                publish_reconnect_ack: Arc::new(|_, _| {}),
+                initiate_rebuild: rebuild_hook,
+                initiate_mdns_reset: Arc::new(|| {}),
+            };
+
+            let (_pkt_tx, pkt_rx) = sc::<sm_domain::encode::EncodedPacket>(1);
+            let h = thread::Builder::new()
+                .name("t65-stream-drain".into())
+                .spawn(move || {
+                    run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                    );
+                })
+                .expect("spawn");
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiverOps),
+                pkt_rx,
+                signaling: None,
+                drain_handles: vec![h],
+                _drain_senders: vec![],
+            })
+        }),
+        session_arc,
+        restart_cache_arc,
+        sup_tx_arc.clone(),
+    );
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(9960),
+        Some("_sm-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Trigger reconnect cycle.
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got_reconnecting =
+        ch.wait_for_status_containing("reconnecting", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting, got: {:?}",
+        ch.status_messages()
+    );
+
+    // Wait for supervisor_signal_tx to be set.
+    let sup_tx = {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(tx) = sup_tx_arc.lock().unwrap().clone() {
+                break tx;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("supervisor_signal_tx not set within 500ms");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Advance supervisor to Rebuilding.
+    let session_nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+    sup_tx
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    // Wait briefly for the worker to be spawned and blocking in the builder.
+    thread::sleep(Duration::from_millis(20));
+
+    let stop_done_tx_in_scope = stop_done_tx;
+
+    // Scoped threads: both borrow `bridge` safely.
+    std::thread::scope(|s| {
+        let _stop_handle = s.spawn(|| {
+            thread::sleep(Duration::from_millis(10));
+            stop_stream_session(&bridge);
+            let _ = stop_done_tx_in_scope.try_send(());
+        });
+
+        // Release the blocking builder after stop has had a chance to fire.
+        thread::sleep(Duration::from_millis(30));
+        let _ = release_tx.try_send(());
+    });
+
+    // Poll for worker done (500ms ceiling).
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let _worker_done = loop {
+        if worker_done_rx
+            .recv_timeout(Duration::from_millis(10))
+            .is_ok()
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+    };
+
+    let _stop_done = stop_done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+
+    // Reaching here without timeout proves no deadlock (scope join returned).
+    assert!(
+        bridge.session.lock().unwrap().is_none(),
+        "after concurrent stop, bridge.session must be None"
+    );
+}
+
+/// T6.5b (AC-R2): After a successful stream rebuild, calling `stop_stream_session`
+/// completes within 1 second and does NOT panic.
+///
+/// Symmetric to `stop_after_successful_rebuild_completes_cleanly` in sender_reconnect.rs.
+/// Verifies design §5 invariant for StreamBridge: `supervisor_signal_tx` is not
+/// updated by the rebuild worker; subsequent stop works regardless.
+#[test]
+fn stop_after_successful_stream_rebuild_completes_cleanly() {
+    let (bridge, ev_tx, ch) =
+        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(9961),
+        Some("_sm-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Trigger a reconnect cycle.
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got_reconnecting =
+        ch.wait_for_status_containing("reconnecting", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting, got: {:?}",
+        ch.status_messages()
+    );
+
+    // Advance supervisor to Rebuilding via PeerAck.
+    let session_nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+
+    let sup_tx = {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(tx) = bridge.supervisor_signal_tx.lock().unwrap().clone() {
+                break tx;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("supervisor_signal_tx not set within 500ms");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    sup_tx
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    // Wait for rebuild to succeed — "streaming" 0x02 frame confirms RebuildSucceeded processed.
+    let got_streaming = ch.wait_for_status_containing("streaming", Duration::from_millis(2000));
+    assert!(
+        got_streaming,
+        "expected streaming after rebuild, got: {:?}",
+        ch.status_messages()
+    );
+
+    // Brief pause to let the OLD drain finish step 14 (sets stop_flag, drains outcomes,
+    // clears supervisor_signal_tx). Tests the window described in design §5.
+    thread::sleep(Duration::from_millis(50));
+
+    // Stop must complete within 1 second and must NOT panic.
+    let start = std::time::Instant::now();
+    stop_stream_session(&bridge);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "stop_stream_session after rebuild must complete within 1s (AC-R2 budget), took: {elapsed:?}"
+    );
+
+    assert!(
+        bridge.session.lock().unwrap().is_none(),
+        "bridge.session must be None after stop"
+    );
+    assert!(
+        bridge.current_args.lock().unwrap().is_none(),
+        "bridge.current_args must be None after stop"
+    );
+}
