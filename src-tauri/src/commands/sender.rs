@@ -948,6 +948,51 @@ pub fn stop_sender_session(bridge: &SenderBridge) {
     *bridge.restart_cache.lock().unwrap() = None;
 }
 
+// ─── retry_session_inner — core of retry_session ─────────────────────────────
+
+/// Retry a sender session after `Dead` state (spec §4.2, T11.1, AC-8).
+///
+/// Reads the cached start params from `SenderBridge::restart_cache` and
+/// re-initialises the session using a fresh `channel`.
+///
+/// # Error variants
+///
+/// | Error string | Condition |
+/// |---|---|
+/// | `"NoCachedParams: ..."` | No session was ever started (cache is empty). |
+///
+/// # Behaviour
+///
+/// If a session is still active (e.g. the user invokes retry while streaming),
+/// `retry_session_inner` stops the existing session first and re-starts it.
+/// This is idempotent: stopping an already-dead session is a no-op for join/cleanup.
+pub fn retry_session_inner(
+    bridge: &SenderBridge,
+    channel: Arc<dyn ChannelLike>,
+) -> Result<(), String> {
+    // Read cached params — None means no session was ever started.
+    let (udp_port, service_name) = {
+        let guard = bridge.restart_cache.lock().unwrap();
+        match &*guard {
+            None => {
+                return Err(
+                    "NoCachedParams: no cached session params — start a session first".to_string(),
+                );
+            }
+            Some(c) => (c.udp_port, c.service_name.clone()),
+        }
+    };
+
+    // Stop any existing session (idempotent — fast if drain threads have already exited).
+    // This also clears current_args so start_sender_inner won't see AlreadyRunning.
+    stop_sender_session(bridge);
+
+    // Re-start with cached params and the new channel.
+    // start_sender_inner populates restart_cache with a fresh session_nonce.
+    start_sender_inner(bridge, channel, Some(udp_port), Some(service_name))
+        .map_err(|e| format!("retry_session start_sender_inner failed: {e}"))
+}
+
 // ─── sender_diagnostics_impl ──────────────────────────────────────────────────
 
 /// Core of `sender_diagnostics` — extracted for unit testing.
@@ -1183,6 +1228,27 @@ pub fn stop_sender(bridge: tauri::State<SenderBridge>) -> Result<(), String> {
 #[tauri::command]
 pub fn sender_diagnostics(bridge: tauri::State<SenderBridge>) -> Result<SenderStats, String> {
     sender_diagnostics_impl(&bridge)
+}
+
+/// Retry the sender session after `Dead` state (spec §4.2, T11.1, AC-8).
+///
+/// Reads cached start params from `SenderBridge::restart_cache` and
+/// re-initialises the session on the new `channel`. The attempt counter resets to 0
+/// (fresh 3-attempt cycle). Any existing session residue is torn down first.
+///
+/// Also updates `dist/sender.js` Retry button: when Phase 11 lands, the JS
+/// TODO stub `invoke("start_sender")` can be swapped to `invoke("retry_session", { channel })`.
+///
+/// # Errors
+///
+/// `"NoCachedParams"` — no session was ever started (the user cannot retry what they never started).
+#[tauri::command]
+pub fn retry_session(
+    bridge: tauri::State<SenderBridge>,
+    channel: tauri::ipc::Channel<InvokeResponseBody>,
+) -> Result<(), String> {
+    let channel_arc: Arc<dyn ChannelLike> = Arc::new(TauriSenderChannel(channel));
+    retry_session_inner(&bridge, channel_arc)
 }
 
 // ─── TauriSenderChannel — production ChannelLike for sender ──────────────────

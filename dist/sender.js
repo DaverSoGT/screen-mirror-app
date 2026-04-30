@@ -185,9 +185,40 @@
     retryBtn.addEventListener("click", async function () {
       hideDeadButtons();
       senderMode = "idle";
-      // TODO Phase 11: replace with `invoke("retry_session", { channel })`.
-      // For now, re-start the sender with default params (same UX as initial start).
-      await startSender();
+      // Phase 11: invoke retry_session — reads cached params from SenderBridge,
+      // tears down residue, re-enters Connecting state (AC-8).
+      const channel = new Channel();
+      channel.onmessage = function (payload) {
+        try {
+          let value;
+          if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) {
+            const text = new TextDecoder().decode(payload);
+            value = JSON.parse(text);
+          } else if (typeof payload === "string") {
+            value = JSON.parse(payload);
+          } else {
+            value = payload;
+          }
+          handleMessage(value);
+        } catch (e) {
+          console.error("[sender] retry channel message parse error:", e, payload);
+        }
+      };
+      try {
+        await invoke("retry_session", { channel });
+        senderMode = "running";
+        window.__sm_streamActive = true;
+      } catch (err) {
+        console.error("[sender] retry_session failed:", err);
+        const msg =
+          typeof err === "object" && err !== null
+            ? JSON.stringify(err)
+            : String(err);
+        const errorDiv = document.getElementById("error");
+        if (errorDiv) errorDiv.textContent = msg;
+        senderMode = "idle";
+        window.__sm_streamActive = false;
+      }
     });
   }
 
