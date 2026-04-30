@@ -42,7 +42,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sm_domain::encode::EncodedPacket;
+use sm_domain::session::{DeadReason, ReconnectPolicy, ReconnectTrigger, SessionState};
 use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+use sm_domain::supervisor::{ReconnectSupervisor, SupervisorOutcome, SupervisorSignal};
 use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, TransportRole,
     VideoReceiver,
@@ -58,6 +60,12 @@ use tauri::ipc::InvokeResponseBody;
 pub(crate) const FRAME_INIT: u8 = 0x00;
 /// Byte 0 of a raw channel frame identifying a media segment.
 pub(crate) const FRAME_SEGMENT: u8 = 0x01;
+/// Byte 0 of a raw channel frame carrying a JSON reconnect-lifecycle status message.
+///
+/// Reconnect status (0x02) is multiplexed on the SAME binary ChannelLike as fMP4
+/// so frames and status are ordered temporally — no cross-channel race (decision #477).
+/// The JS demuxer (`dist/mse-client.js`) routes 0x02 to `handleStatus(payload)`.
+pub const FRAME_STATUS: u8 = 0x02;
 
 // ─── ChannelLike — abstraction over tauri::ipc::Channel for testability ──────
 
@@ -114,10 +122,69 @@ struct BridgeCounters {
     keyframe_requests_fired: AtomicU64,
 }
 
+// ─── StreamStatusEvent — JSON events for 0x02 reconnect status frames ────────
+
+/// JSON payload for receiver-side 0x02 status frames.
+///
+/// Emitted by the reconnect supervisor drain thread via `channel.send_raw(0x02, json)`.
+/// The JS demuxer (`dist/mse-client.js`) parses and routes to `handleStatus(payload)`.
+///
+/// MUST NOT overlap with the sender's `SenderStatusEvent` kind values — both share
+/// the `handleMessage` switch on `dist/sender.js` for sender-side, but receiver
+/// status arrives via 0x02 frames on the binary channel.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StreamStatusEvent {
+    Reconnecting { attempt: u8, max: u8 },
+    Dead { reason: String },
+}
+
+/// Encode a `StreamStatusEvent` to JSON bytes and send as a 0x02 frame.
+fn emit_stream_status(channel: &Arc<dyn ChannelLike>, event: &StreamStatusEvent) {
+    if let Ok(bytes) = serde_json::to_vec(event) {
+        let _ = channel.send_raw(FRAME_STATUS, bytes);
+    }
+}
+
+/// Convert `DeadReason` to its snake_case string for the frontend.
+fn stream_dead_reason_to_str(reason: &DeadReason) -> &'static str {
+    match reason {
+        DeadReason::IceFailedRepeatedly => "ice_failed_repeatedly",
+        DeadReason::ConnectionLostRepeatedly => "connection_lost_repeatedly",
+        DeadReason::SignalingChannelDead => "signaling_channel_dead",
+        DeadReason::UserCanceled => "user_canceled",
+    }
+}
+
+// ─── StreamRestartCache — construction params for retry_session ───────────────
+
+/// Cached construction parameters for the active or most-recent receiver session.
+///
+/// Persisted by `start_stream_inner` and read by `retry_session` (Phase 11).
+/// Symmetric to `RestartCache` on `SenderBridge`.
+///
+/// `session_nonce` is generated once per session; lower nonce wins reconnect race (AC-10).
+#[derive(Clone)]
+pub struct StreamRestartCache {
+    /// UDP port the session was started on.
+    pub udp_port: u16,
+    /// mDNS service name for this session.
+    pub service_name: String,
+    /// Frontend IPC channel — re-used during `retry_session`.
+    pub channel: Arc<dyn ChannelLike>,
+    /// Random u64 nonce generated once at session start. Lower nonce wins race (AC-10).
+    pub session_nonce: u64,
+}
+
 // ─── BuilderFn — injectable seam for ReceiverBundle construction ─────────────
 
 /// Factory closure type: produces a fully-started `ReceiverBundle` given
-/// runtime args `(udp_port, service_name, stop_flag)`.
+/// runtime args `(bind_ctx, udp_port, service_name, stop_flag, channel)`.
+///
+/// The `channel` parameter (Amendment Phase-7) allows the builder's drain closure
+/// to forward 0x02 status frames to the frontend over the same binary ChannelLike
+/// that carries fMP4 segments — keeping frames and status temporally ordered
+/// (decision #477).
 ///
 /// Production: wraps `build_production_bundle` (ignores port/name for now;
 /// B5 will wire them in). Tests inject a closure that returns a fake bundle
@@ -126,12 +193,16 @@ struct BridgeCounters {
 /// Resolved design decisions (design #288 §1.1):
 /// - PQ-A: `Arc<dyn Fn(...) + Send + Sync>` — non-generic bridge keeps Tauri
 ///   `.manage()` happy and prevents infra types from leaking into `lib.rs`.
-/// - PQ-B: `(u16, String, Arc<AtomicBool>)` — args flow EXPLICITLY; no capture.
-/// - OQ-D1: plain `Arc<dyn Fn>` — no `Mutex` wrapper. The `Arc` is `Clone +
-///   Send + Sync`; the underlying `Fn` (not `FnMut`) makes concurrent calls safe.
-/// - OQ-D7: builder does NOT see the `Channel`; returns just `ReceiverBundle`.
+/// - PQ-B: args flow EXPLICITLY; no capture.
+/// - OQ-D1: plain `Arc<dyn Fn>` — no `Mutex` wrapper.
 pub(crate) type BuilderFn = Arc<
-    dyn Fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>
+    dyn Fn(
+            BindCtx,
+            u16,
+            String,
+            Arc<AtomicBool>,
+            Arc<dyn ChannelLike>,
+        ) -> Result<ReceiverBundle, BundleError>
         + Send
         + Sync,
 >;
@@ -182,7 +253,7 @@ impl From<std::io::Error> for BundleError {
 /// No `Clone`/`Copy`/`Default` derives (R2.2): a `UdpSocket` is a unique OS
 /// resource; duplicating or defaulting it has no safe meaning here.
 /// Implements `Send` automatically from `UdpSocket: Send` (R2.3).
-pub(crate) struct BindCtx {
+pub struct BindCtx {
     pub(crate) socket: std::net::UdpSocket,
 }
 
@@ -472,21 +543,43 @@ pub struct StreamBridge {
     ///   stop path:  session FIRST, then current_args.
     /// Future code MUST NOT acquire these locks in reverse order within a single path.
     pub(crate) current_args: Mutex<Option<(u16, String)>>,
+
+    /// Cached construction params + session nonce; populated by `start_stream_inner`;
+    /// cleared by `stop_stream_session`; read by `retry_session` (Phase 11).
+    pub restart_cache: Mutex<Option<StreamRestartCache>>,
+
+    /// Signal channel to the reconnect supervisor, if one is active.
+    ///
+    /// Shared between `stop_stream_session` (which sends `Stop`) and the drain thread
+    /// (which sets it when the supervisor is spawned). Stored on `StreamBridge` (not
+    /// `StreamSession`) so `start_stream_inner` can provision the same Arc that the
+    /// builder captures, before the session is constructed.
+    pub supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 }
 
 impl StreamBridge {
     /// Create a bridge using the production `build_production_bundle` factory.
     ///
-    /// `build_production_bundle` now accepts `(udp_port, service_name, stop_flag)`
-    /// (B5 wiring). The wrapper closure passes all args through directly.
-    /// (Spec #287 R1.2, R2.5; design §1.4 §6)
+    /// Phase 7: adds `channel` to the BuilderFn so the drain thread can emit
+    /// 0x02 status frames over the same binary ChannelLike as fMP4.
     pub fn new() -> Self {
-        // Direct delegation: BuilderFn(port, name, stop_flag) →
-        // build_production_bundle(port, name, stop_flag).
-        // B5 removes the prior `|_port, _name, stop_flag|` shim.
-        Self::new_with_builder(Arc::new(|bind_ctx, port, name, stop_flag| {
-            build_production_bundle(bind_ctx, port, name, stop_flag)
-        }))
+        // supervisor_signal_tx is created here and shared into the builder closure
+        // so the production drain can register the supervisor sender.
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+        let sup_tx_for_builder = sup_tx.clone();
+        Self::new_with_builder_and_sup_tx(
+            Arc::new(move |bind_ctx, port, name, stop_flag, channel| {
+                build_production_bundle(
+                    bind_ctx,
+                    port,
+                    name,
+                    stop_flag,
+                    channel,
+                    sup_tx_for_builder.clone(),
+                )
+            }),
+            sup_tx,
+        )
     }
 
     /// Create a bridge with a custom builder factory (test seam).
@@ -494,11 +587,32 @@ impl StreamBridge {
     /// Both production code and test code may use this constructor.
     /// No `#[cfg(test)]` gate — the constructor is intentionally public so tests
     /// can inject fake builders without a setter (spec #287 R1.3, R1.4).
+    #[allow(dead_code)]
     pub(crate) fn new_with_builder(builder: BuilderFn) -> Self {
         Self {
             session: Mutex::new(None),
             builder,
             current_args: Mutex::new(None),
+            restart_cache: Mutex::new(None),
+            supervisor_signal_tx: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Create a bridge with a pre-provisioned `supervisor_signal_tx` Arc.
+    ///
+    /// Used in tests where the builder closure must capture the same Arc that the
+    /// bridge stores, so `stop_stream_session` can reach the supervisor. Pattern
+    /// mirrors `SenderBridge::new_with_builder_and_sup_tx`.
+    pub fn new_with_builder_and_sup_tx(
+        builder: BuilderFn,
+        supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    ) -> Self {
+        Self {
+            session: Mutex::new(None),
+            builder,
+            current_args: Mutex::new(None),
+            restart_cache: Mutex::new(None),
+            supervisor_signal_tx,
         }
     }
 
@@ -561,7 +675,7 @@ impl StreamSession {
 
 /// Minimal interface needed from the receiver by the bridge (avoids pulling the
 /// full `VideoReceiver` bound into tests).
-trait ReceiverOps: Send {
+pub trait ReceiverOps: Send {
     /// Fire a PLI toward the sender.
     fn request_keyframe(&self) -> Result<(), TransportError>;
     /// Count of dropped frames (backpressure).
@@ -569,7 +683,7 @@ trait ReceiverOps: Send {
 }
 
 /// Minimal interface needed from the signaling adapter by the bridge.
-trait SignalingOps: Send {
+pub trait SignalingOps: Send {
     /// Stop the signaling adapter.
     fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError>;
 }
@@ -621,18 +735,18 @@ trait SignalingPublishOps: Send + Sync {
 /// ```
 /// FnOnce(Arc<AtomicBool>) -> Result<ReceiverBundle, String>
 /// ```
-pub(crate) struct ReceiverBundle {
+pub struct ReceiverBundle {
     /// The receiver, ready for PLI calls and `dropped_frames()` reads.
-    receiver: Box<dyn ReceiverOps>,
+    pub receiver: Box<dyn ReceiverOps>,
     /// The packet receive end — handed to the mux thread.
-    pkt_rx: Receiver<EncodedPacket>,
+    pub pkt_rx: Receiver<EncodedPacket>,
     /// Signaling adapter (optional — None in tests using FakeReceiver).
-    signaling: Option<Box<dyn SignalingOps>>,
+    pub signaling: Option<Box<dyn SignalingOps>>,
     /// Drain thread handles (transport-event drain + signaling-event drain).
-    drain_handles: Vec<JoinHandle<()>>,
+    pub drain_handles: Vec<JoinHandle<()>>,
     /// Senders kept alive so their associated drain threads keep running.
     /// These are dropped first in stop_stream to unblock the drain threads.
-    _drain_senders: Vec<SyncSender<()>>,
+    pub _drain_senders: Vec<SyncSender<()>>,
 }
 
 // ─── Drain functions (W2-fix-B, W2-fix-C) ────────────────────────────────────
@@ -692,11 +806,12 @@ fn run_signaling_drain(
     }
 }
 
-/// Transport-event drain loop (W2-fix-C).
+/// Transport-event drain loop (W2-fix-C) — WITHOUT reconnect supervisor.
 ///
-/// Runs on its own OS thread. Absorbs `TransportEvent`s — logs significant
-/// events (ICE connected/failed) and discards the rest. Exits when `stop_flag`
-/// is set or the event channel is disconnected.
+/// Legacy variant kept for backward compatibility with existing tests that
+/// don't wire the supervisor. Production and new tests use
+/// `run_stream_transport_event_drain_with_supervisor`.
+#[allow(dead_code)]
 fn run_transport_event_drain(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -720,6 +835,242 @@ fn run_transport_event_drain(
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Transport-event drain loop — WITH reconnect supervisor wiring AND custom policy/ack_timeout.
+///
+/// Mirrors `run_sender_transport_event_drain_with_supervisor_custom` from sender.rs.
+/// On `IceFailed` or `ConnectionLost`, enters supervisor mode which emits 0x02 status
+/// frames (`FRAME_STATUS`) on the binary ChannelLike for the JS demuxer (decision #477).
+///
+/// **0x02 ordering contract**: status frames are emitted by the coordinator BETWEEN
+/// transport events; they never interleave inside a fragmented MP4 segment because the
+/// mux thread drains `pkt_rx` independently and only the transport-event drain emits
+/// 0x02 frames on the same `channel`.
+///
+/// Tests use this variant with a fast policy (millisecond-scale backoff) to drive all
+/// 3 attempts without waiting for the production 3s/9s/27s delays.
+pub fn run_stream_transport_event_drain_with_supervisor_custom(
+    ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
+    stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    policy: ReconnectPolicy,
+    ack_timeout: Duration,
+) {
+    let session_nonce: u64 = rand::random();
+
+    'drain: loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        match ev_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => match ev {
+                TransportEvent::IceConnected => {
+                    eprintln!("[sm-stream-transport-drain+sup] ICE connected");
+                }
+                TransportEvent::IceFailed => {
+                    eprintln!(
+                        "[sm-stream-transport-drain+sup] ICE failed — entering supervisor mode"
+                    );
+                    enter_stream_supervisor_mode(
+                        ReconnectTrigger::IceFailed,
+                        session_nonce,
+                        &ev_rx,
+                        &stop_flag,
+                        &channel,
+                        &supervisor_signal_tx,
+                        policy,
+                        ack_timeout,
+                    );
+                    break 'drain;
+                }
+                TransportEvent::ConnectionLost { reason } => {
+                    eprintln!(
+                        "[sm-stream-transport-drain+sup] connection lost: {reason} — entering supervisor mode"
+                    );
+                    enter_stream_supervisor_mode(
+                        ReconnectTrigger::ConnectionLost { reason },
+                        session_nonce,
+                        &ev_rx,
+                        &stop_flag,
+                        &channel,
+                        &supervisor_signal_tx,
+                        policy,
+                        ack_timeout,
+                    );
+                    break 'drain;
+                }
+                _ => {}
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+/// Transport-event drain loop — WITH supervisor wiring AND production defaults.
+///
+/// Uses `ReconnectPolicy::v1_default()` and `ack_timeout = 2s`.
+fn run_stream_transport_event_drain_with_supervisor(
+    ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
+    stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+) {
+    run_stream_transport_event_drain_with_supervisor_custom(
+        ev_rx,
+        stop_flag,
+        channel,
+        supervisor_signal_tx,
+        ReconnectPolicy::v1_default(),
+        Duration::from_secs(2),
+    );
+}
+
+/// Supervisor coordinator mode for the receiver transport-event drain.
+///
+/// Mirrors `enter_supervisor_mode` from sender.rs. Emits 0x02 (`FRAME_STATUS`)
+/// status frames instead of JSON events (receiver uses binary channel — decision #477).
+#[allow(clippy::too_many_arguments)]
+fn enter_stream_supervisor_mode(
+    initial_trigger: ReconnectTrigger,
+    session_nonce: u64,
+    ev_rx: &std::sync::mpsc::Receiver<TransportEvent>,
+    stop_flag: &Arc<AtomicBool>,
+    channel: &Arc<dyn ChannelLike>,
+    supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    policy: ReconnectPolicy,
+    ack_timeout: Duration,
+) {
+    let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
+    let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
+
+    // Register signal_tx so stop_stream_session can interrupt backoff sleep.
+    *supervisor_signal_tx.lock().unwrap() = Some(signal_tx.clone());
+
+    // Send initial trigger to kick off the supervisor.
+    let _ = signal_tx.try_send(SupervisorSignal::LocalFailure {
+        trigger: initial_trigger,
+    });
+
+    // Spawn supervisor on a short-lived thread.
+    let sup_join = std::thread::Builder::new()
+        .name("sm-stream-supervisor".into())
+        .spawn(move || {
+            let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
+            sup.run(ack_timeout)
+        })
+        .expect("supervisor thread spawn must not fail");
+
+    // Coordinator loop: interleave reading outcomes and transport events.
+    'coord: loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break 'coord;
+        }
+
+        // Drain all available outcomes (non-blocking).
+        loop {
+            match outcome_rx.try_recv() {
+                Ok(outcome) => {
+                    handle_stream_supervisor_outcome(&outcome, channel);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break 'coord;
+                }
+            }
+        }
+
+        // Read transport events with short timeout to stay responsive.
+        match ev_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(TransportEvent::IceConnected) => {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
+            }
+            Ok(TransportEvent::IceFailed) | Ok(TransportEvent::ConnectionLost { .. }) => {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+            }
+        }
+    }
+
+    // Clear signal_tx from the session before joining.
+    *supervisor_signal_tx.lock().unwrap() = None;
+
+    // Join the supervisor thread.
+    let _ = sup_join.join();
+}
+
+/// Handle a single `SupervisorOutcome` by emitting the appropriate 0x02 status frame.
+fn handle_stream_supervisor_outcome(outcome: &SupervisorOutcome, channel: &Arc<dyn ChannelLike>) {
+    match outcome {
+        SupervisorOutcome::StateChanged(SessionState::Reconnecting { attempt, max }) => {
+            emit_stream_status(
+                channel,
+                &StreamStatusEvent::Reconnecting {
+                    attempt: attempt.get(),
+                    max: max.get(),
+                },
+            );
+        }
+        SupervisorOutcome::StateChanged(SessionState::Dead { reason }) => {
+            emit_stream_status(
+                channel,
+                &StreamStatusEvent::Dead {
+                    reason: stream_dead_reason_to_str(reason).to_string(),
+                },
+            );
+        }
+        SupervisorOutcome::StateChanged(SessionState::Connected) => {
+            // Reconnect succeeded — JS will receive a streaming event when
+            // the first fMP4 init segment arrives (Phase 10).
+            eprintln!("[sm-stream-sup-coord] reconnect succeeded — awaiting init segment");
+        }
+        SupervisorOutcome::Dead(reason) => {
+            // Already emitted via StateChanged(Dead) above.
+            let _ = reason;
+        }
+        SupervisorOutcome::PublishReconnectRequest {
+            attempt,
+            session_nonce,
+        } => {
+            eprintln!(
+                "[sm-stream-sup-coord] publish ReconnectRequest attempt={attempt} nonce={session_nonce}"
+            );
+            // TODO Phase 7 production: call MdnsSignaling::publish_reconnect_request()
+        }
+        SupervisorOutcome::PublishReconnectAck {
+            attempt,
+            session_nonce,
+        } => {
+            eprintln!(
+                "[sm-stream-sup-coord] publish ReconnectAck attempt={attempt} nonce={session_nonce}"
+            );
+            // TODO Phase 7 production: call MdnsSignaling::publish_reconnect_ack()
+        }
+        SupervisorOutcome::InitiateRebuild => {
+            eprintln!(
+                "[sm-stream-sup-coord] InitiateRebuild — bundle rebuild TODO (Phase 7 production)"
+            );
+            // TODO Phase 7 production: teardown old bundle, call builder again
+        }
+        SupervisorOutcome::InitiateMdnsReset => {
+            eprintln!(
+                "[sm-stream-sup-coord] InitiateMdnsReset — mDNS reset TODO (Phase 7 production)"
+            );
+            // TODO Phase 7 production: call MdnsSignaling::reset()
+        }
+        SupervisorOutcome::Stopped => {
+            eprintln!("[sm-stream-sup-coord] supervisor stopped");
+        }
+        SupervisorOutcome::StateChanged(_) => {
+            // Connecting or other transient states — no 0x02 frame needed.
         }
     }
 }
@@ -864,6 +1215,8 @@ fn build_production_bundle(
     udp_port: u16,
     service_name: String,
     stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) -> Result<ReceiverBundle, BundleError> {
     // Extract the prebound socket from BindCtx (R5.1, D3).
     // The socket was acquired by `bind_probe` in `start_stream_inner` BEFORE any
@@ -920,12 +1273,19 @@ fn build_production_bundle(
     let sig_publish_for_drain: Arc<dyn SignalingPublishOps> =
         Arc::new(MdnsSignalingOps(signaling_mutex));
 
-    // ── 4. Spawn transport-event drain thread (W2-fix-C) ──────────────────
+    // ── 4. Spawn transport-event drain thread with reconnect supervisor ──
+    // Phase 7: uses supervisor-aware drain so 0x02 status frames are emitted
+    // on IceFailed/ConnectionLost (design §3, decision #477).
     let stop_flag_t = stop_flag.clone();
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
         .spawn(move || {
-            run_transport_event_drain(transport_event_rx, stop_flag_t);
+            run_stream_transport_event_drain_with_supervisor(
+                transport_event_rx,
+                stop_flag_t,
+                channel,
+                supervisor_signal_tx,
+            );
         })?;
 
     // ── 5. Spawn signaling-event drain thread (W2-fix-B) ──────────────────
@@ -988,7 +1348,7 @@ fn build_production_bundle(
 ///
 /// Design §10 OQ-A2 (option a): `pub(crate)` so the `#[tauri::command]` wrapper is
 /// a thin 4-line forwarder and tests exercise the same code path.
-pub(crate) fn start_stream_inner(
+pub fn start_stream_inner(
     bridge: &StreamBridge,
     channel: Arc<dyn ChannelLike>,
     udp_port: Option<u16>,
@@ -1058,21 +1418,33 @@ pub(crate) fn start_stream_inner(
         // final wiring. current_args will be set again after session is stored.
     }
 
-    // Step 6 — Wrap socket into BindCtx and clone the builder Arc.
+    // Step 6 — Wrap socket into BindCtx; clone builder; generate session nonce.
     // No borrow of bridge.builder held during the (potentially slow) build (R4.3).
     let bind_ctx = BindCtx { socket };
     let builder = bridge.builder.clone();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    // Generate session nonce once per session (AC-10: lower nonce wins race).
+    // Guaranteed non-zero by retry-loop (collision prob ≈ 1/2^64; acceptable).
+    let session_nonce: u64 = {
+        let mut n = rand::random::<u64>();
+        while n == 0 {
+            n = rand::random::<u64>();
+        }
+        n
+    };
+
+    // Reset the bridge-level supervisor_signal_tx for this new session (AC-13).
+    *bridge.supervisor_signal_tx.lock().unwrap() = None;
+
     // Step 7 — Invoke BuilderFn (no StreamBridge mutex held — R4.3).
-    // Translate BundleError into StartStreamError. PortInUse now originates from
-    // bind_probe (step 4), not the builder. The builder path can still return
-    // BundleError (e.g. signaling failure) which maps to BundleBuildFailed.
+    // Translate BundleError into StartStreamError.
     let bundle = (builder)(
         bind_ctx,
         resolved_port,
         resolved_name.clone(),
         stop_flag.clone(),
+        channel.clone(),
     )
     .map_err(|e| match e {
         BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
@@ -1081,16 +1453,19 @@ pub(crate) fn start_stream_inner(
 
     // Step 8 — Acquire session lock and store the new session.
     let mut guard = bridge.session.lock().unwrap();
-    let session = build_stream_session(channel, bundle, stop_flag)
+    let session = build_stream_session(channel.clone(), bundle, stop_flag)
         .map_err(StartStreamError::BundleBuildFailed)?;
     *guard = Some(session);
     drop(guard);
 
-    // Step 9 — Populate current_args AFTER session is successfully stored.
-    // Re-acquire current_args lock (released at end of step 5 block).
-    // Spec R6.2: "When start_stream completes successfully, current_args MUST
-    // be set to Some((resolved_port, resolved_service_name))."
-    *bridge.current_args.lock().unwrap() = Some((resolved_port, resolved_name));
+    // Step 9 — Populate current_args AND restart_cache AFTER session is stored.
+    *bridge.current_args.lock().unwrap() = Some((resolved_port, resolved_name.clone()));
+    *bridge.restart_cache.lock().unwrap() = Some(StreamRestartCache {
+        udp_port: resolved_port,
+        service_name: resolved_name,
+        channel,
+        session_nonce,
+    });
 
     Ok(())
 }
@@ -1156,7 +1531,14 @@ pub fn start_stream(
 ///
 /// Idempotent: if no session is active, returns immediately (session lock released
 /// without touching current_args, which is already None).
-fn stop_stream_session(bridge: &StreamBridge) {
+pub fn stop_stream_session(bridge: &StreamBridge) {
+    // 0. Interrupt supervisor backoff sleep BEFORE setting stop_flag (AC-13).
+    //    The bridge-level supervisor_signal_tx is shared with the drain thread.
+    let sup_tx_opt = bridge.supervisor_signal_tx.lock().unwrap().clone();
+    if let Some(sup_tx) = sup_tx_opt {
+        let _ = sup_tx.try_send(SupervisorSignal::Stop);
+    }
+
     {
         // Lock-order step 1: acquire session lock FIRST (stop path: session → current_args).
         let mut guard = bridge.session.lock().unwrap();
@@ -1186,10 +1568,9 @@ fn stop_stream_session(bridge: &StreamBridge) {
     }
 
     // 8. Acquire current_args lock AFTER session lock is released (design §4).
-    //    Spec R6.3: clear current_args to None AFTER the drain+join+signaling stop
-    //    completes. Clearing here ensures a concurrent start_stream_inner sees None
-    //    only when the previous teardown is fully done.
     *bridge.current_args.lock().unwrap() = None;
+    // 9. Clear restart_cache AFTER current_args (same lock order tier).
+    *bridge.restart_cache.lock().unwrap() = None;
 }
 
 /// Stop the streaming session. Idempotent.
@@ -1642,23 +2023,25 @@ mod tests {
     /// Design #288 §7.1: "build a `BuilderFn` that, when invoked, records the args
     /// into `probe` and returns a fake bundle".
     fn make_test_builder(probe: Arc<BuilderProbe>, result: Result<(), &'static str>) -> BuilderFn {
-        Arc::new(move |bind_ctx: BindCtx, port, name, _stop_flag| {
-            let _ = bind_ctx; // PQ-C-1: drop the prebound socket in tests; no I/O needed.
-            probe.invocations.lock().unwrap().push((port, name));
-            match result {
-                Ok(()) => {
-                    let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-                    Ok(ReceiverBundle {
-                        receiver: Box::new(FakeReceiver::new()),
-                        pkt_rx,
-                        signaling: None,
-                        drain_handles: Vec::new(),
-                        _drain_senders: Vec::new(),
-                    })
+        Arc::new(
+            move |bind_ctx: BindCtx, port, name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let _ = bind_ctx; // PQ-C-1: drop the prebound socket in tests; no I/O needed.
+                probe.invocations.lock().unwrap().push((port, name));
+                match result {
+                    Ok(()) => {
+                        let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                        Ok(ReceiverBundle {
+                            receiver: Box::new(FakeReceiver::new()),
+                            pkt_rx,
+                            signaling: None,
+                            drain_handles: Vec::new(),
+                            _drain_senders: Vec::new(),
+                        })
+                    }
+                    Err(msg) => Err(BundleError::Other(msg.to_string())),
                 }
-                Err(msg) => Err(BundleError::Other(msg.to_string())),
-            }
-        })
+            },
+        )
     }
 
     // The builder helper that returned Err(PortInUse) was removed (B5.T3, PQ-C-1, R6.2).
@@ -2152,9 +2535,11 @@ mod tests {
 
         // Construct a bridge with a closure that panics if called — the test only
         // checks that the constructor compiles and the builder is stored.
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            panic!("builder must not be called in this test")
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                panic!("builder must not be called in this test")
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         // builder field must be populated: Arc strong count is at least 1.
         assert!(Arc::strong_count(&bridge.builder) >= 1);
@@ -2889,21 +3274,31 @@ mod tests {
         // without executing the function.
         // Updated for TOCTOU hardening (B3): build_production_bundle now accepts
         // BindCtx as its first argument (R5.1, D2).
-        let _: fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError> =
-            build_production_bundle;
+        // Phase 7: signature updated to include channel + supervisor_signal_tx.
+        // The old 4-arg compile gate is replaced by the 6-arg gate below.
+        let _ = build_production_bundle; // ensure fn is reachable
     }
 
     /// B5-1.2 — `StreamBridge::new()` wrapper closure passes udp_port and service_name
     ///           through to `build_production_bundle` instead of ignoring them.
     ///
-    /// Updated for TOCTOU hardening (B3): `build_production_bundle` now accepts `BindCtx`
-    /// as its first argument. The compile-gate below verifies the new 4-arg signature.
+    /// Updated for Phase 7: `build_production_bundle` now accepts 6 args including
+    /// channel and supervisor_signal_tx. The compile-gate verifies the new 6-arg signature.
     #[test]
     fn test_new_wrapper_closure_passes_port_and_name_to_build_production_bundle() {
-        // Compile gate: verify that `build_production_bundle` can be referred to as
-        // a function with the new four-argument signature (BindCtx, u16, String, Arc<AtomicBool>).
+        // Compile gate: verify build_production_bundle is callable with 6 args.
+        // The type alias avoids the `type_complexity` clippy lint.
+        type SupTx = Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>;
+        #[allow(clippy::type_complexity)]
         fn _assert_arity(
-            _f: fn(BindCtx, u16, String, Arc<AtomicBool>) -> Result<ReceiverBundle, BundleError>,
+            _f: fn(
+                BindCtx,
+                u16,
+                String,
+                Arc<AtomicBool>,
+                Arc<dyn ChannelLike>,
+                SupTx,
+            ) -> Result<ReceiverBundle, BundleError>,
         ) {
         }
         _assert_arity(build_production_bundle);
@@ -2924,17 +3319,19 @@ mod tests {
     fn test_start_stream_inner_exists_and_returns_ok_for_valid_args() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
-            probe_clone.lock().unwrap().push((port, name));
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            move |_bind_ctx: BindCtx, port, name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                probe_clone.lock().unwrap().push((port, name));
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -2956,16 +3353,18 @@ mod tests {
     /// RED: `start_stream_inner` does not exist.
     #[test]
     fn test_start_stream_inner_sets_session_on_success() {
-        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            move |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -2990,9 +3389,11 @@ mod tests {
     #[test]
     fn test_start_stream_inner_invalid_port_zero_rejects_before_builder() {
         // Builder panics if called — ensures validator short-circuits before builder.
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            panic!("builder must NOT be called when port validation fails")
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                panic!("builder must NOT be called when port validation fails")
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3016,9 +3417,11 @@ mod tests {
     /// RED: validators not yet wired.
     #[test]
     fn test_start_stream_inner_invalid_port_privileged_rejects_before_builder() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            panic!("builder must NOT be called when port validation fails")
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                panic!("builder must NOT be called when port validation fails")
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3041,9 +3444,11 @@ mod tests {
     /// RED: validators not yet wired.
     #[test]
     fn test_start_stream_inner_invalid_service_name_rejects_before_builder() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            panic!("builder must NOT be called when service-name validation fails")
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                panic!("builder must NOT be called when service-name validation fails")
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3071,17 +3476,19 @@ mod tests {
     fn test_start_stream_inner_none_args_resolve_to_defaults_in_builder() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
-            probe_clone.lock().unwrap().push((port, name));
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            move |_bind_ctx: BindCtx, port, name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                probe_clone.lock().unwrap().push((port, name));
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3115,17 +3522,19 @@ mod tests {
     fn test_start_stream_inner_custom_args_reach_builder() {
         let probe = Arc::new(Mutex::new(Vec::<(u16, String)>::new()));
         let probe_clone = probe.clone();
-        let builder: BuilderFn = Arc::new(move |_bind_ctx: BindCtx, port, name, _stop_flag| {
-            probe_clone.lock().unwrap().push((port, name));
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            move |_bind_ctx: BindCtx, port, name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                probe_clone.lock().unwrap().push((port, name));
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3168,11 +3577,13 @@ mod tests {
     /// must still be returned for non-AddrInUse errors.
     #[test]
     fn test_start_stream_inner_builder_other_error_returns_bundle_build_failed() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            Err(BundleError::Other(
-                "some unrelated build failure".to_string(),
-            ))
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                Err(BundleError::Other(
+                    "some unrelated build failure".to_string(),
+                ))
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3233,16 +3644,18 @@ mod tests {
     /// RED: `start_stream_inner` currently does NOT write to `current_args`.
     #[test]
     fn test_current_args_set_on_successful_start_custom_args() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3271,16 +3684,18 @@ mod tests {
     /// RED: `start_stream_inner` currently does NOT write to `current_args`.
     #[test]
     fn test_current_args_set_on_successful_start_default_args() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3310,16 +3725,18 @@ mod tests {
     /// guard). B6-2 GREEN replaces that with the AlreadyRunning error.
     #[test]
     fn test_double_start_same_args_returns_already_running() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3368,16 +3785,18 @@ mod tests {
     /// RED: `start_stream_inner` currently returns `Ok(())` on double-start.
     #[test]
     fn test_double_start_different_args_returns_already_running_with_current_args() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3429,16 +3848,18 @@ mod tests {
     /// return `Err(AlreadyRunning)` instead of `Ok(())`.
     #[test]
     fn test_stop_clears_current_args_and_second_start_succeeds() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 
@@ -3733,16 +4154,18 @@ mod tests {
     /// RED: `stop_stream_session` does not clear `current_args`.
     #[test]
     fn test_stop_stream_session_clears_current_args() {
-        let builder: BuilderFn = Arc::new(|_bind_ctx: BindCtx, _port, _name, _stop_flag| {
-            let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
-            Ok(ReceiverBundle {
-                receiver: Box::new(FakeReceiver::new()),
-                pkt_rx,
-                signaling: None,
-                drain_handles: Vec::new(),
-                _drain_senders: Vec::new(),
-            })
-        });
+        let builder: BuilderFn = Arc::new(
+            |_bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(1);
+                Ok(ReceiverBundle {
+                    receiver: Box::new(FakeReceiver::new()),
+                    pkt_rx,
+                    signaling: None,
+                    drain_handles: Vec::new(),
+                    _drain_senders: Vec::new(),
+                })
+            },
+        );
         let bridge = StreamBridge::new_with_builder(builder);
         let channel: Arc<dyn ChannelLike> = FakeChannel::new();
 

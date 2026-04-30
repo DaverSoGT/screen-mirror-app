@@ -10,13 +10,13 @@
 
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 use screen_mirror_lib::commands::sender::{
     ChannelLike, SenderBridge, SenderBundle, SenderCounters,
-    run_sender_transport_event_drain_with_supervisor_custom,
-    start_sender_inner, stop_sender_session,
+    run_sender_transport_event_drain_with_supervisor_custom, start_sender_inner,
+    stop_sender_session,
 };
 use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
 use sm_domain::supervisor::SupervisorSignal;
@@ -86,7 +86,11 @@ fn fast_policy() -> ReconnectPolicy {
 fn make_supervised_bridge_with_policy(
     policy: ReconnectPolicy,
     ack_timeout: Duration,
-) -> (SenderBridge, std::sync::mpsc::SyncSender<TransportEvent>, Arc<FakeJsonChannel>) {
+) -> (
+    SenderBridge,
+    std::sync::mpsc::SyncSender<TransportEvent>,
+    Arc<FakeJsonChannel>,
+) {
     let ch = FakeJsonChannel::new();
     let ch_for_caller = ch.clone();
 
@@ -96,13 +100,16 @@ fn make_supervised_bridge_with_policy(
     let ev_rx_slot_clone = ev_rx_slot.clone();
 
     // Create the supervisor_signal_tx Arc BEFORE the bridge so the builder can capture it.
-    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-        Arc::new(Mutex::new(None));
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
     let sup_tx_for_drain = sup_tx.clone();
 
     let bridge = SenderBridge::new_with_builder_and_sup_tx(
         Arc::new(move |_, _, stop_flag, channel| {
-            let ev_rx = ev_rx_slot_clone.lock().unwrap().take().expect("ev_rx taken once");
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
             let counters = Arc::new(SenderCounters::default());
             let st = sup_tx_for_drain.clone();
             let p = policy.clone();
@@ -130,8 +137,11 @@ fn make_supervised_bridge_with_policy(
 ///
 /// Returns `(bridge, ev_tx, ch)` — `ch` is the channel the drain emits status
 /// events to and must be passed to `start_sender_inner` as the active channel.
-fn make_supervised_bridge(
-) -> (SenderBridge, std::sync::mpsc::SyncSender<TransportEvent>, Arc<FakeJsonChannel>) {
+fn make_supervised_bridge() -> (
+    SenderBridge,
+    std::sync::mpsc::SyncSender<TransportEvent>,
+    Arc<FakeJsonChannel>,
+) {
     make_supervised_bridge_with_policy(fast_policy(), Duration::from_millis(200))
 }
 
@@ -141,9 +151,8 @@ fn make_supervised_bridge(
 /// with udp_port, service_name, and a non-zero session_nonce.
 #[test]
 fn t6_1_restart_cache_populated_after_start() {
-    let bridge = SenderBridge::new_with_builder(Arc::new(|_, _, _, _| {
-        Ok(SenderBundle::test_stub())
-    }));
+    let bridge =
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(
@@ -155,7 +164,9 @@ fn t6_1_restart_cache_populated_after_start() {
     .expect("start must succeed");
 
     let cache = bridge.restart_cache.lock().unwrap();
-    let c = cache.as_ref().expect("restart_cache must be Some after start");
+    let c = cache
+        .as_ref()
+        .expect("restart_cache must be Some after start");
     assert_eq!(c.udp_port, 7890);
     assert_eq!(c.service_name, "_screen-mirror._tcp.local.");
     assert_ne!(c.session_nonce, 0, "session_nonce must be non-zero");
@@ -164,9 +175,8 @@ fn t6_1_restart_cache_populated_after_start() {
 /// T6.1 (AC-8): RestartCache is cleared after stop_sender_session.
 #[test]
 fn t6_1_restart_cache_cleared_after_stop() {
-    let bridge = SenderBridge::new_with_builder(Arc::new(|_, _, _, _| {
-        Ok(SenderBundle::test_stub())
-    }));
+    let bridge =
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
@@ -186,9 +196,8 @@ fn t6_1_restart_cache_cleared_after_stop() {
 /// T6.1: session_nonce is stable during the same session.
 #[test]
 fn t6_1_session_nonce_is_stable_during_session() {
-    let bridge = SenderBridge::new_with_builder(Arc::new(|_, _, _, _| {
-        Ok(SenderBundle::test_stub())
-    }));
+    let bridge =
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
@@ -219,13 +228,17 @@ fn t6_1_session_nonce_is_stable_during_session() {
 fn t6_2_ice_failed_emits_reconnecting_event_not_peer_lost() {
     let (bridge, ev_tx, ch) = make_supervised_bridge();
 
-    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
-        .expect("start");
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
 
     ev_tx.send(TransportEvent::IceFailed).unwrap();
 
-    let got = ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
-    assert!(got, "expected reconnecting event after IceFailed, got: {:?}", ch.messages());
+    let got =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got,
+        "expected reconnecting event after IceFailed, got: {:?}",
+        ch.messages()
+    );
 
     let msgs = ch.messages();
     let has_peer_lost = msgs.iter().any(|m| m.contains("\"kind\":\"peer_lost\""));
@@ -242,8 +255,7 @@ fn t6_2_ice_failed_emits_reconnecting_event_not_peer_lost() {
 fn t6_2_connection_lost_emits_reconnecting_event_not_peer_lost() {
     let (bridge, ev_tx, ch) = make_supervised_bridge();
 
-    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
-        .expect("start");
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
 
     ev_tx
         .send(TransportEvent::ConnectionLost {
@@ -251,8 +263,13 @@ fn t6_2_connection_lost_emits_reconnecting_event_not_peer_lost() {
         })
         .unwrap();
 
-    let got = ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
-    assert!(got, "expected reconnecting event after ConnectionLost, got: {:?}", ch.messages());
+    let got =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got,
+        "expected reconnecting event after ConnectionLost, got: {:?}",
+        ch.messages()
+    );
 
     stop_sender_session(&bridge);
 }
@@ -267,12 +284,12 @@ fn t6_2_connection_lost_emits_reconnecting_event_not_peer_lost() {
 fn t6_2_three_rebuild_failures_emit_dead_event() {
     let (bridge, ev_tx, ch) = make_supervised_bridge();
 
-    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
-        .expect("start");
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
 
     // Trigger reconnect.
     ev_tx.send(TransportEvent::IceFailed).unwrap();
-    let got = ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    let got =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
     assert!(got, "expected reconnecting event, got: {:?}", ch.messages());
 
     // Get session nonce.
@@ -324,7 +341,11 @@ fn t6_2_three_rebuild_failures_emit_dead_event() {
         // The ack_timeout in AwaitingAck is 2s; give a generous 3s margin.
         let reconnecting_key = format!("\"attempt\":{i}");
         let got_i = ch.wait_for_message_containing(&reconnecting_key, Duration::from_secs(3));
-        assert!(got_i, "expected reconnecting attempt={i}, got: {:?}", ch.messages());
+        assert!(
+            got_i,
+            "expected reconnecting attempt={i}, got: {:?}",
+            ch.messages()
+        );
 
         // Ack → supervisor moves to Rebuilding.
         sup_tx
@@ -349,7 +370,11 @@ fn t6_2_three_rebuild_failures_emit_dead_event() {
     }
 
     let got_dead = ch.wait_for_message_containing("\"kind\":\"dead\"", Duration::from_millis(1000));
-    assert!(got_dead, "expected dead event after 3 failures, got: {:?}", ch.messages());
+    assert!(
+        got_dead,
+        "expected dead event after 3 failures, got: {:?}",
+        ch.messages()
+    );
 
     stop_sender_session(&bridge);
 }
@@ -362,13 +387,17 @@ fn t6_2_three_rebuild_failures_emit_dead_event() {
 fn t6_2_stop_during_reconnect_cancels_supervisor_cleanly() {
     let (bridge, ev_tx, ch) = make_supervised_bridge();
 
-    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
-        .expect("start");
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
 
     // Enter reconnect.
     ev_tx.send(TransportEvent::IceFailed).unwrap();
-    let got = ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
-    assert!(got, "expected reconnecting before stop, got: {:?}", ch.messages());
+    let got =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got,
+        "expected reconnecting before stop, got: {:?}",
+        ch.messages()
+    );
 
     // Wait for supervisor to set signal_tx.
     let deadline = std::time::Instant::now() + Duration::from_millis(500);

@@ -493,12 +493,8 @@ mod tests {
     fn session_state_accessor_returns_connected_initially() {
         let (_signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(8);
         let (outcome_tx, _outcome_rx) = sync_channel::<SupervisorOutcome>(8);
-        let sup = ReconnectSupervisor::new(
-            ReconnectPolicy::v1_default(),
-            42,
-            signal_rx,
-            outcome_tx,
-        );
+        let sup =
+            ReconnectSupervisor::new(ReconnectPolicy::v1_default(), 42, signal_rx, outcome_tx);
         assert_eq!(sup.session_state(), SessionState::Connected);
     }
 

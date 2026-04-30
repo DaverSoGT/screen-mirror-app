@@ -518,7 +518,9 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                     );
                 }
                 TransportEvent::IceFailed => {
-                    eprintln!("[sm-sender-transport-drain+sup] ICE failed — entering supervisor mode");
+                    eprintln!(
+                        "[sm-sender-transport-drain+sup] ICE failed — entering supervisor mode"
+                    );
                     enter_supervisor_mode(
                         ReconnectTrigger::IceFailed,
                         session_nonce,
@@ -532,7 +534,9 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                     break 'drain;
                 }
                 TransportEvent::ConnectionLost { reason } => {
-                    eprintln!("[sm-sender-transport-drain+sup] connection lost: {reason} — entering supervisor mode");
+                    eprintln!(
+                        "[sm-sender-transport-drain+sup] connection lost: {reason} — entering supervisor mode"
+                    );
                     enter_supervisor_mode(
                         ReconnectTrigger::ConnectionLost { reason },
                         session_nonce,
@@ -550,9 +554,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                         .keyframe_requests_received
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
-                    eprintln!(
-                        "[sm-sender-transport-drain+sup] KeyframeRequested #{n}"
-                    );
+                    eprintln!("[sm-sender-transport-drain+sup] KeyframeRequested #{n}");
                 }
                 _ => {}
             },
@@ -626,9 +628,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
                         .keyframe_requests_received
                         .fetch_add(1, Ordering::Relaxed)
                         + 1;
-                    eprintln!(
-                        "[sm-sender-transport-drain+sup-custom] KeyframeRequested #{n}"
-                    );
+                    eprintln!("[sm-sender-transport-drain+sup-custom] KeyframeRequested #{n}");
                 }
                 _ => {}
             },
@@ -763,20 +763,34 @@ fn handle_supervisor_outcome(outcome: &SupervisorOutcome, channel: &Arc<dyn Chan
             // by the supervisor, so this is a secondary notification; skip to avoid double emit).
             let _ = reason; // already emitted via StateChanged(Dead) above
         }
-        SupervisorOutcome::PublishReconnectRequest { attempt, session_nonce } => {
-            eprintln!("[sm-sender-sup-coord] publish ReconnectRequest attempt={attempt} nonce={session_nonce}");
+        SupervisorOutcome::PublishReconnectRequest {
+            attempt,
+            session_nonce,
+        } => {
+            eprintln!(
+                "[sm-sender-sup-coord] publish ReconnectRequest attempt={attempt} nonce={session_nonce}"
+            );
             // TODO Phase 6 production: call MdnsSignaling::publish_reconnect_request()
         }
-        SupervisorOutcome::PublishReconnectAck { attempt, session_nonce } => {
-            eprintln!("[sm-sender-sup-coord] publish ReconnectAck attempt={attempt} nonce={session_nonce}");
+        SupervisorOutcome::PublishReconnectAck {
+            attempt,
+            session_nonce,
+        } => {
+            eprintln!(
+                "[sm-sender-sup-coord] publish ReconnectAck attempt={attempt} nonce={session_nonce}"
+            );
             // TODO Phase 6 production: call MdnsSignaling::publish_reconnect_ack()
         }
         SupervisorOutcome::InitiateRebuild => {
-            eprintln!("[sm-sender-sup-coord] InitiateRebuild — bundle rebuild TODO (Phase 6 production)");
+            eprintln!(
+                "[sm-sender-sup-coord] InitiateRebuild — bundle rebuild TODO (Phase 6 production)"
+            );
             // TODO Phase 6 production: teardown old bundle, call builder again, signal RebuildSucceeded/Failed
         }
         SupervisorOutcome::InitiateMdnsReset => {
-            eprintln!("[sm-sender-sup-coord] InitiateMdnsReset — mDNS reset TODO (Phase 6 production)");
+            eprintln!(
+                "[sm-sender-sup-coord] InitiateMdnsReset — mDNS reset TODO (Phase 6 production)"
+            );
             // TODO Phase 6 production: call MdnsSignaling::reset()
         }
         SupervisorOutcome::Stopped => {
