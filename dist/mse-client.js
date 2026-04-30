@@ -38,13 +38,22 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
-// Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT in stream.rs).
+// Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT / FRAME_STATUS
+// in stream.rs).
 const FRAME_INIT = 0x00;
 const FRAME_SEGMENT = 0x01;
+const FRAME_STATUS = 0x02;
 
 function setStatus(msg) {
   if (STATUS_EL) STATUS_EL.textContent = msg;
   console.log("[mse]", msg);
+}
+
+// Handle a decoded 0x02 JSON status payload from the Rust reconnect supervisor.
+// Phase 7 will wire this to actual UI state; for now it logs so the console
+// shows reconnect progress during development.
+function handleStatus(payload) {
+  console.log("[mse-client] status:", payload.kind, payload);
 }
 
 // Scan an fMP4 init segment for the `avcC` box and synthesize the matching
@@ -291,6 +300,17 @@ async function main() {
         return;
       }
       enqueue(frameBytes);
+    } else if (discriminant === FRAME_STATUS) {
+      // 0x02 — JSON status event from the reconnect supervisor (Phase 8, T8.2).
+      // Decode the payload bytes as UTF-8 JSON and forward to handleStatus.
+      // Must NOT feed bytes to the SourceBuffer.
+      try {
+        const json = new TextDecoder().decode(frameBytes);
+        const payload = JSON.parse(json);
+        handleStatus(payload);
+      } catch (e) {
+        console.warn("[mse-client] 0x02 frame JSON parse error:", e);
+      }
     } else {
       console.warn("[mse] unknown frame discriminant: 0x" + discriminant.toString(16));
     }
