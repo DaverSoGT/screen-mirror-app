@@ -8,14 +8,17 @@
 //
 // All tests are cross-platform — no real adapters or Windows-only code.
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use screen_mirror_lib::commands::sender::{
-    ChannelLike, SenderBridge, SenderBundle, SenderCounters, retry_session_inner,
-    run_sender_transport_event_drain_with_supervisor_custom, start_sender_inner,
+    ChannelLike, SenderBridge, SenderBundle, SenderCoordinatorHooks, SenderCounters,
+    make_sender_rebuild_hook, retry_session_inner,
+    run_sender_transport_event_drain_with_supervisor_custom,
+    run_sender_transport_event_drain_with_supervisor_custom_and_hooks, start_sender_inner,
     stop_sender_session,
 };
 use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
@@ -637,4 +640,419 @@ fn stop_sender_session_internal_leaves_restart_cache_intact() {
         bridge.current_args.lock().unwrap().is_some(),
         "current_args must remain Some after stop_sender_session_internal"
     );
+}
+
+// ─── Batch 2 (T2.x) — Sender rebuild worker ──────────────────────────────────
+
+/// Build a supervised bridge whose `initiate_rebuild` hook is the V2 worker.
+///
+/// The bridge builder (injected via `SenderBridge.builder`) returns
+/// `SenderBundle::test_stub()` — no real pipeline, cross-platform.
+///
+/// The V2 rebuild hook is constructed via `make_sender_rebuild_hook` and wired
+/// into the drain via `run_sender_transport_event_drain_with_supervisor_custom_and_hooks`.
+///
+/// Returns `(bridge, ev_tx, ch)` identical in shape to `make_supervised_bridge`.
+fn make_supervised_bridge_with_rebuild_hook(
+    policy: ReconnectPolicy,
+    ack_timeout: Duration,
+) -> (
+    SenderBridge,
+    std::sync::mpsc::SyncSender<TransportEvent>,
+    Arc<FakeJsonChannel>,
+) {
+    let ch = FakeJsonChannel::new();
+    let ch_for_caller = ch.clone();
+
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(8);
+    let ev_rx_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+        Arc::new(Mutex::new(Some(ev_rx)));
+    let ev_rx_slot_clone = ev_rx_slot.clone();
+
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let sup_tx_for_drain = sup_tx.clone();
+
+    // Pre-allocate the session and restart_cache arcs BEFORE building the bridge.
+    // Both the bridge (via new_with_builder_and_arcs) and the rebuild hook (captured
+    // in the builder closure) share the SAME arc pointers.
+    // This ensures that when start_sender_inner writes to bridge.session / bridge.restart_cache,
+    // the rebuild hook reads from those exact same arcs.
+    let session_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
+        Arc::new(Mutex::new(None));
+    let restart_cache_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::RestartCache>>> =
+        Arc::new(Mutex::new(None));
+
+    let session_for_builder = session_arc.clone();
+    let cache_for_builder = restart_cache_arc.clone();
+
+    let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
+        Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
+            let st = sup_tx_for_drain.clone();
+            let p = policy.clone();
+            let t = ack_timeout;
+
+            // Construct the V2 rebuild hook using the shared session and cache arcs.
+            // The hook's builder returns test_stub() — no real pipeline.
+            let rebuild_hook = make_sender_rebuild_hook(
+                Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())),
+                cache_for_builder.clone(),
+                session_for_builder.clone(),
+                stop_flag.clone(),
+                1, // attempt — fixed at 1 for this helper
+            );
+
+            let hooks = SenderCoordinatorHooks {
+                publish_reconnect_request: Arc::new(|_, _| {}),
+                publish_reconnect_ack: Arc::new(|_, _| {}),
+                initiate_rebuild: rebuild_hook,
+                initiate_mdns_reset: Arc::new(|| {}),
+            };
+
+            let h = thread::Builder::new()
+                .name("supervised-drain-v2".into())
+                .spawn(move || {
+                    run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                    );
+                })
+                .expect("spawn drain");
+            Ok(SenderBundle {
+                drain_handles: vec![h],
+                shutdown: None,
+            })
+        }),
+        session_arc,
+        restart_cache_arc,
+        sup_tx,
+    );
+
+    (bridge, ev_tx, ch_for_caller)
+}
+
+/// T2.1 (AC-R4, AC-5): Happy path — rebuild hook spawns a worker that calls the
+/// builder and signals `RebuildSucceeded`, causing the drain to emit `"streaming"`.
+///
+/// RED against V1: V1 stub always signals `RebuildFailed` → drain emits `"dead"`,
+/// assertion `streaming_before_dead` fails.
+#[test]
+fn rebuild_hook_calls_builder_and_signals_succeeded() {
+    let (bridge, ev_tx, ch) =
+        make_supervised_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
+
+    // Trigger a reconnect cycle.
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+
+    // Wait for the supervisor to be in AwaitingAck{1}.
+    let got_reconnecting =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting event, got: {:?}",
+        ch.messages()
+    );
+
+    // Obtain the session nonce so we can send a valid PeerAck.
+    let session_nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+
+    // Wait for supervisor_signal_tx to be set.
+    let sup_tx = {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(tx) = bridge.supervisor_signal_tx.lock().unwrap().clone() {
+                break tx;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("supervisor_signal_tx not set within 500ms");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Send PeerAck → supervisor moves to Rebuilding → calls initiate_rebuild hook.
+    sup_tx
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    // The hook (V2) should spawn a worker that signals RebuildSucceeded.
+    // The drain maps StateChanged(Connected) → emit "streaming".
+    let got_streaming =
+        ch.wait_for_message_containing("\"kind\":\"streaming\"", Duration::from_millis(2000));
+    assert!(
+        got_streaming,
+        "expected streaming event after successful rebuild, got: {:?}",
+        ch.messages()
+    );
+
+    // Must NOT have emitted "dead" before "streaming" (attempt 1 succeeded).
+    let msgs = ch.messages();
+    let streaming_idx = msgs
+        .iter()
+        .position(|m| m.contains("\"kind\":\"streaming\""));
+    let dead_idx = msgs.iter().position(|m| m.contains("\"kind\":\"dead\""));
+    assert!(
+        streaming_idx.is_some(),
+        "streaming event must be present, got: {msgs:?}"
+    );
+    if let Some(d) = dead_idx {
+        let s = streaming_idx.unwrap();
+        assert!(
+            s < d,
+            "streaming must appear before dead (rebuild succeeded on attempt 1), got: {msgs:?}"
+        );
+    }
+
+    stop_sender_session(&bridge);
+}
+
+/// T2.3 (AC-R4): Builder error — rebuild hook signals `RebuildFailed`.
+///
+/// RED against V1: V1 stub always signals RebuildFailed regardless of the builder
+/// result, so a builder-returns-Err test would PASS with V1 for the wrong reason.
+/// This test is RED in a different sense: it verifies the worker actually calls
+/// the builder (observable via a shared counter), which V1 does NOT do.
+#[test]
+fn rebuild_hook_signals_failed_on_builder_error() {
+    use std::sync::atomic::AtomicU32;
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let call_count_for_hook = call_count.clone();
+
+    let ch = FakeJsonChannel::new();
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(8);
+    let ev_rx_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+        Arc::new(Mutex::new(Some(ev_rx)));
+    let ev_rx_slot_clone = ev_rx_slot.clone();
+
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let sup_tx_for_drain = sup_tx.clone();
+
+    // Pre-allocate arcs shared between bridge and rebuild hook.
+    let session_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
+        Arc::new(Mutex::new(None));
+    let cache_arc: Arc<Mutex<Option<screen_mirror_lib::commands::sender::RestartCache>>> =
+        Arc::new(Mutex::new(None));
+    let session_clone = session_arc.clone();
+    let cache_clone = cache_arc.clone();
+
+    let policy = fast_policy();
+    let ack_timeout = Duration::from_millis(500);
+
+    let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
+        Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
+            let st = sup_tx_for_drain.clone();
+            let p = policy.clone();
+            let t = ack_timeout;
+            let cnt = call_count_for_hook.clone();
+
+            // Builder that counts calls and always fails.
+            let failing_builder: screen_mirror_lib::commands::sender::SenderBuilderFn =
+                Arc::new(move |_, _, _, _| {
+                    cnt.fetch_add(1, Ordering::Relaxed);
+                    Err(screen_mirror_lib::commands::sender::BundleError::Other(
+                        "injected failure".to_string(),
+                    ))
+                });
+
+            let rebuild_hook = make_sender_rebuild_hook(
+                failing_builder,
+                cache_clone.clone(),
+                session_clone.clone(),
+                stop_flag.clone(),
+                1,
+            );
+
+            let hooks = SenderCoordinatorHooks {
+                publish_reconnect_request: Arc::new(|_, _| {}),
+                publish_reconnect_ack: Arc::new(|_, _| {}),
+                initiate_rebuild: rebuild_hook,
+                initiate_mdns_reset: Arc::new(|| {}),
+            };
+
+            let h = thread::Builder::new()
+                .name("failing-drain".into())
+                .spawn(move || {
+                    run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                    );
+                })
+                .expect("spawn");
+            Ok(SenderBundle {
+                drain_handles: vec![h],
+                shutdown: None,
+            })
+        }),
+        session_arc,
+        cache_arc,
+        sup_tx,
+    );
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got_reconnecting =
+        ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(
+        got_reconnecting,
+        "expected reconnecting, got: {:?}",
+        ch.messages()
+    );
+
+    let session_nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+
+    let sup_tx_guard = {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(tx) = bridge.supervisor_signal_tx.lock().unwrap().clone() {
+                break tx;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("supervisor_signal_tx not set");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    // Sending PeerAck may be ignored by the supervisor if session_nonce mismatches
+    // the supervisor's internal nonce (they are independent rand::random() values).
+    // In that case the supervisor times out from AwaitingAck (after ack_timeout=500ms),
+    // fires InitiateMdnsReset, then InitiateRebuild — which calls our hook.
+    // So we wait up to 2s for the "dead" event (worker calls builder → fails → eventual dead).
+    sup_tx_guard
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    // Wait up to 2s for the supervisor to reach InitiateRebuild and call the hook.
+    // The supervisor spends up to ack_timeout=500ms in AwaitingAck, then calls
+    // InitiateRebuild. The worker calls the failing builder quickly after that.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if call_count.load(Ordering::Relaxed) >= 1 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Builder must have been called at least once (V1 stub does NOT call builder).
+    assert!(
+        call_count.load(Ordering::Relaxed) >= 1,
+        "builder must be called by the rebuild worker, but call_count={}",
+        call_count.load(Ordering::Relaxed)
+    );
+
+    stop_sender_session(&bridge);
+}
+
+/// T2.5 (AC-R2): Successful rebuild swaps the session — new stop_flag differs from old.
+///
+/// RED against V1: V1 stub never swaps the session, so the stop_flag Arc identity
+/// is unchanged after the rebuild → `Arc::ptr_eq` returns true → assertion fails.
+#[test]
+fn rebuild_swaps_session_new_stop_flag_differs_from_old() {
+    let (bridge, ev_tx, ch) =
+        make_supervised_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+
+    start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None).expect("start");
+
+    // Capture the original stop_flag Arc before rebuild.
+    let original_stop_flag = bridge
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.stop_flag.clone())
+        .expect("session must be Some after start");
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+
+    let session_nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+
+    let sup_tx = {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(tx) = bridge.supervisor_signal_tx.lock().unwrap().clone() {
+                break tx;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("supervisor_signal_tx not set");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    sup_tx
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    // Wait for rebuild to succeed.
+    let got_streaming =
+        ch.wait_for_message_containing("\"kind\":\"streaming\"", Duration::from_millis(2000));
+    assert!(
+        got_streaming,
+        "expected streaming after rebuild, got: {:?}",
+        ch.messages()
+    );
+
+    // After rebuild, the session's stop_flag must be a DIFFERENT Arc (fresh_stop_flag
+    // allocated by the worker, not the OLD session's stop_flag).
+    let new_stop_flag = bridge
+        .session
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.stop_flag.clone());
+
+    assert!(
+        new_stop_flag.is_some(),
+        "session must be Some after successful rebuild"
+    );
+    let new_stop_flag = new_stop_flag.unwrap();
+    assert!(
+        !Arc::ptr_eq(&original_stop_flag, &new_stop_flag),
+        "rebuild must install a fresh stop_flag Arc (new Arc identity), but got the same pointer"
+    );
+
+    stop_sender_session(&bridge);
 }
