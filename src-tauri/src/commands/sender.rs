@@ -977,21 +977,21 @@ pub fn start_sender_inner(
     Ok(())
 }
 
-// ─── stop_sender_session — ordered teardown ───────────────────────────────────
+// ─── stop_sender_session_internal — partial teardown (session only) ───────────
 
-/// Ordered teardown for an active sender session.
+/// Partial teardown for an active sender session: steps 1-5 only.
+///
+/// Tears down the session (supervisor interrupt, stop_flag, shutdown closure,
+/// drain join, Stopped event) but does NOT clear `current_args` or
+/// `restart_cache`. This is used by the rebuild worker's cancel-gate D so it
+/// can tear down a newly-installed session without erasing the restart
+/// parameters needed for the next attempt.
+///
+/// The public `stop_sender_session` is a thin wrapper: call internal + clear
+/// args/cache. No behavior change is visible from outside the module.
 ///
 /// Idempotent: if no session is active, returns immediately.
-/// Mirrors stream.rs stop_stream_session lock ordering: session FIRST, then current_args.
-///
-/// Teardown order (C1 fix, with AC-13 supervisor cancel):
-/// 1. Send `SupervisorSignal::Stop` to interrupt any in-flight backoff sleep (AC-13).
-/// 2. Set stop_flag (drain threads exit on next timeout).
-/// 3. Run `shutdown` closure (drops production resources in order).
-/// 4. Join drain handles (now ready to exit via stop_flag or tx-disconnect).
-/// 5. Emit Stopped event and release channel.
-/// 6. Clear current_args and restart_cache.
-pub fn stop_sender_session(bridge: &SenderBridge) {
+pub fn stop_sender_session_internal(bridge: &SenderBridge) {
     let session_opt = {
         let mut guard = bridge.session.lock().unwrap();
         guard.take()
@@ -1024,6 +1024,27 @@ pub fn stop_sender_session(bridge: &SenderBridge) {
     // 5. Emit Stopped event and release channel.
     emit_event(&session.channel, &SenderStatusEvent::Stopped);
     drop(session.channel);
+}
+
+// ─── stop_sender_session — ordered teardown ───────────────────────────────────
+
+/// Ordered teardown for an active sender session.
+///
+/// Idempotent: if no session is active, returns immediately.
+/// Mirrors stream.rs stop_stream_session lock ordering: session FIRST, then current_args.
+///
+/// Teardown order (C1 fix, with AC-13 supervisor cancel):
+/// 1. Send `SupervisorSignal::Stop` to interrupt any in-flight backoff sleep (AC-13).
+/// 2. Set stop_flag (drain threads exit on next timeout).
+/// 3. Run `shutdown` closure (drops production resources in order).
+/// 4. Join drain handles (now ready to exit via stop_flag or tx-disconnect).
+/// 5. Emit Stopped event and release channel.
+/// 6. Clear current_args and restart_cache.
+///
+/// Thin wrapper over `stop_sender_session_internal`: calls internal (steps 1-5),
+/// then clears `current_args` and `restart_cache` (step 6).
+pub fn stop_sender_session(bridge: &SenderBridge) {
+    stop_sender_session_internal(bridge);
 
     // 6. Clear current_args and restart_cache AFTER session lock is released.
     *bridge.current_args.lock().unwrap() = None;

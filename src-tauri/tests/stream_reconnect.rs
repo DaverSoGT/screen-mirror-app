@@ -23,7 +23,7 @@ use std::time::Duration;
 use screen_mirror_lib::commands::sender::ChannelLike;
 use screen_mirror_lib::commands::stream::{
     ReceiverBundle, StreamBridge, run_stream_transport_event_drain_with_supervisor_custom,
-    start_stream_inner, stop_stream_session,
+    start_stream_inner, stop_stream_session, stop_stream_session_internal,
 };
 use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
 use sm_domain::supervisor::SupervisorSignal;
@@ -394,4 +394,62 @@ fn t7_2_stop_during_reconnect_cancels_supervisor_cleanly() {
     // Stop should cancel supervisor and return within 2s (AC-9, AC-13).
     stop_stream_session(&bridge);
     // If we reach here without hanging, the test passes (no orphan threads).
+}
+
+// ─── Batch 1 (T1.3) — stop_stream_session_internal extraction contract ────────
+
+/// T1.3 (AC-NR1): `stop_stream_session_internal` tears down the session but
+/// does NOT clear `restart_cache` or `current_args`.
+///
+/// Symmetric to T1.1 for StreamBridge.
+#[test]
+fn stop_stream_session_internal_leaves_restart_cache_intact() {
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let bridge = StreamBridge::new_with_builder_and_sup_tx(
+        Arc::new(|_bind_ctx, _port, _name, _stop_flag, _channel| {
+            let (_pkt_tx, pkt_rx) = sync_channel::<sm_domain::encode::EncodedPacket>(1);
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiverOps),
+                pkt_rx,
+                signaling: None,
+                drain_handles: vec![],
+                _drain_senders: vec![],
+            })
+        }),
+        sup_tx,
+    );
+    let ch = FakeBinaryChannel::new();
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(9920),
+        Some("_sm-internal-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Verify preconditions.
+    assert!(
+        bridge.restart_cache.lock().unwrap().is_some(),
+        "restart_cache must be Some before internal stop"
+    );
+    assert!(
+        bridge.current_args.lock().unwrap().is_some(),
+        "current_args must be Some before internal stop"
+    );
+
+    // Call the internal variant — partial teardown only.
+    stop_stream_session_internal(&bridge);
+
+    // restart_cache must still be Some (internal does NOT clear it).
+    assert!(
+        bridge.restart_cache.lock().unwrap().is_some(),
+        "restart_cache must remain Some after stop_stream_session_internal"
+    );
+
+    // current_args must still be Some (internal does NOT clear it).
+    assert!(
+        bridge.current_args.lock().unwrap().is_some(),
+        "current_args must remain Some after stop_stream_session_internal"
+    );
 }

@@ -577,3 +577,64 @@ fn t11_1_retry_session_populates_restart_cache_with_new_nonce() {
 
     stop_sender_session(&bridge);
 }
+
+// ─── Batch 1 (T1.1) — stop_sender_session_internal extraction contract ────────
+
+/// T1.1 (AC-NR1): `stop_sender_session_internal` tears down the session but
+/// does NOT clear `restart_cache` or `current_args`.
+///
+/// Proves the extraction contract: the "internal" variant is a partial teardown
+/// (steps 1-5 only); the public `stop_sender_session` is the thin wrapper that
+/// also clears args/cache.
+#[test]
+fn stop_sender_session_internal_leaves_restart_cache_intact() {
+    use screen_mirror_lib::commands::sender::stop_sender_session_internal;
+
+    let bridge =
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+    let ch = FakeJsonChannel::new();
+
+    // Populate current_args and restart_cache via a real start.
+    start_sender_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(7895),
+        Some("_sm-internal-test._tcp.local.".to_string()),
+    )
+    .expect("start must succeed");
+
+    // Verify preconditions: session, args, and cache are all populated.
+    assert!(
+        bridge.session.lock().unwrap().is_some(),
+        "session must be Some before internal stop"
+    );
+    assert!(
+        bridge.current_args.lock().unwrap().is_some(),
+        "current_args must be Some before internal stop"
+    );
+    assert!(
+        bridge.restart_cache.lock().unwrap().is_some(),
+        "restart_cache must be Some before internal stop"
+    );
+
+    // Call the internal variant — partial teardown only.
+    stop_sender_session_internal(&bridge);
+
+    // Session should be torn down (None).
+    assert!(
+        bridge.session.lock().unwrap().is_none(),
+        "session must be None after internal stop"
+    );
+
+    // restart_cache must still be Some (internal does NOT clear it).
+    assert!(
+        bridge.restart_cache.lock().unwrap().is_some(),
+        "restart_cache must remain Some after stop_sender_session_internal"
+    );
+
+    // current_args must still be Some (internal does NOT clear it).
+    assert!(
+        bridge.current_args.lock().unwrap().is_some(),
+        "current_args must remain Some after stop_sender_session_internal"
+    );
+}

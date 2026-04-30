@@ -553,7 +553,10 @@ pub(crate) fn validate_service_name(s: &str) -> Result<(), StartStreamError> {
 /// Wraps a `Mutex<Option<StreamSession>>` to allow mutation inside
 /// immutable Tauri command references.
 pub struct StreamBridge {
-    session: Mutex<Option<StreamSession>>,
+    /// Active session state; `None` when no session is running.
+    /// Exposed as `pub` so integration tests can assert post-teardown state
+    /// (mirrors `SenderBridge::session` which is also `pub`).
+    pub session: Mutex<Option<StreamSession>>,
 
     /// Factory closure used by `start_stream` to build the `ReceiverBundle`.
     /// Plain `Arc<dyn Fn>` — no `Mutex`. Set once in `new_with_builder`; read-only
@@ -574,7 +577,10 @@ pub struct StreamBridge {
     ///   start path: current_args FIRST, then session.
     ///   stop path:  session FIRST, then current_args.
     /// Future code MUST NOT acquire these locks in reverse order within a single path.
-    pub(crate) current_args: Mutex<Option<(u16, String)>>,
+    ///
+    /// Exposed as `pub` so integration tests can assert AlreadyRunning / cleared state
+    /// (mirrors `SenderBridge::current_args` which is also `pub`).
+    pub current_args: Mutex<Option<(u16, String)>>,
 
     /// Cached construction params + session nonce; populated by `start_stream_inner`;
     /// cleared by `stop_stream_session`; read by `retry_session` (Phase 11).
@@ -674,7 +680,11 @@ impl Default for StreamBridge {
 // ─── StreamSession — internal per-run state ───────────────────────────────────
 
 /// Active stream session: receiver + channel + mux thread + counters.
-struct StreamSession {
+/// Active stream session — one per `start_stream_inner` invocation.
+///
+/// Exposed as `pub` so integration tests can assert post-teardown state
+/// (mirrors `SenderSession` which is also `pub`).
+pub struct StreamSession {
     /// Stop flag shared with the mux thread. Set by `stop_stream`.
     stop_flag: Arc<AtomicBool>,
     /// Join handle for the `sm-stream-mux` thread.
@@ -1630,30 +1640,20 @@ pub fn start_stream(
     start_stream_inner(&bridge, channel_arc, udp_port, service_name)
 }
 
-/// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
+/// Partial teardown for an active stream session: steps 1-6 only (session only).
 ///
-/// Shutdown order (W2-fix-D + B6 current_args clear):
-/// 1. Acquire session lock; take the session (guard.take()).
-/// 2. Set the stop flag — signals the mux thread and all drain threads.
-/// 3. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
-/// 4. Join drain threads (they check stop_flag on every 500 ms timeout).
-/// 5. Stop the signaling adapter.
-/// 6. receiver and channel are dropped (their Drop impls call stop).
-/// 7. Drop session lock FIRST (step 1 guard is dropped here).
-/// 8. Acquire current_args lock; clear to None.
+/// Tears down the session (supervisor interrupt, stop_flag, mux join, drain joins,
+/// signaling stop, receiver/channel drop) but does NOT clear `current_args` or
+/// `restart_cache`. Used by the rebuild worker's cancel-gate D so it can tear down
+/// a newly-installed session without erasing restart parameters needed for the next
+/// attempt.
 ///
-/// Lock-ordering discipline (design §4, spec R6.6):
-///   stop path:  session FIRST, then current_args — this is the COMPLEMENTARY ordering
-///   to start_stream_inner which acquires current_args FIRST, then session.
-///   The asymmetry is intentional. Clearing current_args AFTER the session guard
-///   is released ensures that a racing start_stream_inner which sees current_args=None
-///   only enters the builder when the previous session is fully torn down.
+/// The public `stop_stream_session` is a thin wrapper: call internal (steps 1-6),
+/// then clear `current_args` and `restart_cache` (steps 7-8).
 ///
-/// Idempotent: if no session is active, returns immediately (session lock released
-/// without touching current_args, which is already None).
-pub fn stop_stream_session(bridge: &StreamBridge) {
+/// Idempotent: if no session is active, returns immediately.
+pub fn stop_stream_session_internal(bridge: &StreamBridge) {
     // 0. Interrupt supervisor backoff sleep BEFORE setting stop_flag (AC-13).
-    //    The bridge-level supervisor_signal_tx is shared with the drain thread.
     let sup_tx_opt = bridge.supervisor_signal_tx.lock().unwrap().clone();
     if let Some(sup_tx) = sup_tx_opt {
         let _ = sup_tx.try_send(SupervisorSignal::Stop);
@@ -1683,13 +1683,37 @@ pub fn stop_stream_session(bridge: &StreamBridge) {
 
             // 6. receiver and channel are dropped here (their Drop impls call stop).
         }
-        // 7. Session lock (guard) is released here — explicit via block scope.
-        //    Releasing session BEFORE acquiring current_args respects the lock order.
+        // Session lock (guard) is released here — explicit via block scope.
+        // Releasing session BEFORE acquiring current_args respects the lock order.
     }
+}
 
-    // 8. Acquire current_args lock AFTER session lock is released (design §4).
+/// Core of `stop_stream` — extracted for unit testing without the Tauri runtime.
+///
+/// Shutdown order (W2-fix-D + B6 current_args clear):
+/// 1. Acquire session lock; take the session (guard.take()).
+/// 2. Set the stop flag — signals the mux thread and all drain threads.
+/// 3. Join the mux thread (it owns pkt_rx; setting stop_flag causes it to exit).
+/// 4. Join drain threads (they check stop_flag on every 500 ms timeout).
+/// 5. Stop the signaling adapter.
+/// 6. receiver and channel are dropped (their Drop impls call stop).
+/// 7. Acquire current_args lock; clear to None.
+/// 8. Clear restart_cache.
+///
+/// Lock-ordering discipline (design §4, spec R6.6):
+///   stop path:  session FIRST, then current_args — this is the COMPLEMENTARY ordering
+///   to start_stream_inner which acquires current_args FIRST, then session.
+///
+/// Thin wrapper over `stop_stream_session_internal`: calls internal (steps 1-6),
+/// then clears `current_args` and `restart_cache` (steps 7-8).
+///
+/// Idempotent: if no session is active, returns immediately.
+pub fn stop_stream_session(bridge: &StreamBridge) {
+    stop_stream_session_internal(bridge);
+
+    // 7. Acquire current_args lock AFTER session lock is released (design §4).
     *bridge.current_args.lock().unwrap() = None;
-    // 9. Clear restart_cache AFTER current_args (same lock order tier).
+    // 8. Clear restart_cache AFTER current_args (same lock order tier).
     *bridge.restart_cache.lock().unwrap() = None;
 }
 
