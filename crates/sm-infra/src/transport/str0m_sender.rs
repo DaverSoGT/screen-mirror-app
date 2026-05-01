@@ -60,6 +60,10 @@ enum SenderControl {
     /// Test-only: inject a synthetic `Event::KeyframeRequest` into the loop.
     #[cfg(test)]
     InjectKeyframeRequest,
+    /// Test-only: latch `ice_ready = true` AND emit `TransportEvent::IceConnected`,
+    /// matching what the real `IceConnectionStateChange(Connected|Completed)` path does.
+    #[cfg(test)]
+    SetIceReadyForTest,
 }
 
 // ─── Pre-negotiation state ───────────────────────────────────────────────────
@@ -422,6 +426,19 @@ impl Str0mVideoSender {
             let _ = tx.try_send(SenderControl::InjectKeyframeRequest);
         }
     }
+
+    /// Latch the tick loop's local `ice_ready` flag to `true`.
+    ///
+    /// Used by tests that need to drive the post-ICE write path without
+    /// a live str0m peer. Sends `SenderControl::SetIceReadyForTest` on the
+    /// control channel; the tick loop processes it on the next iteration
+    /// and ALSO emits `TransportEvent::IceConnected` so observers see the
+    /// same sequence as production.
+    pub(crate) fn inject_ice_ready_for_test(&self) {
+        if let Some(tx) = &self.control_tx {
+            let _ = tx.try_send(SenderControl::SetIceReadyForTest);
+        }
+    }
 }
 
 // ─── Tick loop ───────────────────────────────────────────────────────────────
@@ -449,6 +466,11 @@ fn run_sender_loop(
 ) {
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
+    // Scoped to this call frame — each new generation of run_sender_loop begins gated.
+    // Set to true when IceConnectionStateChange(Connected|Completed) is observed,
+    // or when SetIceReadyForTest is processed in test builds.
+    // Monotonic within one generation: never reset to false.
+    let mut ice_ready = false;
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -510,6 +532,14 @@ fn run_sender_loop(
                         }
                         let _ = event_tx.try_send(TransportEvent::KeyframeRequested);
                     }
+                }
+                #[cfg(test)]
+                SenderControl::SetIceReadyForTest => {
+                    // Mirror what the real ICE path does: latch the gate AND notify
+                    // the drain thread. Production never takes this path; tests use it
+                    // to bypass a live str0m peer while preserving observable sequencing.
+                    ice_ready = true;
+                    let _ = event_tx.try_send(TransportEvent::IceConnected);
                 }
             }
         }
@@ -961,6 +991,43 @@ mod tests {
         assert!(
             has_keyframe_requested,
             "TransportEvent::KeyframeRequested must be emitted on PLI; got: {events:?}"
+        );
+
+        sender.stop().unwrap();
+    }
+
+    // ─── T2.1 (streaming-emit-on-ice-connect): inject_ice_ready_for_test test seam ──
+
+    /// T2.1 (AC-9) — `inject_ice_ready_for_test` causes `TransportEvent::IceConnected`
+    /// to arrive on the event channel within 100ms.
+    ///
+    /// RED assertion: `inject_ice_ready_for_test` does not exist yet → compile failure.
+    #[test]
+    fn set_ice_ready_for_test_emits_ice_connected() {
+        use std::time::Duration;
+
+        let enc = FakeEncoder::new();
+        let enc_arc = Arc::clone(&enc) as Arc<dyn VideoEncoder + Send + Sync>;
+
+        let mut sender = Str0mVideoSender::new(TransportConfig {
+            udp_port: 0,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+        sender.set_encoder(enc_arc);
+
+        let (_pkt_tx, pkt_rx) = sync_channel(4);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(4);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        sender.inject_ice_ready_for_test();
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceConnected event must arrive within 100ms after inject_ice_ready_for_test");
+        assert!(
+            matches!(ev, TransportEvent::IceConnected),
+            "expected TransportEvent::IceConnected, got {ev:?}"
         );
 
         sender.stop().unwrap();
