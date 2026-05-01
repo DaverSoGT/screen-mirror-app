@@ -197,6 +197,20 @@ impl Default for CaptureConfig {
     }
 }
 
+impl CaptureConfig {
+    /// Validate that this configuration satisfies all domain invariants.
+    ///
+    /// Returns `Err(CaptureError::Internal("max_fps must be > 0"))` when
+    /// `max_fps == Some(0)`. All adapters MUST call this from `new()` before
+    /// performing any platform work.
+    pub fn validate(&self) -> Result<(), CaptureError> {
+        if self.max_fps == Some(0) {
+            return Err(CaptureError::Internal("max_fps must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Port boundary for platform-specific capture adapters.
 ///
 /// Each platform ships a concrete type that implements this trait inside `sm-infra`. The domain
@@ -437,6 +451,32 @@ mod tests {
         assert!(c.max_fps.is_none());
         assert!(matches!(c.border, BorderPolicy::Auto));
         assert!(matches!(c.monitor, MonitorSelector::Primary));
+    }
+
+    #[test]
+    fn validate_rejects_max_fps_zero() {
+        let cfg = CaptureConfig {
+            max_fps: Some(0),
+            ..CaptureConfig::default()
+        };
+        match cfg.validate() {
+            Err(CaptureError::Internal(msg)) => {
+                assert!(msg.contains("max_fps must be > 0"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Err(CaptureError::Internal(_)), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_none_and_positive_max_fps() {
+        // max_fps: None — uncapped, valid.
+        assert!(CaptureConfig::default().validate().is_ok());
+        // max_fps: Some(30) — valid.
+        let cfg = CaptureConfig {
+            max_fps: Some(30),
+            ..CaptureConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
