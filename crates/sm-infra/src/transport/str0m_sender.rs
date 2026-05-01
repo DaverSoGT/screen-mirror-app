@@ -619,11 +619,7 @@ fn run_sender_loop(
                     // A flip back on Disconnected would create a second recovery path
                     // competing with the supervisor; the supervisor owns rebuild via
                     // IceFailed → ReconnectSupervisor (per auto-rebuild-from-drain).
-                    if matches!(
-                        ev,
-                        Event::IceConnectionStateChange(IceConnectionState::Connected)
-                            | Event::IceConnectionStateChange(IceConnectionState::Completed)
-                    ) {
+                    if is_ice_ready_event(&ev) {
                         ice_ready = true;
                     }
                     handle_sender_event(ev, &state, &encoder, &event_tx);
@@ -704,6 +700,20 @@ fn run_sender_loop(
     // Thread exits cleanly — socket dropped here.
 }
 
+/// Return `true` if `ev` is the str0m event that should latch the ICE-ready gate.
+///
+/// The latch fires for `Connected` and `Completed` because, with a single working
+/// candidate pair, str0m may skip `Connected` and jump straight to `Completed`.
+/// `Disconnected` and other state transitions MUST NOT latch the gate — the
+/// supervisor owns recovery via `IceFailed → ReconnectSupervisor`.
+fn is_ice_ready_event(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::IceConnectionStateChange(IceConnectionState::Connected)
+            | Event::IceConnectionStateChange(IceConnectionState::Completed)
+    )
+}
+
 /// Dispatch str0m events for the sender.
 fn handle_sender_event(
     ev: Event,
@@ -747,8 +757,9 @@ mod tests {
 
     use sm_domain::encode::{EncoderConfig, VideoEncoder};
     use sm_domain::transport::{TransportConfig, TransportError, TransportEvent, VideoSender};
+    use str0m::{Event, IceConnectionState};
 
-    use crate::transport::str0m_sender::Str0mVideoSender;
+    use crate::transport::str0m_sender::{Str0mVideoSender, is_ice_ready_event};
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
 
@@ -1307,6 +1318,123 @@ mod tests {
             matches!(result, Err(TransportError::InvalidConfig(_))),
             "start() without prior set_encoder() must return Err(InvalidConfig), got: {result:?}"
         );
+    }
+
+    // ─── S-1 (streaming-emit-on-ice-connect carry-forward): Completed-only path ──
+
+    /// S-1 (AC-3): The ICE-ready latch fires for both `Connected` and `Completed`,
+    /// and ONLY for those — not for `Disconnected` or any other variant.
+    ///
+    /// Closes the carry-forward gap from archive #524 ("AC-3 coverage uses synthetic
+    /// inject"): T4.1 latches the gate via `inject_ice_ready_for_test`, which bypasses
+    /// the `matches!()` predicate that distinguishes Connected/Completed from other
+    /// ICE state transitions. This test exercises the predicate directly.
+    #[test]
+    fn is_ice_ready_event_matches_connected_and_completed_only() {
+        // Build minimal IceConnectionStateChange events for each variant.
+        let connected = Event::IceConnectionStateChange(IceConnectionState::Connected);
+        let completed = Event::IceConnectionStateChange(IceConnectionState::Completed);
+        let disconnected = Event::IceConnectionStateChange(IceConnectionState::Disconnected);
+        let new_event = Event::IceConnectionStateChange(IceConnectionState::New);
+        let checking = Event::IceConnectionStateChange(IceConnectionState::Checking);
+
+        assert!(
+            is_ice_ready_event(&connected),
+            "Connected MUST latch the gate"
+        );
+        assert!(
+            is_ice_ready_event(&completed),
+            "Completed MUST latch the gate (str0m may skip Connected with a single \
+             working candidate pair)"
+        );
+        assert!(
+            !is_ice_ready_event(&disconnected),
+            "Disconnected MUST NOT latch the gate — supervisor owns recovery via \
+             IceFailed → ReconnectSupervisor"
+        );
+        assert!(
+            !is_ice_ready_event(&new_event),
+            "New (initial) MUST NOT latch the gate"
+        );
+        assert!(
+            !is_ice_ready_event(&checking),
+            "Checking (in-flight gathering) MUST NOT latch the gate"
+        );
+    }
+
+    // ─── S-2 (streaming-emit-on-ice-connect carry-forward): IceConnected-before-MediaAdded ──
+
+    /// S-2 (AC-8): When `ice_ready` latches BEFORE `pre_neg.mid` is set
+    /// (the inverted ordering — ICE handshake completes before SDP negotiation
+    /// fully resolves the media line), the gate MUST keep dropping packets until
+    /// BOTH conditions are met.
+    ///
+    /// Closes the carry-forward gap from archive #524 ("AC-8 no dedicated test for
+    /// IceConnected → MediaAdded sequence"): the gate at str0m_sender.rs uses
+    /// `if let Some(mid) { if ice_ready { write } else { drop } } else { drop }`,
+    /// which structurally handles both orderings. This test exercises the
+    /// (mid=None, ice_ready=true) state explicitly: packets MUST drop because
+    /// `pre_neg.mid` is the outer condition.
+    #[test]
+    fn ice_ready_before_media_added_still_drops_packets() {
+        use std::time::Duration;
+
+        let enc = FakeEncoder::new();
+        let enc_arc = Arc::clone(&enc) as Arc<dyn VideoEncoder + Send + Sync>;
+
+        let mut sender = Str0mVideoSender::new(TransportConfig {
+            udp_port: 0,
+            ..TransportConfig::default()
+        })
+        .unwrap();
+        sender.set_encoder(enc_arc);
+
+        let (pkt_tx, pkt_rx) = sync_channel(8);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(8);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        // Latch the ICE-ready flag BEFORE any MediaAdded event arrives. In a unit
+        // test, `pre_neg.mid` is never set (no real SDP exchange), so this models
+        // the worst-case inverted ordering: ICE done, SDP not yet resolved.
+        sender.inject_ice_ready_for_test();
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceConnected must arrive after inject_ice_ready_for_test");
+        assert!(
+            matches!(ev, TransportEvent::IceConnected),
+            "expected IceConnected, got {ev:?}"
+        );
+
+        let dropped_before = sender.dropped_frames();
+
+        // Send 5 packets. Because `pre_neg.mid` is None (no MediaAdded), the
+        // outer `if let Some(mid)` branch is false → all 5 must hit the
+        // pre-negotiation drain-and-drop path (str0m_sender.rs:593-598),
+        // regardless of `ice_ready` being true.
+        for i in 0..5u64 {
+            pkt_tx
+                .send(sm_domain::encode::EncodedPacket {
+                    data: vec![0u8; 16].into(),
+                    timestamp: std::time::Duration::ZERO,
+                    is_keyframe: false,
+                    sequence: i,
+                })
+                .unwrap();
+        }
+
+        // Wait for the tick loop to drain the packet channel.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let dropped_after = sender.dropped_frames();
+        assert_eq!(
+            dropped_after - dropped_before,
+            5,
+            "S-2 (AC-8): with ice_ready=true and mid=None, all 5 packets MUST drop. \
+             dropped_before={dropped_before}, dropped_after={dropped_after}"
+        );
+
+        drop(pkt_tx);
+        sender.stop().unwrap();
     }
 
     /// R14.3, S14.2 — When the event channel is full and a PLI fires, the sender
