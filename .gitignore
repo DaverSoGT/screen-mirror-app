@@ -10,3 +10,6 @@ src-tauri/gen/**/build/
 node_modules/
 coverage/
 .vitest-cache/
+
+# Agent tooling — local skill registry cache
+.atl/
