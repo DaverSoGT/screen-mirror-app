@@ -440,6 +440,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_max_fps_zero() {
+        let cfg = CaptureConfig {
+            max_fps: Some(0),
+            ..CaptureConfig::default()
+        };
+        match cfg.validate() {
+            Err(CaptureError::Internal(msg)) => {
+                assert!(msg.contains("max_fps must be > 0"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Err(CaptureError::Internal(_)), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_none_and_positive_max_fps() {
+        // max_fps: None — uncapped, valid.
+        assert!(CaptureConfig::default().validate().is_ok());
+        // max_fps: Some(30) — valid.
+        let cfg = CaptureConfig {
+            max_fps: Some(30),
+            ..CaptureConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn capture_config_is_debug_and_clone() {
         let c = CaptureConfig::default();
         let _ = format!("{c:?}");
