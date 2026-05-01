@@ -1209,9 +1209,7 @@ mod tests {
 
         // Assert exactly one IceConnected (no duplicate).
         assert!(
-            event_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err(),
+            event_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "IceConnected must not be emitted more than once"
         );
 

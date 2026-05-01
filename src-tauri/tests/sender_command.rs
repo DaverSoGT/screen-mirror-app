@@ -1025,7 +1025,9 @@ fn streaming_event_does_not_fire_before_ice_connected() {
     thread::sleep(Duration::from_millis(50));
     let msgs_before = ch.messages();
     assert!(
-        !msgs_before.iter().any(|m| m.contains("\"kind\":\"streaming\"")),
+        !msgs_before
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
         "streaming must NOT fire before IceConnected; got: {msgs_before:?}"
     );
 
@@ -1035,7 +1037,9 @@ fn streaming_event_does_not_fire_before_ice_connected() {
 
     let msgs_after = ch.messages();
     assert!(
-        msgs_after.iter().any(|m| m.contains("\"kind\":\"streaming\"")),
+        msgs_after
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
         "streaming must fire after IceConnected; got: {msgs_after:?}"
     );
 
@@ -1067,7 +1071,9 @@ fn rebuild_streaming_event_fires_only_after_new_ice_connected() {
 
     let msgs_gen1 = ch.messages();
     assert!(
-        msgs_gen1.iter().any(|m| m.contains("\"kind\":\"streaming\"")),
+        msgs_gen1
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
         "gen1 streaming must fire after IceConnected; got: {msgs_gen1:?}"
     );
 
