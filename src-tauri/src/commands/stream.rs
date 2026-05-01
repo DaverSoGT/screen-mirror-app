@@ -1836,10 +1836,24 @@ pub fn make_stream_rebuild_hook(
                 // is now the live coordinator, listening on the NEW `tr_ev_rx`.
                 let _ = signal_tx.try_send(SupervisorSignal::Stop);
 
-                // Also set old_stop_flag so the OLD drain's transport-event loop
-                // (which runs before entering supervisor mode) exits if the worker
-                // fires during a non-supervisor iteration. Belt-and-suspenders.
-                old_stop_flag.store(true, Ordering::Relaxed);
+                // INTENTIONALLY do NOT set old_stop_flag = true here.
+                //
+                // The OLD coord loop checks `stop_flag.load()` AFTER draining outcomes,
+                // but on a fast path the worker can complete before the coord loop has
+                // had a chance to drain `StateChanged(Connected)` from the previous
+                // iteration. Setting old_stop_flag right after `try_send(Stop)` races:
+                // the coord loop may observe stop_flag=true and break BEFORE the
+                // supervisor (other thread) has emitted StateChanged(Connected) into
+                // outcome_rx. The frontend then never receives "streaming" and the
+                // overlay persists (T12.2 manual smoke FAIL post-fix-v2, engram #509).
+                //
+                // The Stop signal alone is sufficient for clean termination: the
+                // supervisor processes RebuildSucceeded (→ emit StateChanged(Connected)),
+                // then Stop (→ emit Stopped, return), then drops outcome_tx. The OLD
+                // coord loop drains all buffered outcomes, then sees outcome_rx
+                // Disconnected, then breaks. This ordering is enforced by the FIFO
+                // semantics of mpsc::sync_channel and the coord loop's drain-first
+                // policy. No race window.
             });
 
             if spawn_result.is_err() {
