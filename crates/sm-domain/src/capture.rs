@@ -197,6 +197,20 @@ impl Default for CaptureConfig {
     }
 }
 
+impl CaptureConfig {
+    /// Validate that this configuration satisfies all domain invariants.
+    ///
+    /// Returns `Err(CaptureError::Internal("max_fps must be > 0"))` when
+    /// `max_fps == Some(0)`. All adapters MUST call this from `new()` before
+    /// performing any platform work.
+    pub fn validate(&self) -> Result<(), CaptureError> {
+        if self.max_fps == Some(0) {
+            return Err(CaptureError::Internal("max_fps must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Port boundary for platform-specific capture adapters.
 ///
 /// Each platform ships a concrete type that implements this trait inside `sm-infra`. The domain

@@ -279,10 +279,8 @@ impl CaptureSource for WindowsCaptureSource {
     where
         Self: Sized,
     {
-        // Validate max_fps (R5.4).
-        if config.max_fps == Some(0) {
-            return Err(CaptureError::Internal("max_fps must be > 0".into()));
-        }
+        // Validate domain invariants (R5.4 — moved to sm-domain CaptureConfig::validate).
+        config.validate()?;
 
         // Resolve the requested monitor.
         let monitor = match config.monitor {
