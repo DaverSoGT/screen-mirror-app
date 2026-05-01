@@ -472,6 +472,7 @@ fn stop_stream_session_internal_leaves_restart_cache_intact() {
 fn make_supervised_stream_bridge_with_rebuild_hook(
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
 ) -> (
     StreamBridge,
     SyncSender<TransportEvent>,
@@ -509,7 +510,8 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 .expect("ev_rx taken once");
             let st = sup_tx_for_drain.clone();
             let p = policy.clone();
-            let t = ack_timeout;
+            let ack_t = ack_timeout;
+            let rebuild_t = rebuild_timeout;
 
             // Construct the V2 rebuild hook using the shared session and cache arcs.
             let rebuild_hook = make_stream_rebuild_hook(
@@ -543,7 +545,7 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 .name("supervised-stream-drain-v2".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, ack_t, rebuild_t, hooks,
                     );
                 })
                 .expect("spawn stream drain");
@@ -571,8 +573,11 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
 /// assertion `streaming_before_dead` fails.
 #[test]
 fn rebuild_hook_calls_builder_and_signals_succeeded() {
-    let (bridge, ev_tx, ch) =
-        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+    let (bridge, ev_tx, ch) = make_supervised_stream_bridge_with_rebuild_hook(
+        fast_policy(),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
 
     start_stream_inner(
         &bridge,
@@ -815,8 +820,11 @@ fn rebuild_hook_signals_failed_on_builder_error() {
 /// RED against V1: V1 stub never swaps the session, so Arc identity is unchanged.
 #[test]
 fn rebuild_swaps_session_new_stop_flag_differs_from_old() {
-    let (bridge, ev_tx, ch) =
-        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+    let (bridge, ev_tx, ch) = make_supervised_stream_bridge_with_rebuild_hook(
+        fast_policy(),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
 
     start_stream_inner(
         &bridge,
@@ -1574,8 +1582,11 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
 /// updated by the rebuild worker; subsequent stop works regardless.
 #[test]
 fn stop_after_successful_stream_rebuild_completes_cleanly() {
-    let (bridge, ev_tx, ch) =
-        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), Duration::from_millis(500));
+    let (bridge, ev_tx, ch) = make_supervised_stream_bridge_with_rebuild_hook(
+        fast_policy(),
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
 
     start_stream_inner(
         &bridge,
@@ -1673,10 +1684,16 @@ fn stop_after_successful_stream_rebuild_completes_cleanly() {
 /// Dead after 3 attempts and emits `"dead"` — no `"streaming"` ever appears.
 #[test]
 fn t12_2_stream_rebuild_succeeds_on_attempt1() {
-    // Use a short ack_timeout so the supervisor advances to InitiateRebuild quickly.
+    // Use a short ack_timeout so the supervisor advances to InitiateRebuild quickly,
+    // but a generous rebuild_timeout so the worker has time to bind UDP and signal
+    // RebuildSucceeded — Windows CI runners can take >50ms for bind_probe under load.
     let ack_timeout = Duration::from_millis(50);
-    let (bridge, ev_tx, ch) =
-        make_supervised_stream_bridge_with_rebuild_hook(fast_policy(), ack_timeout);
+    let rebuild_timeout = Duration::from_millis(1500);
+    let (bridge, ev_tx, ch) = make_supervised_stream_bridge_with_rebuild_hook(
+        fast_policy(),
+        ack_timeout,
+        rebuild_timeout,
+    );
 
     start_stream_inner(
         &bridge,
