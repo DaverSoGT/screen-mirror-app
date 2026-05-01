@@ -38,13 +38,184 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
-// Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT in stream.rs).
+// ── Module-level MSE state ───────────────────────────────────────────────────
+// Lifted from main() so tearDownMse / setUpMse (called by handleStatus) can
+// mutate it without threading closure references through every caller.
+// Phase 10 — T10.1: SWAP-MEDIASOURCE pattern (spec §5.2, design §5).
+const mseState = {
+  /** Active MediaSource instance, or null when torn down. */
+  ms: null,
+  /** Active SourceBuffer, or null when torn down. */
+  sb: null,
+  /** The ObjectURL currently assigned to VIDEO_EL.src. */
+  objectUrl: null,
+  /** Sequential byte append queue (flushed on updateend). */
+  pending: [],
+  /** True after the first FRAME_INIT has been processed this session. */
+  initReceived: false,
+  /** True while a live MSE session is active (ms != null && sb ready). */
+  active: false,
+};
+
+// Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT / FRAME_STATUS
+// in stream.rs).
 const FRAME_INIT = 0x00;
 const FRAME_SEGMENT = 0x01;
+const FRAME_STATUS = 0x02;
 
 function setStatus(msg) {
   if (STATUS_EL) STATUS_EL.textContent = msg;
   console.log("[mse]", msg);
+}
+
+// ── tearDownMse ──────────────────────────────────────────────────────────────
+// Spec §5.2 (receiver MSE teardown — T10.1):
+//   1. endOfStream("decode") signals a decode error to the browser so it does
+//      not attempt to play remaining buffered frames from the stale segment.
+//   2. Revoke the ObjectURL and clear VIDEO_EL.src so the element is detached.
+//   3. Call VIDEO_EL.load() to reset the element state machine (required by MSE
+//      spec before attaching a new MediaSource — Chromium WebView2 tested).
+//   4. Reset mseState so the next FRAME_INIT triggers a fresh setUpMse path.
+//
+// Idempotent: safe to call when no MSE session is active (mseState.ms == null).
+function tearDownMse() {
+  try {
+    if (mseState.ms && mseState.ms.readyState === "open") {
+      mseState.ms.endOfStream("decode");
+    }
+  } catch (_) {
+    // endOfStream can throw if readyState transitions concurrently — ignore.
+  }
+  if (mseState.objectUrl) {
+    try { URL.revokeObjectURL(mseState.objectUrl); } catch (_) {}
+    mseState.objectUrl = null;
+  }
+  VIDEO_EL.removeAttribute("src");
+  VIDEO_EL.load();
+  // Reset all MSE state so the onmessage handler starts fresh.
+  mseState.ms = null;
+  mseState.sb = null;
+  mseState.pending = [];
+  mseState.initReceived = false;
+  mseState.active = false;
+}
+
+// ── setUpMse ─────────────────────────────────────────────────────────────────
+// Spec §5.2: re-attach a fresh MediaSource and await sourceopen.
+// setUpMse prepares VIDEO_EL for the next init segment; the first FRAME_INIT
+// received after setUpMse creates the SourceBuffer (existing lazy-init path).
+//
+// Returns a Promise that resolves when sourceopen fires (or rejects on error).
+// Called by handleStatus on "streaming" event following a reconnect.
+function setUpMse() {
+  const ms = new MediaSource();
+  mseState.ms = ms;
+  const url = URL.createObjectURL(ms);
+  mseState.objectUrl = url;
+  VIDEO_EL.src = url;
+  mseState.pending = [];
+  mseState.sb = null;
+  mseState.initReceived = false;
+  mseState.active = false;
+
+  return new Promise((resolve, reject) => {
+    ms.addEventListener("sourceopen", () => {
+      mseState.active = true;
+      setStatus("MSE ready (reconnect) — awaiting fresh init segment…");
+      resolve();
+    }, { once: true });
+    ms.addEventListener("error", (e) => {
+      reject(e);
+    }, { once: true });
+  });
+}
+
+// ── handleStatus ─────────────────────────────────────────────────────────────
+// Handle a decoded 0x02 JSON status payload from the Rust reconnect supervisor.
+// Spec §5.2, T10.1: routes reconnecting/dead/streaming lifecycle events to
+// tearDownMse / setUpMse and shows/hides the viewer overlay/modal.
+//
+// Phase 9 (Batch 6 CRITICAL-1): also shows/hides the reconnecting-overlay and
+// dead-modal elements added to viewer.html (spec §5.4).
+
+const reconnectingOverlay = document.getElementById("reconnecting-overlay");
+const deadModal = document.getElementById("dead-modal");
+const deadReasonEl = document.getElementById("dead-reason");
+const receiverRetryBtn = document.getElementById("receiver-retry");
+const receiverCancelBtn = document.getElementById("receiver-cancel");
+
+// Retry: stop current session (if any) then restart via start_stream with
+// cached channel. Per spec §4.2: receiver retry is stop_stream + start_stream
+// with the same parameters — the JS side re-invokes main() which creates a
+// fresh Channel. Simplest V1 implementation: reload the page to re-run main().
+if (receiverRetryBtn) {
+  receiverRetryBtn.addEventListener("click", async function () {
+    if (deadModal) deadModal.hidden = true;
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      try { await invoke("stop_stream"); } catch (_) {}
+    }
+    // Re-run main() by reloading the page (fresh Channel, fresh MSE session).
+    window.location.reload();
+  });
+}
+
+// Cancel: stop the stream and return to idle (no reload).
+if (receiverCancelBtn) {
+  receiverCancelBtn.addEventListener("click", async function () {
+    if (deadModal) deadModal.hidden = true;
+    const invoke = window.__TAURI__?.core?.invoke;
+    if (invoke) {
+      try { await invoke("stop_stream"); } catch (_) {}
+    }
+    window.__sm_streamActive = false;
+    setStatus("Stopped");
+  });
+}
+
+function handleStatus(payload) {
+  console.log("[mse-client] status:", payload.kind, payload);
+  switch (payload.kind) {
+    case "reconnecting":
+      // Reconnect in progress — tear down the stale MSE session immediately.
+      // The receiver will emit FRAME_INIT again after the bundle is rebuilt.
+      setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…");
+      tearDownMse();
+      // Show reconnecting overlay; hide dead modal (in case a previous dead was shown).
+      if (reconnectingOverlay) {
+        reconnectingOverlay.textContent =
+          "Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…";
+        reconnectingOverlay.hidden = false;
+      }
+      if (deadModal) deadModal.hidden = true;
+      break;
+    case "dead":
+      // All reconnect attempts exhausted — show dead-session modal with Retry/Cancel.
+      setStatus("Disconnected — session lost");
+      tearDownMse();
+      window.__sm_streamActive = false;
+      if (reconnectingOverlay) reconnectingOverlay.hidden = true;
+      if (deadModal) {
+        if (deadReasonEl) {
+          deadReasonEl.textContent =
+            "Connection lost: " + (payload.reason || "unknown");
+        }
+        deadModal.hidden = false;
+      }
+      break;
+    case "streaming":
+      // Reconnect supervisor reports the rebuild succeeded. Prepare a fresh MSE
+      // session so the next FRAME_INIT can re-initialize the SourceBuffer.
+      if (reconnectingOverlay) reconnectingOverlay.hidden = true;
+      if (deadModal) deadModal.hidden = true;
+      setUpMse().catch((e) => {
+        console.error("[mse-client] setUpMse failed after reconnect:", e);
+      });
+      break;
+    default:
+      // Other status events (connected, stopped) — log only.
+      break;
+  }
 }
 
 // Scan an fMP4 init segment for the `avcC` box and synthesize the matching
@@ -74,6 +245,131 @@ function deriveCodecFromInitSegment(buf) {
   return null;
 }
 
+// ── Append queue helpers ─────────────────────────────────────────────────────
+// These operate on mseState (module-level) so tearDownMse / setUpMse can reset
+// the queue without needing closure references. Phase 10 — T10.1.
+
+function enqueue(bytes) {
+  mseState.pending.push(bytes);
+  flushQueue();
+}
+
+function flushQueue() {
+  const sb = mseState.sb;
+  const pending = mseState.pending;
+  if (!sb || sb.updating || pending.length === 0) return;
+  const next = pending.shift();
+  try {
+    sb.appendBuffer(next);
+  } catch (e) {
+    if (e.name === "QuotaExceededError") {
+      trimSourceBuffer();
+      pending.unshift(next); // retry after trim
+    } else {
+      console.error("[mse] appendBuffer error", e);
+    }
+  }
+}
+
+function trimSourceBuffer() {
+  const sb = mseState.sb;
+  if (!sb || sb.updating || !VIDEO_EL) return;
+  try {
+    const cur = VIDEO_EL.currentTime;
+    const cutoff = Math.max(0, cur - 30);
+    if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
+      sb.remove(sb.buffered.start(0), cutoff);
+    }
+  } catch (e) {
+    // Buffered/remove can throw if SourceBuffer detached — log once, don't spam.
+    console.warn("[mse] trim skipped", e.name);
+  }
+}
+
+// ── onInitFrame — lazy SourceBuffer creation on first FRAME_INIT ─────────────
+// Extracted from main() so setUpMse() reconnects can also receive a fresh init.
+// Reads mseState.ms (current MediaSource) and writes mseState.sb.
+function onInitFrame(data, frameBytes) {
+  if (mseState.sb !== null) {
+    // Already have a SourceBuffer — re-init not supported in v1; ignore.
+    // After tearDownMse + setUpMse, mseState.sb is reset to null so this
+    // branch only fires if two FRAME_INIT arrive without a teardown in between.
+    console.warn("[mse] additional init segment ignored");
+    return;
+  }
+
+  const ms = mseState.ms;
+  if (!ms) {
+    // No active MediaSource yet (should not happen in normal flow).
+    console.warn("[mse] FRAME_INIT arrived with no active MediaSource — ignoring");
+    return;
+  }
+
+  // B11 diagnostic: dump the first 128 bytes of the init segment in hex.
+  const initBytes = new Uint8Array(frameBytes);
+  const previewLen = Math.min(128, initBytes.length);
+  const hex = Array.from(initBytes.subarray(0, previewLen))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join(" ");
+  console.log(
+    "[mse] init segment hex (first " + previewLen + "/" + initBytes.length + " bytes):\n" + hex
+  );
+
+  const derived = deriveCodecFromInitSegment(frameBytes);
+  if (!derived) {
+    setStatus("init segment missing avcC — cannot derive codec");
+    return;
+  }
+  if (!MediaSource.isTypeSupported(derived)) {
+    setStatus("FATAL: derived codec not supported: " + derived);
+    return;
+  }
+  let sb;
+  try {
+    sb = ms.addSourceBuffer(derived);
+    // B11-S12: 'sequence' instead of 'segments'.
+    //
+    // 'segments' honours each segment's tfdt absolute timestamp on the
+    // MSE timeline. With a screen-capture pipeline whose effective frame
+    // rate fluctuates (Windows Graphics Capture only emits a frame on
+    // visible-content change → 1-5 fps on a static desktop, 30 fps on a
+    // moving one) the muxer produces non-contiguous buffered ranges
+    // ([0→0.1], gap, [2.8→2.95], gap, …) and the <video> element stalls
+    // at the first gap with readyState=HAVE_CURRENT_DATA waiting for
+    // contiguous data that never arrives.
+    //
+    // 'sequence' tells MSE to append each segment immediately after the
+    // last in append order, ignoring per-segment tfdt. Playback stays
+    // continuous regardless of capture-rate variability — exactly what
+    // a live screen mirror wants. Latency is unchanged (~2 s, driven by
+    // the IDR cadence).
+    sb.mode = "sequence";
+    sb.addEventListener("updateend", flushQueue);
+    mseState.sb = sb; // write into module-level state (heartbeat + tearDownMse)
+  } catch (e) {
+    setStatus("addSourceBuffer failed: " + e);
+    return;
+  }
+  // Surface SourceBuffer error and updateend events so MSE failures are visible.
+  sb.addEventListener("error", (e) => {
+    console.error("[mse] SourceBuffer error event", e);
+  });
+  sb.addEventListener("abort", () => {
+    console.warn("[mse] SourceBuffer abort event");
+  });
+  ms.addEventListener("sourceended", () => {
+    console.warn("[mse] MediaSource sourceended");
+  });
+  ms.addEventListener("sourceclose", () => {
+    console.warn("[mse] MediaSource sourceclose — readyState=" + ms.readyState);
+  });
+  setStatus(
+    "init segment received (" + (data.length - 1) + " bytes), codec=" + derived
+  );
+  mseState.initReceived = true;
+  enqueue(frameBytes);
+}
+
 async function main() {
   // ── R11.2: probe MSE+H.264 support generically ───────────────────────────
   if (!("MediaSource" in window) || !MediaSource.isTypeSupported(PROBE_CODEC)) {
@@ -88,12 +384,13 @@ async function main() {
   // ── 1. Wire <video> to a fresh MediaSource (sourceopen but no SourceBuffer yet) ──
   // SourceBuffer creation is deferred until the first init segment arrives so
   // we can derive the precise codec string from its avcC box (B11-S4 fix).
+  //
+  // Phase 10: state stored in mseState so tearDownMse / setUpMse can mutate it.
   const ms = new MediaSource();
-  VIDEO_EL.src = URL.createObjectURL(ms);
-
-  // Holder for the (lazy) SourceBuffer so the diagnostic heartbeat can read
-  // the latest reference once it's been created on init-segment arrival.
-  const sbRef = { sb: null };
+  const objectUrl = URL.createObjectURL(ms);
+  mseState.ms = ms;
+  mseState.objectUrl = objectUrl;
+  VIDEO_EL.src = objectUrl;
 
   // B11 diagnostic: surface video-element lifecycle so we can tell whether
   // segments reach the decoder and whether playback starts. Without these,
@@ -102,6 +399,7 @@ async function main() {
   // every frame is black".
   ["loadedmetadata", "loadeddata", "canplay", "playing", "stalled", "waiting", "error", "emptied"].forEach((ev) => {
     VIDEO_EL.addEventListener(ev, () => {
+      const curMs = mseState.ms;
       console.log(
         "[video]",
         ev,
@@ -111,16 +409,20 @@ async function main() {
         "paused=" + VIDEO_EL.paused,
         "videoWidth=" + VIDEO_EL.videoWidth,
         "videoHeight=" + VIDEO_EL.videoHeight,
-        VIDEO_EL.error ? "error.code=" + VIDEO_EL.error.code + " msg=" + VIDEO_EL.error.message : ""
+        VIDEO_EL.error ? "error.code=" + VIDEO_EL.error.code + " msg=" + VIDEO_EL.error.message : "",
+        curMs ? "ms.readyState=" + curMs.readyState : ""
       );
     });
   });
   // Heartbeat: report buffered ranges + currentTime every 2 s while a SB exists.
+  // Reads from mseState (updated by tearDownMse / setUpMse / onInitFrame).
   setInterval(() => {
-    if (!sbRef.sb) return;
+    const sb = mseState.sb;
+    const curMs = mseState.ms;
+    if (!sb) return;
     const ranges = [];
     try {
-      const buf = sbRef.sb.buffered;
+      const buf = sb.buffered;
       for (let i = 0; i < buf.length; i++) {
         ranges.push("[" + buf.start(i).toFixed(3) + "→" + buf.end(i).toFixed(3) + "]");
       }
@@ -129,7 +431,7 @@ async function main() {
       "[video.tick] currentTime=" + VIDEO_EL.currentTime.toFixed(3),
       "paused=" + VIDEO_EL.paused,
       "buffered=" + (ranges.join(",") || "<none>"),
-      "ms.readyState=" + ms.readyState
+      curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
   }, 2000);
 
@@ -143,50 +445,13 @@ async function main() {
     return;
   }
 
+  mseState.active = true;
   setStatus("MSE ready — awaiting init segment…");
 
-  // ── 2. Sequential append queue + lazy SourceBuffer (R11.5) ────────────────
-  let sb = null;
-  const pending = [];
-  let initReceived = false;
-
-  function enqueue(bytes) {
-    pending.push(bytes);
-    flushQueue();
-  }
-
-  function flushQueue() {
-    if (!sb || sb.updating || pending.length === 0) return;
-    const next = pending.shift();
-    try {
-      sb.appendBuffer(next);
-    } catch (e) {
-      if (e.name === "QuotaExceededError") {
-        trimSourceBuffer();
-        pending.unshift(next); // retry after trim
-      } else {
-        console.error("[mse] appendBuffer error", e);
-      }
-    }
-  }
-
-  // ── 3. Buffer trim — every 5 s, keep last 30 s (R11.6, OQ-mse-trim-1) ────
-  function trimSourceBuffer() {
-    if (!sb || sb.updating || !VIDEO_EL) return;
-    try {
-      const cur = VIDEO_EL.currentTime;
-      const cutoff = Math.max(0, cur - 30);
-      if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
-        sb.remove(sb.buffered.start(0), cutoff);
-      }
-    } catch (e) {
-      // Buffered/remove can throw if SourceBuffer detached — log once, don't spam.
-      console.warn("[mse] trim skipped", e.name);
-    }
-  }
+  // ── 2. Buffer trim — every 5 s, keep last 30 s (R11.6, OQ-mse-trim-1) ────
   const trimHandle = setInterval(trimSourceBuffer, 5000);
 
-  // ── 4. Create a Tauri Channel<Bytes> (F-fix-3) ───────────────────────────
+  // ── 3. Create a Tauri Channel<Bytes> (F-fix-3) ───────────────────────────
   //
   // window.__TAURI__.core.Channel is the Tauri 2 Channel constructor (per
   // dual-mode-shell amendment #339).
@@ -214,89 +479,30 @@ async function main() {
     const frameBytes = data.subarray(1);
 
     if (discriminant === FRAME_INIT) {
-      if (sb !== null) {
-        // Already have a SourceBuffer from a previous init — re-init not
-        // supported in v1; ignore subsequent init segments.
-        console.warn("[mse] additional init segment ignored");
-        return;
-      }
-      // B11 diagnostic: dump the first 128 bytes of the init segment in hex
-      // so we can validate the box structure (ftyp magic, moov, tkhd dims,
-      // avcC bytes) when MSE rejects appendBuffer with the SourceBuffer
-      // "removed from parent media source" error.
-      const initBytes = new Uint8Array(frameBytes);
-      const previewLen = Math.min(128, initBytes.length);
-      const hex = Array.from(initBytes.subarray(0, previewLen))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join(" ");
-      console.log(
-        "[mse] init segment hex (first " + previewLen + "/" + initBytes.length + " bytes):\n" + hex
-      );
-
-      const derived = deriveCodecFromInitSegment(frameBytes);
-      if (!derived) {
-        setStatus("init segment missing avcC — cannot derive codec");
-        return;
-      }
-      if (!MediaSource.isTypeSupported(derived)) {
-        setStatus("FATAL: derived codec not supported: " + derived);
-        return;
-      }
-      try {
-        sb = ms.addSourceBuffer(derived);
-        // B11-S12: 'sequence' instead of 'segments'.
-        //
-        // 'segments' honours each segment's tfdt absolute timestamp on the
-        // MSE timeline. With a screen-capture pipeline whose effective frame
-        // rate fluctuates (Windows Graphics Capture only emits a frame on
-        // visible-content change → 1-5 fps on a static desktop, 30 fps on a
-        // moving one) the muxer produces non-contiguous buffered ranges
-        // ([0→0.1], gap, [2.8→2.95], gap, …) and the <video> element stalls
-        // at the first gap with readyState=HAVE_CURRENT_DATA waiting for
-        // contiguous data that never arrives.
-        //
-        // 'sequence' tells MSE to append each segment immediately after the
-        // last in append order, ignoring per-segment tfdt. Playback stays
-        // continuous regardless of capture-rate variability — exactly what
-        // a live screen mirror wants. Latency is unchanged (~2 s, driven by
-        // the IDR cadence).
-        sb.mode = "sequence";
-        sb.addEventListener("updateend", flushQueue);
-        sbRef.sb = sb; // expose to the diagnostic heartbeat (B11)
-      } catch (e) {
-        setStatus("addSourceBuffer failed: " + e);
-        return;
-      }
-      // Surface SourceBuffer error and updateend events so MSE failures are visible.
-      sb.addEventListener("error", (e) => {
-        console.error("[mse] SourceBuffer error event", e);
-      });
-      sb.addEventListener("abort", () => {
-        console.warn("[mse] SourceBuffer abort event");
-      });
-      ms.addEventListener("sourceended", () => {
-        console.warn("[mse] MediaSource sourceended");
-      });
-      ms.addEventListener("sourceclose", () => {
-        console.warn("[mse] MediaSource sourceclose — readyState=" + ms.readyState);
-      });
-      setStatus(
-        "init segment received (" + (data.length - 1) + " bytes), codec=" + derived
-      );
-      initReceived = true;
-      enqueue(frameBytes);
+      onInitFrame(data, frameBytes);
     } else if (discriminant === FRAME_SEGMENT) {
-      if (!initReceived) {
+      if (!mseState.initReceived) {
         console.warn("[mse] segment arrived before init — discarding");
         return;
       }
       enqueue(frameBytes);
+    } else if (discriminant === FRAME_STATUS) {
+      // 0x02 — JSON status event from the reconnect supervisor (Phase 8, T8.2).
+      // Decode the payload bytes as UTF-8 JSON and forward to handleStatus.
+      // Must NOT feed bytes to the SourceBuffer.
+      try {
+        const json = new TextDecoder().decode(frameBytes);
+        const statusPayload = JSON.parse(json);
+        handleStatus(statusPayload);
+      } catch (e) {
+        console.warn("[mse-client] 0x02 frame JSON parse error:", e);
+      }
     } else {
       console.warn("[mse] unknown frame discriminant: 0x" + discriminant.toString(16));
     }
   };
 
-  // ── 5. Invoke start_stream, passing the Channel ref (F-fix-3) ────────────
+  // ── 4. Invoke start_stream, passing the Channel ref (F-fix-3) ────────────
   //
   // Tauri serializes Channel<T> as a "__CHANNEL__:{id}" string on the JS side,
   // which the Rust CommandArg impl deserialises back into Channel<InvokeResponseBody>.

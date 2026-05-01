@@ -820,6 +820,192 @@ fn transport_loopback_ice_connects_over_loopback_r11_2() {
     );
 }
 
+// ─── T6.1 (streaming-emit-on-ice-connect): loopback pre-ICE packets are dropped ─
+
+/// T6.1 (TST-L-1) — Pre-ICE packets pushed to the sender before any ICE
+/// candidate exchange are counted in `dropped_frames()`.
+///
+/// This test withholds candidate exchange entirely — the sender starts but
+/// ICE never completes. Packets arrive at the tick loop, the ice_ready gate
+/// is false, and they must be dropped and counted.
+///
+/// ACs: AC-1, AC-2 (REQ-EMIT-1, REQ-EMIT-4, REQ-EMIT-8)
+#[test]
+fn loopback_pre_ice_packets_are_dropped() {
+    let enc = FakeLoopbackEncoder::new();
+
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    // Exchange offer/answer so mid is eventually set (simulates MediaAdded scenario).
+    let offer = sender.create_local_offer().expect("offer");
+    let answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+    let (pkt_tx, pkt_rx) = sync_channel(8);
+    let (sender_event_tx, _sender_event_rx) = sync_channel::<TransportEvent>(8);
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
+
+    sender.start(pkt_rx, sender_event_tx).expect("sender start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
+
+    // Apply the answer (so SDP is done and mid may be set by MediaAdded).
+    sender.apply_remote_answer(answer).expect("apply answer");
+
+    // Deliberately withhold candidate exchange — ICE never completes.
+    // Push 4 packets into the sender. With ice_ready=false, all must be dropped.
+    for i in 0..4u64 {
+        let _ = pkt_tx.send(EncodedPacket {
+            data: vec![0x00, 0x00, 0x00, 0x01, 0x65].into(),
+            is_keyframe: true,
+            timestamp: Duration::from_millis(i * 33),
+            sequence: i,
+        });
+    }
+    // 250ms > max tick timeout (200ms): guarantees at least one full iteration.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let dropped = sender.dropped_frames();
+    // Clean up before asserting.
+    drop(pkt_tx);
+    sender.stop().unwrap();
+    receiver.stop().unwrap();
+
+    assert!(
+        dropped >= 4,
+        "dropped_frames must be >= 4 when ICE never completes (ice_ready=false), got {dropped}"
+    );
+}
+
+// ─── T6.2 (streaming-emit-on-ice-connect): ICE-Completed also opens gate ──────
+
+/// T6.2 (TST-L-2) — After a full ICE handshake completes and IceConnected
+/// arrives, `dropped_frames()` does not increase for subsequently-sent packets
+/// (the gate is open and frames flow, even if DTLS doesn't complete for writing).
+///
+/// # Why this may be `#[ignore]`d
+///
+/// This test requires full loopback ICE to complete. In CI with a single-process
+/// loopback setup, ICE completing is reliable (verified by
+/// `transport_loopback_ice_connects_over_loopback_r11_2`). However the assertion
+/// that `dropped_frames` doesn't increase post-ICE depends on mid being resolved
+/// via MediaAdded, which needs DTLS to complete — that is NOT guaranteed.
+/// The test is therefore `#[ignore]`d per the loopback file's pattern.
+///
+/// ACs: AC-3 (REQ-EMIT-2, REQ-EMIT-3)
+#[test]
+#[ignore = "Requires full DTLS loopback to verify mid+ice_ready write path — \
+             use transport_loopback_ice_connects_over_loopback_r11_2 for ICE gate smoke"]
+fn loopback_ice_completed_also_opens_gate() {
+    let enc = FakeLoopbackEncoder::new();
+
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+    let (pkt_tx, pkt_rx) = sync_channel(8);
+    let (sender_event_tx, sender_event_rx) = sync_channel::<TransportEvent>(8);
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
+
+    sender.start(pkt_rx, sender_event_tx).expect("sender start");
+    receiver
+        .start(pkt_out_tx, receiver_event_tx)
+        .expect("receiver start");
+
+    let sender_addr = sender.local_addr().expect("sender local_addr");
+    let receiver_addr = receiver.local_addr().expect("receiver local_addr");
+
+    sender.apply_remote_answer(answer).expect("apply answer");
+
+    let sender_candidate =
+        str0m::Candidate::host(sender_addr, "udp").expect("sender host candidate");
+    let receiver_candidate =
+        str0m::Candidate::host(receiver_addr, "udp").expect("receiver host candidate");
+
+    receiver
+        .add_remote_candidate(IceCandidate(
+            serde_json::to_string(&sender_candidate).expect("serialize"),
+        ))
+        .expect("receiver add_remote_candidate");
+    sender
+        .add_remote_candidate(IceCandidate(
+            serde_json::to_string(&receiver_candidate).expect("serialize"),
+        ))
+        .expect("sender add_remote_candidate");
+
+    // Wait for IceConnected (up to 5s).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ice_connected = false;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        match sender_event_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(TransportEvent::IceConnected) => {
+                ice_connected = true;
+                break;
+            }
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert!(ice_connected, "ICE must connect for T6.2 to be meaningful");
+
+    let dropped_at_ice = sender.dropped_frames();
+
+    // Send 2 packets post-ICE. With ice_ready=true, they should NOT be dropped
+    // (assuming mid is also resolved). If DTLS isn't done, mid may still be None,
+    // in which case they're dropped — but that's the DTLS path, not the ICE gate.
+    for i in 0..2u64 {
+        let _ = pkt_tx.send(EncodedPacket {
+            data: vec![0x00, 0x00, 0x00, 0x01, 0x65].into(),
+            is_keyframe: true,
+            timestamp: Duration::from_millis((4 + i) * 33),
+            sequence: 4 + i,
+        });
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let dropped_after = sender.dropped_frames();
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+    receiver.stop().unwrap();
+
+    assert_eq!(
+        dropped_at_ice, dropped_after,
+        "dropped_frames must NOT increase after IceConnected when mid is resolved; \
+         before={dropped_at_ice} after={dropped_after}"
+    );
+}
+
 // ─── S-CT-2: candidate_addr() returns None before start() ────────────────────
 
 /// S-CT-2 (sender variant) — `candidate_addr()` MUST return `None` before

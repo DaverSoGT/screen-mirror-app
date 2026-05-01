@@ -13,6 +13,7 @@ pub fn run() {
             commands::sender::start_sender,
             commands::sender::stop_sender,
             commands::sender::sender_diagnostics,
+            commands::sender::retry_session,
             smoke::smoke_com_apartment,
         ])
         .run(tauri::generate_context!())

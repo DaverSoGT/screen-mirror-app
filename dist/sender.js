@@ -5,6 +5,12 @@
 //
 // Channel binding: __TAURI__.core.Channel (per dual-mode-shell amendment #339,
 // commit f6fc389 — NOT __TAURI_INTERNALS__).
+//
+// Phase 9 additions:
+// - "reconnecting" event: show transient status, hide Retry/Cancel.
+// - "dead" event: show error + Retry/Cancel buttons.
+//   Retry: invokes retry_session (Phase 11 stub — falls back to start_sender).
+//   Cancel: invokes stop_sender.
 
 (function () {
   const { invoke, Channel } = window.__TAURI__.core;
@@ -13,9 +19,25 @@
   const statusDiv = document.getElementById("status");
   const errorDiv = document.getElementById("error");
   const changeModeLink = document.getElementById("change-mode");
+  // Phase 9: Retry and Cancel buttons for dead-session UI.
+  // These elements may be absent from older HTML pages — guard with ?. calls.
+  const retryBtn = document.getElementById("retry");
+  const cancelBtn = document.getElementById("cancel");
 
-  // "idle" | "running" | "restart"
+  // "idle" | "running" | "restart" | "reconnecting" | "dead"
   let senderMode = "idle";
+
+  // ── Phase 9 helpers ──────────────────────────────────────────────────────────
+
+  function showDeadButtons() {
+    if (retryBtn) retryBtn.style.display = "";
+    if (cancelBtn) cancelBtn.style.display = "";
+  }
+
+  function hideDeadButtons() {
+    if (retryBtn) retryBtn.style.display = "none";
+    if (cancelBtn) cancelBtn.style.display = "none";
+  }
 
   // ── Channel message handler ──────────────────────────────────────────────────
 
@@ -28,19 +50,43 @@
       case "connecting":
         statusDiv.textContent = "Connecting...";
         errorDiv.textContent = "";
+        hideDeadButtons();
         break;
       case "streaming":
         statusDiv.textContent = "Streaming";
         errorDiv.textContent = "";
+        hideDeadButtons();
+        senderMode = "running";
+        break;
+      case "reconnecting":
+        // Transient reconnect status — show attempt N of max (AC-2).
+        statusDiv.textContent =
+          "Reconnecting (attempt " + value.attempt + "/" + value.max + ")…";
+        errorDiv.textContent = "";
+        hideDeadButtons();
+        senderMode = "reconnecting";
+        break;
+      case "dead":
+        // All reconnect attempts exhausted — show error + Retry/Cancel (AC-7).
+        errorDiv.textContent =
+          "Connection lost: " + (value.reason || "unknown");
+        statusDiv.textContent = "Disconnected";
+        showDeadButtons();
+        senderMode = "dead";
+        window.__sm_streamActive = false;
         break;
       case "peer_lost":
+        // V1-incompatible-peer path only (transient ICE failure now goes
+        // through the reconnect supervisor, not here). Kept for backwards compat.
         statusDiv.textContent = "Disconnected";
+        hideDeadButtons();
         break;
       case "stopped":
         statusDiv.textContent = "Not connected";
         startBtn.textContent = "Start streaming";
         senderMode = "idle";
         window.__sm_streamActive = false;
+        hideDeadButtons();
         break;
       case "button":
         startBtn.textContent = value.label;
@@ -55,12 +101,14 @@
         startBtn.textContent = "Start streaming";
         senderMode = "idle";
         window.__sm_streamActive = false;
+        hideDeadButtons();
         break;
       case "failed":
         errorDiv.textContent = value.reason || "Unknown error";
         startBtn.textContent = "Start streaming";
         senderMode = "idle";
         window.__sm_streamActive = false;
+        hideDeadButtons();
         break;
     }
   }
@@ -127,6 +175,61 @@
     errorDiv.textContent = "";
     senderMode = "idle";
     window.__sm_streamActive = false;
+  }
+
+  // ── Phase 9: Retry button handler ───────────────────────────────────────────
+  // Retry invokes retry_session (Phase 11). Until Phase 11 lands, falls back to
+  // start_sender with cached params (TODO Phase 11: swap to retry_session).
+
+  if (retryBtn) {
+    retryBtn.addEventListener("click", async function () {
+      hideDeadButtons();
+      senderMode = "idle";
+      // Phase 11: invoke retry_session — reads cached params from SenderBridge,
+      // tears down residue, re-enters Connecting state (AC-8).
+      const channel = new Channel();
+      channel.onmessage = function (payload) {
+        try {
+          let value;
+          if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) {
+            const text = new TextDecoder().decode(payload);
+            value = JSON.parse(text);
+          } else if (typeof payload === "string") {
+            value = JSON.parse(payload);
+          } else {
+            value = payload;
+          }
+          handleMessage(value);
+        } catch (e) {
+          console.error("[sender] retry channel message parse error:", e, payload);
+        }
+      };
+      try {
+        await invoke("retry_session", { channel });
+        senderMode = "running";
+        window.__sm_streamActive = true;
+      } catch (err) {
+        console.error("[sender] retry_session failed:", err);
+        const msg =
+          typeof err === "object" && err !== null
+            ? JSON.stringify(err)
+            : String(err);
+        const errorDiv = document.getElementById("error");
+        if (errorDiv) errorDiv.textContent = msg;
+        senderMode = "idle";
+        window.__sm_streamActive = false;
+      }
+    });
+  }
+
+  // ── Phase 9: Cancel button handler ──────────────────────────────────────────
+  // Cancel invokes stop_sender to return to idle state (spec §5.1).
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", async function () {
+      hideDeadButtons();
+      await stopSender();
+    });
   }
 
   // ── Button click handler ─────────────────────────────────────────────────────

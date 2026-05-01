@@ -1,10 +1,10 @@
 name: Security
 
-# Runs on every push to main to catch newly-introduced vulnerabilities, and on a
+# Runs on every push to master to catch newly-introduced vulnerabilities, and on a
 # weekly cron to surface advisories published against an unchanged Cargo.lock.
 on:
   push:
-    branches: [main]
+    branches: [master]
   schedule:
     # Every Monday at 06:00 UTC — catches advisories published mid-week against
     # a dependency graph that has not changed since the last push.

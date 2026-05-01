@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Screen Mirror — Receiver</title>
     <style>
+      [hidden] { display: none !important; }
       body {
         margin: 0;
         background: #111;
@@ -29,6 +30,46 @@
         opacity: 0.7;
         font-family: ui-monospace, monospace;
       }
+      /* ── Phase 9 — reconnecting overlay and dead-session modal ─────── */
+      #reconnecting-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        color: #fff;
+        font-family: ui-monospace, monospace;
+        font-size: 1rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+      }
+      #dead-modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.8);
+        color: #ddd;
+        font-family: system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        z-index: 11;
+      }
+      #dead-modal p { margin: 0; font-size: 1rem; }
+      #dead-modal .dead-buttons { display: flex; gap: 0.75rem; }
+      #receiver-retry, #receiver-cancel {
+        padding: 0.5rem 1.4rem;
+        font-size: 0.9rem;
+        font-family: inherit;
+        border-radius: 4px;
+        cursor: pointer;
+        border: 1px solid #555;
+        background: #1e1e1e;
+        color: #ddd;
+      }
+      #receiver-retry { border-color: #4a9; color: #8ef; }
+      #receiver-cancel { border-color: #844; color: #f88; }
       /* ── R10.2 smoke section (debug) ────────────────────────────────── */
       #smoke-section {
         position: fixed;
@@ -53,6 +94,18 @@
 
     <!-- Status line for MSE state -->
     <div id="status">starting…</div>
+
+    <!-- Phase 9 — reconnecting overlay: hidden by default, shown by handleStatus("reconnecting") -->
+    <div id="reconnecting-overlay" hidden>Reconnecting…</div>
+
+    <!-- Phase 9 — dead-session modal: hidden by default, shown by handleStatus("dead") -->
+    <div id="dead-modal" hidden>
+      <p id="dead-reason">Connection lost</p>
+      <div class="dead-buttons">
+        <button id="receiver-retry">Retry</button>
+        <button id="receiver-cancel">Cancel</button>
+      </div>
+    </div>
 
     <!-- R6/R7 — Change mode link: nav-guarded by inline script below -->
     <a id="change-mode" href="./index.html" style="position:fixed;bottom:8px;right:8px;font-size:12px;color:#777;font-family:ui-monospace,monospace;text-decoration:underline;">Change mode</a>

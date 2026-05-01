@@ -155,10 +155,15 @@ pub enum TransportError {
 /// # Thread model
 ///
 /// `new()` does NOT spawn a thread. `start()` spawns exactly one OS thread.
-/// `stop()` is idempotent and joins the thread.
+/// `stop()` is idempotent and bounded: implementations MUST guarantee `stop()`
+/// returns within a bounded time independent of caller channel discipline.
 ///
-/// CALLER MUST DROP the input `Sender<EncodedPacket>` BEFORE calling `stop()`
-/// so the thread's `rx.recv()` unblocks naturally.
+/// Dropping the input `Sender<EncodedPacket>` before `stop()` is a performance
+/// hint that allows the worker to exit at the next channel observation;
+/// it is NOT a correctness requirement. Implementations achieve bounded stop
+/// either by polling with a short timeout (`FakeVideoSender`, 5 ms) or by
+/// capping the blocking syscall via socket read timeout (`Str0mVideoSender`,
+/// 200 ms cap on `recv_from`).
 ///
 /// # Encoder injection
 ///
@@ -262,7 +267,7 @@ pub trait VideoReceiver: Send + Sync {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::{SyncSender, sync_channel};
+    use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
     use std::time::Duration;
 
     // ─── Trait bound assertions: VideoSender / VideoReceiver are Send + Sync ────
@@ -296,6 +301,9 @@ mod tests {
         dropped: Arc<AtomicU64>,
         encoder: Option<Arc<dyn VideoEncoder + Send + Sync>>,
         handle: Option<std::thread::JoinHandle<()>>,
+        /// Stored clone of the `event_tx` passed to `start()`.
+        /// `None` before `start()` is called.
+        event_tx: Option<SyncSender<TransportEvent>>,
     }
 
     impl FakeVideoSender {
@@ -307,7 +315,47 @@ mod tests {
                 dropped: Arc::new(AtomicU64::new(0)),
                 encoder: None,
                 handle: None,
+                event_tx: None,
             }
+        }
+
+        /// Inject a `TransportEvent::IceFailed` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_ice_failed_for_test(&self) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_ice_failed_for_test called before start()");
+            tx.try_send(TransportEvent::IceFailed)
+                .expect("event channel must accept IceFailed");
+        }
+
+        /// Inject a `TransportEvent::IceConnected` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_ice_connected_for_test(&self) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_ice_connected_for_test called before start()");
+            tx.try_send(TransportEvent::IceConnected)
+                .expect("event channel must accept IceConnected");
+        }
+
+        /// Inject a `TransportEvent::ConnectionLost` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_connection_lost_for_test(&self, reason: String) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_connection_lost_for_test called before start()");
+            tx.try_send(TransportEvent::ConnectionLost { reason })
+                .expect("event channel must accept ConnectionLost");
         }
     }
 
@@ -326,12 +374,14 @@ mod tests {
         fn start(
             &mut self,
             rx: Receiver<EncodedPacket>,
-            _event_tx: SyncSender<TransportEvent>,
+            event_tx: SyncSender<TransportEvent>,
         ) -> Result<(), TransportError> {
             if self.started.load(Ordering::Acquire) {
                 return Err(TransportError::AlreadyRunning);
             }
             self.started.store(true, Ordering::Release);
+            // Store a clone so test helpers can inject events after start().
+            self.event_tx = Some(event_tx);
             let stopped = Arc::clone(&self.stopped);
             let dropped = Arc::clone(&self.dropped);
             let handle = std::thread::spawn(move || {
@@ -339,9 +389,12 @@ mod tests {
                     if stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    match rx.recv() {
+                    // matches FakeVideoReceiver poll cadence (5 ms) — bounds stop()
+                    // regardless of whether the caller dropped the input Sender
+                    match rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(_pkt) => {}
-                        Err(_) => break,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
                     }
                     let _ = dropped.load(Ordering::Relaxed);
                 }
@@ -382,6 +435,9 @@ mod tests {
         stopped: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
         handle: Option<std::thread::JoinHandle<()>>,
+        /// Stored clone of the `event_tx` passed to `start()`.
+        /// `None` before `start()` is called.
+        event_tx: Option<SyncSender<TransportEvent>>,
     }
 
     impl FakeVideoReceiver {
@@ -390,7 +446,34 @@ mod tests {
                 stopped: Arc::new(AtomicBool::new(false)),
                 dropped: Arc::new(AtomicU64::new(0)),
                 handle: None,
+                event_tx: None,
             }
+        }
+
+        /// Inject a `TransportEvent::IceFailed` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_ice_failed_for_test(&self) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_ice_failed_for_test called before start()");
+            tx.try_send(TransportEvent::IceFailed)
+                .expect("event channel must accept IceFailed");
+        }
+
+        /// Inject a `TransportEvent::ConnectionLost` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_connection_lost_for_test(&self, reason: String) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_connection_lost_for_test called before start()");
+            tx.try_send(TransportEvent::ConnectionLost { reason })
+                .expect("event channel must accept ConnectionLost");
         }
     }
 
@@ -405,8 +488,10 @@ mod tests {
         fn start(
             &mut self,
             _pkt_tx: SyncSender<EncodedPacket>,
-            _event_tx: SyncSender<TransportEvent>,
+            event_tx: SyncSender<TransportEvent>,
         ) -> Result<(), TransportError> {
+            // Store a clone so test helpers can inject events after start().
+            self.event_tx = Some(event_tx);
             let stopped = Arc::clone(&self.stopped);
             let handle = std::thread::spawn(move || {
                 while !stopped.load(Ordering::Acquire) {
@@ -464,11 +549,12 @@ mod tests {
         // stop on never-started sender
         sender.stop().unwrap();
         // start + stop + stop
-        let (_pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
         let (event_tx, _event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
         sender.started.store(false, Ordering::Release);
         sender.stopped.store(false, Ordering::Release);
         sender.start(pkt_rx, event_tx).unwrap();
+        drop(pkt_tx); // unblock worker before stop() — matches lifecycle_s1_2
         sender.stop().unwrap();
         sender.stop().unwrap(); // second stop must not panic
     }
@@ -557,5 +643,121 @@ mod tests {
             dbg.contains("7889"),
             "Debug must contain '7889', got: {dbg}"
         );
+    }
+
+    // ─── T2.1: FakeVideoSender inject helpers (AC-12) ─────────────────────────
+
+    /// AC-12 / T2.1 — `inject_ice_failed_for_test` delivers `IceFailed` on the event channel.
+    #[test]
+    fn fake_video_sender_inject_ice_failed_delivers_event() {
+        let mut sender = FakeVideoSender::new_fake();
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        sender.inject_ice_failed_for_test();
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceFailed event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::IceFailed),
+            "expected IceFailed, got {ev:?}"
+        );
+
+        drop(pkt_tx);
+        sender.stop().unwrap();
+    }
+
+    /// AC-12 / T2.1 — `inject_connection_lost_for_test` delivers `ConnectionLost` on the event channel.
+    #[test]
+    fn fake_video_sender_inject_connection_lost_delivers_event() {
+        let mut sender = FakeVideoSender::new_fake();
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        sender.inject_connection_lost_for_test("poll error".to_string());
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("ConnectionLost event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::ConnectionLost { ref reason } if reason == "poll error"),
+            "expected ConnectionLost with reason, got {ev:?}"
+        );
+
+        drop(pkt_tx);
+        sender.stop().unwrap();
+    }
+
+    // ─── T1.1 (streaming-emit-on-ice-connect): FakeVideoSender inject_ice_connected helper ───
+
+    /// T1.1 (AC-6, AC-9) — `inject_ice_connected_for_test` delivers `IceConnected` on the event channel.
+    ///
+    /// RED assertion: `inject_ice_connected_for_test` does not exist yet → compile failure.
+    #[test]
+    fn fake_video_sender_inject_ice_connected_delivers_event() {
+        let mut sender = FakeVideoSender::new_fake();
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        sender.inject_ice_connected_for_test();
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceConnected event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::IceConnected),
+            "expected IceConnected, got {ev:?}"
+        );
+
+        drop(pkt_tx);
+        sender.stop().unwrap();
+    }
+
+    // ─── T2.2: FakeVideoReceiver inject helpers (AC-12) ───────────────────────
+
+    /// AC-12 / T2.2 — `inject_ice_failed_for_test` delivers `IceFailed` via `FakeVideoReceiver`.
+    #[test]
+    fn fake_video_receiver_inject_ice_failed_delivers_event() {
+        let mut receiver = FakeVideoReceiver::new_fake();
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        receiver.inject_ice_failed_for_test();
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceFailed event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::IceFailed),
+            "expected IceFailed, got {ev:?}"
+        );
+
+        receiver.stop().unwrap();
+    }
+
+    /// AC-12 / T2.2 — `inject_connection_lost_for_test` delivers `ConnectionLost` via `FakeVideoReceiver`.
+    #[test]
+    fn fake_video_receiver_inject_connection_lost_delivers_event() {
+        let mut receiver = FakeVideoReceiver::new_fake();
+        let (pkt_tx, _pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        receiver.start(pkt_tx, event_tx).unwrap();
+
+        receiver.inject_connection_lost_for_test("timeout".to_string());
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("ConnectionLost event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::ConnectionLost { ref reason } if reason == "timeout"),
+            "expected ConnectionLost with reason, got {ev:?}"
+        );
+
+        receiver.stop().unwrap();
     }
 }

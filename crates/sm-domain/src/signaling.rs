@@ -46,7 +46,11 @@ pub struct IceCandidate(pub String);
 /// Role for a signaling instance.
 ///
 /// Sender publishes the mDNS service; Receiver discovers and connects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are required because `SignalingRole` is embedded
+/// in `SignalingFrame::ReconnectRequest` which travels over the TCP wire.
+/// Plain enum representation: `"Sender"` / `"Receiver"` (PascalCase default).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SignalingRole {
     /// This instance publishes the service and accepts the TCP control connection.
     Sender,

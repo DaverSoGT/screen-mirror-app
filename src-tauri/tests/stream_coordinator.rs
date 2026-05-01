@@ -1,0 +1,334 @@
+// Integration tests for StreamBridge production coordinator wiring (Batch 6, CRITICAL-2).
+//
+// Symmetric to sender_coordinator.rs — tests that StreamCoordinatorHooks are invoked
+// by the stream coordinator when the supervisor emits the corresponding outcomes.
+//
+// TDD cycle (Strict TDD Mode): tests written FIRST (RED), then implementation.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use screen_mirror_lib::commands::sender::ChannelLike;
+use screen_mirror_lib::commands::stream::{
+    ReceiverBundle, StreamBridge, StreamCoordinatorHooks,
+    run_stream_transport_event_drain_with_supervisor_custom_and_hooks, start_stream_inner,
+    stop_stream_session,
+};
+use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
+use sm_domain::supervisor::SupervisorSignal;
+use sm_domain::transport::TransportEvent;
+
+// ─── FakeBinaryChannel ────────────────────────────────────────────────────────
+
+struct FakeBinaryChannel {
+    frames: Mutex<Vec<(u8, Vec<u8>)>>,
+}
+
+impl FakeBinaryChannel {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            frames: Mutex::new(vec![]),
+        })
+    }
+
+    fn status_messages(&self) -> Vec<String> {
+        self.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(disc, bytes)| {
+                if *disc == 0x02 {
+                    String::from_utf8(bytes.clone()).ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn wait_for_status_containing(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.status_messages().iter().any(|m| m.contains(needle)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl ChannelLike for FakeBinaryChannel {
+    fn send_raw(&self, discriminant: u8, bytes: Vec<u8>) -> Result<(), String> {
+        self.frames.lock().unwrap().push((discriminant, bytes));
+        Ok(())
+    }
+}
+
+// ─── Fake receiver for ReceiverBundle ─────────────────────────────────────────
+
+struct FakeReceiverOps;
+impl screen_mirror_lib::commands::stream::ReceiverOps for FakeReceiverOps {
+    fn request_keyframe(&self) -> Result<(), sm_domain::transport::TransportError> {
+        Ok(())
+    }
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
+}
+
+struct FakeSignalingOps;
+impl screen_mirror_lib::commands::stream::SignalingOps for FakeSignalingOps {
+    fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
+        Ok(())
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fn fast_policy() -> ReconnectPolicy {
+    ReconnectPolicy {
+        max_attempts: std::num::NonZeroU8::new(3).unwrap(),
+        backoff: BackoffSchedule::Exponential {
+            base_ms: 1,
+            factor: 2,
+        },
+    }
+}
+
+fn wait_for_sup_tx(bridge: &StreamBridge, timeout: Duration) -> SyncSender<SupervisorSignal> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(tx) = bridge.supervisor_signal_tx.lock().unwrap().clone() {
+            return tx;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("supervisor_signal_tx not set within {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn make_stream_bridge_with_counting_hooks() -> (
+    StreamBridge,
+    SyncSender<TransportEvent>,
+    Arc<FakeBinaryChannel>,
+    Arc<AtomicU32>, // rebuild
+    Arc<AtomicU32>, // publish_req
+    Arc<AtomicU32>, // publish_ack
+    Arc<AtomicU32>, // mdns_reset
+) {
+    let ch = FakeBinaryChannel::new();
+    let ch_for_caller = ch.clone();
+
+    let rebuild_count = Arc::new(AtomicU32::new(0));
+    let publish_req_count = Arc::new(AtomicU32::new(0));
+    let publish_ack_count = Arc::new(AtomicU32::new(0));
+    let reset_count = Arc::new(AtomicU32::new(0));
+
+    let rb_c = rebuild_count.clone();
+    let pr_c = publish_req_count.clone();
+    let pa_c = publish_ack_count.clone();
+    let re_c = reset_count.clone();
+
+    let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
+    let ev_rx_slot: Arc<Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>> =
+        Arc::new(Mutex::new(Some(ev_rx)));
+    let ev_rx_slot_clone = ev_rx_slot.clone();
+
+    let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+    let sup_tx_for_drain = sup_tx.clone();
+
+    let policy = fast_policy();
+    let ack_timeout = Duration::from_millis(200);
+
+    let (dummy_pkt_tx, dummy_pkt_rx) = sync_channel(1);
+    let dummy_pkt_rx_slot: Arc<
+        Mutex<Option<std::sync::mpsc::Receiver<sm_domain::encode::EncodedPacket>>>,
+    > = Arc::new(Mutex::new(Some(dummy_pkt_rx)));
+    let dummy_pkt_rx_slot_c = dummy_pkt_rx_slot.clone();
+    drop(dummy_pkt_tx); // disconnect it so mux thread exits fast
+
+    let bridge = StreamBridge::new_with_builder_and_sup_tx(
+        Arc::new(move |_bind_ctx, _port, _name, stop_flag, channel| {
+            let ev_rx = ev_rx_slot_clone
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ev_rx taken once");
+            let pkt_rx = dummy_pkt_rx_slot_c
+                .lock()
+                .unwrap()
+                .take()
+                .expect("pkt_rx taken once");
+            let st = sup_tx_for_drain.clone();
+            let p = policy.clone();
+            let t = ack_timeout;
+
+            let rb = rb_c.clone();
+            let pr = pr_c.clone();
+            let pa = pa_c.clone();
+            let re = re_c.clone();
+            let hooks = StreamCoordinatorHooks {
+                publish_reconnect_request: Arc::new(move |_attempt, _nonce| {
+                    pr.fetch_add(1, Ordering::Relaxed);
+                }),
+                publish_reconnect_ack: Arc::new(move |_attempt, _nonce| {
+                    pa.fetch_add(1, Ordering::Relaxed);
+                }),
+                initiate_rebuild: Arc::new(move |signal_tx| {
+                    rb.fetch_add(1, Ordering::Relaxed);
+                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                }),
+                initiate_mdns_reset: Arc::new(move || {
+                    re.fetch_add(1, Ordering::Relaxed);
+                }),
+            };
+
+            let h = thread::Builder::new()
+                .name("stream-coord-test-drain".into())
+                .spawn(move || {
+                    run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                    );
+                })
+                .expect("spawn drain");
+
+            Ok(ReceiverBundle {
+                receiver: Box::new(FakeReceiverOps),
+                pkt_rx,
+                signaling: Some(Box::new(FakeSignalingOps)),
+                drain_handles: vec![h],
+                _drain_senders: vec![],
+            })
+        }),
+        sup_tx,
+    );
+
+    (
+        bridge,
+        ev_tx,
+        ch_for_caller,
+        rebuild_count,
+        publish_req_count,
+        publish_ack_count,
+        reset_count,
+    )
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+/// CRITICAL-2 (stream): InitiateRebuild invokes the initiate_rebuild hook.
+#[test]
+fn coordinator_invokes_builder_on_initiate_rebuild() {
+    let (bridge, ev_tx, ch, rebuild_count, _pr, _pa, _re) =
+        make_stream_bridge_with_counting_hooks();
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(19999),
+        None,
+    )
+    .expect("start must succeed");
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got =
+        ch.wait_for_status_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(got, "expected reconnecting 0x02 after IceFailed");
+
+    let nonce = bridge
+        .restart_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.session_nonce)
+        .unwrap_or(1);
+
+    let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(500));
+    sup_tx
+        .try_send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 1,
+        })
+        .ok();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while rebuild_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        rebuild_count.load(Ordering::Relaxed) >= 1,
+        "stream initiate_rebuild hook must be called on InitiateRebuild outcome"
+    );
+
+    stop_stream_session(&bridge);
+}
+
+/// CRITICAL-2 (stream): PublishReconnectRequest invokes the hook.
+#[test]
+fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
+    let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) =
+        make_stream_bridge_with_counting_hooks();
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(19998),
+        None,
+    )
+    .expect("start must succeed");
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while publish_req_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(
+        publish_req_count.load(Ordering::Relaxed) >= 1,
+        "stream publish_reconnect_request hook must be called on PublishReconnectRequest outcome"
+    );
+
+    stop_stream_session(&bridge);
+}
+
+/// CRITICAL-2 (stream): InitiateMdnsReset invokes the hook (ack timeout path).
+#[test]
+fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
+    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) = make_stream_bridge_with_counting_hooks();
+
+    start_stream_inner(
+        &bridge,
+        ch.clone() as Arc<dyn ChannelLike>,
+        Some(19997),
+        None,
+    )
+    .expect("start must succeed");
+
+    ev_tx.send(TransportEvent::IceFailed).unwrap();
+    let got =
+        ch.wait_for_status_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
+    assert!(got, "expected reconnecting 0x02");
+
+    // No PeerAck — let ack_timeout (200ms) fire → InitiateMdnsReset.
+    let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    while reset_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        reset_count.load(Ordering::Relaxed) >= 1,
+        "stream initiate_mdns_reset hook must be called on InitiateMdnsReset outcome"
+    );
+
+    stop_stream_session(&bridge);
+}

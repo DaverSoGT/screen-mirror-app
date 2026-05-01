@@ -40,6 +40,26 @@
         border-color: #888;
         color: #fff;
       }
+      /* Phase 9 — dead-session buttons (hidden until "dead" event) */
+      button#retry,
+      button#cancel {
+        padding: 0.5rem 1.4rem;
+        font-size: 0.9rem;
+        font-family: inherit;
+        border: 1px solid #555;
+        background: #1e1e1e;
+        color: #ddd;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button#retry { border-color: #4a9; color: #8ef; }
+      button#retry:hover { border-color: #6cb; color: #aff; }
+      button#cancel { border-color: #844; color: #f88; }
+      button#cancel:hover { border-color: #a66; color: #faa; }
+      .dead-buttons {
+        display: flex;
+        gap: 0.5rem;
+      }
       #status {
         font-size: 0.8rem;
         font-family: ui-monospace, monospace;
@@ -66,6 +86,12 @@
       <h1>Sender</h1>
 
       <button id="start">Start streaming</button>
+
+      <!-- Phase 9 — dead-session modal: hidden by default, shown on "dead" event -->
+      <div class="dead-buttons">
+        <button id="retry" hidden>Retry</button>
+        <button id="cancel" hidden>Cancel</button>
+      </div>
 
       <div id="status">Not connected</div>
       <div id="error"></div>

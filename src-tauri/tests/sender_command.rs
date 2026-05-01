@@ -990,3 +990,141 @@ fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
         "shutdown closure must drop production resources during stop_sender_session"
     );
 }
+
+// ─── T6.3/T6.4 (streaming-emit-on-ice-connect): drain-level gate tests ────────
+//
+// These tests verify that the drain thread does NOT emit a "streaming" event
+// to FakeJsonChannel before the transport emits TransportEvent::IceConnected.
+//
+// The test approach:
+// - Manually wire a SyncSender<TransportEvent> to a drain thread
+// - Assert no "streaming" in FakeJsonChannel before injecting IceConnected
+// - Inject IceConnected, assert "streaming" arrives
+//
+// This directly replicates what FakeVideoSender::inject_ice_connected_for_test()
+// would do (send TransportEvent::IceConnected on the event channel), without
+// needing access to the private FakeVideoSender test struct in sm-domain.
+
+/// T6.3 (TST-S-1, AC-6) — No "streaming" event fires before IceConnected.
+/// After IceConnected, "streaming" arrives within 100ms.
+#[test]
+fn streaming_event_does_not_fire_before_ice_connected() {
+    // Wire a drain thread directly with a manually-controlled TransportEvent channel.
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone = ch.clone();
+    let counters = Arc::new(SenderCounters::default());
+    let stop_clone = stop_flag.clone();
+
+    let drain = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx, stop_clone, ch_clone, counters);
+    });
+
+    // Phase 1: Do NOT send IceConnected. Wait 50ms and assert no "streaming".
+    thread::sleep(Duration::from_millis(50));
+    let msgs_before = ch.messages();
+    assert!(
+        !msgs_before
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
+        "streaming must NOT fire before IceConnected; got: {msgs_before:?}"
+    );
+
+    // Phase 2: Inject IceConnected (mirrors inject_ice_connected_for_test behavior).
+    ev_tx.send(TransportEvent::IceConnected).unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    let msgs_after = ch.messages();
+    assert!(
+        msgs_after
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
+        "streaming must fire after IceConnected; got: {msgs_after:?}"
+    );
+
+    stop_flag.store(true, Ordering::Relaxed);
+    drop(ev_tx);
+    drain.join().expect("drain must exit");
+}
+
+/// T6.4 (TST-S-2, AC-5, AC-6) — After a rebuild (simulated by stopping the drain
+/// and starting a fresh one with a new event channel), the second generation MUST
+/// NOT emit "streaming" until IceConnected arrives on the new channel.
+#[test]
+fn rebuild_streaming_event_fires_only_after_new_ice_connected() {
+    // ── Generation 1 ─────────────────────────────────────────────────────────────
+    let (ev_tx1, ev_rx1) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag1 = Arc::new(AtomicBool::new(false));
+    let ch = FakeJsonChannel::new();
+    let ch_clone1 = ch.clone();
+    let counters1 = Arc::new(SenderCounters::default());
+    let stop_clone1 = stop_flag1.clone();
+
+    let drain1 = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx1, stop_clone1, ch_clone1, counters1);
+    });
+
+    // Gen 1 gets IceConnected → streaming fires.
+    ev_tx1.send(TransportEvent::IceConnected).unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    let msgs_gen1 = ch.messages();
+    assert!(
+        msgs_gen1
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
+        "gen1 streaming must fire after IceConnected; got: {msgs_gen1:?}"
+    );
+
+    // Stop gen 1 (simulate rebuild teardown).
+    stop_flag1.store(true, Ordering::Relaxed);
+    drop(ev_tx1);
+    drain1.join().expect("gen1 drain must exit");
+
+    // ── Generation 2 ─────────────────────────────────────────────────────────────
+    // Fresh drain thread with a new event channel — simulates what build_production_sender_bundle
+    // does for each rebuild generation.
+    let (ev_tx2, ev_rx2) = std::sync::mpsc::sync_channel::<TransportEvent>(4);
+    let stop_flag2 = Arc::new(AtomicBool::new(false));
+    let ch_clone2 = ch.clone();
+    let counters2 = Arc::new(SenderCounters::default());
+    let stop_clone2 = stop_flag2.clone();
+
+    // Record message count before gen2 starts.
+    let msgs_count_before_gen2 = ch.messages().len();
+
+    let drain2 = thread::spawn(move || {
+        run_sender_transport_event_drain(ev_rx2, stop_clone2, ch_clone2, counters2);
+    });
+
+    // Gen 2: Do NOT inject IceConnected. Assert no NEW streaming event.
+    thread::sleep(Duration::from_millis(50));
+    let msgs_gen2_before = ch.messages();
+    assert!(
+        !msgs_gen2_before[msgs_count_before_gen2..]
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
+        "gen2 must NOT emit streaming before its own IceConnected; \
+         new messages: {:?}",
+        &msgs_gen2_before[msgs_count_before_gen2..]
+    );
+
+    // Now inject IceConnected on gen2 channel.
+    ev_tx2.send(TransportEvent::IceConnected).unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    let msgs_gen2_after = ch.messages();
+    assert!(
+        msgs_gen2_after[msgs_count_before_gen2..]
+            .iter()
+            .any(|m| m.contains("\"kind\":\"streaming\"")),
+        "gen2 streaming must fire after its own IceConnected; \
+         new messages: {:?}",
+        &msgs_gen2_after[msgs_count_before_gen2..]
+    );
+
+    stop_flag2.store(true, Ordering::Relaxed);
+    drop(ev_tx2);
+    drain2.join().expect("gen2 drain must exit");
+}
