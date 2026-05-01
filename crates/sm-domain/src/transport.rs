@@ -332,6 +332,19 @@ mod tests {
                 .expect("event channel must accept IceFailed");
         }
 
+        /// Inject a `TransportEvent::IceConnected` on the stored event channel.
+        ///
+        /// Only callable after `start()`. Panics if `start()` was not called.
+        /// Gated to test builds by the enclosing `#[cfg(test)]` module.
+        fn inject_ice_connected_for_test(&self) {
+            let tx = self
+                .event_tx
+                .as_ref()
+                .expect("inject_ice_connected_for_test called before start()");
+            tx.try_send(TransportEvent::IceConnected)
+                .expect("event channel must accept IceConnected");
+        }
+
         /// Inject a `TransportEvent::ConnectionLost` on the stored event channel.
         ///
         /// Only callable after `start()`. Panics if `start()` was not called.
@@ -672,6 +685,32 @@ mod tests {
         assert!(
             matches!(ev, TransportEvent::ConnectionLost { ref reason } if reason == "poll error"),
             "expected ConnectionLost with reason, got {ev:?}"
+        );
+
+        drop(pkt_tx);
+        sender.stop().unwrap();
+    }
+
+    // ─── T1.1 (streaming-emit-on-ice-connect): FakeVideoSender inject_ice_connected helper ───
+
+    /// T1.1 (AC-6, AC-9) — `inject_ice_connected_for_test` delivers `IceConnected` on the event channel.
+    ///
+    /// RED assertion: `inject_ice_connected_for_test` does not exist yet → compile failure.
+    #[test]
+    fn fake_video_sender_inject_ice_connected_delivers_event() {
+        let mut sender = FakeVideoSender::new_fake();
+        let (pkt_tx, pkt_rx) = sync_channel::<EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+        sender.start(pkt_rx, event_tx).unwrap();
+
+        sender.inject_ice_connected_for_test();
+
+        let ev = event_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("IceConnected event must arrive within 100ms");
+        assert!(
+            matches!(ev, TransportEvent::IceConnected),
+            "expected IceConnected, got {ev:?}"
         );
 
         drop(pkt_tx);
