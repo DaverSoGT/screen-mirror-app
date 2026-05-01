@@ -1140,20 +1140,19 @@ fn enter_stream_supervisor_mode(
             break 'coord;
         }
 
-        // Read transport events with short timeout to stay responsive.
-        match ev_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(TransportEvent::IceConnected) => {
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
-            }
-            Ok(TransportEvent::IceFailed) | Ok(TransportEvent::ConnectionLost { .. }) => {
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-            }
-            Ok(_) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-            }
-        }
+        // Drain (and DISCARD) any pending OLD-transport event so the loop
+        // stays responsive without busy-waiting. We must NOT translate OLD
+        // transport events into RebuildSucceeded/RebuildFailed signals: the
+        // OLD transport keeps emitting IceFailed/ConnectionLost noise after
+        // the peer goes down, and during the rebuild window each one used to
+        // be forwarded as RebuildFailed — which (a) was ignored in
+        // AwaitingAck, but (b) escalated attempt+1 in Rebuilding, breaking
+        // backoff and dropping the worker's late RebuildSucceeded into
+        // AwaitingAck's Ignore branch. Recovery silently failed end-to-end
+        // (T12.2 manual smoke FAIL post-fix-v1, engram #509). The worker is
+        // now the sole reporter of rebuild outcome via signal_tx; the OLD
+        // ev_rx is consumed-and-ignored purely as a timer.
+        let _ = ev_rx.recv_timeout(Duration::from_millis(50));
     }
 
     // Clear signal_tx from the session before joining.

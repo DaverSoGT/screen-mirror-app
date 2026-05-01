@@ -864,30 +864,19 @@ fn enter_supervisor_mode(
             break 'coord;
         }
 
-        // Read transport events with short timeout to stay responsive.
-        match ev_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(TransportEvent::IceConnected) => {
-                // Rebuild succeeded — signal supervisor.
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
-            }
-            Ok(TransportEvent::IceFailed) | Ok(TransportEvent::ConnectionLost { .. }) => {
-                // Rebuild failed — signal supervisor.
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-            }
-            Ok(_) => {
-                // Other transport events during reconnect: discard (AC-11).
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Normal poll — continue.
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Transport channel dropped — treat as rebuild failure.
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
-            }
-        }
-
-        // Check if supervisor thread has finished (peek at outcome_rx for Disconnected).
-        // We'll detect this on the next iteration's try_recv loop.
+        // Drain (and DISCARD) any pending OLD-transport event so the loop
+        // stays responsive without busy-waiting. We must NOT translate OLD
+        // transport events into RebuildSucceeded/RebuildFailed signals: the
+        // OLD transport keeps emitting IceFailed/ConnectionLost noise after
+        // the peer goes down, and during the rebuild window each one used to
+        // be forwarded as RebuildFailed — which (a) was ignored in
+        // AwaitingAck, but (b) escalated attempt+1 in Rebuilding, breaking
+        // backoff and dropping the worker's late RebuildSucceeded into
+        // AwaitingAck's Ignore branch. Recovery silently failed end-to-end
+        // (T12.2 manual smoke FAIL post-fix-v1, engram #509). The worker is
+        // now the sole reporter of rebuild outcome via signal_tx; the OLD
+        // ev_rx is consumed-and-ignored purely as a timer.
+        let _ = ev_rx.recv_timeout(Duration::from_millis(50));
     }
 
     // Clear signal_tx from the session before joining.
