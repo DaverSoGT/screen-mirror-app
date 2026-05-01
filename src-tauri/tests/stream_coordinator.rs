@@ -195,7 +195,7 @@ fn make_stream_bridge_with_counting_hooks() -> (
                 .name("stream-coord-test-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn drain");

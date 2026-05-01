@@ -148,7 +148,7 @@ enum SupervisorState {
 ///     outcome_tx,
 /// );
 /// // Run on drain thread:
-/// sup.run(ack_timeout);
+/// sup.run(ack_timeout, rebuild_timeout);
 /// ```
 pub struct ReconnectSupervisor {
     policy: ReconnectPolicy,
@@ -201,10 +201,20 @@ impl ReconnectSupervisor {
 
     /// Drive the supervisor until it reaches a terminal state (`Dead` or `Stopped`).
     ///
-    /// `ack_timeout` is the maximum time to wait for a `PeerAck` in `AwaitingAck` state,
-    /// AND the maximum duration of each backoff sleep step in `Rebuilding` state.
-    /// In tests, pass a very short duration (e.g., `Duration::from_millis(10)`) to make
-    /// tests run in milliseconds. In production, pass the actual backoff delay.
+    /// Two independent timeouts govern the wait windows:
+    ///
+    /// - `ack_timeout`: maximum time to wait for a `PeerAck` in `AwaitingAck` state.
+    ///   Production default is short (~2s) so a missing ack escalates quickly to mDNS
+    ///   reset. Tests can use very short durations.
+    /// - `rebuild_timeout`: maximum time to wait for `RebuildSucceeded`/`RebuildFailed`
+    ///   in `Rebuilding` state. Must be large enough to cover a real-world rebuild
+    ///   (mDNS rediscovery + SDP handshake + ICE establishment + bind_probe retries),
+    ///   typically ≥15s in production. If this expires before the worker reports a
+    ///   result, the supervisor escalates to attempt n+1 — and any late
+    ///   `RebuildSucceeded` arriving afterwards is dropped (AwaitingAck ignores it).
+    ///   Conflating the two timeouts caused the T12.2 manual smoke FAIL of 2026-04-30
+    ///   (engram #509): production used ack_timeout=2s for both states, but real
+    ///   rebuilds take ≥5s.
     ///
     /// # Returns
     ///
@@ -213,10 +223,15 @@ impl ReconnectSupervisor {
     ///
     /// # Note on backoff
     ///
-    /// The backoff sleep is achieved by `recv_timeout(delay)` on `signal_rx`. This means
-    /// any `Stop` signal interrupts the sleep within the `recv_timeout` granularity
-    /// (at most `ack_timeout` latency, typically milliseconds in tests). AC-13, AC-14.
-    pub fn run(&mut self, ack_timeout: std::time::Duration) -> Option<DeadReason> {
+    /// The backoff sleep between attempts is achieved by `recv_timeout(delay)` on
+    /// `signal_rx`, where `delay` comes from `policy.delay_for_attempt(...)`. This
+    /// means any `Stop` signal interrupts the sleep within `recv_timeout` granularity
+    /// (typically milliseconds in tests). AC-13, AC-14.
+    pub fn run(
+        &mut self,
+        ack_timeout: std::time::Duration,
+        rebuild_timeout: std::time::Duration,
+    ) -> Option<DeadReason> {
         loop {
             match &self.state.clone() {
                 SupervisorState::Connected => {
@@ -354,8 +369,10 @@ impl ReconnectSupervisor {
                 SupervisorState::Rebuilding { attempt, trigger } => {
                     let attempt = *attempt;
                     let trigger = trigger.clone();
-                    // Wait for rebuild result.
-                    match self.signal_rx.recv_timeout(ack_timeout) {
+                    // Wait for rebuild result. Must use `rebuild_timeout` (not
+                    // `ack_timeout`) because real rebuilds take ≥5s (mDNS + SDP
+                    // + ICE) while ack_timeout is ~2s. See engram #509.
+                    match self.signal_rx.recv_timeout(rebuild_timeout) {
                         Ok(SupervisorSignal::Stop) => {
                             self.emit(SupervisorOutcome::Stopped);
                             self.state = SupervisorState::Stopped;
@@ -543,6 +560,11 @@ mod tests {
     /// "sleep" phases. AC-14: recv_timeout means NO spin loop.
     const TEST_ACK_TIMEOUT: Duration = Duration::from_millis(20);
 
+    /// Default rebuild timeout for tests — same as ack so existing tests behave
+    /// as before (their fake builders signal RebuildSucceeded synchronously).
+    /// Tests that need to simulate a slow rebuild use `spawn_with_timeouts`.
+    const TEST_REBUILD_TIMEOUT: Duration = TEST_ACK_TIMEOUT;
+
     // ─── Helper to drive supervisor on a background thread ──────────────────
 
     struct SupervisorHandle {
@@ -553,11 +575,23 @@ mod tests {
 
     impl SupervisorHandle {
         fn spawn(policy: ReconnectPolicy, my_nonce: u64) -> Self {
+            Self::spawn_with_timeouts(policy, my_nonce, TEST_ACK_TIMEOUT, TEST_REBUILD_TIMEOUT)
+        }
+
+        /// Spawn with explicit ack/rebuild timeouts. Use this when a test needs
+        /// to exercise the difference between the two waits — e.g. simulating a
+        /// rebuild that legitimately takes longer than `ack_timeout`.
+        fn spawn_with_timeouts(
+            policy: ReconnectPolicy,
+            my_nonce: u64,
+            ack_timeout: Duration,
+            rebuild_timeout: Duration,
+        ) -> Self {
             let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
             let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
             let join = std::thread::spawn(move || {
                 let mut sup = ReconnectSupervisor::new(policy, my_nonce, signal_rx, outcome_tx);
-                sup.run(TEST_ACK_TIMEOUT)
+                sup.run(ack_timeout, rebuild_timeout)
             });
             Self {
                 signal_tx,
@@ -1011,6 +1045,76 @@ mod tests {
 
         let rebuild = h.recv_outcome();
         assert_eq!(rebuild, SupervisorOutcome::InitiateRebuild);
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    // ─── Slow-rebuild reproductor (T12.2 manual smoke FAIL 2026-04-30) ───────
+
+    /// Reproductor del bug detectado en el smoke manual T12.2 Escenario 1
+    /// (engram #509, sdd/auto-rebuild-from-drain/smoke-fail-diagnosis).
+    ///
+    /// Cuando el rebuild real toma más que `ack_timeout`, el supervisor en estado
+    /// `Rebuilding` toma la rama `Err(_)` del `recv_timeout(ack_timeout)`
+    /// (este archivo, líneas 418-444): trata el silencio como `RebuildFailed`,
+    /// transiciona a `AwaitingAck{n+1}` y emite `PublishReconnectRequest{n+1}`.
+    ///
+    /// Cuando el worker finalmente envía `RebuildSucceeded`, el supervisor está
+    /// en `AwaitingAck` → la señal cae en la rama Ignore (líneas 333-336) → nunca
+    /// se emite `StateChanged(Connected)` → frontend nunca recibe `Streaming` →
+    /// overlay "Reconnecting" persiste indefinidamente. AC-5 violado.
+    ///
+    /// En producción `ack_timeout = 2s` y el rebuild real (mDNS + SDP + ICE)
+    /// toma ≥5s, por lo que el bug se dispara siempre. Los tests anteriores no
+    /// lo detectaron porque sus builders fake retornan en <1ms y nunca expira
+    /// `recv_timeout` en `Rebuilding`.
+    ///
+    /// Fix esperado (Opción A): separar `rebuild_timeout` de `ack_timeout` en
+    /// `ReconnectSupervisor::run`, y propagar un valor amplio (≥15s) en
+    /// producción para `Rebuilding`. Después del fix, este test debe pasar.
+    #[test]
+    fn slow_rebuild_succeeded_must_not_be_dropped_when_exceeds_ack_timeout() {
+        // ack_timeout = 20ms (short, like production's 2s relative to rebuild)
+        // rebuild_timeout = 1s (large, like production's 15s relative to ack)
+        // The slow-rebuild sleep below (50ms) lies between the two: it would
+        // expire `ack_timeout` if reused (the bug) but stays well within
+        // `rebuild_timeout` (the fix).
+        let h = SupervisorHandle::spawn_with_timeouts(
+            fast_policy(),
+            42,
+            Duration::from_millis(20),
+            Duration::from_millis(1000),
+        );
+
+        // Drive Connected → Rebuilding{1} via PeerRequest (loser path).
+        h.send(SupervisorSignal::PeerRequest {
+            peer_nonce: 1,
+            attempt: 1,
+        });
+        let _ack = h.recv_outcome(); // PublishReconnectAck
+        let _state = h.recv_outcome(); // StateChanged(Reconnecting{1})
+        let _rebuild = h.recv_outcome(); // InitiateRebuild
+
+        // Simulate a slow rebuild — sleep > ack_timeout (20ms) but < rebuild_timeout (1000ms).
+        // Production analogue: rebuild takes 5+s while ack_timeout = 2s and
+        // rebuild_timeout = 15s.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Worker reports rebuild success after the slow operation completes.
+        h.send(SupervisorSignal::RebuildSucceeded);
+
+        // Expectation: next outcome MUST be StateChanged(Connected). The slow
+        // rebuild's RebuildSucceeded must be honored, not dropped because the
+        // supervisor escalated to attempt 2 after ack_timeout expired in
+        // Rebuilding state.
+        let outcome = h.recv_outcome();
+        assert_eq!(
+            outcome,
+            SupervisorOutcome::StateChanged(SessionState::Connected),
+            "Slow rebuild's RebuildSucceeded must result in \
+             StateChanged(Connected). Got {outcome:?}"
+        );
 
         h.send(SupervisorSignal::Stop);
         h.join();

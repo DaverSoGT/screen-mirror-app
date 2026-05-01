@@ -605,6 +605,9 @@ pub fn run_sender_transport_event_drain_with_supervisor(
 ) {
     // Production ack_timeout: 2s per design §3.
     let ack_timeout = Duration::from_secs(2);
+    // Production rebuild_timeout: 15s — must cover mDNS rediscovery + SDP
+    // handshake + ICE establishment + bind_probe retries (engram #509).
+    let rebuild_timeout = Duration::from_secs(15);
 
     // Session nonce is generated once when the first reconnect is needed.
     let session_nonce: u64 = rand::random();
@@ -638,6 +641,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                         &supervisor_signal_tx,
                         ReconnectPolicy::v1_default(),
                         ack_timeout,
+                        rebuild_timeout,
                         SenderCoordinatorHooks::noop(),
                     );
                     break 'drain;
@@ -655,6 +659,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                         &supervisor_signal_tx,
                         ReconnectPolicy::v1_default(),
                         ack_timeout,
+                        rebuild_timeout,
                         SenderCoordinatorHooks::noop(),
                     );
                     break 'drain;
@@ -682,6 +687,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
 ///
 /// Tests use this variant with a fast policy (millisecond-scale backoff) to drive all
 /// 3 attempts without waiting for the production 3s/9s/27s delays.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sender_transport_event_drain_with_supervisor_custom(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -690,6 +696,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
 ) {
     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
         ev_rx,
@@ -698,6 +705,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
         supervisor_signal_tx,
         policy,
         ack_timeout,
+        rebuild_timeout,
         SenderCoordinatorHooks::noop(),
     );
     // Note: `counters` not used in the hooks variant — kept in signature for backward compat.
@@ -709,6 +717,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
 /// This is the primary drain function for production coordinator wiring.
 /// `hooks` receives the coordinator actions (rebuild, signaling publish, mDNS reset).
 /// For tests that only care about event emission, use `..._custom` (no-op hooks).
+#[allow(clippy::too_many_arguments)]
 pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -716,6 +725,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
     hooks: SenderCoordinatorHooks,
 ) {
     let session_nonce: u64 = rand::random();
@@ -746,6 +756,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        rebuild_timeout,
                         hooks,
                     );
                     break 'drain;
@@ -760,6 +771,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        rebuild_timeout,
                         hooks,
                     );
                     break 'drain;
@@ -793,6 +805,7 @@ fn enter_supervisor_mode(
     supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
     hooks: SenderCoordinatorHooks,
 ) {
     use std::sync::mpsc::sync_channel;
@@ -813,7 +826,7 @@ fn enter_supervisor_mode(
         .name("sm-sender-supervisor".into())
         .spawn(move || {
             let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
-            sup.run(ack_timeout)
+            sup.run(ack_timeout, rebuild_timeout)
         })
         .expect("supervisor thread spawn must not fail");
 
@@ -1647,6 +1660,7 @@ fn build_production_sender_bundle(
                 sup_tx,
                 ReconnectPolicy::v1_default(),
                 Duration::from_secs(2),
+                Duration::from_secs(15),
                 coordinator_hooks,
             );
         })

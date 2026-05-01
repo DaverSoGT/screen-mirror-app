@@ -965,6 +965,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
 ) {
     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
         ev_rx,
@@ -973,6 +974,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
         supervisor_signal_tx,
         policy,
         ack_timeout,
+        rebuild_timeout,
         StreamCoordinatorHooks::noop(),
     );
 }
@@ -981,6 +983,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
 ///
 /// This is the primary drain function for production coordinator wiring (CRITICAL-2).
 /// `hooks` receives the coordinator actions (rebuild, signaling publish, mDNS reset).
+#[allow(clippy::too_many_arguments)]
 pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
     ev_rx: std::sync::mpsc::Receiver<TransportEvent>,
     stop_flag: Arc<AtomicBool>,
@@ -988,6 +991,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
 ) {
     let session_nonce: u64 = rand::random();
@@ -1014,6 +1018,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        rebuild_timeout,
                         hooks,
                     );
                     break 'drain;
@@ -1031,6 +1036,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         &supervisor_signal_tx,
                         policy,
                         ack_timeout,
+                        rebuild_timeout,
                         hooks,
                     );
                     break 'drain;
@@ -1045,7 +1051,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
 
 /// Transport-event drain loop — WITH supervisor wiring AND production defaults.
 ///
-/// Uses `ReconnectPolicy::v1_default()` and `ack_timeout = 2s`.
+/// Uses `ReconnectPolicy::v1_default()`, `ack_timeout = 2s`, `rebuild_timeout = 15s`.
 /// Kept for reference; production path now uses `_and_hooks` variant directly.
 #[allow(dead_code)]
 fn run_stream_transport_event_drain_with_supervisor(
@@ -1061,6 +1067,7 @@ fn run_stream_transport_event_drain_with_supervisor(
         supervisor_signal_tx,
         ReconnectPolicy::v1_default(),
         Duration::from_secs(2),
+        Duration::from_secs(15),
     );
 }
 
@@ -1079,6 +1086,7 @@ fn enter_stream_supervisor_mode(
     supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     policy: ReconnectPolicy,
     ack_timeout: Duration,
+    rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
 ) {
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
@@ -1097,7 +1105,7 @@ fn enter_stream_supervisor_mode(
         .name("sm-stream-supervisor".into())
         .spawn(move || {
             let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
-            sup.run(ack_timeout)
+            sup.run(ack_timeout, rebuild_timeout)
         })
         .expect("supervisor thread spawn must not fail");
 
@@ -1536,6 +1544,7 @@ fn build_production_bundle(
                 supervisor_signal_tx,
                 ReconnectPolicy::v1_default(),
                 Duration::from_secs(2),
+                Duration::from_secs(15),
                 coordinator_hooks,
             );
         })?;

@@ -121,7 +121,7 @@ fn make_supervised_bridge_with_policy(
                 .name("supervised-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom(
-                        ev_rx, stop_flag, channel, counters, st, p, t,
+                        ev_rx, stop_flag, channel, counters, st, p, t, t,
                     );
                 })
                 .expect("spawn drain");
@@ -717,7 +717,7 @@ fn make_supervised_bridge_with_rebuild_hook(
                 .name("supervised-drain-v2".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn drain");
@@ -893,7 +893,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 .name("failing-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn");
@@ -1215,6 +1215,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                             sup_tx_slot,
                             p,
                             t,
+                            t,
                             hooks,
                         );
                     })
@@ -1476,7 +1477,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                 .name("t6-1-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn drain");

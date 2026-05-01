@@ -154,7 +154,7 @@ fn make_supervised_stream_bridge(
                 .name("supervised-stream-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom(
-                        ev_rx, stop_flag, channel, st, p, t,
+                        ev_rx, stop_flag, channel, st, p, t, t,
                     );
                 })
                 .expect("spawn stream drain");
@@ -543,7 +543,7 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 .name("supervised-stream-drain-v2".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn stream drain");
@@ -725,7 +725,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 .name("failing-stream-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn");
@@ -1031,6 +1031,7 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                             sup_tx_slot,
                             p,
                             t,
+                            t,
                             hooks,
                         );
                     })
@@ -1299,7 +1300,7 @@ fn rebuild_releases_udp_port_before_rebind() {
                 .name("retry-probe-stream-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn stream drain");
@@ -1460,7 +1461,7 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                 .name("t65-stream-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, hooks,
+                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
                     );
                 })
                 .expect("spawn");
