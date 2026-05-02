@@ -2319,24 +2319,25 @@ fn mux_thread(
                 // 14496-15 §5.2.4.1.1, tkhd and avc1 boxes MUST carry the visible
                 // dimensions; otherwise Chromium MSE detects a mismatch versus the SPS
                 // embedded in avcC and silently closes the MediaSource (B11-S5).
-                let dims = match sm_infra::render::avcc::parse_sps(&sps) {
-                    Ok(info) => info.display_dimensions(),
+                let sps_info = match sm_infra::render::avcc::parse_sps(&sps) {
+                    Ok(info) => info,
                     Err(e) => {
                         eprintln!("[sm-stream-mux] parse_sps failed; keep buffering: {e}");
                         pre_idr_buffer.push(pkt);
                         continue;
                     }
                 };
+                let (w, h) = sps_info.display_dimensions();
                 eprintln!(
                     "[sm-stream-mux] init segment dims: {}x{} (display, cropped from SPS), at +{}ms from first packet",
-                    dims.0,
-                    dims.1,
+                    w,
+                    h,
                     first_pkt_seen
                         .map(|t| std::time::Instant::now().duration_since(t).as_millis())
                         .unwrap_or(0)
                 );
-                let m = Mp4Muxer::new(dims.0, dims.1, 30, 1);
-                match m.build_init_segment(&sps, &pps) {
+                let m = Mp4Muxer::new(w, h, 30, 1);
+                match m.build_init_segment(&sps_info, &sps, &pps) {
                     Ok(init_bytes) => {
                         emit_init(&channel, &counters, init_bytes);
                         init_emitted = true;
