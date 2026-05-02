@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sm_domain::encode::EncodedPacket;
+use sm_infra::render::avcc::parse_sps;
 use sm_infra::render::fmp4_muxer::{Mp4Muxer, annex_b_to_avcc, extract_sps_pps_from_idr};
 
 // ─── Golden SPS/PPS fixtures ─────────────────────────────────────────────────
@@ -93,8 +94,9 @@ fn extract_tfdt_time(seg: &[u8]) -> u64 {
 #[test]
 fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
     let init = muxer
-        .build_init_segment(SPS, PPS)
+        .build_init_segment(&sps_info, SPS, PPS)
         .expect("init segment must build");
 
     // Verify init segment structure.
@@ -167,7 +169,8 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
 #[test]
 fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-    muxer.build_init_segment(SPS, PPS).unwrap();
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
+    muxer.build_init_segment(&sps_info, SPS, PPS).unwrap();
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
@@ -214,7 +217,8 @@ fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
 #[test]
 fn mp4_muxer_tfdt_decode_time_monotonic() {
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-    muxer.build_init_segment(SPS, PPS).unwrap();
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
+    muxer.build_init_segment(&sps_info, SPS, PPS).unwrap();
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
@@ -262,7 +266,10 @@ fn mp4_muxer_tfdt_decode_time_monotonic() {
 #[test]
 fn mp4_muxer_init_segment_avcc_matches_input_sps_pps() {
     let muxer = Mp4Muxer::new(320, 240, 30, 1);
-    let init = muxer.build_init_segment(SPS, PPS).expect("init must build");
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
+    let init = muxer
+        .build_init_segment(&sps_info, SPS, PPS)
+        .expect("init must build");
 
     // Find avcC box in the init segment.
     let avcc_pos = init
@@ -341,7 +348,10 @@ fn mp4_muxer_with_mp4_crate_reader_attempts_parse() {
     use std::io::Cursor;
 
     let muxer = Mp4Muxer::new(320, 240, 30, 1);
-    let init = muxer.build_init_segment(SPS, PPS).expect("init must build");
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
+    let init = muxer
+        .build_init_segment(&sps_info, SPS, PPS)
+        .expect("init must build");
 
     // Attempt to parse the init segment with mp4::Mp4Reader.
     // Expected: this WILL fail because mp4 0.14 Mp4Reader expects a complete

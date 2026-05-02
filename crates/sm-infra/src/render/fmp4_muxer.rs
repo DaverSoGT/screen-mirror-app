@@ -718,8 +718,13 @@ struct PendingSample {
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut muxer = Mp4Muxer::new(1920, 1080, 30, 1);
-/// let init = muxer.build_init_segment(sps_nal, pps_nal)?;
+/// use sm_infra::render::avcc::parse_sps;
+/// use sm_infra::render::fmp4_muxer::Mp4Muxer;
+///
+/// let sps_info = parse_sps(sps_nal)?;
+/// let (w, h) = sps_info.display_dimensions();
+/// let muxer = Mp4Muxer::new(w, h, 30, 1);
+/// let init = muxer.build_init_segment(&sps_info, sps_nal, pps_nal)?;
 /// // emit init bytes to the frontend once
 /// while let Ok(pkt) = pkt_rx.recv() {
 ///     if let Some(segment) = muxer.append_packet(&pkt) {
@@ -785,34 +790,35 @@ impl Mp4Muxer {
         ((TIMESCALE as u64 * self.fps_den as u64) / self.fps_num as u64) as u32
     }
 
-    /// Build the fMP4 init segment from the first SPS and PPS NAL bytes.
+    /// Build the fMP4 init segment from a pre-parsed `SpsInfo` and the raw SPS/PPS NAL bytes.
+    ///
+    /// The caller MUST parse the SPS first via [`crate::render::avcc::parse_sps`] and pass
+    /// the resulting [`crate::render::avcc::SpsInfo`] alongside the raw SPS/PPS NAL bytes.
+    /// The muxer trusts that `sps_info` was derived from `sps_nal` — they are expected to be
+    /// coherent.
     ///
     /// Output layout: `[ftyp][moov]`. Concatenate with subsequent media segments
     /// (from `append_packet`, B6) to form a valid fMP4 stream.
     ///
     /// # Errors
     ///
-    /// - `Err(MuxerError::InvalidInput)` if `sps_nal` or `pps_nal` is empty.
-    /// - `Err(MuxerError::AvccError)` if the SPS bytes are malformed or unparseable.
+    /// - `Err(MuxerError::InvalidInput)` if `pps_nal` is empty.
+    /// - `Err(MuxerError::AvccError)` if the avcC configuration record cannot be built.
     pub fn build_init_segment(
         &self,
+        sps_info: &crate::render::avcc::SpsInfo,
         sps_nal: &[u8],
         pps_nal: &[u8],
     ) -> Result<Vec<u8>, MuxerError> {
-        if sps_nal.is_empty() {
-            return Err(MuxerError::InvalidInput("sps_nal must not be empty".into()));
-        }
         if pps_nal.is_empty() {
             return Err(MuxerError::InvalidInput("pps_nal must not be empty".into()));
         }
-
-        let sps_info = crate::render::avcc::parse_sps(sps_nal)?;
 
         let ftyp = build_ftyp();
         let moov = build_moov(
             self.width,
             self.height,
-            &sps_info,
+            sps_info,
             sps_nal,
             pps_nal,
             self.default_sample_duration_ticks(),
@@ -1001,8 +1007,9 @@ mod tests {
     fn round_trip_init_segment_parses_with_mp4_crate() {
         // Build the init segment from known-good SPS+PPS.
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_RT).expect("should parse SPS_RT");
         let init = muxer
-            .build_init_segment(SPS_RT, PPS_RT)
+            .build_init_segment(&sps_info, SPS_RT, PPS_RT)
             .expect("init segment must build successfully");
 
         // The mp4 crate reads via Mp4Reader which needs a seekable stream.
@@ -1065,8 +1072,9 @@ mod tests {
     #[test]
     fn round_trip_init_plus_two_media_segments_structural_parse() {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_RT).expect("should parse SPS_RT");
         let init = muxer
-            .build_init_segment(SPS_RT, PPS_RT)
+            .build_init_segment(&sps_info, SPS_RT, PPS_RT)
             .expect("init segment");
 
         // IDR1 → buffers (no emit)
@@ -1850,8 +1858,9 @@ mod tests {
     #[test]
     fn init_segment_first_8_bytes_are_ftyp_box() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         // bytes[0..4] = ftyp box size; bytes[4..8] = 'ftyp' tag
         assert_eq!(
@@ -1864,8 +1873,9 @@ mod tests {
     #[test]
     fn init_segment_ftyp_major_brand_is_iso5() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         assert_eq!(&bytes[8..12], b"iso5");
     }
@@ -1873,8 +1883,9 @@ mod tests {
     #[test]
     fn init_segment_contains_moov_box() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         assert!(
             bytes.windows(4).any(|w| w == b"moov"),
@@ -1885,8 +1896,9 @@ mod tests {
     #[test]
     fn init_segment_avc1_sample_entry_present() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         assert!(
             bytes.windows(4).any(|w| w == b"avc1"),
@@ -1897,8 +1909,9 @@ mod tests {
     #[test]
     fn init_segment_length_greater_than_200_bytes() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
         assert!(
             bytes.len() > 200,
@@ -1908,25 +1921,25 @@ mod tests {
     }
 
     #[test]
-    fn init_segment_empty_sps_returns_error() {
-        let muxer = Mp4Muxer::new(320, 240, 30, 1);
-        assert!(muxer.build_init_segment(&[], MINIMAL_PPS).is_err());
-    }
-
-    #[test]
     fn init_segment_empty_pps_returns_error() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
-        assert!(muxer.build_init_segment(SPS_320X240, &[]).is_err());
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
+        assert!(
+            muxer
+                .build_init_segment(&sps_info, SPS_320X240, &[])
+                .is_err()
+        );
     }
 
     #[test]
     fn init_segment_is_deterministic() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes1 = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("ok");
         let bytes2 = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("ok");
         assert_eq!(bytes1, bytes2, "build_init_segment must be deterministic");
     }
@@ -1934,8 +1947,9 @@ mod tests {
     #[test]
     fn init_segment_mvhd_timescale_big_endian_90000() {
         let muxer = Mp4Muxer::new(1280, 720, 30, 1);
+        let sps_info = parse_sps(SPS_1280X720).expect("should parse SPS_1280X720");
         let bytes = muxer
-            .build_init_segment(SPS_1280X720, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_1280X720, MINIMAL_PPS)
             .expect("should build init segment");
 
         let mvhd_tag_pos = bytes
@@ -1958,8 +1972,9 @@ mod tests {
     fn init_segment_avc_codec_bytes_match_baseline_13() {
         // SPS_320X240: profile_idc=66=0x42, constraint_set_flags=0xC0, level_idc=13=0x0D
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
 
         let avcc_tag_pos = bytes
@@ -1985,8 +2000,9 @@ mod tests {
     #[test]
     fn init_segment_mdhd_timescale_is_90000() {
         let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
         let bytes = muxer
-            .build_init_segment(SPS_320X240, MINIMAL_PPS)
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
             .expect("should build init segment");
 
         let mdhd_tag_pos = bytes
@@ -2002,5 +2018,54 @@ mod tests {
             bytes[ts_offset + 3],
         ]);
         assert_eq!(timescale, 90_000, "mdhd.timescale must be 90_000");
+    }
+
+    /// Byte-for-byte snapshot of the pre-refactor `build_init_segment` output for
+    /// `SPS_320X240` + `MINIMAL_PPS`.  Captured before the `&SpsInfo` parameter was
+    /// added.  Any change to the ftyp/moov construction will cause this test to fail,
+    /// which is the intended anti-regression guard.
+    #[rustfmt::skip]
+    const GOLDEN_INIT_SEGMENT: &[u8] = &[
+        0, 0, 0, 32, 102, 116, 121, 112, 105, 115, 111, 53, 0, 0, 2, 0, 105, 115, 111, 53, 97,
+        118, 99, 49, 105, 115, 111, 54, 109, 112, 52, 50, 0, 0, 2, 109, 109, 111, 111, 118, 0, 0,
+        0, 108, 109, 118, 104, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 95, 144, 0, 0, 0,
+        0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 209, 116,
+        114, 97, 107, 0, 0, 0, 92, 116, 107, 104, 100, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        64, 0, 0, 0, 1, 64, 0, 0, 0, 240, 0, 0, 0, 0, 1, 109, 109, 100, 105, 97, 0, 0, 0, 32,
+        109, 100, 104, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 95, 144, 0, 0, 0, 0, 85,
+        195, 0, 0, 0, 0, 0, 52, 104, 100, 108, 114, 0, 0, 0, 0, 0, 0, 0, 0, 118, 105, 100, 101,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 83, 99, 114, 101, 101, 110, 32, 77, 105, 114, 114,
+        111, 114, 32, 86, 105, 100, 101, 111, 0, 0, 0, 1, 17, 109, 105, 110, 102, 0, 0, 0, 20,
+        118, 109, 104, 100, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 100, 105, 110, 102,
+        0, 0, 0, 28, 100, 114, 101, 102, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 12, 117, 114, 108, 32,
+        0, 0, 0, 1, 0, 0, 0, 209, 115, 116, 98, 108, 0, 0, 0, 133, 115, 116, 115, 100, 0, 0, 0,
+        0, 0, 0, 0, 1, 0, 0, 0, 117, 97, 118, 99, 49, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 64, 0, 240, 0, 72, 0, 0, 0, 72, 0, 0, 0, 0, 0, 0, 0, 1,
+        13, 83, 99, 114, 101, 101, 110, 32, 77, 105, 114, 114, 111, 114, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 255, 255, 0, 0, 0, 31, 97, 118, 99, 67, 1, 66, 192,
+        13, 255, 225, 0, 8, 103, 66, 192, 13, 244, 10, 15, 192, 1, 0, 4, 104, 206, 56, 128, 0, 0,
+        0, 16, 115, 116, 116, 115, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 115, 116, 115, 99, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 115, 116, 115, 122, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 16, 115, 116, 99, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 109, 118, 101, 120,
+        0, 0, 0, 32, 116, 114, 101, 120, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 11, 184, 0,
+        0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn init_segment_golden_snapshot() {
+        let muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let sps_info = parse_sps(SPS_320X240).expect("should parse SPS_320X240");
+        let out = muxer
+            .build_init_segment(&sps_info, SPS_320X240, MINIMAL_PPS)
+            .expect("should build init segment");
+        assert_eq!(
+            out.as_slice(),
+            GOLDEN_INIT_SEGMENT,
+            "build_init_segment output must match pre-refactor golden bytes (653 B)"
+        );
     }
 }
