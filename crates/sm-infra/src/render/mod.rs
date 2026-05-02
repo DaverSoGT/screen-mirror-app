@@ -5,3 +5,4 @@
 
 pub mod avcc;
 pub mod fmp4_muxer;
+pub(crate) mod fps_tracker;

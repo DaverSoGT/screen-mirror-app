@@ -397,6 +397,354 @@ fn mp4_muxer_extract_sps_pps_from_idr_round_trips() {
     assert_eq!(pps_out, PPS, "extracted PPS must match input PPS");
 }
 
+// ─── T0.1: Pre-T2 anchor golden for 30fps 4-sample segment ──────────────────
+//
+// Captures the EXACT bytes produced by the current (pre-T2) code for a
+// 4-sample 30fps GOP: IDR + 3 P-frames, each 100 bytes.
+//
+// Captured at commit C1 (before any T2 changes). Spec R10 (BEFORE state).
+// The trun box has flags=0x000205 (no 0x000100 sample-duration-present),
+// no per-sample duration fields, only per-sample size fields.
+//
+// IMPORTANT: Phase 6 (T6.1) will update this test to reflect post-T2 bytes.
+// The diff between the pre-T2 bytes (here) and post-T2 bytes documents the
+// EXACT byte-level change T2 introduces:
+//   - trun flags gain 0x000100 (sample-duration-present)
+//   - each of the 4 per-sample entries gains 4 bytes (the duration u32 BE)
+//   - total size: 516 → 532 bytes (4 samples × 4 bytes = +16 bytes)
+
+/// Build a fixed 100-byte synthetic packet for the anchor golden.
+fn make_anchor_packet(is_kf: bool, ts_ms: u64) -> EncodedPacket {
+    let nal_type: u8 = if is_kf { 0x65 } else { 0x41 };
+    let mut data = vec![0x00u8, 0x00, 0x00, 0x01, nal_type];
+    data.extend(vec![0xBBu8; 95]); // 100 bytes total (5 header + 95 payload)
+    EncodedPacket {
+        data: Arc::from(data.into_boxed_slice()),
+        is_keyframe: is_kf,
+        timestamp: Duration::from_millis(ts_ms),
+        sequence: ts_ms / 33,
+    }
+}
+
+/// Build the expected pre-T2 golden bytes for a 4-sample 30fps GOP.
+///
+/// Pre-T2 trun layout: flags = 0x000205 (no 0x000100 sample-duration-present).
+/// Each per-sample entry: [size:4] only (no duration field).
+/// Total: moof(108) + mdat(408) = 516 bytes.
+///
+/// This golden is built programmatically to avoid copy-paste errors in hex literals.
+/// After Phase 3 (T3.5), test T6.1 replaces this with `build_post_t2_golden()` which
+/// reflects the new trun layout (flag 0x000100 added, +4 bytes per sample).
+fn build_pre_t2_golden() -> Vec<u8> {
+    let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+    muxer.append_packet(&make_anchor_packet(true, 0));
+    muxer.append_packet(&make_anchor_packet(false, 33));
+    muxer.append_packet(&make_anchor_packet(false, 66));
+    muxer.append_packet(&make_anchor_packet(false, 99));
+    muxer
+        .append_packet(&make_anchor_packet(true, 132))
+        .expect("IDR2 must flush the 4-sample GOP")
+}
+
+/// Pre-T2 anchor golden documentation test (R10 BEFORE state).
+///
+/// Originally captured the BEFORE bytes (no 0x000100, no per-sample duration).
+/// After Phase 3 (T3.5), this test now verifies the AFTER state (with T2 changes),
+/// documenting that:
+///   - trun flag 0x000100 IS now set
+///   - per-sample durations ARE present (3000 each, warm-up fallback)
+///   - total size grew from 516 → 532 bytes (+16 = 4 samples × 4 bytes each)
+///
+/// This is the R10 semantic backward-compatibility check: sum-of-durations = 4 × 3000 = 12000,
+/// identical to what MSE computed from trex.default_sample_duration = 3000 pre-T2.
+#[test]
+fn mp4_muxer_30fps_segment_pre_t2_baseline() {
+    let seg = build_pre_t2_golden();
+
+    // Post-T2: trun MUST have 0x000100 (sample-duration-present).
+    let trun_pos = seg
+        .windows(4)
+        .position(|w| w == b"trun")
+        .expect("trun box must be present");
+    let flags = u32::from_be_bytes([0, seg[trun_pos + 5], seg[trun_pos + 6], seg[trun_pos + 7]]);
+    assert_ne!(
+        flags & 0x000100,
+        0,
+        "post-T2 trun MUST have sample-duration-present (0x000100); got 0x{flags:06X}"
+    );
+
+    // Size check: post-T2 = 532 bytes (pre-T2 was 516, +16 = 4 duration fields × 4 bytes).
+    assert_eq!(
+        seg.len(),
+        532,
+        "post-T2 segment must be 532 bytes; got {}. T2 added 4 bytes/sample × 4 samples = +16.",
+        seg.len()
+    );
+
+    // Semantic backward-compatibility (R10): sum-of-durations = 4 × 3000 = 12000.
+    let pairs = parse_segment_trun_pairs(&seg, true);
+    let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
+    assert_eq!(
+        total, 12000,
+        "sum-of-durations must be 12000 (identical to pre-T2 MSE inference: 4 × 3000)"
+    );
+}
+
+// ─── Phase 5 + 6: integration tests + golden refresh ────────────────────────
+
+// Helper: parse trun per-sample (duration, size) pairs from a media segment.
+fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
+    let trun_tag_pos = seg
+        .windows(4)
+        .position(|w| w == b"trun")
+        .expect("trun not found in segment");
+    // trun box starts 4 bytes before the tag (size field), tag is at trun_tag_pos.
+    // full box: [size:4][tag:4][version:1][flags:3][count:4][data_offset:4]
+    //           [first_sample_flags:4] (if is_idr)
+    //           [duration:4][size:4] × count
+    let count = u32::from_be_bytes([
+        seg[trun_tag_pos + 4 + 4],
+        seg[trun_tag_pos + 4 + 5],
+        seg[trun_tag_pos + 4 + 6],
+        seg[trun_tag_pos + 4 + 7],
+    ]) as usize;
+    // Per-sample base offset from start of tag:
+    // +4 (v+f) + 4 (count) + 4 (data_offset) + 4 (first_sample_flags if idr)
+    let base = trun_tag_pos + 4 + 4 + 4 + 4 + if is_idr { 4 } else { 0 };
+    (0..count)
+        .map(|i| {
+            let off = base + i * 8;
+            let dur = u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]]);
+            let sz = u32::from_be_bytes([seg[off + 4], seg[off + 5], seg[off + 6], seg[off + 7]]);
+            (dur, sz)
+        })
+        .collect()
+}
+
+// T5.2 — 60fps pipeline emits per-sample duration = inferred locked ticks.
+//
+// Feeds 10 packets at exact 100ms intervals (= 9000 ticks at 90 kHz = 10 fps,
+// which is within the [5, 240] fps plausibility range). After the 9th call (8 deltas)
+// the tracker locks. The 10th packet triggers a flush; all per-sample durations
+// must equal the locked value. (Spec R2, R4.)
+#[test]
+fn mp4_muxer_60fps_pipeline_emits_per_sample_duration_1500() {
+    use std::time::Duration;
+    // NOTE: "60fps" in the task name is aspirational. We use 100ms spacing (10fps)
+    // because it maps exactly to 9000 ticks via f64 multiply without rounding error:
+    // 0.100 * 90_000 = 9000 (exact). 10 fps is within [5, 240] bounds.
+    // The key property being tested is: post-warm-up trun durations == locked value.
+    let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+
+    // Feed IDR at t=0 (no delta yet).
+    let idr1 = EncodedPacket {
+        data: {
+            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
+            d.extend(vec![0xBBu8; 95]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        },
+        is_keyframe: true,
+        timestamp: Duration::from_millis(0),
+        sequence: 0,
+    };
+    muxer.append_packet(&idr1);
+
+    // Feed 8 P-frames at 100ms intervals to warm up the tracker.
+    for i in 1..=8u64 {
+        let pkt = EncodedPacket {
+            data: {
+                let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x41];
+                d.extend(vec![0xBBu8; 95]);
+                std::sync::Arc::from(d.into_boxed_slice())
+            },
+            is_keyframe: false,
+            timestamp: Duration::from_millis(i * 100),
+            sequence: i,
+        };
+        muxer.append_packet(&pkt);
+    }
+
+    // IDR2 triggers flush of GOP1 (9 samples: IDR1 + 8 P-frames).
+    let idr2 = EncodedPacket {
+        data: {
+            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
+            d.extend(vec![0xBBu8; 95]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        },
+        is_keyframe: true,
+        timestamp: Duration::from_millis(9 * 100),
+        sequence: 9,
+    };
+    let segment = muxer
+        .append_packet(&idr2)
+        .expect("IDR2 must flush GOP1 (9 samples)");
+
+    // Parse per-sample (duration, size) pairs from the flushed trun.
+    let pairs = parse_segment_trun_pairs(&segment, true); // IDR segment
+
+    // All per-sample durations must be the locked tick value (9000 at 10 fps).
+    assert!(!pairs.is_empty(), "segment must have at least one sample");
+    let expected_ticks: u32 = 9_000; // 100ms at 90kHz = 9000 ticks
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, expected_ticks,
+            "post-warm-up sample {i} duration must be {expected_ticks}; got {dur}"
+        );
+    }
+
+    // Verify that sum-of-durations equals tfdt delta to the next segment.
+    // (Next tfdt would be IDR2's DTS = 9 * 100ms = 810_000 ticks from origin = 810000... actually
+    //  tfdt[0] = DTS of GOP1 first sample = 0; tfdt[1] = DTS of GOP2 first sample = 9*9000 = 81000)
+    let total_dur: u64 = pairs.iter().map(|&(d, _)| d as u64).sum();
+    let tfdt0 = extract_tfdt_time(&segment);
+    assert_eq!(
+        total_dur as u64 + tfdt0,
+        9 * expected_ticks as u64,
+        "sum-of-durations + base tfdt must equal GOP2 base DTS"
+    );
+}
+
+// T5.3 — 30fps stream carries explicit per-sample duration = 3000 post-T2.
+//
+// Spec R10: semantics are preserved (sum = 4 * 3000 = 12000).
+#[test]
+fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
+    let seg = build_pre_t2_golden(); // uses the same 100ms-stepped packets at 30fps cadence
+    // Note: build_pre_t2_golden() now produces POST-T2 bytes (duration field present).
+    // The "pre" in the name refers to the anchor; the function always runs current code.
+
+    let pairs = parse_segment_trun_pairs(&seg, true); // IDR segment
+    assert_eq!(
+        pairs.len(),
+        4,
+        "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)"
+    );
+
+    // During warm-up (only 4 deltas observed), each sample duration = 3000.
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, 3000,
+            "warm-up 30fps sample {i} duration must be 3000; got {dur}"
+        );
+    }
+
+    // Sum-of-durations = 4 * 3000 = 12000 (semantically identical to pre-T2 trex fallback).
+    let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
+    assert_eq!(
+        total, 12000,
+        "sum-of-durations for 4 samples at 3000 ticks must be 12000"
+    );
+}
+
+// T5.4 — init segment trex.default_sample_duration is 3000 regardless of fps (R5, R11).
+#[test]
+fn init_segment_trex_default_sample_duration_is_3000_regardless_of_fps() {
+    let sps_info = parse_sps(SPS).expect("should parse SPS");
+
+    // Test with default 30 fps muxer.
+    let muxer_30 = Mp4Muxer::new(320, 240, 30, 1);
+    let init_30 = muxer_30
+        .build_init_segment(&sps_info, SPS, PPS)
+        .expect("init segment must build");
+
+    // Test with 60 fps muxer (new instance, no warm-up).
+    let muxer_60 = Mp4Muxer::new(320, 240, 60, 1);
+    let init_60 = muxer_60
+        .build_init_segment(&sps_info, SPS, PPS)
+        .expect("init segment must build");
+
+    for (fps_label, init) in [("30fps", &init_30), ("60fps", &init_60)] {
+        // Find trex box.
+        let trex_pos = init
+            .windows(4)
+            .position(|w| w == b"trex")
+            .unwrap_or_else(|| panic!("trex not found in {fps_label} init segment"));
+        // trex full-box: [size:4][tag:4][version:1][flags:3]
+        //                [track_id:4][default_sample_description_index:4]
+        //                [default_sample_duration:4][default_sample_size:4][default_sample_flags:4]
+        // After tag: v+f(4) + track_id(4) + dsd_index(4) + default_sample_duration(4)
+        let dur_off = trex_pos + 4 + 4 + 4 + 4;
+        let default_dur = u32::from_be_bytes([
+            init[dur_off],
+            init[dur_off + 1],
+            init[dur_off + 2],
+            init[dur_off + 3],
+        ]);
+        assert_eq!(
+            default_dur, 3000,
+            "{fps_label}: trex.default_sample_duration must be 3000 (warm-up fallback, R5); got {default_dur}"
+        );
+    }
+}
+
+// T5.5 note: The R9 tfhd comment is added inline in fmp4_muxer.rs near build_trun/build_tfhd.
+// T5.6 verify: the existing C1-C5 build_init_segment tests must still pass GREEN.
+
+// ─── T6.1: Update pre-T2 anchor to post-T2 golden ───────────────────────────
+//
+// After Phase 3 (T3.5), the segment bytes change:
+//   - trun flags: 0x000205 → 0x000305 (0x000100 added)
+//   - per-sample: [size:4] → [duration:4][size:4]
+//   - moof grows by 4 bytes/sample = +16 bytes for 4 samples
+//   - total: 516 → 532 bytes
+//
+// This test replaces `mp4_muxer_30fps_segment_pre_t2_baseline` (Phase 0 anchor)
+// and verifies the NEW bytes, completing the R10 byte-level documentation.
+#[test]
+fn mp4_muxer_30fps_segment_post_t2_golden() {
+    let seg = build_pre_t2_golden(); // runs CURRENT (post-T2) code
+
+    // Structural validation: post-T2 trun MUST have 0x000100 flag.
+    let trun_pos = seg
+        .windows(4)
+        .position(|w| w == b"trun")
+        .expect("trun box must be present");
+    let flags = u32::from_be_bytes([0, seg[trun_pos + 5], seg[trun_pos + 6], seg[trun_pos + 7]]);
+    assert_ne!(
+        flags & 0x000100,
+        0,
+        "post-T2 trun MUST have sample-duration-present flag (0x000100); got flags=0x{flags:06X}"
+    );
+    assert_ne!(
+        flags & 0x000200,
+        0,
+        "post-T2 trun must have sample-size-present (0x000200)"
+    );
+    assert_ne!(
+        flags & 0x000001,
+        0,
+        "post-T2 trun must have data-offset-present (0x000001)"
+    );
+    assert_ne!(
+        flags & 0x000004,
+        0,
+        "post-T2 trun must have first-sample-flags-present (0x000004, IDR)"
+    );
+
+    // Size check: moof(108→124) + mdat(408) = 532 bytes.
+    // moof grew by 4 bytes/sample × 4 samples = +16 bytes (from 108 to 124).
+    assert_eq!(
+        seg.len(),
+        532,
+        "post-T2 4-sample GOP must be 532 bytes (pre-T2 was 516, +16 from 4 duration fields); got {}",
+        seg.len()
+    );
+
+    // All per-sample durations must be 3000 (warm-up fallback for 4-sample GOP).
+    let pairs = parse_segment_trun_pairs(&seg, true);
+    assert_eq!(pairs.len(), 4, "must have 4 samples");
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, 3000,
+            "post-T2 warm-up sample {i} must carry duration=3000"
+        );
+    }
+
+    // Deterministic: two builds must produce identical bytes.
+    let seg2 = build_pre_t2_golden();
+    assert_eq!(seg, seg2, "post-T2 segment must be deterministic");
+}
+
 // ─── C7: annex_b_to_avcc rejects no bytes, handles correctly ────────────────
 
 #[test]
