@@ -499,7 +499,11 @@ fn build_mfhd(sequence_number: u32) -> Vec<u8> {
 /// * `data_offset` — byte offset from start of `moof` box to first byte of `mdat` payload.
 /// * `is_idr`      — if true, marks the first sample as an IDR (keyframe).
 fn build_traf(base_dts: u64, samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
-    let tfhd = build_tfhd(1, 0x02_0000); // default-base-is-moof flag
+    // R9: tfhd MUST NOT carry flag 0x000008 (default-sample-duration-present).
+    // ISO 14496-12 §8.8.7 precedence: per-sample trun > tfhd > trex.
+    // Keeping tfhd clean (0x020000 only) ensures the per-sample durations from
+    // build_trun (R1: 0x000100 set) are ALWAYS the authoritative timing source.
+    let tfhd = build_tfhd(1, 0x02_0000); // default-base-is-moof flag only (R9)
     let tfdt = build_tfdt(base_dts);
     let trun = build_trun(samples, data_offset, is_idr);
 
@@ -838,13 +842,17 @@ impl Mp4Muxer {
         }
 
         let ftyp = build_ftyp();
+        // R5/R11: trex.default_sample_duration is always the warm-up fallback (3000 ticks = 30 fps).
+        // The init segment is built before warm-up completes, and per-sample trun durations
+        // (flag 0x000100, set by build_trun) always override trex once T2 changes are active.
+        // Encoding the fps-derived value here would be premature and would break R11 (frozen signature).
         let moov = build_moov(
             self.width,
             self.height,
             sps_info,
             sps_nal,
             pps_nal,
-            self.default_sample_duration_ticks(),
+            crate::render::fps_tracker::WARMUP_FALLBACK_TICKS,
         )?;
 
         let mut out = Vec::with_capacity(ftyp.len() + moov.len());
@@ -2101,6 +2109,31 @@ mod tests {
             out.as_slice(),
             GOLDEN_INIT_SEGMENT,
             "build_init_segment output must match pre-refactor golden bytes (653 B)"
+        );
+    }
+
+    // ─── Phase 5: tfhd invariant (R9) ─────────────────────────────────────
+
+    // T5.1 — tfhd in moof assembly MUST NOT have 0x000008 and MUST be 0x020000.
+    #[test]
+    fn build_tfhd_does_not_set_default_sample_duration_present_bit() {
+        // Call build_moof (the real production path) and verify tfhd flags via byte scan.
+        let samples = vec![make_sample(100)];
+        let moof = build_moof(1, 0, &samples, 0);
+
+        let tfhd_pos = moof.windows(4).position(|w| w == b"tfhd").expect("tfhd must be in moof");
+        // tfhd full-box: [size:4][tag:4][version:1][flags:3][track_id:4]
+        // After tag: version at tfhd_pos+4, flags bytes at +5,+6,+7
+        let flags = u32::from_be_bytes([0, moof[tfhd_pos + 5], moof[tfhd_pos + 6], moof[tfhd_pos + 7]]);
+        assert_eq!(
+            flags & 0x000008,
+            0,
+            "tfhd MUST NOT have default-sample-duration-present (0x000008) — per-sample trun wins (R9)"
+        );
+        assert_eq!(
+            flags,
+            0x020000,
+            "tfhd flags must be exactly 0x020000 (default-base-is-moof only); got 0x{flags:06X}"
         );
     }
 
