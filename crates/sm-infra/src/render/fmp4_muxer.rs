@@ -551,14 +551,14 @@ pub(crate) fn build_moof(
 
 /// Per-sample data for a `trun` box.
 pub(crate) struct TrunSample {
-    /// Optional per-sample duration override (in 90 kHz units). `None` → use track default.
-    /// Reserved for V1.5 sub-GOP fragmentation; not yet read by `build_trun`.
-    #[allow(dead_code)]
-    pub duration: Option<u32>,
+    /// Per-sample duration in 90 kHz timescale units. Always present (R2, R3).
+    /// Set to `FpsTracker::effective_ticks_per_sample()` by `flush_pending`.
+    /// During warm-up: 3000 (30 fps fallback, R5). After lock: inferred fps ticks.
+    pub duration: u32,
     /// Byte size of this sample (NAL AVCC payload for this sample).
     pub size: u32,
     /// Optional per-sample flags override. `None` → use default from `tfhd`.
-    /// Reserved for V1.5 per-sample flag control; not yet read by `build_trun`.
+    /// Reserved for V1.5 per-sample flag control (B-frame CTS offsets). Not yet live.
     #[allow(dead_code)]
     pub flags: Option<u32>,
 }
@@ -570,23 +570,35 @@ pub(crate) struct TrunSample {
 /// [size:4][b"trun":4][version:1 = 0][flags:3]
 /// [sample_count:4][data_offset:4]
 /// [first_sample_flags:4]  (if is_idr — indicates IDR frame)
-/// per-sample: [size:4] × N
+/// per-sample: [duration:4][size:4] × N
 /// ```
 ///
 /// # flags selection (24-bit field)
 ///
 /// - `0x000001` — `data-offset-present`
 /// - `0x000004` — `first-sample-flags-present` (set when `is_idr = true`)
+/// - `0x000100` — `sample-duration-present` (R1: always set — MSE reads per-sample duration)
 /// - `0x000200` — `sample-size-present`
+///
+/// # R9 tfhd precedence note
+///
+/// `tfhd` MUST NOT carry flag `0x000008` (default-sample-duration-present).
+/// ISO 14496-12 §8.8.7 precedence: per-sample trun > tfhd > trex.
+/// Keeping `tfhd` flag `0x000008` clear ensures the per-sample durations written
+/// here are always the authoritative source. `tfhd` uses `0x020000` only.
 ///
 /// # Arguments
 ///
-/// * `samples`     — per-sample size values (and optional per-sample overrides).
+/// * `samples`     — per-sample values (duration + size; optional flags override).
 /// * `data_offset` — signed byte offset from start of `moof` to start of `mdat` payload.
 /// * `is_idr`      — if true, inserts a `first_sample_flags` field marking the IDR sample.
 pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
-    // flags: data-offset-present (0x1) + sample-size-present (0x200) + optionally first-sample-flags (0x4)
-    let flags: u32 = 0x0000_0001 | 0x0000_0200 | if is_idr { 0x0000_0004 } else { 0 };
+    // R1: OR in 0x000100 (sample-duration-present) — MSE uses per-sample trun duration
+    // rather than falling back to trex.default_sample_duration.
+    // R9: bit 0x000008 (default-sample-duration-present) MUST stay clear in tfhd;
+    // per-sample trun wins (ISO 14496-12 §8.8.7: sample > tfhd > trex).
+    let flags: u32 = 0x0000_0001 | 0x0000_0100 | 0x0000_0200
+        | if is_idr { 0x0000_0004 } else { 0 };
 
     let mut payload = Vec::new();
     write_full_box_header(&mut payload, 0, flags);
@@ -599,7 +611,10 @@ pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool)
         write_u32_be(&mut payload, 0x0200_0000);
     }
 
+    // R2: ISO 14496-12 §8.8.8 column ordering when both 0x000100 and 0x000200 are set:
+    // sample_duration first, then sample_size.
     for s in samples {
+        write_u32_be(&mut payload, s.duration);
         write_u32_be(&mut payload, s.size);
     }
 
@@ -893,12 +908,16 @@ impl Mp4Muxer {
             .flat_map(|s| s.avcc.iter().copied())
             .collect();
 
-        // Build trun samples (size-only for now; baseline = no B-frames → DTS=PTS=CTS).
+        // R5: per-sample duration — Phase 4 replaces this constant with
+        // `self.fps_tracker.effective_ticks_per_sample()` (returns warm-up fallback
+        // 3000 or the inferred fps ticks once locked).
+        let ticks: u32 = 3_000;
+
         let trun_samples: Vec<TrunSample> = self
             .pending
             .iter()
             .map(|s| TrunSample {
-                duration: None,
+                duration: ticks,    // R2/R3: always concrete u32
                 size: s.avcc.len() as u32,
                 flags: None,
             })
@@ -1469,10 +1488,10 @@ mod tests {
 
     // ─── Capability D (B6): trun box builder ───────────────────────────────
 
-    /// Helper to create a `TrunSample` with just a size (no duration/flags override).
+    /// Helper to create a `TrunSample` with a size and the 30 fps warm-up fallback duration.
     fn make_sample(size: u32) -> TrunSample {
         TrunSample {
-            duration: None,
+            duration: 3000, // warm-up fallback (30 fps); Phase 4 wires FpsTracker
             size,
             flags: None,
         }
@@ -1480,9 +1499,9 @@ mod tests {
 
     #[test]
     fn trun_golden_bytes_single_sample() {
-        // One sample, data_offset = 8 (arbitrary), no per-sample duration/flags.
-        // flags = 0x000301 (data-offset-present | sample-size-present)
-        // Layout: [size][b"trun"][v=0][flags:3][sample_count:4][data_offset:4][size_0:4]
+        // One sample, data_offset = 8 (arbitrary).
+        // flags = 0x000301 (data-offset-present | duration-present | sample-size-present)
+        // Layout: [size:4][b"trun":4][v=0:1][flags:3][sample_count:4][data_offset:4][duration:4][size:4]
         let samples = vec![make_sample(100)];
         let trun = build_trun(&samples, 8, false);
         assert_eq!(&trun[4..8], b"trun", "box type must be trun");
@@ -1510,10 +1529,13 @@ mod tests {
     fn trun_per_sample_sizes_are_big_endian() {
         let samples = vec![make_sample(0x12345678), make_sample(0x9ABCDEF0)];
         let trun = build_trun(&samples, 0, false);
-        // After fixed header (12) + sample_count (4) + data_offset (4) = offset 20
-        // per-sample: size (4 bytes each)
-        let s0 = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
-        let s1 = u32::from_be_bytes([trun[24], trun[25], trun[26], trun[27]]);
+        // Layout (non-IDR, with 0x000100 + 0x000200 flags):
+        // [size:4][tag:4][v+f:4][count:4][data_offset:4] = offset 20 for per-sample section
+        // Per-sample (0x000100 set): [duration:4][size:4] × N
+        // sample 0: duration at 20..24, size at 24..28
+        // sample 1: duration at 28..32, size at 32..36
+        let s0 = u32::from_be_bytes([trun[24], trun[25], trun[26], trun[27]]);
+        let s1 = u32::from_be_bytes([trun[32], trun[33], trun[34], trun[35]]);
         assert_eq!(s0, 0x12345678);
         assert_eq!(s1, 0x9ABCDEF0);
     }
@@ -2067,5 +2089,86 @@ mod tests {
             GOLDEN_INIT_SEGMENT,
             "build_init_segment output must match pre-refactor golden bytes (653 B)"
         );
+    }
+
+    // ─── Phase 2 + 3: TrunSample.duration shape + build_trun flag/payload ──
+
+    // T2.1 — TrunSample.duration is u32 (not Option<u32>). RED until T2.2.
+    #[test]
+    fn trun_sample_duration_field_is_u32_not_option() {
+        // Construct TrunSample with an explicit u32 duration value.
+        // This will fail to compile when duration is still Option<u32>.
+        let sample = TrunSample { duration: 3000, size: 100, flags: None };
+        assert_eq!(sample.duration, 3000u32, "duration must be a concrete u32, not Option");
+    }
+
+    // T3.1 — build_trun flags include 0x000100 (sample-duration-present). RED until T3.5.
+    #[test]
+    fn build_trun_flags_include_sample_duration_present_bit() {
+        let samples = vec![make_sample(100)];
+        let trun = build_trun(&samples, 0, false);
+        // trun full-box header: [size:4][tag:4][version:1][flags:3]
+        let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(flags & 0x000100, 0, "trun flags must have sample-duration-present (0x000100)");
+        assert_ne!(flags & 0x000001, 0, "trun flags must have data-offset-present (0x000001)");
+        assert_ne!(flags & 0x000200, 0, "trun flags must have sample-size-present (0x000200)");
+    }
+
+    // T3.2 — build_trun IDR path includes first-sample-flags + duration-present. RED until T3.5.
+    #[test]
+    fn build_trun_flags_idr_includes_first_sample_flags_and_duration_present() {
+        let samples = vec![make_sample(100)];
+        let trun = build_trun(&samples, 0, true);
+        let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        // Expected: 0x000305 = data-offset(0x1) | first-sample-flags(0x4) | sample-size(0x200) | duration(0x100)
+        assert_eq!(
+            flags & 0x000305,
+            0x000305,
+            "IDR trun flags must have 0x000305 (got 0x{flags:06X})"
+        );
+        assert_ne!(flags & 0x000100, 0, "IDR trun flags must have sample-duration-present (0x000100)");
+    }
+
+    // T3.3 — per-sample loop writes duration then size (3 samples). RED until T3.5.
+    #[test]
+    fn build_trun_per_sample_loop_writes_duration_then_size() {
+        fn make_sample_with_duration(size: u32, duration: u32) -> TrunSample {
+            TrunSample { duration, size, flags: None }
+        }
+        let samples = vec![
+            make_sample_with_duration(100, 3000),
+            make_sample_with_duration(200, 3000),
+            make_sample_with_duration(300, 3000),
+        ];
+        let trun = build_trun(&samples, 0, false);
+        // Layout (non-IDR): [size:4][tag:4][v+f:4][count:4][data_offset:4][per-sample...]
+        // With 0x000100 + 0x000200: per-sample = [duration:4][size:4]
+        let per_sample_offset = 8 + 4 + 4 + 4; // box header(8) + v+f(4) + count(4) + data_offset(4)
+        for (i, &expected_size) in [100u32, 200, 300].iter().enumerate() {
+            let off = per_sample_offset + i * 8;
+            let dur = u32::from_be_bytes([trun[off], trun[off+1], trun[off+2], trun[off+3]]);
+            let sz  = u32::from_be_bytes([trun[off+4], trun[off+5], trun[off+6], trun[off+7]]);
+            assert_eq!(dur, 3000, "sample {i} duration must be 3000");
+            assert_eq!(sz, expected_size, "sample {i} size must be {expected_size}");
+        }
+    }
+
+    // T3.4 — single-sample trun emits exactly one duration+size pair. RED until T3.5.
+    #[test]
+    fn build_trun_single_sample_emits_one_duration_size_pair() {
+        let samples = vec![TrunSample { duration: 1500, size: 50, flags: None }];
+        let trun = build_trun(&samples, 0, false);
+        // With flags 0x000301 (duration+size+data-offset): per-sample = [duration:4][size:4] = 8 bytes
+        // Total box = 8 (box hdr) + 4 (v+f) + 4 (count) + 4 (data_offset) + 8 (1 sample) = 28 bytes
+        let expected_box_len: u32 = 8 + 4 + 4 + 4 + 8;
+        let actual_box_len = u32::from_be_bytes([trun[0], trun[1], trun[2], trun[3]]);
+        assert_eq!(actual_box_len, expected_box_len, "single-sample trun must be {expected_box_len} bytes");
+        let per_sample_offset = 8 + 4 + 4 + 4;
+        let dur = u32::from_be_bytes([trun[per_sample_offset], trun[per_sample_offset+1],
+                                       trun[per_sample_offset+2], trun[per_sample_offset+3]]);
+        let sz  = u32::from_be_bytes([trun[per_sample_offset+4], trun[per_sample_offset+5],
+                                       trun[per_sample_offset+6], trun[per_sample_offset+7]]);
+        assert_eq!(dur, 1500, "single-sample duration must be 1500");
+        assert_eq!(sz, 50, "single-sample size must be 50");
     }
 }
