@@ -397,6 +397,98 @@ fn mp4_muxer_extract_sps_pps_from_idr_round_trips() {
     assert_eq!(pps_out, PPS, "extracted PPS must match input PPS");
 }
 
+// ─── T0.1: Pre-T2 anchor golden for 30fps 4-sample segment ──────────────────
+//
+// Captures the EXACT bytes produced by the current (pre-T2) code for a
+// 4-sample 30fps GOP: IDR + 3 P-frames, each 100 bytes.
+//
+// Captured at commit C1 (before any T2 changes). Spec R10 (BEFORE state).
+// The trun box has flags=0x000205 (no 0x000100 sample-duration-present),
+// no per-sample duration fields, only per-sample size fields.
+//
+// IMPORTANT: Phase 6 (T6.1) will update this test to reflect post-T2 bytes.
+// The diff between the pre-T2 bytes (here) and post-T2 bytes documents the
+// EXACT byte-level change T2 introduces:
+//   - trun flags gain 0x000100 (sample-duration-present)
+//   - each of the 4 per-sample entries gains 4 bytes (the duration u32 BE)
+//   - total size: 516 → 532 bytes (4 samples × 4 bytes = +16 bytes)
+
+/// Build a fixed 100-byte synthetic packet for the anchor golden.
+fn make_anchor_packet(is_kf: bool, ts_ms: u64) -> EncodedPacket {
+    let nal_type: u8 = if is_kf { 0x65 } else { 0x41 };
+    let mut data = vec![0x00u8, 0x00, 0x00, 0x01, nal_type];
+    data.extend(vec![0xBBu8; 95]); // 100 bytes total (5 header + 95 payload)
+    EncodedPacket {
+        data: Arc::from(data.into_boxed_slice()),
+        is_keyframe: is_kf,
+        timestamp: Duration::from_millis(ts_ms),
+        sequence: ts_ms / 33,
+    }
+}
+
+/// Build the expected pre-T2 golden bytes for a 4-sample 30fps GOP.
+///
+/// Pre-T2 trun layout: flags = 0x000205 (no 0x000100 sample-duration-present).
+/// Each per-sample entry: [size:4] only (no duration field).
+/// Total: moof(108) + mdat(408) = 516 bytes.
+///
+/// This golden is built programmatically to avoid copy-paste errors in hex literals.
+/// After Phase 3 (T3.5), test T6.1 replaces this with `build_post_t2_golden()` which
+/// reflects the new trun layout (flag 0x000100 added, +4 bytes per sample).
+fn build_pre_t2_golden() -> Vec<u8> {
+    let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+    muxer.append_packet(&make_anchor_packet(true, 0));
+    muxer.append_packet(&make_anchor_packet(false, 33));
+    muxer.append_packet(&make_anchor_packet(false, 66));
+    muxer.append_packet(&make_anchor_packet(false, 99));
+    muxer
+        .append_packet(&make_anchor_packet(true, 132))
+        .expect("IDR2 must flush the 4-sample GOP")
+}
+
+/// Verify the pre-T2 anchor golden is stable (same segment built twice must be identical).
+///
+/// This test is the R10 anchor (BEFORE state). After Phase 3, test T6.1 renames this
+/// to `mp4_muxer_30fps_segment_post_t2_golden` and updates the expected bytes.
+#[test]
+fn mp4_muxer_30fps_segment_pre_t2_baseline() {
+    let seg1 = build_pre_t2_golden();
+    let seg2 = build_pre_t2_golden();
+
+    // Deterministic: same inputs must produce identical bytes every time.
+    assert_eq!(
+        seg1, seg2,
+        "pre-T2 segment must be deterministic (same bytes on repeated builds)"
+    );
+
+    // Structural validation: pre-T2 trun must NOT have 0x000100 flag.
+    let trun_pos = seg1
+        .windows(4)
+        .position(|w| w == b"trun")
+        .expect("trun box must be present");
+    // trun full-box header: [size:4][tag:4][version:1][flags:3]
+    // After tag: version at trun_pos+4, flags bytes at +5,+6,+7
+    let flags = u32::from_be_bytes([0, seg1[trun_pos + 5], seg1[trun_pos + 6], seg1[trun_pos + 7]]);
+    assert_eq!(
+        flags & 0x000100,
+        0,
+        "pre-T2 trun MUST NOT have sample-duration-present flag (0x000100); got flags=0x{flags:06X}"
+    );
+    assert_ne!(
+        flags & 0x000200,
+        0,
+        "pre-T2 trun must have sample-size-present (0x000200)"
+    );
+
+    // Size check: moof(108) + mdat(408) = 516 bytes.
+    assert_eq!(
+        seg1.len(),
+        516,
+        "pre-T2 4-sample GOP segment must be 516 bytes; got {}",
+        seg1.len()
+    );
+}
+
 // ─── C7: annex_b_to_avcc rejects no bytes, handles correctly ────────────────
 
 #[test]
