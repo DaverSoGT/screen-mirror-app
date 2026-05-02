@@ -563,7 +563,10 @@ pub(crate) struct TrunSample {
     pub size: u32,
     /// Optional per-sample flags override. `None` → use default from `tfhd`.
     /// Reserved for V1.5 per-sample flag control (B-frame CTS offsets). Not yet live.
-    #[expect(dead_code, reason = "Reserved for V1.5 per-sample flag control (B-frame CTS offsets)")]
+    #[expect(
+        dead_code,
+        reason = "Reserved for V1.5 per-sample flag control (B-frame CTS offsets)"
+    )]
     pub flags: Option<u32>,
 }
 
