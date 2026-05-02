@@ -563,7 +563,7 @@ pub(crate) struct TrunSample {
     pub size: u32,
     /// Optional per-sample flags override. `None` → use default from `tfhd`.
     /// Reserved for V1.5 per-sample flag control (B-frame CTS offsets). Not yet live.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "Reserved for V1.5 per-sample flag control (B-frame CTS offsets)")]
     pub flags: Option<u32>,
 }
 
@@ -601,8 +601,7 @@ pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool)
     // rather than falling back to trex.default_sample_duration.
     // R9: bit 0x000008 (default-sample-duration-present) MUST stay clear in tfhd;
     // per-sample trun wins (ISO 14496-12 §8.8.7: sample > tfhd > trex).
-    let flags: u32 = 0x0000_0001 | 0x0000_0100 | 0x0000_0200
-        | if is_idr { 0x0000_0004 } else { 0 };
+    let flags: u32 = 0x0000_0001 | 0x0000_0100 | 0x0000_0200 | if is_idr { 0x0000_0004 } else { 0 };
 
     let mut payload = Vec::new();
     write_full_box_header(&mut payload, 0, flags);
@@ -757,8 +756,20 @@ pub struct Mp4Muxer {
     /// Frame height in pixels (pre-validated from the SPS or caller-supplied).
     height: u32,
     /// Frame rate numerator (e.g. 30 for 30 fps).
+    /// Retained for API compatibility (R11) and future VFR support. Not currently
+    /// read after construction — `FpsTracker` infers the real fps from RTP deltas.
+    #[expect(
+        dead_code,
+        reason = "API-compat field retained for R11; inferred fps used instead"
+    )]
     fps_num: u32,
     /// Frame rate denominator (e.g. 1 for 30 fps).
+    /// Retained for API compatibility (R11) and future VFR support. Not currently
+    /// read after construction — `FpsTracker` infers the real fps from RTP deltas.
+    #[expect(
+        dead_code,
+        reason = "API-compat field retained for R11; inferred fps used instead"
+    )]
     fps_den: u32,
     /// Monotonically increasing fragment sequence number for `mfhd`.
     fragment_seq: u32,
@@ -809,12 +820,6 @@ impl Mp4Muxer {
             first_dts_offset: None,
             fps_tracker: crate::render::fps_tracker::FpsTracker::new(),
         }
-    }
-
-    /// Default per-sample duration in TIMESCALE (90 kHz) units, derived from
-    /// the muxer's nominal frame rate. For 30 fps: 90 000 / 30 = 3000.
-    fn default_sample_duration_ticks(&self) -> u32 {
-        ((TIMESCALE as u64 * self.fps_den as u64) / self.fps_num as u64) as u32
     }
 
     /// Build the fMP4 init segment from a pre-parsed `SpsInfo` and the raw SPS/PPS NAL bytes.
@@ -938,7 +943,7 @@ impl Mp4Muxer {
             .pending
             .iter()
             .map(|s| TrunSample {
-                duration: ticks,    // R2/R3: always concrete u32
+                duration: ticks, // R2/R3: always concrete u32
                 size: s.avcc.len() as u32,
                 flags: None,
             })
@@ -2121,18 +2126,25 @@ mod tests {
         let samples = vec![make_sample(100)];
         let moof = build_moof(1, 0, &samples, 0);
 
-        let tfhd_pos = moof.windows(4).position(|w| w == b"tfhd").expect("tfhd must be in moof");
+        let tfhd_pos = moof
+            .windows(4)
+            .position(|w| w == b"tfhd")
+            .expect("tfhd must be in moof");
         // tfhd full-box: [size:4][tag:4][version:1][flags:3][track_id:4]
         // After tag: version at tfhd_pos+4, flags bytes at +5,+6,+7
-        let flags = u32::from_be_bytes([0, moof[tfhd_pos + 5], moof[tfhd_pos + 6], moof[tfhd_pos + 7]]);
+        let flags = u32::from_be_bytes([
+            0,
+            moof[tfhd_pos + 5],
+            moof[tfhd_pos + 6],
+            moof[tfhd_pos + 7],
+        ]);
         assert_eq!(
             flags & 0x000008,
             0,
             "tfhd MUST NOT have default-sample-duration-present (0x000008) — per-sample trun wins (R9)"
         );
         assert_eq!(
-            flags,
-            0x020000,
+            flags, 0x020000,
             "tfhd flags must be exactly 0x020000 (default-base-is-moof only); got 0x{flags:06X}"
         );
     }
@@ -2144,8 +2156,15 @@ mod tests {
     fn trun_sample_duration_field_is_u32_not_option() {
         // Construct TrunSample with an explicit u32 duration value.
         // This will fail to compile when duration is still Option<u32>.
-        let sample = TrunSample { duration: 3000, size: 100, flags: None };
-        assert_eq!(sample.duration, 3000u32, "duration must be a concrete u32, not Option");
+        let sample = TrunSample {
+            duration: 3000,
+            size: 100,
+            flags: None,
+        };
+        assert_eq!(
+            sample.duration, 3000u32,
+            "duration must be a concrete u32, not Option"
+        );
     }
 
     // T3.1 — build_trun flags include 0x000100 (sample-duration-present). RED until T3.5.
@@ -2155,9 +2174,21 @@ mod tests {
         let trun = build_trun(&samples, 0, false);
         // trun full-box header: [size:4][tag:4][version:1][flags:3]
         let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
-        assert_ne!(flags & 0x000100, 0, "trun flags must have sample-duration-present (0x000100)");
-        assert_ne!(flags & 0x000001, 0, "trun flags must have data-offset-present (0x000001)");
-        assert_ne!(flags & 0x000200, 0, "trun flags must have sample-size-present (0x000200)");
+        assert_ne!(
+            flags & 0x000100,
+            0,
+            "trun flags must have sample-duration-present (0x000100)"
+        );
+        assert_ne!(
+            flags & 0x000001,
+            0,
+            "trun flags must have data-offset-present (0x000001)"
+        );
+        assert_ne!(
+            flags & 0x000200,
+            0,
+            "trun flags must have sample-size-present (0x000200)"
+        );
     }
 
     // T3.2 — build_trun IDR path includes first-sample-flags + duration-present. RED until T3.5.
@@ -2172,14 +2203,22 @@ mod tests {
             0x000305,
             "IDR trun flags must have 0x000305 (got 0x{flags:06X})"
         );
-        assert_ne!(flags & 0x000100, 0, "IDR trun flags must have sample-duration-present (0x000100)");
+        assert_ne!(
+            flags & 0x000100,
+            0,
+            "IDR trun flags must have sample-duration-present (0x000100)"
+        );
     }
 
     // T3.3 — per-sample loop writes duration then size (3 samples). RED until T3.5.
     #[test]
     fn build_trun_per_sample_loop_writes_duration_then_size() {
         fn make_sample_with_duration(size: u32, duration: u32) -> TrunSample {
-            TrunSample { duration, size, flags: None }
+            TrunSample {
+                duration,
+                size,
+                flags: None,
+            }
         }
         let samples = vec![
             make_sample_with_duration(100, 3000),
@@ -2192,8 +2231,9 @@ mod tests {
         let per_sample_offset = 8 + 4 + 4 + 4; // box header(8) + v+f(4) + count(4) + data_offset(4)
         for (i, &expected_size) in [100u32, 200, 300].iter().enumerate() {
             let off = per_sample_offset + i * 8;
-            let dur = u32::from_be_bytes([trun[off], trun[off+1], trun[off+2], trun[off+3]]);
-            let sz  = u32::from_be_bytes([trun[off+4], trun[off+5], trun[off+6], trun[off+7]]);
+            let dur = u32::from_be_bytes([trun[off], trun[off + 1], trun[off + 2], trun[off + 3]]);
+            let sz =
+                u32::from_be_bytes([trun[off + 4], trun[off + 5], trun[off + 6], trun[off + 7]]);
             assert_eq!(dur, 3000, "sample {i} duration must be 3000");
             assert_eq!(sz, expected_size, "sample {i} size must be {expected_size}");
         }
@@ -2202,18 +2242,33 @@ mod tests {
     // T3.4 — single-sample trun emits exactly one duration+size pair. RED until T3.5.
     #[test]
     fn build_trun_single_sample_emits_one_duration_size_pair() {
-        let samples = vec![TrunSample { duration: 1500, size: 50, flags: None }];
+        let samples = vec![TrunSample {
+            duration: 1500,
+            size: 50,
+            flags: None,
+        }];
         let trun = build_trun(&samples, 0, false);
         // With flags 0x000301 (duration+size+data-offset): per-sample = [duration:4][size:4] = 8 bytes
         // Total box = 8 (box hdr) + 4 (v+f) + 4 (count) + 4 (data_offset) + 8 (1 sample) = 28 bytes
         let expected_box_len: u32 = 8 + 4 + 4 + 4 + 8;
         let actual_box_len = u32::from_be_bytes([trun[0], trun[1], trun[2], trun[3]]);
-        assert_eq!(actual_box_len, expected_box_len, "single-sample trun must be {expected_box_len} bytes");
+        assert_eq!(
+            actual_box_len, expected_box_len,
+            "single-sample trun must be {expected_box_len} bytes"
+        );
         let per_sample_offset = 8 + 4 + 4 + 4;
-        let dur = u32::from_be_bytes([trun[per_sample_offset], trun[per_sample_offset+1],
-                                       trun[per_sample_offset+2], trun[per_sample_offset+3]]);
-        let sz  = u32::from_be_bytes([trun[per_sample_offset+4], trun[per_sample_offset+5],
-                                       trun[per_sample_offset+6], trun[per_sample_offset+7]]);
+        let dur = u32::from_be_bytes([
+            trun[per_sample_offset],
+            trun[per_sample_offset + 1],
+            trun[per_sample_offset + 2],
+            trun[per_sample_offset + 3],
+        ]);
+        let sz = u32::from_be_bytes([
+            trun[per_sample_offset + 4],
+            trun[per_sample_offset + 5],
+            trun[per_sample_offset + 6],
+            trun[per_sample_offset + 7],
+        ]);
         assert_eq!(dur, 1500, "single-sample duration must be 1500");
         assert_eq!(sz, 50, "single-sample size must be 50");
     }
@@ -2231,8 +2286,14 @@ mod tests {
         (0..count)
             .map(|i| {
                 let off = base + i * 8;
-                let dur = u32::from_be_bytes([trun[off], trun[off+1], trun[off+2], trun[off+3]]);
-                let sz  = u32::from_be_bytes([trun[off+4], trun[off+5], trun[off+6], trun[off+7]]);
+                let dur =
+                    u32::from_be_bytes([trun[off], trun[off + 1], trun[off + 2], trun[off + 3]]);
+                let sz = u32::from_be_bytes([
+                    trun[off + 4],
+                    trun[off + 5],
+                    trun[off + 6],
+                    trun[off + 7],
+                ]);
                 (dur, sz)
             })
             .collect()
@@ -2326,11 +2387,17 @@ mod tests {
         let segment = muxer.append_packet(&idr2).expect("IDR2 must flush GOP1");
 
         // The tracker must be locked.
-        assert!(muxer.fps_tracker.is_locked(), "fps_tracker must be locked after 9 uniform 100ms packets");
+        assert!(
+            muxer.fps_tracker.is_locked(),
+            "fps_tracker must be locked after 9 uniform 100ms packets"
+        );
         let expected_ticks = muxer.fps_tracker.effective_ticks_per_sample();
 
         // Parse trun from the flushed segment.
-        let trun_pos = segment.windows(4).position(|w| w == b"trun").expect("trun must be present");
+        let trun_pos = segment
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("trun must be present");
         let trun = &segment[trun_pos - 4..];
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 
@@ -2363,7 +2430,10 @@ mod tests {
         let idr2 = make_packet(true, 4 * 17, 100);
         let segment = muxer.append_packet(&idr2).expect("IDR2 must flush GOP1");
 
-        let trun_pos = segment.windows(4).position(|w| w == b"trun").expect("trun must be present");
+        let trun_pos = segment
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("trun must be present");
         let trun = &segment[trun_pos - 4..];
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 

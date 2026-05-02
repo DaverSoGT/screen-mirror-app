@@ -515,7 +515,7 @@ fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
         .map(|i| {
             let off = base + i * 8;
             let dur = u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]]);
-            let sz  = u32::from_be_bytes([seg[off + 4], seg[off + 5], seg[off + 6], seg[off + 7]]);
+            let sz = u32::from_be_bytes([seg[off + 4], seg[off + 5], seg[off + 6], seg[off + 7]]);
             (dur, sz)
         })
         .collect()
@@ -614,7 +614,11 @@ fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
     // The "pre" in the name refers to the anchor; the function always runs current code.
 
     let pairs = parse_segment_trun_pairs(&seg, true); // IDR segment
-    assert_eq!(pairs.len(), 4, "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)");
+    assert_eq!(
+        pairs.len(),
+        4,
+        "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)"
+    );
 
     // During warm-up (only 4 deltas observed), each sample duration = 3000.
     for (i, &(dur, _)) in pairs.iter().enumerate() {
@@ -626,7 +630,10 @@ fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
 
     // Sum-of-durations = 4 * 3000 = 12000 (semantically identical to pre-T2 trex fallback).
     let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
-    assert_eq!(total, 12000, "sum-of-durations for 4 samples at 3000 ticks must be 12000");
+    assert_eq!(
+        total, 12000,
+        "sum-of-durations for 4 samples at 3000 ticks must be 12000"
+    );
 }
 
 // T5.4 — init segment trex.default_sample_duration is 3000 regardless of fps (R5, R11).
@@ -698,9 +705,21 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
         0,
         "post-T2 trun MUST have sample-duration-present flag (0x000100); got flags=0x{flags:06X}"
     );
-    assert_ne!(flags & 0x000200, 0, "post-T2 trun must have sample-size-present (0x000200)");
-    assert_ne!(flags & 0x000001, 0, "post-T2 trun must have data-offset-present (0x000001)");
-    assert_ne!(flags & 0x000004, 0, "post-T2 trun must have first-sample-flags-present (0x000004, IDR)");
+    assert_ne!(
+        flags & 0x000200,
+        0,
+        "post-T2 trun must have sample-size-present (0x000200)"
+    );
+    assert_ne!(
+        flags & 0x000001,
+        0,
+        "post-T2 trun must have data-offset-present (0x000001)"
+    );
+    assert_ne!(
+        flags & 0x000004,
+        0,
+        "post-T2 trun must have first-sample-flags-present (0x000004, IDR)"
+    );
 
     // Size check: moof(108→124) + mdat(408) = 532 bytes.
     // moof grew by 4 bytes/sample × 4 samples = +16 bytes (from 108 to 124).
@@ -715,7 +734,10 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
     let pairs = parse_segment_trun_pairs(&seg, true);
     assert_eq!(pairs.len(), 4, "must have 4 samples");
     for (i, &(dur, _)) in pairs.iter().enumerate() {
-        assert_eq!(dur, 3000, "post-T2 warm-up sample {i} must carry duration=3000");
+        assert_eq!(
+            dur, 3000,
+            "post-T2 warm-up sample {i} must carry duration=3000"
+        );
     }
 
     // Deterministic: two builds must produce identical bytes.

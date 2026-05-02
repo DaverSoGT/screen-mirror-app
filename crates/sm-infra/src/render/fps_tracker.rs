@@ -109,8 +109,8 @@ impl FpsTracker {
             return; // Slide window on next observe_dts; stays WarmingUp.
         }
 
-        // Plausibility check (R6).
-        if median < MIN_PLAUSIBLE_TICKS || median > MAX_PLAUSIBLE_TICKS {
+        // Plausibility check (R6): median must be within [MIN_PLAUSIBLE_TICKS, MAX_PLAUSIBLE_TICKS].
+        if !(MIN_PLAUSIBLE_TICKS..=MAX_PLAUSIBLE_TICKS).contains(&median) {
             tracing::warn!(
                 rejected_ticks = median,
                 "fps inference rejected: median tick {} outside [5, 240] fps bounds [{}, {}]",
@@ -179,7 +179,10 @@ mod tests {
     fn fps_tracker_locks_at_3000_for_30fps_uniform_window() {
         let mut tracker = FpsTracker::new();
         feed_uniform(&mut tracker, 9, 3000);
-        assert!(tracker.is_locked(), "should be locked after 9 uniform 3000-tick deltas");
+        assert!(
+            tracker.is_locked(),
+            "should be locked after 9 uniform 3000-tick deltas"
+        );
         assert_eq!(
             tracker.effective_ticks_per_sample(),
             3000,
@@ -192,7 +195,10 @@ mod tests {
     fn fps_tracker_locks_at_1500_for_60fps_uniform_window() {
         let mut tracker = FpsTracker::new();
         feed_uniform(&mut tracker, 9, 1500);
-        assert!(tracker.is_locked(), "should be locked after 9 uniform 1500-tick deltas");
+        assert!(
+            tracker.is_locked(),
+            "should be locked after 9 uniform 1500-tick deltas"
+        );
         assert_eq!(
             tracker.effective_ticks_per_sample(),
             1500,
@@ -384,7 +390,10 @@ mod tests {
             dts += 3000;
             tracker.observe_dts(dts);
         }
-        assert!(tracker.is_locked(), "must remain locked after 1000 divergent observations");
+        assert!(
+            tracker.is_locked(),
+            "must remain locked after 1000 divergent observations"
+        );
         assert_eq!(
             tracker.effective_ticks_per_sample(),
             1500,
