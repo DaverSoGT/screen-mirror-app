@@ -4,9 +4,8 @@
 // Linux/macOS CI can catch stride bugs before any Windows machine sees them.
 //
 // NOTE: `windows_mft` is the sole consumer of this module on Windows. Until that
-// module is added in Phase 3, items appear unused to the compiler. The cfg_attr
-// below suppresses dead_code on non-Windows targets; on Windows the #[allow] on
-// each item handles it until `windows_mft` starts referencing them.
+// module references these items, they appear unused to the compiler.
+// Suppressed via cfg_attr when the hw-encoder feature is off or on non-Windows targets.
 
 use sm_domain::CaptureFrame;
 
