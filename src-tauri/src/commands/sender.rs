@@ -1441,7 +1441,7 @@ fn build_production_sender_bundle(
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder};
     use sm_infra::capture::WindowsCaptureSource;
-    use sm_infra::encode::windows::WindowsOpenH264Encoder;
+    use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{Str0mVideoSender, publish_host_candidate};
     use std::sync::mpsc::sync_channel;
@@ -1474,8 +1474,8 @@ fn build_production_sender_bundle(
         WindowsCaptureSource::new(capture_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     let encoder_config = EncoderConfig::default();
-    let mut encoder = WindowsOpenH264Encoder::new(encoder_config)
-        .map_err(|e| BundleError::Other(e.to_string()))?;
+    let mut encoder =
+        build_video_encoder(encoder_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     let transport_config = TransportConfig {
         udp_port,
@@ -1504,7 +1504,8 @@ fn build_production_sender_bundle(
         .start(capture_to_enc_rx, enc_to_sender_tx)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
-    let encoder_arc: Arc<dyn VideoEncoder + Send + Sync> = Arc::new(encoder);
+    // Arc::from(Box<dyn T>) unsizes Box→Arc via impl From<Box<T>> for Arc<T> (stable since Rust 1.6).
+    let encoder_arc: Arc<dyn VideoEncoder + Send + Sync> = Arc::from(encoder);
     sender.set_encoder(Arc::clone(&encoder_arc));
 
     // Extract offer BEFORE start(): start() consumes pre_neg via guard.take(),

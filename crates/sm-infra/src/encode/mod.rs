@@ -14,5 +14,9 @@ pub mod factory;
 
 #[cfg(target_os = "windows")]
 pub use windows::{ENCODE_CHANNEL_CAPACITY, WindowsOpenH264Encoder};
-// Re-exports for WindowsMftH264Encoder and build_video_encoder are added in Phase 3/5
-// once the items are defined in their respective modules.
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+pub use windows_mft::WindowsMftH264Encoder;
+
+#[cfg(target_os = "windows")]
+pub use factory::build_video_encoder;
