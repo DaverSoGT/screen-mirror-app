@@ -2,10 +2,6 @@
 //
 // BT.601 limited-range coefficients. No cfg gate — runs on all platforms so that
 // Linux/macOS CI can catch stride bugs before any Windows machine sees them.
-//
-// NOTE: `windows_mft` is the sole consumer of this module on Windows. Until that
-// module references these items, they appear unused to the compiler.
-// Suppressed via cfg_attr when the hw-encoder feature is off or on non-Windows targets.
 
 use sm_domain::CaptureFrame;
 
@@ -16,13 +12,6 @@ use sm_domain::CaptureFrame;
 /// The UV plane stores chroma as interleaved pairs: U₀ V₀ U₁ V₁ …
 ///
 /// `buf` is pre-allocated and reused across frames to avoid per-frame heap allocation.
-#[cfg_attr(
-    not(all(target_os = "windows", feature = "hw-encoder")),
-    expect(
-        dead_code,
-        reason = "consumed by windows_mft on Windows+hw-encoder; dead on other platforms/feature combinations"
-    )
-)]
 pub(crate) struct Nv12 {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -32,13 +21,6 @@ pub(crate) struct Nv12 {
 
 impl Nv12 {
     /// Create a new zero-initialised NV12 buffer sized for `width × height`.
-    #[cfg_attr(
-        not(all(target_os = "windows", feature = "hw-encoder")),
-        expect(
-            dead_code,
-            reason = "consumed by windows_mft on Windows+hw-encoder; dead on other platforms/feature combinations"
-        )
-    )]
     pub(crate) fn new(width: u32, height: u32) -> Self {
         let y_size = (width as usize) * (height as usize);
         // UV plane: ceil(width/2) * ceil(height/2) chroma samples, each 2 bytes (U=Cb, V=Cr).
@@ -55,26 +37,12 @@ impl Nv12 {
 
     /// Byte offset into `buf` where the Y plane starts (always 0).
     #[inline]
-    #[cfg_attr(
-        not(all(target_os = "windows", feature = "hw-encoder")),
-        expect(
-            dead_code,
-            reason = "consumed by windows_mft on Windows+hw-encoder; dead on other platforms/feature combinations"
-        )
-    )]
     pub(crate) fn y_offset(&self) -> usize {
         0
     }
 
     /// Byte offset into `buf` where the UV interleaved plane starts.
     #[inline]
-    #[cfg_attr(
-        not(all(target_os = "windows", feature = "hw-encoder")),
-        expect(
-            dead_code,
-            reason = "consumed by windows_mft on Windows+hw-encoder; dead on other platforms/feature combinations"
-        )
-    )]
     pub(crate) fn uv_offset(&self) -> usize {
         (self.width as usize) * (self.height as usize)
     }
@@ -106,13 +74,6 @@ impl Nv12 {
 /// - Y  = clip( 0.257·R + 0.504·G + 0.098·B + 16  )
 /// - Cb = clip(-0.148·R - 0.291·G + 0.439·B + 128 )
 /// - Cr = clip( 0.439·R - 0.368·G - 0.071·B + 128 )
-#[cfg_attr(
-    not(all(target_os = "windows", feature = "hw-encoder")),
-    expect(
-        dead_code,
-        reason = "consumed by windows_mft on Windows+hw-encoder; dead on other platforms/feature combinations"
-    )
-)]
 pub(crate) fn convert(frame: &CaptureFrame, out: &mut Nv12) {
     let w = frame.width as usize;
     let h = frame.height as usize;
