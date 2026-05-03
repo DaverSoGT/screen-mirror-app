@@ -8,7 +8,10 @@
 // even though the unit tests in this file exercise the API. `#[allow(dead_code)]`
 // is correct here because `#[expect]` would be unfulfilled when tests DO link
 // the items (every platform's test target).
-#![allow(dead_code, reason = "consumed by windows_mft on Windows+hw-encoder; always exercised by this module's unit tests")]
+#![allow(
+    dead_code,
+    reason = "consumed by windows_mft on Windows+hw-encoder; always exercised by this module's unit tests"
+)]
 
 use sm_domain::CaptureFrame;
 
