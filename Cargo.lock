@@ -3930,6 +3930,7 @@ dependencies = [
  "str0m",
  "thiserror 2.0.18",
  "tracing",
+ "windows 0.62.2",
  "windows-capture",
  "windows-version",
 ]
