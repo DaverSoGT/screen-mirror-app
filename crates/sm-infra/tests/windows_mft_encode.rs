@@ -460,7 +460,8 @@ fn mft_stop_is_idempotent() {
     enc.stop().expect("first stop() should succeed");
 
     // Second stop — must return Ok(()) without panic (idempotent).
-    enc.stop().expect("second stop() should be idempotent and return Ok(())");
+    enc.stop()
+        .expect("second stop() should be idempotent and return Ok(())");
 }
 
 /// T13.2 — Dropping without calling `stop()` must not leak the encoder thread.

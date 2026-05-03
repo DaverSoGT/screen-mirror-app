@@ -702,7 +702,10 @@ fn extract_bytes(
 
 // ── Pump loop (design §5a) ────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + avcc flag — design §5a one-function pump shape"
+)]
 fn pump_loop(
     mft: &IMFTransform,
     codec_api: &ICodecAPI,
