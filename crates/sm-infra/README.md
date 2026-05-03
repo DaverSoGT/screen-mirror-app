@@ -110,6 +110,40 @@ if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
 This ensures the test exits cleanly on Windows Server Core, headless CI, or
 Windows 10 < 1903 without a panic.
 
+### Hardware encoder smoke tests (`crates/sm-infra/src/encode/windows_mft.rs`)
+
+The `WindowsMftH264Encoder` uses Windows Media Foundation Transform (MFT) with
+`MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)`. Hardware
+tests are annotated `#[ignore]` and run on a Windows host with a dedicated GPU.
+
+**Preconditions:**
+- Windows 10 1709 (Fall Creators Update) or Windows 11
+- A GPU with a hardware H.264 encoder (Intel Quick Sync, NVIDIA NVENC, AMD AMF,
+  or compatible)
+- Up-to-date GPU driver
+
+**Run hardware encoder tests manually:**
+
+```sh
+cargo nextest run -p sm-infra --features hw-encoder --run-ignored only
+```
+
+**Force software encoder (bypass HW enumeration):**
+
+Set the environment variable `SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER=1` to skip
+`MFTEnumEx` and always use the OpenH264 software encoder. Useful for debugging,
+CPU benchmarks, or machines without a compatible GPU:
+
+```sh
+$env:SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER = "1"
+cargo nextest run -p sm-infra
+```
+
+**Factory fallback behaviour:** if no hardware MFT encoder is found (`InitFailed`
+returned by `WindowsMftH264Encoder::new`), `build_video_encoder` automatically
+falls back to `WindowsOpenH264Encoder`. A one-time `tracing::info!` log records
+the reason.
+
 ## Transport & Signaling
 
 The `transport` module (`Str0mVideoSender`, `Str0mVideoReceiver`) and the
