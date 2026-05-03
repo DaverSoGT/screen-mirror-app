@@ -110,11 +110,13 @@ if !GraphicsCaptureApi::is_supported().unwrap_or(false) {
 This ensures the test exits cleanly on Windows Server Core, headless CI, or
 Windows 10 < 1903 without a panic.
 
-### Hardware encoder smoke tests (`crates/sm-infra/src/encode/windows_mft.rs`)
+### Hardware encoder smoke tests (`crates/sm-infra/tests/windows_mft_encode.rs`)
 
 The `WindowsMftH264Encoder` uses Windows Media Foundation Transform (MFT) with
 `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)`. Hardware
-tests are annotated `#[ignore]` and run on a Windows host with a dedicated GPU.
+tests are annotated `#[ignore]` and live in the dedicated integration test file
+`crates/sm-infra/tests/windows_mft_encode.rs`. They run on a Windows host with
+a dedicated GPU.
 
 **Preconditions:**
 - Windows 10 1709 (Fall Creators Update) or Windows 11
@@ -125,7 +127,7 @@ tests are annotated `#[ignore]` and run on a Windows host with a dedicated GPU.
 **Run hardware encoder tests manually:**
 
 ```sh
-cargo nextest run -p sm-infra --features hw-encoder --run-ignored only
+cargo nextest run -p sm-infra --features hw-encoder --run-ignored only --tests windows_mft_encode
 ```
 
 **Force software encoder (bypass HW enumeration):**
