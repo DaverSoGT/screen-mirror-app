@@ -947,6 +947,35 @@ fn make_variant_bool(value: bool) -> VARIANT {
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
+// ── Test-only helpers ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+impl WindowsMftH264Encoder {
+    /// Construct a `WindowsMftH264Encoder` with only the shared state initialised,
+    /// bypassing COM init, MFStartup, and MFTEnumEx.
+    ///
+    /// # Purpose
+    /// Enables testing methods that operate purely on the shared atomics
+    /// (e.g. `set_bitrate`, `request_keyframe`) without requiring a GPU or COM
+    /// apartment. The resulting encoder MUST NOT be started — it has no MFT handle.
+    ///
+    /// # Safety
+    /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
+    /// which would be incorrect since COM was never initialised by this constructor.
+    /// `mft` and `codec_api` are `None`, so any call to `start()` will return
+    /// `Err(Internal(_))` rather than accessing an invalid COM pointer.
+    fn new_for_validation_test() -> Self {
+        Self {
+            config: EncoderConfig::default(),
+            state: Arc::new(MftEncoderShared::default()),
+            mft: None,
+            codec_api: None,
+            handle: None,
+            com_initialized: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,28 +1018,16 @@ mod tests {
         assert_send_sync::<WindowsMftH264Encoder>();
     }
 
-    // ─── T3b.3: set_bitrate_zero_returns_invalid_config ──────────────────────
-    // Tier-2 test: touches real MFT enumeration (calls CoInitializeEx + MFTEnumEx).
-    // Marked #[ignore] so CI skips it; run manually on a Windows machine with a GPU.
-    // If new() succeeds (GPU present) → asserts set_bitrate(0) returns InvalidConfig.
-    // If new() returns InitFailed (no HW encoder) → passes vacuously.
+    // ─── T8.1: set_bitrate_zero_returns_invalid_config ───────────────────────
+    // CI-runnable: uses new_for_validation_test() which bypasses COM/MFT init.
+    // set_bitrate() only accesses self.state (an AtomicU32) — no COM calls needed.
     #[test]
-    #[ignore = "hardware MFT enumeration — requires GPU, run manually"]
     fn set_bitrate_zero_returns_invalid_config() {
-        match WindowsMftH264Encoder::new(EncoderConfig::default()) {
-            Ok(enc) => {
-                let err = enc.set_bitrate(0).unwrap_err();
-                assert!(
-                    matches!(err, EncoderError::InvalidConfig(_)),
-                    "expected InvalidConfig for set_bitrate(0), got {err:?}"
-                );
-            }
-            Err(EncoderError::InitFailed(_)) => {
-                // No HW encoder on this machine — test passes vacuously.
-            }
-            Err(other) => {
-                panic!("unexpected error from new(): {other:?}");
-            }
-        }
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        let err = enc.set_bitrate(0).unwrap_err();
+        assert!(
+            matches!(err, EncoderError::InvalidConfig(_)),
+            "expected InvalidConfig for set_bitrate(0), got {err:?}"
+        );
     }
 }
