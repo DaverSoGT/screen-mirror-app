@@ -605,6 +605,58 @@ fn mft_setup_falls_back_when_config_dimensions_zero() {
     enc.stop().expect("stop should succeed");
 }
 
+// ─── T5.1 (DD9 drain smoke): drain after channel close ───────────────────────
+
+/// Drain path: after the input channel is closed, `pump_loop` calls
+/// `MFT_MESSAGE_COMMAND_DRAIN` and continues looping until `MEEndOfStream`
+/// arrives. This test exercises that path explicitly.
+///
+/// Without this test the post-disconnect drain path is unsmoked. The `< 2s`
+/// assertion documents that the drain path is bounded — if discovery #585's
+/// drain-spin pattern ever becomes pathological, this test will catch it.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_drain_after_channel_close_does_not_panic() {
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(8);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Push a few frames so the MFT is mid-encode when we close the channel.
+    for i in 0..3u64 {
+        frame_tx
+            .send(make_synthetic_frame(640, 480, i * 33))
+            .expect("frame_tx should be open");
+    }
+    // Close the input channel. pump_loop's NeedInput arm will hit Disconnected
+    // and call ProcessMessage(COMMAND_DRAIN, 0).
+    drop(frame_tx);
+
+    // Drain any output packets — don't require a specific count.
+    let drain_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < drain_deadline {
+        match pkt_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(_) => continue,
+            Err(_) => break, // timeout or disconnected — both fine
+        }
+    }
+
+    // Most important assertion: stop() does not hang or panic.
+    let t0 = Instant::now();
+    enc.stop().expect("stop after drain must succeed");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "stop() after drain took {:?} — drain path may be looping",
+        t0.elapsed()
+    );
+}
+
 // ─── T13.1 / T13.2: Lifecycle ────────────────────────────────────────────────
 
 /// T13.1 — `stop()` is idempotent: calling it twice returns `Ok(())` both times.
@@ -618,6 +670,13 @@ fn mft_stop_is_idempotent() {
     let (pkt_tx, _pkt_rx) = mpsc::sync_channel(4);
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Liveness probe: send one frame and assert the channel is open (thread alive).
+    // Before the Bucket A + B fixes this send returns SendError (thread died during probe).
+    // After the fixes: channel open = thread alive. Satisfies spec R5/T5.2.
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("encoder thread died during start() — channel closed");
 
     drop(frame_tx); // signal encoder thread to drain and exit
 
@@ -645,7 +704,14 @@ fn mft_drop_without_stop_does_not_leak_thread() {
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
 
-    // Drop frame_tx first so the encoder thread can drain and exit.
+    // Liveness probe: send one frame and assert the channel is open (thread alive).
+    // Before the Bucket A + B fixes this send returns SendError (thread died during probe).
+    // After the fixes: channel open = thread alive. Satisfies spec R5/T5.1.
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("encoder thread died during start() — channel closed");
+
+    // Drop frame_tx so the encoder thread can drain and exit.
     drop(frame_tx);
 
     // Drop the encoder without calling stop() — Drop impl must join the thread.
