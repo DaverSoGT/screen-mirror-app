@@ -29,6 +29,20 @@ use sm_infra::encode::windows_mft::WindowsMftH264Encoder;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Install a tracing subscriber for the duration of one test process.
+///
+/// nextest runs each test in its own process so a single try_init per test
+/// is fine. Use RUST_LOG to control verbosity (e.g. `sm_infra::encode=trace`).
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 /// Build a synthetic BGRA8 `CaptureFrame` with a gradient pattern.
 ///
 /// The gradient (B=row%256, G=col%256, R=128, A=255) gives the codec meaningful
@@ -163,6 +177,7 @@ fn mft_encoded_packet_starts_with_annex_b_start_code() {
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_thirty_frame_smoke_emits_at_least_one_keyframe() {
+    init_tracing();
     const WIDTH: u32 = 1920;
     const HEIGHT: u32 = 1080;
     const N_FRAMES: u64 = 30;
@@ -550,6 +565,7 @@ fn mft_new_does_not_submit_frames_to_mft_during_init() {
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_setup_uses_config_dimensions_when_nonzero() {
+    init_tracing();
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: 640,
         height: 480,

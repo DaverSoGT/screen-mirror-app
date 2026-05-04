@@ -57,3 +57,7 @@ mp4 = "0.14.0"
 # the library (not the #[cfg(test)] build), so test-support is the only way to
 # expose NicOverrideGuard and enumerate_local_ipv4 to them.
 sm-infra = { path = ".", features = ["test-support"] }
+# Subscriber so HW smoke tests can show tracing output via RUST_LOG (the lib
+# uses `tracing` macros but does not install a subscriber — that is the
+# binary's job).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

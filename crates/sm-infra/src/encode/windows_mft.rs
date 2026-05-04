@@ -418,6 +418,13 @@ fn run_encoder_thread(
         tracing::error!("encoder thread CoInitializeEx failed: 0x{:08X}", co_hr.0);
         return;
     }
+    tracing::debug!(
+        "encoder thread CoInitializeEx OK; config: {}x{} @ {}fps {}bps",
+        config.width,
+        config.height,
+        config.framerate,
+        config.bitrate_bps
+    );
 
     // Steps 7b–7h: Setup media types, unlock async, get event generator, send messages.
     if let Err(e) = setup_mft(&mft, &config) {
@@ -426,6 +433,7 @@ fn run_encoder_thread(
         // the caller thread's new() owns MFStartup/MFShutdown (step 2 and Drop).
         return;
     }
+    tracing::debug!("setup_mft OK; entering pump_loop");
 
     let event_gen: IMFMediaEventGenerator = match mft.cast() {
         Ok(g) => g,
@@ -746,6 +754,7 @@ fn pump_loop(
                 break;
             }
         };
+        tracing::trace!("pump_loop event_type=0x{:08X}", event_type);
 
         if event_type == METransformNeedInput.0 as u32 {
             // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
@@ -812,9 +821,20 @@ fn pump_loop(
                 }
             }
         } else if event_type == MEEndOfStream.0 as u32 {
+            tracing::debug!("pump_loop received MEEndOfStream (0x{:08X}); exiting", event_type);
             break;
+        } else {
+            // Catch-all: vendor MFTs may emit MEError, MESessionStreamSinkFormatChanged,
+            // or other events not anticipated by the original design. Log loudly so
+            // the smoke transcript reveals the actual event sequence rather than
+            // silently spinning until a test timeout.
+            tracing::warn!(
+                "pump_loop received unhandled event_type=0x{:08X}; continuing loop",
+                event_type
+            );
         }
     }
+    tracing::debug!("pump_loop exited cleanly");
 }
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
