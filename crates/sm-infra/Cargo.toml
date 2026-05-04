@@ -5,10 +5,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+# Default: hw-encoder is ON for Windows production builds (zero user action needed).
+default = ["hw-encoder"]
 # Reserved for V2 Media Foundation MFT hardware decoder adapter.
 # Empty in V1 — no code is gated behind it yet.
 hw-decoder = []
+# Gates the WindowsMftH264Encoder MFT adapter and its windows crate dependency.
+# Default-on; downstream embedders can opt out via --no-default-features.
+hw-encoder = []
 # Exposes test-support helpers (NicOverrideGuard, enumerate_local_ipv4_raw)
 # for use in integration tests outside this crate. Never enable in production.
 test-support = []
@@ -28,6 +32,19 @@ windows-capture = "2"
 windows-version = "0.1"
 openh264 = "0.9"
 openh264-sys2 = "0.9"
+# Direct pin matching windows-capture's transitive resolution (Cargo.lock line 5316).
+# Exact version prevents silent upgrade past windows-capture's pin (discovery #571).
+# Features selected to cover all MFT/CodecAPI symbols used in windows_mft.rs (design §9).
+# Win32_System_Com_StructuredStorage is included defensively; dropped if cargo check proves unused.
+windows = { version = "0.62.2", features = [
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 
