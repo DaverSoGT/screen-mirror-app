@@ -502,6 +502,18 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     // See effective_dimensions() for the fallback policy.
     let (w, h) = effective_dimensions(config);
 
+    // Step 7a: MF_TRANSFORM_ASYNC_UNLOCK MUST be set before any other call on a
+    // hardware (async) MFT. Per Microsoft Async MFT contract: "Before calling any
+    // other methods on the transform, the application must set
+    // MF_TRANSFORM_ASYNC_UNLOCK on the IMFAttributes attribute store of the
+    // transform." Setting it after SetInputType caused the HW MFT to reject the
+    // input type with MF_E_INVALIDMEDIATYPE (0xC00D6D77) — see discovery #592.
+    let attrs = unsafe { mft.GetAttributes() }
+        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
+    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
+        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
+    })?;
+
     // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
     let out_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
         EncoderError::InitFailed(format!("MFCreateMediaType(out): 0x{:08X}", e.code().0))
@@ -591,14 +603,8 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
             .map_err(|e| EncoderError::InitFailed(format!("SetInputType: 0x{:08X}", e.code().0)))?;
     }
 
-    // Step 7d: MF_TRANSFORM_ASYNC_UNLOCK (required for async hardware MFTs).
-    let attrs = unsafe { mft.GetAttributes() }
-        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
-    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
-        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
-    })?;
-
     // Steps 7f–7h: Send streaming messages.
+    // (Async unlock was already set at Step 7a — see top of function.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
