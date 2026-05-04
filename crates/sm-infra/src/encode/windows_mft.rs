@@ -435,8 +435,11 @@ fn run_encoder_thread(
         }
     };
 
-    // Step 7i: Probe output format (Annex-B vs AVCC).
-    let output_is_avcc = probe_output_format(&mft, &event_gen);
+    // Per OQ-NEW-1 resolution (DD5): detect Annex-B vs AVCC at first packet in
+    // collect_output, not during init. The probe_output_format approach (submit
+    // a 16×16 NV12 frame during setup) corrupted the MFT event pipeline on
+    // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
+    let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
     // Step 8: Pump loop.
     pump_loop(
@@ -446,7 +449,7 @@ fn run_encoder_thread(
         &state,
         rx,
         tx,
-        output_is_avcc,
+        &mut output_format_known,
         &config,
     );
 
@@ -606,64 +609,6 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     Ok(())
 }
 
-/// Probe output format (step 7i). Returns `true` if output is AVCC (requires rewrite).
-fn probe_output_format(mft: &IMFTransform, event_gen: &IMFMediaEventGenerator) -> bool {
-    // Submit a minimal synthetic 16×16 NV12 frame and inspect the first output bytes.
-    // If bytes start with [0x00, 0x00, 0x00, 0x01] → Annex-B (no rewrite needed).
-    // Otherwise → AVCC (length-prefix format; rewrite needed).
-    let probe_w: u32 = 16;
-    let probe_h: u32 = 16;
-    let y_size = (probe_w * probe_h) as usize;
-    let uv_size = (probe_w * probe_h / 2) as usize;
-    let frame_bytes = vec![0u8; y_size + uv_size]; // black NV12 frame
-
-    // Try to push one synthetic frame and get one output sample.
-    let probe_result = try_probe(mft, event_gen, &frame_bytes);
-
-    match probe_result {
-        Some(bytes) if bytes.len() >= 4 => {
-            // Check for Annex-B start code.
-            let is_annex_b =
-                bytes[0..4] == [0x00, 0x00, 0x00, 0x01] || bytes[0..3] == [0x00, 0x00, 0x01];
-            !is_annex_b // true = AVCC
-        }
-        _ => false, // Assume Annex-B if probe fails or returns too few bytes
-    }
-}
-
-/// Attempt to send a synthetic frame and collect the first output sample.
-fn try_probe(
-    mft: &IMFTransform,
-    event_gen: &IMFMediaEventGenerator,
-    frame_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    use std::time::Duration;
-
-    // Wait for NeedInput, submit a synthetic frame, wait for HaveOutput.
-    for _ in 0..32 {
-        let event = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NONE) }.ok()?;
-        let event_type = unsafe { event.GetType() }.ok()?;
-
-        if event_type == METransformNeedInput.0 as u32 {
-            // Build a minimal IMFSample with the probe frame.
-            let sample = build_imfsample(frame_bytes, Duration::ZERO, 33_333_333).ok()?;
-            unsafe { mft.ProcessInput(0, &sample, 0) }.ok()?;
-        } else if event_type == METransformHaveOutput.0 as u32 {
-            let mut output = MFT_OUTPUT_DATA_BUFFER::default();
-            let mut status: u32 = 0;
-            if let Ok(()) =
-                unsafe { mft.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status) }
-            {
-                if let Some(sample) = output.pSample.take() {
-                    return extract_bytes(&sample).ok();
-                }
-            }
-            return None;
-        }
-    }
-    None
-}
-
 /// Build an `IMFSample` wrapping raw NV12 bytes.
 fn build_imfsample(
     data: &[u8],
@@ -748,7 +693,7 @@ fn extract_bytes(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + avcc flag — design §5a one-function pump shape"
+    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + format state — design §5a one-function pump shape"
 )]
 fn pump_loop(
     mft: &IMFTransform,
@@ -757,7 +702,7 @@ fn pump_loop(
     state: &MftEncoderShared,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
-    output_is_avcc: bool,
+    output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
 ) {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
@@ -852,7 +797,7 @@ fn pump_loop(
                 }
             }
         } else if event_type == METransformHaveOutput.0 as u32 {
-            match collect_output(mft, output_is_avcc, current_ts, &mut seq) {
+            match collect_output(mft, output_format_known, current_ts, &mut seq) {
                 Ok(Some(pkt)) => match tx.try_send(pkt) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -887,9 +832,15 @@ fn submit_frame(
 }
 
 /// Collect one output sample from `ProcessOutput` and build an `EncodedPacket`.
+///
+/// Implements per-packet Annex-B vs AVCC detection (DD5, OQ-NEW-1 option (a)).
+/// `output_format_known` is `None` until the first packet arrives; afterwards
+/// `Some(false)` = Annex-B (no rewrite) or `Some(true)` = AVCC (apply shim).
+/// Sniffing every packet while the cache is `None` self-corrects against
+/// partial first-packet (R-NEW-6).
 fn collect_output(
     mft: &IMFTransform,
-    output_is_avcc: bool,
+    output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     frame_timestamp: std::time::Duration,
     seq: &mut u64,
 ) -> Result<Option<EncodedPacket>, EncoderError> {
@@ -915,10 +866,33 @@ fn collect_output(
 
     let raw_bytes = extract_bytes(&sample)?;
 
-    let annex_b = if output_is_avcc {
-        avcc_to_annex_b(&raw_bytes)
-    } else {
-        raw_bytes
+    // Per-packet Annex-B sniff (resolves OQ-NEW-1 option (a), mitigates R-NEW-6).
+    // If the packet is too short to sniff, defer and skip — do not cache.
+    if raw_bytes.len() < 4 {
+        tracing::warn!(
+            "collect_output: packet too short to sniff format ({} bytes), deferring",
+            raw_bytes.len()
+        );
+        return Ok(None);
+    }
+
+    let is_annex_b_now = raw_bytes[0] == 0x00
+        && raw_bytes[1] == 0x00
+        && raw_bytes[2] == 0x00
+        && raw_bytes[3] == 0x01;
+
+    // Cache decision on first clean observation; trust it thereafter.
+    let annex_b = match (*output_format_known, is_annex_b_now) {
+        (None, true) => {
+            *output_format_known = Some(false); // Annex-B confirmed
+            raw_bytes
+        }
+        (None, false) => {
+            *output_format_known = Some(true); // AVCC confirmed — apply rewrite
+            avcc_to_annex_b(&raw_bytes)
+        }
+        (Some(false), _) => raw_bytes, // cached Annex-B
+        (Some(true), _) => avcc_to_annex_b(&raw_bytes), // cached AVCC (always rewrite)
     };
 
     // DD10: read is_keyframe from MFSampleExtension_CleanPoint attribute.
