@@ -25,18 +25,18 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFTransform, MEEndOfStream, METransformHaveOutput,
-    METransformNeedInput, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_EVENT_FLAG_NONE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown,
-    MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    IMFMediaEventGenerator, IMFTransform, MEEndOfStream, METransformDrainComplete,
+    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -99,6 +99,20 @@ impl Default for MftEncoderShared {
 // DR4: eAVEncH264VProfile_Main = 77 (confirmed present in MediaFoundation 0.62.2).
 // Using the newtype value directly to be explicit about the integer.
 const H264_PROFILE_MAIN: u32 = eAVEncH264VProfile_Main.0 as u32;
+
+// ── Pump-loop timing constants ────────────────────────────────────────────────
+
+/// Sleep duration per idle iteration in the NO_WAIT polling loop.
+/// Bounds stop latency to ≤ 2 ms worst case (spec R5/S5.1, design DD6).
+const POLLING_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Maximum wait for the next frame in the NeedInput service path.
+///
+/// WHY: ≤50ms is load-bearing for T-NEW-2 (`mft_stop_during_active_encode_returns_within_deadline`).
+/// When stop() is called mid-encode the pump_loop may be inside this wait; it exits within
+/// FRAME_RECV_TIMEOUT (≤50ms) and reaches the top-of-loop stop check. Option A (Phase 1 user
+/// decision). See spec OQ-5 + design DD7.
+const FRAME_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 // ── WindowsMftH264Encoder ─────────────────────────────────────────────────────
 
@@ -705,6 +719,35 @@ fn extract_bytes(
 
 // ── Pump loop (design §5a) ────────────────────────────────────────────────────
 
+/// Apply pending keyframe and bitrate codec settings before a ProcessInput call.
+///
+/// Mechanical extraction from the NeedInput arm (design DD9). Module-private.
+fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) {
+    // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
+    if state.keyframe_pending.swap(false, Ordering::AcqRel) {
+        // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
+        let v = make_variant_bool(true);
+        unsafe {
+            let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
+        }
+    }
+
+    // Apply pending bitrate change (design §7, DD11).
+    let new_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
+    if new_bps != 0 {
+        let v = make_variant_u32(new_bps);
+        unsafe {
+            if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v) {
+                // Log warn but do NOT crash — driver rejection is non-fatal (DD11).
+                tracing::warn!(
+                    "ICodecAPI::SetValue(bitrate) rejected: 0x{:08X}",
+                    e.code().0
+                );
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + format state — design §5a one-function pump shape"
@@ -734,113 +777,203 @@ fn pump_loop(
         333_333 // 30fps fallback
     };
 
+    // Dual-arm counters tracking pending MFT credits (spec R2, design DD1/DD2).
+    // Stack-local — no atomics needed; only the pump thread reads/writes these.
+    let mut ni_count: u32 = 0; // pending METransformNeedInput credits
+    let mut ho_count: u32 = 0; // pending METransformHaveOutput credits
+
+    // Change-detection sentinels for DD8 counter snapshot logging (spec R7/S7.2).
+    let mut last_logged_ni: u32 = u32::MAX;
+    let mut last_logged_ho: u32 = u32::MAX;
+    let mut iter_count: u64 = 0;
+
     loop {
+        // Top-of-loop stop check — sole exit via stop flag (design DD1, spec R4/S4.1).
+        // With POLLING_SLEEP=1ms this is reached within ≤2ms from any idle state.
         if state.stop.load(Ordering::Acquire) {
+            tracing::info!("pump_loop: stop signaled, exiting");
             break;
         }
 
-        // Blocking wait for next MFT event.
-        let event = match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NONE) } {
-            Ok(e) => e,
-            Err(e) => {
-                let code = e.code().0 as u32;
-                if code == 0x8000_4004 {
-                    // E_ABORT — graceful shutdown signal.
+        // Non-blocking event poll (spec R1/S1.1, design DD1).
+        // MF_EVENT_FLAG_NO_WAIT returns MF_E_NO_EVENTS_AVAILABLE immediately if idle.
+        let event_opt = match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => {
+                let event_type = match unsafe { event.GetType() } {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("GetType failed: 0x{:08X}", e.code().0);
+                        break;
+                    }
+                };
+                tracing::trace!("pump_loop event_type=0x{:08X}", event_type);
+
+                if event_type == METransformNeedInput.0 as u32 {
+                    ni_count = ni_count.saturating_add(1);
+                } else if event_type == METransformHaveOutput.0 as u32 {
+                    ho_count = ho_count.saturating_add(1);
+                } else if event_type == METransformDrainComplete.0 as u32 {
+                    // Phase 3 — DrainComplete arm will handle this in C3.
+                    // Until then, fall through to catch-all warn (spec R6 deferred).
+                    tracing::warn!(
+                        "pump_loop received METransformDrainComplete (0x{:08X}); DrainComplete arm not yet active (Phase 3)",
+                        event_type
+                    );
+                } else if event_type == MEEndOfStream.0 as u32 {
+                    tracing::info!("pump_loop: MEEndOfStream (0x{:08X}), exiting", event_type);
                     break;
+                } else {
+                    // Catch-all: vendor MFTs may emit MEError, MESessionStreamSinkFormatChanged,
+                    // or other events not anticipated by the original design. Log loudly so
+                    // the smoke transcript reveals the actual event sequence rather than
+                    // silently spinning until a test timeout.
+                    tracing::warn!(
+                        "pump_loop received unhandled event_type=0x{:08X}; continuing loop",
+                        event_type
+                    );
                 }
-                tracing::error!("GetEvent failed: 0x{:08X}", code);
+                true // got an event
+            }
+            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                // Expected idle state — no event queued. Fall through to service pass.
+                false
+            }
+            Err(e) if e.code() == MF_E_SHUTDOWN => {
+                tracing::info!("pump_loop: MF_E_SHUTDOWN, exiting");
                 break;
             }
-        };
-
-        let event_type = match unsafe { event.GetType() } {
-            Ok(t) => t,
+            Err(e) if e.code().0 as u32 == 0x8000_4004 => {
+                // E_ABORT — graceful shutdown signal (preserved from original code).
+                tracing::info!("pump_loop: E_ABORT, exiting");
+                break;
+            }
             Err(e) => {
-                tracing::error!("GetType failed: 0x{:08X}", e.code().0);
+                tracing::error!("pump_loop: GetEvent unexpected error: 0x{:08X}", e.code().0);
                 break;
             }
         };
-        tracing::trace!("pump_loop event_type=0x{:08X}", event_type);
 
-        if event_type == METransformNeedInput.0 as u32 {
-            // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
-            if state.keyframe_pending.swap(false, Ordering::AcqRel) {
-                // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
-                let v = make_variant_bool(true);
-                unsafe {
-                    let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
+        // ── Drain HaveOutput FIRST (vendor priming requirement, spec R3, design DD1) ──
+        // HaveOutput credits must be consumed before NeedInput to prevent pipeline deadlock
+        // on vendor MFTs that emit HaveOutput before the first NeedInput at startup.
+        while ho_count > 0 {
+            match collect_output(mft, output_format_known, current_ts, &mut seq) {
+                Ok(Some(pkt)) => {
+                    // Decrement AFTER successful COM call (spec OQ-1, design DD2).
+                    ho_count -= 1;
+                    match tx.try_send(pkt) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            state.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            tracing::info!("pump_loop: packet channel disconnected, exiting");
+                            return;
+                        }
+                    }
                 }
-            }
-
-            // Apply pending bitrate change (design §7, DD11).
-            let new_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
-            if new_bps != 0 {
-                let v = make_variant_u32(new_bps);
-                unsafe {
-                    if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v) {
-                        // Log warn but do NOT crash — driver rejection is non-fatal (DD11).
+                Ok(None) => {
+                    // NEED_MORE_INPUT or stream-change — consume credit (output was attempted).
+                    ho_count -= 1;
+                }
+                Err(e) => {
+                    // Detect vendor-priming E_UNEXPECTED via string prefix match (design DD4,
+                    // DR-NEW-2). Recognition: EncodeFailed reason starts with "ProcessOutput: 0x80004005".
+                    let reason = e.to_string();
+                    if reason.contains("ProcessOutput: 0x80004005") {
+                        // E_UNEXPECTED on vendor priming: consume credit, log warn, continue.
+                        // This is expected during HW MFT startup before any frame is submitted.
                         tracing::warn!(
-                            "ICodecAPI::SetValue(bitrate) rejected: 0x{:08X}",
-                            e.code().0
+                            "pump_loop: ProcessOutput E_UNEXPECTED (vendor priming) — consuming credit"
                         );
+                        ho_count -= 1;
+                    } else {
+                        tracing::error!("pump_loop: collect_output failed: {e}");
+                        return;
                     }
                 }
             }
+        }
 
-            // Fetch next frame (50ms timeout to remain responsive to stop flag).
-            match rx.recv_timeout(Duration::from_millis(50)) {
+        // ── Service NeedInput (submit frames) ─────────────────────────────────────
+        while ni_count > 0 {
+            apply_pending_codec_settings(codec_api, state);
+
+            // WHY: FRAME_RECV_TIMEOUT ≤50ms is load-bearing for T-NEW-2
+            // (`mft_stop_during_active_encode_returns_within_deadline`). When stop()
+            // is called during active encode, the loop exits this wait within 50ms
+            // and reaches the top-of-loop stop check. Option A (Phase 1 user decision).
+            // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
+            match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
                 Ok(frame) => {
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
-                    if let Err(e) =
-                        submit_frame(mft, &nv12_scratch, frame.timestamp, frame_dur_100ns)
-                    {
-                        tracing::warn!("ProcessInput failed: {e}");
-                        // Skip frame, continue — mirrors openh264 behaviour.
+                    match submit_frame(mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
+                        Ok(()) => {
+                            // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
+                            ni_count -= 1;
+                        }
+                        Err(e) => {
+                            // Check for MF_E_NOTACCEPTING — indicates counter desync (design DD5).
+                            let reason = e.to_string();
+                            if reason.contains("ProcessInput: 0xC00D36B5") {
+                                // MF_E_NOTACCEPTING should NEVER happen when counters are correct.
+                                debug_assert!(
+                                    false,
+                                    "MF_E_NOTACCEPTING on serviced NeedInput credit — counter logic wrong"
+                                );
+                                tracing::error!(
+                                    "pump_loop: MF_E_NOTACCEPTING — counter desync (should be unreachable): {e}"
+                                );
+                                return;
+                            }
+                            // Other ProcessInput errors: skip frame, consume credit, continue
+                            // (mirrors openh264 behaviour for non-fatal input errors).
+                            tracing::warn!("pump_loop: ProcessInput failed (skipping frame): {e}");
+                            ni_count -= 1;
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // No frame available; MFT will re-emit NeedInput.
-                    continue;
+                    // No frame available within timeout — do NOT consume the NeedInput credit.
+                    // The MFT retains the credit; we re-poll events on the next iteration.
+                    // This path exits the inner loop so the top-of-loop stop check runs (DD2).
+                    break;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    // Upstream closed — drain and exit.
+                    // Upstream closed — drain MFT and continue looping (do NOT consume credit).
+                    tracing::info!("pump_loop: frame channel disconnected, sending COMMAND_DRAIN");
                     unsafe {
                         let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
                     }
-                    continue;
-                }
-            }
-        } else if event_type == METransformHaveOutput.0 as u32 {
-            match collect_output(mft, output_format_known, current_ts, &mut seq) {
-                Ok(Some(pkt)) => match tx.try_send(pkt) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        state.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                },
-                Ok(None) => {} // need-more-input or stream-change
-                Err(e) => {
-                    tracing::error!("collect_output: {e}");
                     break;
                 }
             }
-        } else if event_type == MEEndOfStream.0 as u32 {
-            tracing::debug!(
-                "pump_loop received MEEndOfStream (0x{:08X}); exiting",
-                event_type
+        }
+
+        // ── Idle sleep — avoid busy-wait when nothing happened (spec R5, design DD6) ──
+        if !event_opt && ni_count == 0 && ho_count == 0 {
+            std::thread::sleep(POLLING_SLEEP);
+        }
+
+        // ── Heartbeat and counter snapshot logging (spec R7, design DD8) ────────────
+        iter_count = iter_count.wrapping_add(1);
+
+        // Emit counter snapshot only when values changed (change-only, no spam).
+        if ni_count != last_logged_ni || ho_count != last_logged_ho {
+            tracing::trace!(
+                ni_count,
+                ho_count,
+                iter_count,
+                "pump_loop: counter snapshot (on change)"
             );
-            break;
-        } else {
-            // Catch-all: vendor MFTs may emit MEError, MESessionStreamSinkFormatChanged,
-            // or other events not anticipated by the original design. Log loudly so
-            // the smoke transcript reveals the actual event sequence rather than
-            // silently spinning until a test timeout.
-            tracing::warn!(
-                "pump_loop received unhandled event_type=0x{:08X}; continuing loop",
-                event_type
-            );
+            last_logged_ni = ni_count;
+            last_logged_ho = ho_count;
+        }
+
+        // Periodic debug heartbeat every 1000 iterations.
+        if iter_count % 1000 == 0 {
+            tracing::debug!(ni_count, ho_count, iter_count, "pump_loop: heartbeat");
         }
     }
     tracing::debug!("pump_loop exited cleanly");

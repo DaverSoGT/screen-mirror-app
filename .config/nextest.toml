@@ -4,11 +4,3 @@
 [[profile.default.overrides]]
 filter = 'test(=fake_video_sender_stop_idempotent_s1_3)'
 slow-timeout = { period = "5s", terminate-after = 1 }
-
-# Strict TDD RED gate for hw-encoder-mft-rework Phase 1 (Bug 2 — stop starvation).
-# T-NEW-1: stop() during idle hangs indefinitely (GetEvent(MF_EVENT_FLAG_NONE) blocks).
-# Bounds the hang at 15s so the RED transcript is captured cleanly and CI does not
-# spin indefinitely. Will become GREEN after Phase 2 pump_loop redesign (C2).
-[[profile.default.overrides]]
-filter = 'test(=mft_stop_during_idle_returns_within_deadline)'
-slow-timeout = { period = "15s", terminate-after = 1 }
