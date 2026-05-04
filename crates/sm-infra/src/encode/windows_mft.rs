@@ -827,7 +827,10 @@ fn pump_loop(
                 }
             }
         } else if event_type == MEEndOfStream.0 as u32 {
-            tracing::debug!("pump_loop received MEEndOfStream (0x{:08X}); exiting", event_type);
+            tracing::debug!(
+                "pump_loop received MEEndOfStream (0x{:08X}); exiting",
+                event_type
+            );
             break;
         } else {
             // Catch-all: vendor MFTs may emit MEError, MESessionStreamSinkFormatChanged,
