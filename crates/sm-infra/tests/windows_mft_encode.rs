@@ -704,6 +704,111 @@ fn mft_stop_is_idempotent() {
         .expect("second stop() should be idempotent and return Ok(())");
 }
 
+// ─── T-NEW-1 (spec R8/R4/S4.1/S8.3): Stop during idle returns within deadline ─
+
+/// T-NEW-1 — `stop()` returns within `STOP_DEADLINE_MS` when no frames have been sent.
+///
+/// **Why RED on master**: `pump_loop` blocks in `GetEvent(MF_EVENT_FLAG_NONE)`.
+/// No MFT events ever arrive while idle, so the blocking call never returns.
+/// `stop()` sets the flag but `join()` deadlocks — circular wait.
+///
+/// **Why GREEN after fix**: `GetEvent(MF_EVENT_FLAG_NO_WAIT)` returns
+/// `MF_E_NO_EVENTS_AVAILABLE` immediately. The top-of-loop stop-flag check
+/// sees `state.stop == true` within ≤ 1 ms and the thread exits cleanly.
+///
+/// Satisfies: R8/S8.1–S8.3, R4/S4.1.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_stop_during_idle_returns_within_deadline() {
+    init_tracing();
+    const STOP_DEADLINE_MS: u128 = 2000;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (_frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, _pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Allow the pump_loop thread to reach its first blocking GetEvent call.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // No frames sent — encoder is idle.
+    let t0 = Instant::now();
+    enc.stop().expect("stop should succeed");
+    let elapsed = t0.elapsed();
+
+    assert!(
+        elapsed.as_millis() < STOP_DEADLINE_MS,
+        "stop() took {:?} — exceeded STOP_DEADLINE_MS={}ms (Bug 2 stop starvation)",
+        elapsed,
+        STOP_DEADLINE_MS,
+    );
+}
+
+// ─── T-NEW-2 (spec R9/R4/S4.2/S9.3): Stop during active encode returns within deadline ─
+
+/// T-NEW-2 — `stop()` returns within `STOP_DEADLINE_MS` when 5 frames have been
+/// sent and `frame_tx` is still open at the time of the call.
+///
+/// Keeping `frame_tx` open is the "active encode" case: the encoder thread may be
+/// mid-stream waiting for the next MFT event. On master the same `GetEvent` blocking
+/// bug causes indefinite deadlock even when the MFT has processed some frames.
+///
+/// After the pump_loop fix the top-of-loop stop check exits in ≤ 1 ms regardless
+/// of MFT event cadence. `frame_tx` is dropped AFTER `stop()` returns.
+///
+/// Satisfies: R9/S9.1–S9.3, R4/S4.2.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_stop_during_active_encode_returns_within_deadline() {
+    init_tracing();
+    const STOP_DEADLINE_MS: u128 = 2000;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, _pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Send 5 frames spaced 20 ms apart — pump_loop is actively processing.
+    for i in 0..5u64 {
+        frame_tx
+            .send(make_synthetic_frame(640, 480, i * 33))
+            .expect("frame_tx should be open during active encode");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // frame_tx is NOT dropped here — this is the "active encode" case (DD7 / S9.2).
+    let t0 = Instant::now();
+    enc.stop().expect("stop should succeed");
+    let elapsed = t0.elapsed();
+
+    // Drop frame_tx after stop() has returned (channel is already disconnected
+    // on the encoder side; this is a clean-up only).
+    drop(frame_tx);
+
+    assert!(
+        elapsed.as_millis() < STOP_DEADLINE_MS,
+        "stop() took {:?} — exceeded STOP_DEADLINE_MS={}ms (Bug 2 stop starvation)",
+        elapsed,
+        STOP_DEADLINE_MS,
+    );
+}
+
+// ─── T13.2: Drop without stop ─────────────────────────────────────────────────
+
 /// T13.2 — Dropping without calling `stop()` must not leak the encoder thread.
 ///
 /// This test is inherently best-effort: we cannot directly inspect the OS thread
