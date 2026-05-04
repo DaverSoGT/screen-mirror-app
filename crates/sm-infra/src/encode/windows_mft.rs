@@ -813,11 +813,19 @@ fn pump_loop(
                 } else if event_type == METransformHaveOutput.0 as u32 {
                     ho_count = ho_count.saturating_add(1);
                 } else if event_type == METransformDrainComplete.0 as u32 {
-                    // Phase 3 — DrainComplete arm will handle this in C3.
-                    // Until then, fall through to catch-all warn (spec R6 deferred).
-                    tracing::warn!(
-                        "pump_loop received METransformDrainComplete (0x{:08X}); DrainComplete arm not yet active (Phase 3)",
-                        event_type
+                    // WHY: DrainComplete signals the encoder has flushed all in-flight frames after
+                    // a COMMAND_DRAIN. Reset both counters so any subsequent stream re-arm starts
+                    // clean — without this, phantom credits from the drained segment would cause
+                    // over-servicing on the next input cycle. Spec R6/S6.1, design DD3.
+                    // Do NOT break: top-of-loop state.stop is the sole exit point (OQ-4 resolved).
+                    let old_ni = ni_count;
+                    let old_ho = ho_count;
+                    ni_count = 0;
+                    ho_count = 0;
+                    tracing::info!(
+                        old_ni_count = old_ni,
+                        old_ho_count = old_ho,
+                        "pump_loop: DrainComplete — counters reset"
                     );
                 } else if event_type == MEEndOfStream.0 as u32 {
                     tracing::info!("pump_loop: MEEndOfStream (0x{:08X}), exiting", event_type);
