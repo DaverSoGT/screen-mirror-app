@@ -436,16 +436,36 @@ fn run_encoder_thread(
     // CoUninitGuard calls CoUninitialize when this function returns.
 }
 
+/// Resolve effective (width, height) from config, applying 1920×1080 fallback for sentinel zeros.
+///
+/// Sentinel `0` triggers the fallback: adapters that do not know the capture
+/// dimensions at construction time pass zero, and `setup_mft` uses the 1920×1080
+/// default. Production callers should supply real screen dimensions via
+/// `EncoderConfig { width: cap_w, height: cap_h, ..EncoderConfig::default() }`.
+///
+/// See design DD3 and spec R3.
+fn effective_dimensions(config: &EncoderConfig) -> (u32, u32) {
+    let w = if config.width == 0 {
+        1920
+    } else {
+        config.width
+    };
+    let h = if config.height == 0 {
+        1080
+    } else {
+        config.height
+    };
+    (w, h)
+}
+
 /// Setup MFT media types and streaming messages (steps 7b–7h).
 fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderError> {
     use windows::Win32::Media::MediaFoundation::IMFMediaType;
 
-    // Frame dimensions are not in EncoderConfig — use hardcoded 1920×1080 as default.
-    // The MFT will accept any input frame at SetInputType time; actual frame dimensions
-    // are constrained only by the output type set here. For the V1 use case (1080p30),
-    // this is correct. A future enhancement could pass dimensions via EncoderConfig.
-    let w: u32 = 1920;
-    let h: u32 = 1080;
+    // Sentinel-zero triggers 1920×1080 fallback per DD3; production callers supply
+    // real dimensions via EncoderConfig.width / EncoderConfig.height.
+    // See effective_dimensions() for the fallback policy.
+    let (w, h) = effective_dimensions(config);
 
     // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
     let out_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
@@ -983,6 +1003,63 @@ impl WindowsMftH264Encoder {
 mod tests {
     use super::*;
     use sm_domain::encode::{EncoderConfig, EncoderError, VideoEncoder};
+
+    // ─── T2.1: effective_dimensions_returns_fallback_for_sentinel_zero ────────
+    //
+    // CI-runnable. Verifies that (0, 0) config triggers the 1920×1080 fallback.
+    // RED until effective_dimensions() is added (T2.4).
+
+    #[test]
+    fn effective_dimensions_returns_fallback_for_sentinel_zero() {
+        let cfg = EncoderConfig {
+            width: 0,
+            height: 0,
+            ..EncoderConfig::default()
+        };
+        let (w, h) = effective_dimensions(&cfg);
+        assert_eq!(w, 1920, "sentinel width 0 must fall back to 1920");
+        assert_eq!(h, 1080, "sentinel height 0 must fall back to 1080");
+    }
+
+    // ─── T2.2: effective_dimensions_passes_through_nonzero ───────────────────
+    //
+    // CI-runnable. Verifies that non-zero dimensions pass through unchanged.
+    // RED until effective_dimensions() is added (T2.4).
+
+    #[test]
+    fn effective_dimensions_passes_through_nonzero() {
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 480,
+            ..EncoderConfig::default()
+        };
+        let (w, h) = effective_dimensions(&cfg);
+        assert_eq!(w, 640, "non-zero width must pass through unchanged");
+        assert_eq!(h, 480, "non-zero height must pass through unchanged");
+    }
+
+    // ─── T4.1 (Phase 4 advance): avcc_to_annex_b converts known AVCC payload ───
+    //
+    // CI-runnable pure-byte test for the rewrite shim. Placed here (in Phase 2
+    // test block) because it tests a function that already exists and is already
+    // GREEN — this is a defensive regression guard, not a RED→GREEN transition.
+
+    #[test]
+    fn avcc_to_annex_b_converts_known_avcc_payload() {
+        // AVCC: [4-byte BE length = 5][5 bytes NAL]
+        let avcc = vec![0x00u8, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x00];
+        let out = avcc_to_annex_b(&avcc);
+        assert_eq!(
+            &out[..4],
+            &[0x00u8, 0x00, 0x00, 0x01],
+            "AVCC→AnnexB must produce start code 00 00 00 01"
+        );
+        assert_eq!(
+            &out[4..9],
+            &[0x65u8, 0x88, 0x84, 0x00, 0x00],
+            "AVCC→AnnexB must preserve NAL payload bytes"
+        );
+    }
 
     // ─── T3a.1: new_rejects_zero_bitrate ──────────────────────────────────────
     // No MFT call — validation fires before any COM call.
