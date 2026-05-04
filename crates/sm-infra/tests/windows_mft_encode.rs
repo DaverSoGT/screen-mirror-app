@@ -60,6 +60,32 @@ fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::Captu
     }
 }
 
+// ─── T1.1 (Bucket B / Phase 3): Drop ordering — new() then drop without start() ──
+
+/// T1.1 — Constructing a `WindowsMftH264Encoder` and immediately dropping it
+/// (without ever calling `start()`) MUST NOT cause an access violation.
+///
+/// **Before the Drop fix**: process aborts with `0xc0000005` because Rust's
+/// automatic field-drop releases COM pointers after `MFShutdown` runs in the
+/// old `Drop` body.
+/// **After the Drop fix**: `drop(self.mft.take())` + `drop(self.codec_api.take())`
+/// execute BEFORE `MFShutdown` so the AV is impossible.
+///
+/// This is the canonical RED→GREEN evidence for Bucket B (spec R1, T1.1).
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_new_then_drop_does_not_av() {
+    let enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+    // Immediately drop — no start() call.
+    // BEFORE fix: ABORT 0xc0000005. AFTER fix: clean return.
+    drop(enc);
+}
+
 // ─── T3.1 / T3.2: MFT hardware enumeration ───────────────────────────────────
 
 /// T3.2 — `new()` succeeds when a hardware H.264 MFT is registered.

@@ -245,14 +245,29 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
 impl Drop for WindowsMftH264Encoder {
     fn drop(&mut self) {
-        // Join encoder thread if still running.
+        // Join encoder thread first. If start() was never called this is a no-op.
         let _ = self.stop();
 
+        // SAFETY: COM Release() on IMFTransform / ICodecAPI MUST execute while the
+        // Media Foundation runtime is still alive. Rust's automatic field-drop runs
+        // AFTER this Drop body returns, so we explicitly drop the Option<COMInterface>
+        // fields here. If we let MFShutdown() run first, the subsequent automatic
+        // Release() would land on memory torn down by MF → access violation 0xc0000005
+        // (see explore #583 Bucket B diagnosis).
+        drop(self.codec_api.take());
+        // SAFETY: same ordering contract as above for the IMFTransform handle.
+        // Order between codec_api and mft does not matter — both are sibling COM
+        // pointers; only their position relative to MFShutdown matters.
+        drop(self.mft.take());
+
         if self.com_initialized {
-            // SAFETY: MFShutdown paired with MFStartup in new(); refcount managed by
-            // Microsoft runtime per A4 in proposal. CoUninitialize paired with CoInitializeEx.
             unsafe {
+                // SAFETY: MFShutdown is the documented teardown for MFStartup.
+                // Process-global refcount per A4; safe to call here AFTER all MF
+                // interface refs above have been Release()d.
                 let _ = MFShutdown();
+                // SAFETY: CoUninitialize matches the CoInitializeEx in init_mft_sync()
+                // on this same thread. Safe AFTER all COM refs above are released.
                 CoUninitialize();
             }
             self.com_initialized = false;
@@ -372,7 +387,11 @@ struct CoUninitGuard;
 
 impl Drop for CoUninitGuard {
     fn drop(&mut self) {
-        // SAFETY: Paired with CoInitializeEx in run_encoder_thread.
+        // SAFETY: Paired with CoInitializeEx in run_encoder_thread. If init failed
+        // on this thread, this call is a documented no-op (apartment refcount
+        // was never incremented; decrementing stays at 0). See DD10 and Microsoft
+        // COM docs: "CoUninitialize on a thread where CoInitializeEx returned an error
+        // does not corrupt other threads' apartments."
         unsafe { CoUninitialize() };
     }
 }
@@ -385,10 +404,15 @@ fn run_encoder_thread(
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
-    // SAFETY: encoder thread must be MTA for IMFTransform cross-thread use per DD9.
-    // S_FALSE (already MTA) is acceptable.
+    // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
+    // S_FALSE (1, already initialised on this apartment) both pass is_err() == false.
+    // We install the CoUninitGuard BEFORE checking co_hr so the un-init runs even
+    // on failure paths below. Per Microsoft docs, CoUninitialize on a thread whose
+    // CoInitializeEx returned an error (apartment refcount stayed 0) is a no-op —
+    // it does NOT corrupt other threads' apartments. Verified safe. (See DD10.)
     let co_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let _co_guard = CoUninitGuard; // CoUninitialize on thread exit regardless of init result
+    // SAFETY: paired with CoInitializeEx above (or no-op if init failed, per docs).
+    let _co_guard = CoUninitGuard;
 
     if co_hr.is_err() {
         tracing::error!("encoder thread CoInitializeEx failed: 0x{:08X}", co_hr.0);
