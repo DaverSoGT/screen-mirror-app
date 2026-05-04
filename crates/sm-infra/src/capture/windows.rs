@@ -384,6 +384,25 @@ impl CaptureSource for WindowsCaptureSource {
 }
 
 // ---------------------------------------------------------------------------
+// Additional accessors
+// ---------------------------------------------------------------------------
+
+impl WindowsCaptureSource {
+    /// Returns the resolved monitor's pixel dimensions as `(width, height)`.
+    ///
+    /// The monitor is resolved at `new()` time (see `CaptureSource::new`). This method
+    /// queries the stored `Monitor` handle synchronously. On error (e.g., the monitor
+    /// was disconnected between `new()` and this call), returns `(0, 0)` so callers
+    /// that forward dimensions to `EncoderConfig` will fall back to the adapter default
+    /// via the sentinel-zero mechanism (see `effective_dimensions` in `windows_mft.rs`).
+    pub fn dimensions(&self) -> (u32, u32) {
+        let w = self.monitor.width().unwrap_or(0);
+        let h = self.monitor.height().unwrap_or(0);
+        (w, h)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

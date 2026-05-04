@@ -245,14 +245,29 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
 impl Drop for WindowsMftH264Encoder {
     fn drop(&mut self) {
-        // Join encoder thread if still running.
+        // Join encoder thread first. If start() was never called this is a no-op.
         let _ = self.stop();
 
+        // SAFETY: COM Release() on IMFTransform / ICodecAPI MUST execute while the
+        // Media Foundation runtime is still alive. Rust's automatic field-drop runs
+        // AFTER this Drop body returns, so we explicitly drop the Option<COMInterface>
+        // fields here. If we let MFShutdown() run first, the subsequent automatic
+        // Release() would land on memory torn down by MF → access violation 0xc0000005
+        // (see explore #583 Bucket B diagnosis).
+        drop(self.codec_api.take());
+        // SAFETY: same ordering contract as above for the IMFTransform handle.
+        // Order between codec_api and mft does not matter — both are sibling COM
+        // pointers; only their position relative to MFShutdown matters.
+        drop(self.mft.take());
+
         if self.com_initialized {
-            // SAFETY: MFShutdown paired with MFStartup in new(); refcount managed by
-            // Microsoft runtime per A4 in proposal. CoUninitialize paired with CoInitializeEx.
             unsafe {
+                // SAFETY: MFShutdown is the documented teardown for MFStartup.
+                // Process-global refcount per A4; safe to call here AFTER all MF
+                // interface refs above have been Release()d.
                 let _ = MFShutdown();
+                // SAFETY: CoUninitialize matches the CoInitializeEx in init_mft_sync()
+                // on this same thread. Safe AFTER all COM refs above are released.
                 CoUninitialize();
             }
             self.com_initialized = false;
@@ -372,7 +387,11 @@ struct CoUninitGuard;
 
 impl Drop for CoUninitGuard {
     fn drop(&mut self) {
-        // SAFETY: Paired with CoInitializeEx in run_encoder_thread.
+        // SAFETY: Paired with CoInitializeEx in run_encoder_thread. If init failed
+        // on this thread, this call is a documented no-op (apartment refcount
+        // was never incremented; decrementing stays at 0). See DD10 and Microsoft
+        // COM docs: "CoUninitialize on a thread where CoInitializeEx returned an error
+        // does not corrupt other threads' apartments."
         unsafe { CoUninitialize() };
     }
 }
@@ -385,15 +404,27 @@ fn run_encoder_thread(
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
-    // SAFETY: encoder thread must be MTA for IMFTransform cross-thread use per DD9.
-    // S_FALSE (already MTA) is acceptable.
+    // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
+    // S_FALSE (1, already initialised on this apartment) both pass is_err() == false.
+    // We install the CoUninitGuard BEFORE checking co_hr so the un-init runs even
+    // on failure paths below. Per Microsoft docs, CoUninitialize on a thread whose
+    // CoInitializeEx returned an error (apartment refcount stayed 0) is a no-op —
+    // it does NOT corrupt other threads' apartments. Verified safe. (See DD10.)
     let co_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    let _co_guard = CoUninitGuard; // CoUninitialize on thread exit regardless of init result
+    // SAFETY: paired with CoInitializeEx above (or no-op if init failed, per docs).
+    let _co_guard = CoUninitGuard;
 
     if co_hr.is_err() {
         tracing::error!("encoder thread CoInitializeEx failed: 0x{:08X}", co_hr.0);
         return;
     }
+    tracing::debug!(
+        "encoder thread CoInitializeEx OK; config: {}x{} @ {}fps {}bps",
+        config.width,
+        config.height,
+        config.framerate,
+        config.bitrate_bps
+    );
 
     // Steps 7b–7h: Setup media types, unlock async, get event generator, send messages.
     if let Err(e) = setup_mft(&mft, &config) {
@@ -402,6 +433,7 @@ fn run_encoder_thread(
         // the caller thread's new() owns MFStartup/MFShutdown (step 2 and Drop).
         return;
     }
+    tracing::debug!("setup_mft OK; entering pump_loop");
 
     let event_gen: IMFMediaEventGenerator = match mft.cast() {
         Ok(g) => g,
@@ -411,8 +443,11 @@ fn run_encoder_thread(
         }
     };
 
-    // Step 7i: Probe output format (Annex-B vs AVCC).
-    let output_is_avcc = probe_output_format(&mft, &event_gen);
+    // Per OQ-NEW-1 resolution (DD5): detect Annex-B vs AVCC at first packet in
+    // collect_output, not during init. The probe_output_format approach (submit
+    // a 16×16 NV12 frame during setup) corrupted the MFT event pipeline on
+    // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
+    let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
     // Step 8: Pump loop.
     pump_loop(
@@ -422,7 +457,7 @@ fn run_encoder_thread(
         &state,
         rx,
         tx,
-        output_is_avcc,
+        &mut output_format_known,
         &config,
     );
 
@@ -436,16 +471,48 @@ fn run_encoder_thread(
     // CoUninitGuard calls CoUninitialize when this function returns.
 }
 
+/// Resolve effective (width, height) from config, applying 1920×1080 fallback for sentinel zeros.
+///
+/// Sentinel `0` triggers the fallback: adapters that do not know the capture
+/// dimensions at construction time pass zero, and `setup_mft` uses the 1920×1080
+/// default. Production callers should supply real screen dimensions via
+/// `EncoderConfig { width: cap_w, height: cap_h, ..EncoderConfig::default() }`.
+///
+/// See design DD3 and spec R3.
+fn effective_dimensions(config: &EncoderConfig) -> (u32, u32) {
+    let w = if config.width == 0 {
+        1920
+    } else {
+        config.width
+    };
+    let h = if config.height == 0 {
+        1080
+    } else {
+        config.height
+    };
+    (w, h)
+}
+
 /// Setup MFT media types and streaming messages (steps 7b–7h).
 fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderError> {
     use windows::Win32::Media::MediaFoundation::IMFMediaType;
 
-    // Frame dimensions are not in EncoderConfig — use hardcoded 1920×1080 as default.
-    // The MFT will accept any input frame at SetInputType time; actual frame dimensions
-    // are constrained only by the output type set here. For the V1 use case (1080p30),
-    // this is correct. A future enhancement could pass dimensions via EncoderConfig.
-    let w: u32 = 1920;
-    let h: u32 = 1080;
+    // Sentinel-zero triggers 1920×1080 fallback per DD3; production callers supply
+    // real dimensions via EncoderConfig.width / EncoderConfig.height.
+    // See effective_dimensions() for the fallback policy.
+    let (w, h) = effective_dimensions(config);
+
+    // Step 7a: MF_TRANSFORM_ASYNC_UNLOCK MUST be set before any other call on a
+    // hardware (async) MFT. Per Microsoft Async MFT contract: "Before calling any
+    // other methods on the transform, the application must set
+    // MF_TRANSFORM_ASYNC_UNLOCK on the IMFAttributes attribute store of the
+    // transform." Setting it after SetInputType caused the HW MFT to reject the
+    // input type with MF_E_INVALIDMEDIATYPE (0xC00D6D77) — see discovery #592.
+    let attrs = unsafe { mft.GetAttributes() }
+        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
+    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
+        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
+    })?;
 
     // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
     let out_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
@@ -536,14 +603,8 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
             .map_err(|e| EncoderError::InitFailed(format!("SetInputType: 0x{:08X}", e.code().0)))?;
     }
 
-    // Step 7d: MF_TRANSFORM_ASYNC_UNLOCK (required for async hardware MFTs).
-    let attrs = unsafe { mft.GetAttributes() }
-        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
-    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
-        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
-    })?;
-
     // Steps 7f–7h: Send streaming messages.
+    // (Async unlock was already set at Step 7a — see top of function.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
@@ -560,64 +621,6 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     }
 
     Ok(())
-}
-
-/// Probe output format (step 7i). Returns `true` if output is AVCC (requires rewrite).
-fn probe_output_format(mft: &IMFTransform, event_gen: &IMFMediaEventGenerator) -> bool {
-    // Submit a minimal synthetic 16×16 NV12 frame and inspect the first output bytes.
-    // If bytes start with [0x00, 0x00, 0x00, 0x01] → Annex-B (no rewrite needed).
-    // Otherwise → AVCC (length-prefix format; rewrite needed).
-    let probe_w: u32 = 16;
-    let probe_h: u32 = 16;
-    let y_size = (probe_w * probe_h) as usize;
-    let uv_size = (probe_w * probe_h / 2) as usize;
-    let frame_bytes = vec![0u8; y_size + uv_size]; // black NV12 frame
-
-    // Try to push one synthetic frame and get one output sample.
-    let probe_result = try_probe(mft, event_gen, &frame_bytes);
-
-    match probe_result {
-        Some(bytes) if bytes.len() >= 4 => {
-            // Check for Annex-B start code.
-            let is_annex_b =
-                bytes[0..4] == [0x00, 0x00, 0x00, 0x01] || bytes[0..3] == [0x00, 0x00, 0x01];
-            !is_annex_b // true = AVCC
-        }
-        _ => false, // Assume Annex-B if probe fails or returns too few bytes
-    }
-}
-
-/// Attempt to send a synthetic frame and collect the first output sample.
-fn try_probe(
-    mft: &IMFTransform,
-    event_gen: &IMFMediaEventGenerator,
-    frame_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    use std::time::Duration;
-
-    // Wait for NeedInput, submit a synthetic frame, wait for HaveOutput.
-    for _ in 0..32 {
-        let event = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NONE) }.ok()?;
-        let event_type = unsafe { event.GetType() }.ok()?;
-
-        if event_type == METransformNeedInput.0 as u32 {
-            // Build a minimal IMFSample with the probe frame.
-            let sample = build_imfsample(frame_bytes, Duration::ZERO, 33_333_333).ok()?;
-            unsafe { mft.ProcessInput(0, &sample, 0) }.ok()?;
-        } else if event_type == METransformHaveOutput.0 as u32 {
-            let mut output = MFT_OUTPUT_DATA_BUFFER::default();
-            let mut status: u32 = 0;
-            if let Ok(()) =
-                unsafe { mft.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status) }
-            {
-                if let Some(sample) = output.pSample.take() {
-                    return extract_bytes(&sample).ok();
-                }
-            }
-            return None;
-        }
-    }
-    None
 }
 
 /// Build an `IMFSample` wrapping raw NV12 bytes.
@@ -704,7 +707,7 @@ fn extract_bytes(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + avcc flag — design §5a one-function pump shape"
+    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + format state — design §5a one-function pump shape"
 )]
 fn pump_loop(
     mft: &IMFTransform,
@@ -713,7 +716,7 @@ fn pump_loop(
     state: &MftEncoderShared,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
-    output_is_avcc: bool,
+    output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
 ) {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
@@ -757,6 +760,7 @@ fn pump_loop(
                 break;
             }
         };
+        tracing::trace!("pump_loop event_type=0x{:08X}", event_type);
 
         if event_type == METransformNeedInput.0 as u32 {
             // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
@@ -808,7 +812,7 @@ fn pump_loop(
                 }
             }
         } else if event_type == METransformHaveOutput.0 as u32 {
-            match collect_output(mft, output_is_avcc, current_ts, &mut seq) {
+            match collect_output(mft, output_format_known, current_ts, &mut seq) {
                 Ok(Some(pkt)) => match tx.try_send(pkt) {
                     Ok(()) => {}
                     Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -823,9 +827,23 @@ fn pump_loop(
                 }
             }
         } else if event_type == MEEndOfStream.0 as u32 {
+            tracing::debug!(
+                "pump_loop received MEEndOfStream (0x{:08X}); exiting",
+                event_type
+            );
             break;
+        } else {
+            // Catch-all: vendor MFTs may emit MEError, MESessionStreamSinkFormatChanged,
+            // or other events not anticipated by the original design. Log loudly so
+            // the smoke transcript reveals the actual event sequence rather than
+            // silently spinning until a test timeout.
+            tracing::warn!(
+                "pump_loop received unhandled event_type=0x{:08X}; continuing loop",
+                event_type
+            );
         }
     }
+    tracing::debug!("pump_loop exited cleanly");
 }
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
@@ -843,9 +861,15 @@ fn submit_frame(
 }
 
 /// Collect one output sample from `ProcessOutput` and build an `EncodedPacket`.
+///
+/// Implements per-packet Annex-B vs AVCC detection (DD5, OQ-NEW-1 option (a)).
+/// `output_format_known` is `None` until the first packet arrives; afterwards
+/// `Some(false)` = Annex-B (no rewrite) or `Some(true)` = AVCC (apply shim).
+/// Sniffing every packet while the cache is `None` self-corrects against
+/// partial first-packet (R-NEW-6).
 fn collect_output(
     mft: &IMFTransform,
-    output_is_avcc: bool,
+    output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     frame_timestamp: std::time::Duration,
     seq: &mut u64,
 ) -> Result<Option<EncodedPacket>, EncoderError> {
@@ -871,10 +895,33 @@ fn collect_output(
 
     let raw_bytes = extract_bytes(&sample)?;
 
-    let annex_b = if output_is_avcc {
-        avcc_to_annex_b(&raw_bytes)
-    } else {
-        raw_bytes
+    // Per-packet Annex-B sniff (resolves OQ-NEW-1 option (a), mitigates R-NEW-6).
+    // If the packet is too short to sniff, defer and skip — do not cache.
+    if raw_bytes.len() < 4 {
+        tracing::warn!(
+            "collect_output: packet too short to sniff format ({} bytes), deferring",
+            raw_bytes.len()
+        );
+        return Ok(None);
+    }
+
+    let is_annex_b_now = raw_bytes[0] == 0x00
+        && raw_bytes[1] == 0x00
+        && raw_bytes[2] == 0x00
+        && raw_bytes[3] == 0x01;
+
+    // Cache decision on first clean observation; trust it thereafter.
+    let annex_b = match (*output_format_known, is_annex_b_now) {
+        (None, true) => {
+            *output_format_known = Some(false); // Annex-B confirmed
+            raw_bytes
+        }
+        (None, false) => {
+            *output_format_known = Some(true); // AVCC confirmed — apply rewrite
+            avcc_to_annex_b(&raw_bytes)
+        }
+        (Some(false), _) => raw_bytes, // cached Annex-B
+        (Some(true), _) => avcc_to_annex_b(&raw_bytes), // cached AVCC (always rewrite)
     };
 
     // DD10: read is_keyframe from MFSampleExtension_CleanPoint attribute.
@@ -983,6 +1030,63 @@ impl WindowsMftH264Encoder {
 mod tests {
     use super::*;
     use sm_domain::encode::{EncoderConfig, EncoderError, VideoEncoder};
+
+    // ─── T2.1: effective_dimensions_returns_fallback_for_sentinel_zero ────────
+    //
+    // CI-runnable. Verifies that (0, 0) config triggers the 1920×1080 fallback.
+    // RED until effective_dimensions() is added (T2.4).
+
+    #[test]
+    fn effective_dimensions_returns_fallback_for_sentinel_zero() {
+        let cfg = EncoderConfig {
+            width: 0,
+            height: 0,
+            ..EncoderConfig::default()
+        };
+        let (w, h) = effective_dimensions(&cfg);
+        assert_eq!(w, 1920, "sentinel width 0 must fall back to 1920");
+        assert_eq!(h, 1080, "sentinel height 0 must fall back to 1080");
+    }
+
+    // ─── T2.2: effective_dimensions_passes_through_nonzero ───────────────────
+    //
+    // CI-runnable. Verifies that non-zero dimensions pass through unchanged.
+    // RED until effective_dimensions() is added (T2.4).
+
+    #[test]
+    fn effective_dimensions_passes_through_nonzero() {
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 480,
+            ..EncoderConfig::default()
+        };
+        let (w, h) = effective_dimensions(&cfg);
+        assert_eq!(w, 640, "non-zero width must pass through unchanged");
+        assert_eq!(h, 480, "non-zero height must pass through unchanged");
+    }
+
+    // ─── T4.1 (Phase 4 advance): avcc_to_annex_b converts known AVCC payload ───
+    //
+    // CI-runnable pure-byte test for the rewrite shim. Placed here (in Phase 2
+    // test block) because it tests a function that already exists and is already
+    // GREEN — this is a defensive regression guard, not a RED→GREEN transition.
+
+    #[test]
+    fn avcc_to_annex_b_converts_known_avcc_payload() {
+        // AVCC: [4-byte BE length = 5][5 bytes NAL]
+        let avcc = vec![0x00u8, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x00];
+        let out = avcc_to_annex_b(&avcc);
+        assert_eq!(
+            &out[..4],
+            &[0x00u8, 0x00, 0x00, 0x01],
+            "AVCC→AnnexB must produce start code 00 00 00 01"
+        );
+        assert_eq!(
+            &out[4..9],
+            &[0x65u8, 0x88, 0x84, 0x00, 0x00],
+            "AVCC→AnnexB must preserve NAL payload bytes"
+        );
+    }
 
     // ─── T3a.1: new_rejects_zero_bitrate ──────────────────────────────────────
     // No MFT call — validation fires before any COM call.

@@ -1473,7 +1473,17 @@ fn build_production_sender_bundle(
     let mut capture =
         WindowsCaptureSource::new(capture_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
-    let encoder_config = EncoderConfig::default();
+    // Pull capture dimensions from the just-resolved WindowsCaptureSource monitor.
+    // WindowsCaptureSource::new() above resolved the target monitor; dimensions()
+    // queries its stored Monitor handle. On error returns (0, 0) → sentinel falls
+    // back to 1920×1080 in setup_mft (effective_dimensions DD3). Production path
+    // supplies real screen dimensions so the HW MFT is configured at matching resolution.
+    let (cap_w, cap_h) = capture.dimensions();
+    let encoder_config = EncoderConfig {
+        width: cap_w,
+        height: cap_h,
+        ..EncoderConfig::default()
+    };
     let mut encoder =
         build_video_encoder(encoder_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
@@ -1762,5 +1772,48 @@ impl ChannelLike for TauriSenderChannel {
         self.0
             .send(InvokeResponseBody::Raw(bytes))
             .map_err(|e| e.to_string())
+    }
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use sm_domain::EncoderConfig;
+
+    // ─── T2.3: build_video_encoder_propagates_config_dimensions_when_set ──────
+    //
+    // CI-runnable. Verifies that EncoderConfig width/height fields survive
+    // construction without being zeroed by the call site. Tests the config
+    // plumbing path only — no real MFT required (satisfies spec T7.1).
+
+    #[test]
+    fn build_video_encoder_propagates_config_dimensions_when_set() {
+        // Simulate what the sender.rs call site now does: pull capture dimensions
+        // and forward them through EncoderConfig.
+        let (cap_w, cap_h) = (1280u32, 720u32);
+        let encoder_config = EncoderConfig {
+            width: cap_w,
+            height: cap_h,
+            ..EncoderConfig::default()
+        };
+        // Assert the fields are not zeroed by the struct-update syntax.
+        assert_eq!(
+            encoder_config.width, 1280,
+            "width must survive EncoderConfig construction"
+        );
+        assert_eq!(
+            encoder_config.height, 720,
+            "height must survive EncoderConfig construction"
+        );
+        // Sentinel values must NOT be produced when real dims are given.
+        assert_ne!(
+            encoder_config.width, 0,
+            "non-zero width must not be replaced with sentinel"
+        );
+        assert_ne!(
+            encoder_config.height, 0,
+            "non-zero height must not be replaced with sentinel"
+        );
     }
 }

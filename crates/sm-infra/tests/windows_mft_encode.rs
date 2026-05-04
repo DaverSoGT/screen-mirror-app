@@ -29,6 +29,20 @@ use sm_infra::encode::windows_mft::WindowsMftH264Encoder;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Install a tracing subscriber for the duration of one test process.
+///
+/// nextest runs each test in its own process so a single try_init per test
+/// is fine. Use RUST_LOG to control verbosity (e.g. `sm_infra::encode=trace`).
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 /// Build a synthetic BGRA8 `CaptureFrame` with a gradient pattern.
 ///
 /// The gradient (B=row%256, G=col%256, R=128, A=255) gives the codec meaningful
@@ -58,6 +72,32 @@ fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::Captu
         format: PixelFormat::Bgra8,
         timestamp: Duration::from_millis(ts_ms),
     }
+}
+
+// ─── T1.1 (Bucket B / Phase 3): Drop ordering — new() then drop without start() ──
+
+/// T1.1 — Constructing a `WindowsMftH264Encoder` and immediately dropping it
+/// (without ever calling `start()`) MUST NOT cause an access violation.
+///
+/// **Before the Drop fix**: process aborts with `0xc0000005` because Rust's
+/// automatic field-drop releases COM pointers after `MFShutdown` runs in the
+/// old `Drop` body.
+/// **After the Drop fix**: `drop(self.mft.take())` + `drop(self.codec_api.take())`
+/// execute BEFORE `MFShutdown` so the AV is impossible.
+///
+/// This is the canonical RED→GREEN evidence for Bucket B (spec R1, T1.1).
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_new_then_drop_does_not_av() {
+    let enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+    // Immediately drop — no start() call.
+    // BEFORE fix: ABORT 0xc0000005. AFTER fix: clean return.
+    drop(enc);
 }
 
 // ─── T3.1 / T3.2: MFT hardware enumeration ───────────────────────────────────
@@ -137,6 +177,7 @@ fn mft_encoded_packet_starts_with_annex_b_start_code() {
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_thirty_frame_smoke_emits_at_least_one_keyframe() {
+    init_tracing();
     const WIDTH: u32 = 1920;
     const HEIGHT: u32 = 1080;
     const N_FRAMES: u64 = 30;
@@ -440,6 +481,198 @@ fn mft_set_bitrate_updates_encoder_without_restart() {
     enc.stop().expect("stop should succeed");
 }
 
+// ─── T6.1 (spec R6): Annex-B detection on no-probe path ─────────────────────
+
+/// T6.1 — After probe removal, the first real output packet must start with the
+/// Annex-B 4-byte start code `0x00 0x00 0x00 0x01`.
+///
+/// This test constructs the encoder at 640×480, sends one frame, receives the
+/// first `EncodedPacket`, and asserts its leading 4 bytes match the start code.
+/// It exercises the per-packet sniff path implemented in `collect_output`.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_first_real_packet_is_annex_b() {
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("frame_tx should be open");
+
+    let pkt = pkt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first encoded packet should arrive within 5 s");
+
+    assert!(
+        pkt.data.len() >= 4,
+        "first packet too short: {} bytes",
+        pkt.data.len()
+    );
+    assert_eq!(
+        &pkt.data[..4],
+        &[0x00, 0x00, 0x00, 0x01],
+        "first real packet (post-probe-removal path) must start with Annex-B start code"
+    );
+
+    drop(frame_tx);
+    enc.stop().expect("stop should succeed");
+}
+
+// ─── T2.1 (spec R2): no frame submitted during init ──────────────────────────
+
+/// T2.1 — After probe removal, the encoder thread must NOT die during `start()`.
+/// Verify by sending a frame immediately after `start()` and asserting `Ok(())`.
+/// SendError = thread died (was the Bucket A failure mode on master).
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_new_does_not_submit_frames_to_mft_during_init() {
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, _pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Wait 200ms then send the first real frame — if no probe happened, the thread
+    // is still alive and the channel is open.
+    std::thread::sleep(Duration::from_millis(200));
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("channel must be open — encoder thread must still be alive (no probe frame was submitted during init)");
+
+    drop(frame_tx);
+    enc.stop().expect("stop should succeed");
+}
+
+// ─── T3.3 / T3.4 (spec R3): dimensions thread through ────────────────────────
+
+/// T3.3 — Encoder configured at 640×480 accepts a 640×480 frame.
+/// Verifies that non-zero dimensions are used in setup_mft.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_setup_uses_config_dimensions_when_nonzero() {
+    init_tracing();
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Send a 640x480 BGRA frame — if MFT was configured at 640x480 it will accept it.
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("frame_tx should be open — thread alive after start()");
+
+    let _pkt = pkt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("encoded packet must arrive within 5 s — MFT accepted 640x480 frame");
+
+    drop(frame_tx);
+    enc.stop().expect("stop should succeed");
+}
+
+/// T3.4 — Encoder configured with sentinel zero (width=0, height=0) uses 1920×1080 fallback.
+/// Verifies the sentinel mechanism in effective_dimensions.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_setup_falls_back_when_config_dimensions_zero() {
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 0,
+        height: 0,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
+
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Send a 1920×1080 frame — fallback dimensions should match.
+    frame_tx
+        .send(make_synthetic_frame(1920, 1080, 0))
+        .expect("frame_tx should be open — thread alive after start()");
+
+    let _pkt = pkt_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("encoded packet must arrive within 5 s — sentinel fallback to 1920x1080");
+
+    drop(frame_tx);
+    enc.stop().expect("stop should succeed");
+}
+
+// ─── T5.1 (DD9 drain smoke): drain after channel close ───────────────────────
+
+/// Drain path: after the input channel is closed, `pump_loop` calls
+/// `MFT_MESSAGE_COMMAND_DRAIN` and continues looping until `MEEndOfStream`
+/// arrives. This test exercises that path explicitly.
+///
+/// Without this test the post-disconnect drain path is unsmoked. The `< 2s`
+/// assertion documents that the drain path is bounded — if discovery #585's
+/// drain-spin pattern ever becomes pathological, this test will catch it.
+#[test]
+#[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
+fn mft_drain_after_channel_close_does_not_panic() {
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(8);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Push a few frames so the MFT is mid-encode when we close the channel.
+    for i in 0..3u64 {
+        frame_tx
+            .send(make_synthetic_frame(640, 480, i * 33))
+            .expect("frame_tx should be open");
+    }
+    // Close the input channel. pump_loop's NeedInput arm will hit Disconnected
+    // and call ProcessMessage(COMMAND_DRAIN, 0).
+    drop(frame_tx);
+
+    // Drain any output packets — don't require a specific count.
+    let drain_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < drain_deadline {
+        match pkt_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(_) => continue,
+            Err(_) => break, // timeout or disconnected — both fine
+        }
+    }
+
+    // Most important assertion: stop() does not hang or panic.
+    let t0 = Instant::now();
+    enc.stop().expect("stop after drain must succeed");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "stop() after drain took {:?} — drain path may be looping",
+        t0.elapsed()
+    );
+}
+
 // ─── T13.1 / T13.2: Lifecycle ────────────────────────────────────────────────
 
 /// T13.1 — `stop()` is idempotent: calling it twice returns `Ok(())` both times.
@@ -453,6 +686,13 @@ fn mft_stop_is_idempotent() {
     let (pkt_tx, _pkt_rx) = mpsc::sync_channel(4);
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // Liveness probe: send one frame and assert the channel is open (thread alive).
+    // Before the Bucket A + B fixes this send returns SendError (thread died during probe).
+    // After the fixes: channel open = thread alive. Satisfies spec R5/T5.2.
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("encoder thread died during start() — channel closed");
 
     drop(frame_tx); // signal encoder thread to drain and exit
 
@@ -480,7 +720,14 @@ fn mft_drop_without_stop_does_not_leak_thread() {
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
 
-    // Drop frame_tx first so the encoder thread can drain and exit.
+    // Liveness probe: send one frame and assert the channel is open (thread alive).
+    // Before the Bucket A + B fixes this send returns SendError (thread died during probe).
+    // After the fixes: channel open = thread alive. Satisfies spec R5/T5.1.
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("encoder thread died during start() — channel closed");
+
+    // Drop frame_tx so the encoder thread can drain and exit.
     drop(frame_tx);
 
     // Drop the encoder without calling stop() — Drop impl must join the thread.
