@@ -52,6 +52,8 @@ pub enum RateControlMode {
 /// - `framerate`: 30
 /// - `intra_period`: 60 (one IDR every 2 s at 30 fps)
 /// - `rate_control`: `ConstantBitrate` (CBR)
+/// - `width`: 0 (sentinel — adapter picks default, currently 1920 for MFT)
+/// - `height`: 0 (sentinel — adapter picks default, currently 1080 for MFT)
 ///
 /// Fields are `pub` to allow `EncoderConfig { bitrate_bps: 8_000_000, ..Default::default() }`
 /// ergonomics without a builder.
@@ -65,6 +67,14 @@ pub struct EncoderConfig {
     pub intra_period: u32,
     /// Rate control mode.
     pub rate_control: RateControlMode,
+    /// Frame width in pixels.
+    /// Sentinel `0` = let the adapter pick its default (current adapters: 1920 for MFT).
+    /// Production callers MUST pass the real screen dimensions (see `src-tauri/src/commands/sender.rs`).
+    pub width: u32,
+    /// Frame height in pixels.
+    /// Sentinel `0` = let the adapter pick its default (current adapters: 1080 for MFT).
+    /// Production callers MUST pass the real screen dimensions.
+    pub height: u32,
 }
 
 impl Default for EncoderConfig {
@@ -74,6 +84,8 @@ impl Default for EncoderConfig {
             framerate: 30,
             intra_period: 60,
             rate_control: RateControlMode::ConstantBitrate,
+            width: 0,  // sentinel — adapter picks default
+            height: 0, // sentinel — adapter picks default
         }
     }
 }
@@ -294,6 +306,46 @@ mod tests {
         fn dropped_frames(&self) -> u64 {
             self.dropped.load(Ordering::Relaxed)
         }
+    }
+
+    // ─── T3.1: encoder_config_accepts_zero_dimensions ─────────────────────────
+    //
+    // Sentinel semantics: width=0, height=0 must be accepted without panic.
+    // This test is RED until T1.3 adds the width/height fields to EncoderConfig.
+
+    #[test]
+    fn encoder_config_accepts_zero_dimensions() {
+        let cfg = EncoderConfig {
+            bitrate_bps: 4_000_000,
+            framerate: 30,
+            intra_period: 60,
+            rate_control: RateControlMode::ConstantBitrate,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(cfg.width, 0, "sentinel width must be 0");
+        assert_eq!(cfg.height, 0, "sentinel height must be 0");
+
+        // Default() must also return sentinel zeros.
+        let def = EncoderConfig::default();
+        assert_eq!(def.width, 0, "default width must be sentinel 0");
+        assert_eq!(def.height, 0, "default height must be sentinel 0");
+    }
+
+    // ─── T3.1b: encoder_config_accepts_nonzero_dimensions ─────────────────────
+    //
+    // Round-trip: non-zero dimensions pass through unchanged.
+    // This test is RED until T1.3 adds the width/height fields.
+
+    #[test]
+    fn encoder_config_accepts_nonzero_dimensions() {
+        let cfg = EncoderConfig {
+            width: 640,
+            height: 480,
+            ..Default::default()
+        };
+        assert_eq!(cfg.width, 640, "width must round-trip correctly");
+        assert_eq!(cfg.height, 480, "height must round-trip correctly");
     }
 
     // ─── D1: EncoderConfig::default() field values ─────────────────────────────
