@@ -13,9 +13,13 @@
 //!
 //! # Thread model
 //!
-//! - `new()`: validates config, performs synchronous MFT enumeration and candidate
-//!   probing (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + per-candidate probe).
-//! - `start(rx, tx)`: spawns one OS thread that owns the MFT pump loop.
+//! - `new()`: validates config, runs a DESTRUCTIVE probe on the caller thread
+//!   (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + per-candidate
+//!   `ActivateObject` + `try_setup_output_type` + `ShutdownObject`). The winning
+//!   `IMFActivate` is retained; its `IMFTransform` is discarded after the probe.
+//! - `start(rx, tx)`: transfers the `IMFActivate` to a spawned OS thread. The
+//!   encoder thread calls `ActivateObject` itself and owns the `IMFTransform`
+//!   entirely — no cross-thread COM transfer of `IMFTransform` or `ICodecAPI`.
 //! - `stop()`: idempotent. Sets stop flag and joins the handle.
 //! - `Drop`: calls `stop()` + `MFShutdown` + `CoUninitialize` on the caller thread.
 
@@ -84,7 +88,8 @@ impl<T> ComSend<T> {
 }
 
 // SAFETY: See safety contract on ComSend above — only used with MTA-registered
-// hardware MFT interfaces (IMFTransform, ICodecAPI).
+// hardware MFT factory pointers (IMFActivate). IMFTransform and ICodecAPI are
+// NOT transferred cross-thread; they live entirely on the encoder thread.
 unsafe impl<T> Send for ComSend<T> {}
 
 // ── Shared cross-thread state ─────────────────────────────────────────────────
@@ -134,10 +139,15 @@ const FRAME_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 pub struct WindowsMftH264Encoder {
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
-    /// COM interfaces obtained in `new()`, consumed by `start()`.
-    /// `None` after `start()` has transferred them to the encoder thread.
-    mft: Option<IMFTransform>,
-    codec_api: Option<ICodecAPI>,
+    /// The winning `IMFActivate` selected during the destructive probe in `new()`.
+    ///
+    /// `IMFActivate` is an MTA-registered COM factory pointer; it is safe to transfer
+    /// across MTA threads (see `ComSend` safety contract). Transferred to the encoder
+    /// thread in `start()` via `ComSend`. The encoder thread calls `ActivateObject` on
+    /// it to produce a fresh `IMFTransform` that lives ENTIRELY on that thread —
+    /// no cross-thread COM for `IMFTransform` or `ICodecAPI` (root cause of AVs in
+    /// commit ccd2e43, see sdd/.../phase0v3-final-root-cause).
+    winning_activate: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
     /// Tracks whether `new()` performed `CoInitializeEx` + `MFStartup`.
@@ -155,8 +165,10 @@ impl std::fmt::Debug for WindowsMftH264Encoder {
 }
 
 // SAFETY: `WindowsMftH264Encoder` is used from a single owner thread.
-// `mft` and `codec_api` (both `Option<COM interface>`) are transferred to the encoder
-// thread inside `start()` and set to `None` on the caller side immediately after.
+// `winning_activate` (`Option<IMFActivate>`) is transferred to the encoder thread
+// inside `start()` via `ComSend` and set to `None` on the caller side immediately
+// after. `IMFActivate` is an MTA-registered factory pointer; cross-thread transfer
+// is safe per Windows COM rules for MTA-registered objects (see `ComSend` docs).
 // Once `start()` has been called the struct never accesses these COM pointers again.
 // All remaining shared state (`state: Arc<MftEncoderShared>`) consists entirely of
 // atomics, which are `Send + Sync`. `JoinHandle<()>` and `EncoderConfig` are `Send`.
@@ -169,10 +181,11 @@ unsafe impl Sync for WindowsMftH264Encoder {}
 impl VideoEncoder for WindowsMftH264Encoder {
     /// Construct and validate an encoder configuration.
     ///
-    /// Performs synchronous MFT enumeration and candidate probing on the caller's thread:
-    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate probe
+    /// Performs a synchronous DESTRUCTIVE probe on the caller's thread:
+    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate
     /// (`ActivateObject` + `MF_TRANSFORM_ASYNC_UNLOCK` + `GetOutputAvailableType(0,0)`
-    /// + `SetOutputType` with Strategy E).
+    /// + `SetOutputType` with Strategy E + `ShutdownObject`). The winning candidate's
+    /// `IMFTransform` is discarded after the probe; only the `IMFActivate` is retained.
     ///
     /// Returns:
     /// - `Err(InvalidConfig(_))` for `bitrate_bps == 0` or `framerate == 0`.
@@ -191,18 +204,19 @@ impl VideoEncoder for WindowsMftH264Encoder {
             return Err(EncoderError::InvalidConfig("framerate must be > 0".into()));
         }
 
-        // Synchronous MFT initialisation (design §5 steps 1–6).
-        // Pass the real config so the probe's SetOutputType uses the session's
-        // dimensions/framerate/bitrate — that is the ONLY SetOutputType call
-        // (the encoder thread does NOT re-negotiate; cross-thread re-negotiation
-        // corrupted NVENC state and AV'd in pump_loop, see phase0v3 trace).
-        let (mft, codec_api) = init_mft_sync(&config)?;
+        // Synchronous MFT probe (design §5 steps 1–5).
+        // Returns only the winning IMFActivate — the IMFTransform from the probe is
+        // ShutdownObject'd immediately. The encoder thread re-activates from the
+        // IMFActivate to produce a fresh IMFTransform that lives entirely on that thread.
+        // This eliminates cross-thread IMFTransform transfer, the root cause of AVs in
+        // commit ccd2e43 (phase0v3 trace: H-AV3 confirmed — NVENC singleton corruption
+        // when IMFTransform is used from a different thread than ActivateObject).
+        let activate = init_mft_sync(&config)?;
 
         Ok(Self {
             config,
             state: Arc::new(MftEncoderShared::default()),
-            mft: Some(mft),
-            codec_api: Some(codec_api),
+            winning_activate: Some(activate),
             handle: None,
             com_initialized: true,
         })
@@ -214,31 +228,27 @@ impl VideoEncoder for WindowsMftH264Encoder {
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
         av_trace!("start: ENTER");
-        let mft = self.mft.take().ok_or_else(|| {
-            EncoderError::Internal("start() called after IMFTransform was already consumed".into())
-        })?;
-        let codec_api = self.codec_api.take().ok_or_else(|| {
-            EncoderError::Internal("start() called after ICodecAPI was already consumed".into())
+        let activate = self.winning_activate.take().ok_or_else(|| {
+            EncoderError::Internal("start() called after IMFActivate was already consumed".into())
         })?;
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
 
         state.stop.store(false, Ordering::Release);
 
-        // Wrap COM interfaces in ComSend so the closure is Send.
-        // SAFETY: Both this thread and the encoder thread initialise as MTA
-        // (CoInitializeEx(COINIT_MULTITHREADED)), so MTA-registered hardware
-        // MFT interfaces cross thread boundaries safely (see ComSend docs).
-        let mft_send = ComSend(mft);
-        let codec_api_send = ComSend(codec_api);
+        // Wrap IMFActivate in ComSend so the closure is Send.
+        // SAFETY: IMFActivate is an MTA-registered COM factory; cross-thread transfer
+        // is safe when both threads join the MTA via CoInitializeEx(COINIT_MULTITHREADED).
+        // The encoder thread calls ActivateObject on the activate to produce a fresh
+        // IMFTransform that lives ENTIRELY on that thread — no cross-thread IMFTransform
+        // or ICodecAPI transfer (root cause of AVs in commit ccd2e43).
+        let activate_send = ComSend(activate);
 
         av_trace!("start: before thread spawn");
         let handle = std::thread::spawn(move || {
-            // into_inner() unwraps ComSend<T> → T inside the thread.
-            // The closure captures ComSend<IMFTransform> and ComSend<ICodecAPI> (both Send).
+            // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
             run_encoder_thread(
-                mft_send.into_inner(),
-                codec_api_send.into_inner(),
+                activate_send.into_inner(),
                 config,
                 state,
                 rx,
@@ -297,35 +307,25 @@ impl VideoEncoder for WindowsMftH264Encoder {
 impl Drop for WindowsMftH264Encoder {
     fn drop(&mut self) {
         av_trace!(
-            "Drop: ENTER handle_is_some={} com_initialized={} mft_is_some={} codec_api_is_some={}",
+            "Drop: ENTER handle_is_some={} com_initialized={} winning_activate_is_some={}",
             self.handle.is_some(),
             self.com_initialized,
-            self.mft.is_some(),
-            self.codec_api.is_some()
+            self.winning_activate.is_some()
         );
         // Join encoder thread first. If start() was never called this is a no-op.
         av_trace!("Drop: before stop()");
         let _ = self.stop();
         av_trace!("Drop: after stop()");
 
-        // SAFETY: COM Release() on IMFTransform / ICodecAPI MUST execute while the
-        // Media Foundation runtime is still alive. Rust's automatic field-drop runs
-        // AFTER this Drop body returns, so we explicitly drop the Option<COMInterface>
-        // fields here. If we let MFShutdown() run first, the subsequent automatic
-        // Release() would land on memory torn down by MF → access violation 0xc0000005
-        // (see explore #583 Bucket B diagnosis).
+        // winning_activate: if start() was never called, the IMFActivate is still here.
+        // Drop it before MFShutdown to release the COM ref while MF is still alive.
+        // If start() was called, winning_activate is already None (transferred to thread).
         av_trace!(
-            "Drop: before codec_api.take() (is_some={})",
-            self.codec_api.is_some()
+            "Drop: before winning_activate.take() (is_some={})",
+            self.winning_activate.is_some()
         );
-        drop(self.codec_api.take());
-        av_trace!("Drop: after codec_api.take() (now None)");
-        // SAFETY: same ordering contract as above for the IMFTransform handle.
-        // Order between codec_api and mft does not matter — both are sibling COM
-        // pointers; only their position relative to MFShutdown matters.
-        av_trace!("Drop: before mft.take() (is_some={})", self.mft.is_some());
-        drop(self.mft.take());
-        av_trace!("Drop: after mft.take() (now None)");
+        drop(self.winning_activate.take());
+        av_trace!("Drop: after winning_activate.take() (now None)");
 
         if self.com_initialized {
             av_trace!("Drop: com_initialized=true — before MFShutdown");
@@ -350,7 +350,18 @@ impl Drop for WindowsMftH264Encoder {
 
 // ── Synchronous MFT initialisation (design §5 steps 1–6) ─────────────────────
 
-fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFTransform, ICodecAPI), EncoderError> {
+/// Caller-thread MFT probe. Returns the winning `IMFActivate` (not an `IMFTransform`).
+///
+/// Each candidate is activated, probed with `try_setup_output_type`, then immediately
+/// `ShutdownObject`'d — including the winner. The returned `IMFActivate` is transferred
+/// to the encoder thread in `start()`, which calls `ActivateObject` to produce a fresh
+/// `IMFTransform` that lives entirely on that thread.
+///
+/// WHY: NVENC's `IMFTransform` — despite MTA registration — AVs when used from a
+/// different thread than the one that called `ActivateObject` (phase0v3 trace: H-AV3
+/// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
+/// for `IMFTransform` and `ICodecAPI`.
+fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
     av_trace!("init_mft_sync: ENTER");
     // Step 1: CoInitializeEx on caller thread (MTA).
     // SAFETY: Paired with CoUninitialize in Drop.
@@ -382,8 +393,8 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFTransform, ICodecAPI), En
 
     // Steps 3–5: Enumerate IMFActivate candidates and probe each with full output-type
     // negotiation. MFTEnumEx(MFT_ENUM_FLAG_HARDWARE) returns vendor MFTs even when
-    // their hardware is absent (e.g. AMD MFT on a non-AMD system). We must probe the
-    // full setup_mft output-type path to select the winner, not merely ActivateObject.
+    // their hardware is absent (e.g. AMD MFT on a non-AMD system). Probe selects the
+    // winner; winner's IMFTransform is ShutdownObject'd after probe.
     // Phase 0 v2 evidence: Host B has 3 candidates — pactivates[0] and [1] are
     // AMDh264Encoder (no AMD GPU), [2] is NVIDIA H.264 Encoder MFT. Only [2] accepts
     // strategy E (FRAME_SIZE + FRAME_RATE + AVG_BITRATE on cloned slot[0] type).
@@ -401,11 +412,10 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFTransform, ICodecAPI), En
     };
 
     match result {
-        Ok((mft, codec_api)) => {
-            av_trace!("init_mft_sync: probe_and_select_mft OK — winner obtained");
-            av_trace!("init_mft_sync: before query_interface ICodecAPI (already done in probe)");
+        Ok(activate) => {
+            av_trace!("init_mft_sync: probe_and_select_mft OK — winning IMFActivate retained");
             av_trace!("init_mft_sync: EXIT Ok");
-            Ok((mft, codec_api))
+            Ok(activate)
         }
         Err(err) => {
             av_trace!("init_mft_sync: probe_and_select_mft ERR {err}");
@@ -477,27 +487,29 @@ fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
     Ok(activates)
 }
 
-/// Iterate IMFActivate candidates and return the first one that passes the full
-/// output-type negotiation probe (DD-A, DD-D, DD-E).
+/// Iterate IMFActivate candidates and return the FIRST one that passes the full
+/// output-type negotiation probe (DD-A, DD-D, DD-E). This is a DESTRUCTIVE probe:
+/// the winner's `IMFTransform` is `ShutdownObject`'d after the probe, just like
+/// the rejected candidates. Only the `IMFActivate` (factory pointer) is returned.
 ///
 /// For each candidate:
 ///   1. `ActivateObject::<IMFTransform>` — if Err, log + `ShutdownObject` + skip.
 ///   2. `MF_TRANSFORM_ASYNC_UNLOCK = 1` — required before any other MFT call.
-///      Set here (not in `setup_mft`) so the probe uses the same activation state.
 ///   3. `try_setup_output_type` — Strategy E probe (DD-B). If Err, log + `ShutdownObject` + skip.
-///   4. If Ok: cast to `ICodecAPI`; if Err, `ShutdownObject` + skip.
-///   5. Winner found — return `(IMFTransform, ICodecAPI)`.
+///   4. Winner found — `ShutdownObject` the temporary IMFTransform, return the `IMFActivate`.
+///      The encoder thread will call `ActivateObject` again to get a fresh `IMFTransform`
+///      on its own thread, eliminating cross-thread COM transfer entirely.
 ///
 /// If all candidates fail, returns `EncoderError::InitFailed` with the last error.
+///
+/// Note: `ICodecAPI` cast is NOT done here — it is done on the encoder thread after
+/// the fresh `ActivateObject` call, where the IMFTransform will actually be used.
 fn probe_and_select_mft(
     activates: Vec<IMFActivate>,
     config: &EncoderConfig,
-) -> Result<(IMFTransform, ICodecAPI), EncoderError> {
-    // Placeholder dimensions for the probe. These must be valid (non-zero) so
-    // try_setup_output_type calls SetOutputType with the SESSION's real config.
-    // After phase0v3 we no longer use placeholder PROBE_* constants — the probe
-    // IS the only SetOutputType call (setup_mft on the encoder thread does NOT
-    // re-negotiate, since cross-thread re-negotiation corrupted NVENC state).
+) -> Result<IMFActivate, EncoderError> {
+    // Use the session's real config dimensions for the probe so the
+    // SetOutputType call validates the actual session parameters.
     let (probe_w, probe_h) = effective_dimensions(config);
     let probe_fps = config.framerate;
     let probe_bps = config.bitrate_bps;
@@ -646,41 +658,26 @@ fn probe_and_select_mft(
         }
         av_trace!("probe[{i}]: try_setup_output_type OK");
 
-        // ── Step 4: Cast to ICodecAPI ─────────────────────────────────────────
-        // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
-        av_trace!("probe[{i}]: before ICodecAPI cast");
-        let codec_api = match mft.cast::<ICodecAPI>() {
-            Ok(c) => {
-                av_trace!("probe[{i}]: ICodecAPI cast OK");
-                c
-            }
-            Err(e) => {
-                av_trace!("probe[{i}]: ICodecAPI cast FAILED 0x{:08X}", e.code().0);
-                tracing::warn!(
-                    "probe_and_select_mft: candidate [{i}] \"{friendly_name}\" ICodecAPI cast \
-                     failed (0x{:08X}); trying next",
-                    e.code().0
-                );
-                av_trace!("probe[{i}]: before ShutdownObject (ICodecAPI cast failed)");
-                let _ = unsafe { activate.ShutdownObject() };
-                av_trace!("probe[{i}]: after ShutdownObject (ICodecAPI cast failed)");
-                last_err = EncoderError::InitFailed(format!(
-                    "ICodecAPI cast[{i}] ({friendly_name}): 0x{:08X}",
-                    e.code().0
-                ));
-                continue;
-            }
-        };
-
-        // ── Winner ────────────────────────────────────────────────────────────
+        // ── Step 4 (WINNER) — destructive shutdown of the probe IMFTransform ──
+        // ShutdownObject releases the temporary IMFTransform obtained above.
+        // The encoder thread will call ActivateObject again to get a fresh
+        // IMFTransform that lives entirely on its own thread, eliminating cross-thread
+        // COM transfer of IMFTransform (root cause of AVs — phase0v3 H-AV3 confirmed).
+        // ICodecAPI cast is NOT done here — it happens on the encoder thread.
         av_trace!(
-            "probe[{i}]: WINNER \"{friendly_name}\" {clsid_str} — handing IMFTransform out"
+            "probe[{i}]: WINNER \"{friendly_name}\" {clsid_str} — ShutdownObject probe IMFTransform"
         );
+        // Drop mft first so the COM ref is released before ShutdownObject.
+        drop(mft);
+        av_trace!("probe[{i}]: before ShutdownObject (winner — probe cleanup)");
+        let _ = unsafe { activate.ShutdownObject() };
+        av_trace!("probe[{i}]: after ShutdownObject (winner — probe cleanup)");
+
         tracing::info!(
             "probe_and_select_mft: selected candidate [{i}] \"{friendly_name}\" {clsid_str}"
         );
         av_trace!("probe_and_select_mft: EXIT Ok winner_index={i}");
-        return Ok((mft, codec_api));
+        return Ok(activate.clone());
     }
 
     av_trace!("probe_and_select_mft: no winner — EXIT Err");
@@ -798,14 +795,14 @@ impl Drop for CoUninitGuard {
 }
 
 fn run_encoder_thread(
-    mft: IMFTransform,
-    codec_api: ICodecAPI,
+    activate: IMFActivate,
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
     av_trace!("run_encoder_thread: ENTER (encoder thread)");
+    // Step 1: CoInitializeEx on the encoder thread (MTA).
     // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
     // S_FALSE (1, already initialised on this apartment) both pass is_err() == false.
     // We install the CoUninitGuard BEFORE checking co_hr so the un-init runs even
@@ -835,8 +832,61 @@ fn run_encoder_thread(
         config.bitrate_bps
     );
 
-    // Steps 7b–7h: Setup output/input media types and streaming messages.
-    // (MF_TRANSFORM_ASYNC_UNLOCK was already set during probe_and_select_mft.)
+    // Step 2: ActivateObject — produce a fresh IMFTransform ENTIRELY ON THIS THREAD.
+    // WHY: NVENC's IMFTransform AVs when used from a different thread than ActivateObject.
+    // The caller thread (init_mft_sync / probe_and_select_mft) only validated the activate;
+    // it ShutdownObject'd its probe IMFTransform immediately. This re-activation creates a
+    // new, thread-local IMFTransform with no cross-thread COM history (phase0v3 H-AV3 fix).
+    // SAFETY: ActivateObject is the documented way to instantiate an IMFTransform from
+    // an IMFActivate obtained via MFTEnumEx. The activate is an MTA-registered factory;
+    // both this thread and the caller thread are MTA — transfer is safe (see ComSend docs).
+    av_trace!("run_encoder_thread: before ActivateObject (fresh IMFTransform on this thread)");
+    let mft: IMFTransform = match unsafe { activate.ActivateObject() } {
+        Ok(m) => {
+            av_trace!("run_encoder_thread: ActivateObject OK");
+            m
+        }
+        Err(e) => {
+            av_trace!("run_encoder_thread: ActivateObject FAILED 0x{:08X} — thread exit", e.code().0);
+            tracing::error!(
+                "encoder thread ActivateObject failed: 0x{:08X}",
+                e.code().0
+            );
+            return;
+        }
+    };
+
+    // Step 3: MF_TRANSFORM_ASYNC_UNLOCK — required before any other call on an async MFT.
+    // Set here on the same thread that will use the MFT, NOT in the probe (the probe's
+    // IMFTransform was ShutdownObject'd; this is a fresh activation).
+    av_trace!("run_encoder_thread: before GetAttributes (ASYNC_UNLOCK)");
+    let attrs = match unsafe { mft.GetAttributes() } {
+        Ok(a) => {
+            av_trace!("run_encoder_thread: GetAttributes OK");
+            a
+        }
+        Err(e) => {
+            av_trace!("run_encoder_thread: GetAttributes FAILED 0x{:08X} — thread exit", e.code().0);
+            tracing::error!(
+                "encoder thread GetAttributes failed: 0x{:08X}",
+                e.code().0
+            );
+            return;
+        }
+    };
+    av_trace!("run_encoder_thread: before SetUINT32 MF_TRANSFORM_ASYNC_UNLOCK");
+    if let Err(e) = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) } {
+        av_trace!("run_encoder_thread: ASYNC_UNLOCK FAILED 0x{:08X} — thread exit", e.code().0);
+        tracing::error!(
+            "encoder thread MF_TRANSFORM_ASYNC_UNLOCK failed: 0x{:08X}",
+            e.code().0
+        );
+        return;
+    }
+    av_trace!("run_encoder_thread: ASYNC_UNLOCK OK");
+
+    // Steps 4–6 (via setup_mft): output-type negotiation, input type, streaming messages.
+    // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
     av_trace!("run_encoder_thread: before setup_mft");
     if let Err(e) = setup_mft(&mft, &config) {
         av_trace!("run_encoder_thread: setup_mft FAILED: {e} — thread exit");
@@ -847,6 +897,24 @@ fn run_encoder_thread(
     }
     av_trace!("run_encoder_thread: setup_mft OK");
     tracing::debug!("setup_mft OK; entering pump_loop");
+
+    // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
+    // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
+    av_trace!("run_encoder_thread: before ICodecAPI cast");
+    let codec_api: ICodecAPI = match mft.cast() {
+        Ok(c) => {
+            av_trace!("run_encoder_thread: ICodecAPI cast OK");
+            c
+        }
+        Err(e) => {
+            av_trace!("run_encoder_thread: ICodecAPI cast FAILED 0x{:08X} — thread exit", e.code().0);
+            tracing::error!(
+                "encoder thread ICodecAPI cast failed: 0x{:08X}",
+                e.code().0
+            );
+            return;
+        }
+    };
 
     av_trace!("run_encoder_thread: before IMFMediaEventGenerator cast");
     let event_gen: IMFMediaEventGenerator = match mft.cast() {
@@ -867,7 +935,7 @@ fn run_encoder_thread(
     // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
     let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
-    // Step 8: Pump loop.
+    // Step 8: Pump loop. mft, codec_api, event_gen all owned by this thread.
     av_trace!("run_encoder_thread: before pump_loop");
     pump_loop(
         &mft,
@@ -887,8 +955,8 @@ fn run_encoder_thread(
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
-    av_trace!("run_encoder_thread: after cleanup messages — mft/codec_api/event_gen about to drop");
-    // mft, codec_api, event_gen are dropped here (COM Release via Drop).
+    av_trace!("run_encoder_thread: after cleanup messages — mft/codec_api/event_gen/activate about to drop");
+    // mft, codec_api, event_gen, activate are dropped here (COM Release via Drop).
     // MFShutdown for the thread is NOT called here — the caller thread's Drop handles it.
     // CoUninitGuard calls CoUninitialize when this function returns.
     av_trace!("run_encoder_thread: EXIT (CoUninitGuard will fire CoUninitialize)");
@@ -918,10 +986,13 @@ fn effective_dimensions(config: &EncoderConfig) -> (u32, u32) {
 
 /// Setup MFT media types and streaming messages (steps 7b–7h).
 ///
-/// `MF_TRANSFORM_ASYNC_UNLOCK` is NOT set here — it is set once in
-/// `probe_and_select_mft` during the candidate probe (before `ActivateObject`
-/// returns the winning IMFTransform). Setting it again here would be idempotent
-/// on most MFTs but is cleaner to do once. See DD-A / DD-B.
+/// `MF_TRANSFORM_ASYNC_UNLOCK` is set by the encoder thread in `run_encoder_thread`
+/// BEFORE calling this function (using the fresh `IMFTransform` produced by
+/// `ActivateObject` on the encoder thread). This function starts with output-type
+/// negotiation (`try_setup_output_type`) — same-thread as the subsequent pump_loop,
+/// so no cross-thread COM state corruption is possible (contrast with commit ccd2e43
+/// where the output type was set on the caller thread and the pump ran on the encoder
+/// thread, triggering H-AV2 in the phase0v3 trace).
 fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderError> {
     av_trace!("setup_mft: ENTER");
     // Sentinel-zero triggers 1920×1080 fallback per DD3; production callers supply
@@ -930,14 +1001,15 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     let (w, h) = effective_dimensions(config);
     av_trace!("setup_mft: effective dims w={w} h={h} fps={} bps={}", config.framerate, config.bitrate_bps);
 
-    // Step 7b: SetOutputType was ALREADY done in probe_and_select_mft on the
-    // caller thread, with the session's real config. Per phase0v3 root cause
-    // (H-AV2 confirmed): a second SetOutputType from the encoder thread on the
-    // same IMFTransform corrupts NVENC's internal state and AVs the pump_loop.
-    // We must NOT re-negotiate the output type here. The IMFTransform we
-    // received via ComSend is already configured for the session.
-    av_trace!("setup_mft: skipping output-type negotiation (already done in caller-thread probe)");
-    let _ = (w, h); // silence unused after removing the call
+    // Step 7b: SetOutputType (output-type negotiation — SAME THREAD as pump_loop).
+    // WHY this is here (and not on the caller thread): the probe in probe_and_select_mft
+    // called try_setup_output_type and then IMMEDIATELY ShutdownObject'd the IMFTransform.
+    // This is a fresh IMFTransform (new ActivateObject call in run_encoder_thread); its
+    // output type must be negotiated here, on the thread that will drive the pump_loop.
+    // This is the ONLY SetOutputType call for this IMFTransform — no double-negotiation.
+    av_trace!("setup_mft: before try_setup_output_type (same-thread negotiation)");
+    try_setup_output_type(mft, w, h, config.framerate, config.bitrate_bps)?;
+    av_trace!("setup_mft: try_setup_output_type OK");
 
     // Step 7c: SetInputType (NV12).
     av_trace!("setup_mft: before MFCreateMediaType (input type)");
@@ -982,7 +1054,7 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     }
 
     // Steps 7f–7h: Send streaming messages.
-    // (Async unlock was set in probe_and_select_mft during init — not repeated here.)
+    // (Async unlock was set by run_encoder_thread before calling this function — not repeated here.)
     av_trace!("setup_mft: before COMMAND_FLUSH");
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
