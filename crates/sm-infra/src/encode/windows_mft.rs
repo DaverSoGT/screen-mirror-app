@@ -1217,6 +1217,12 @@ fn pump_loop(
     } else {
         333_333 // 30fps fallback
     };
+    // Configured frame dimensions (sentinel-zero → fallback). Frames whose dimensions
+    // don't match are DROPPED at submission time: NVENC's MFT trusts the input buffer
+    // size to match the negotiated output frame size, and a smaller-than-expected NV12
+    // buffer causes an out-of-bounds read inside the driver → 0xC0000005 AV. The guard
+    // is defensive — well-behaved producers send matching dims.
+    let (cfg_w, cfg_h) = effective_dimensions(config);
 
     // Dual-arm counters tracking pending MFT credits (spec R2, design DD1/DD2).
     // Stack-local — no atomics needed; only the pump thread reads/writes these.
@@ -1355,6 +1361,16 @@ fn pump_loop(
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
                 Ok(frame) => {
+                    if frame.width != cfg_w || frame.height != cfg_h {
+                        tracing::warn!(
+                            "pump_loop: frame dim mismatch — configured {}x{}, got {}x{}; dropping frame to avoid NVENC driver AV",
+                            cfg_w, cfg_h, frame.width, frame.height
+                        );
+                        state.dropped.fetch_add(1, Ordering::Relaxed);
+                        // Do NOT consume the NeedInput credit — break out so the next
+                        // poll iteration re-evaluates and we don't busy-loop on bad input.
+                        break;
+                    }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
                     match submit_frame(mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
