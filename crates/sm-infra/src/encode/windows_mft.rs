@@ -4,15 +4,17 @@
 //! # Overview
 //!
 //! [`WindowsMftH264Encoder`] wraps an async `IMFTransform` behind the [`VideoEncoder`]
-//! domain trait. It selects the first hardware H.264 MFT returned by
-//! `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)`, returning
-//! `EncoderError::InitFailed` if none is available (so the factory can fall back
-//! to `WindowsOpenH264Encoder`).
+//! domain trait. It probes all hardware H.264 MFTs returned by
+//! `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)` and selects the
+//! first candidate whose output-type negotiation succeeds (strategy E: clone
+//! `GetOutputAvailableType(0,0)` and overlay `FRAME_SIZE + FRAME_RATE + AVG_BITRATE`).
+//! This handles systems where vendor MFTs (e.g. AMD) are registered but have no
+//! backing hardware. Returns `EncoderError::InitFailed` if no candidate succeeds.
 //!
 //! # Thread model
 //!
-//! - `new()`: validates config, performs synchronous MFT enumeration and activation
-//!   (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + `ActivateObject`).
+//! - `new()`: validates config, performs synchronous MFT enumeration and candidate
+//!   probing (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + per-candidate probe).
 //! - `start(rx, tx)`: spawns one OS thread that owns the MFT pump loop.
 //! - `stop()`: idempotent. Sets stop flag and joins the handle.
 //! - `Drop`: calls `stop()` + `MFShutdown` + `CoUninitialize` on the caller thread.
@@ -25,24 +27,25 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFTransform, MEEndOfStream, METransformDrainComplete,
+    IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream, METransformDrainComplete,
     METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_REGISTER_TYPE_INFO, MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
-use windows::core::Interface;
+use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
 
@@ -93,12 +96,6 @@ impl Default for MftEncoderShared {
         }
     }
 }
-
-// ── H264 profile constant ─────────────────────────────────────────────────────
-
-// DR4: eAVEncH264VProfile_Main = 77 (confirmed present in MediaFoundation 0.62.2).
-// Using the newtype value directly to be explicit about the integer.
-const H264_PROFILE_MAIN: u32 = eAVEncH264VProfile_Main.0 as u32;
 
 // ── Pump-loop timing constants ────────────────────────────────────────────────
 
@@ -157,12 +154,14 @@ unsafe impl Sync for WindowsMftH264Encoder {}
 impl VideoEncoder for WindowsMftH264Encoder {
     /// Construct and validate an encoder configuration.
     ///
-    /// Performs synchronous MFT enumeration on the caller's thread:
-    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → `ActivateObject`.
+    /// Performs synchronous MFT enumeration and candidate probing on the caller's thread:
+    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate probe
+    /// (`ActivateObject` + `MF_TRANSFORM_ASYNC_UNLOCK` + `GetOutputAvailableType(0,0)`
+    /// + `SetOutputType` with Strategy E).
     ///
     /// Returns:
     /// - `Err(InvalidConfig(_))` for `bitrate_bps == 0` or `framerate == 0`.
-    /// - `Err(InitFailed(_))` if no hardware H.264 MFT is available.
+    /// - `Err(InitFailed(_))` if no hardware H.264 MFT candidate passes the probe.
     fn new(config: EncoderConfig) -> Result<Self, EncoderError>
     where
         Self: Sized,
@@ -314,25 +313,20 @@ fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
         )));
     }
 
-    // Steps 3–4: MFTEnumEx + ActivateObject.
-    match enumerate_and_activate() {
-        Ok(mft) => {
-            // Step 5: Cast to ICodecAPI.
-            // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
-            match mft.cast::<ICodecAPI>() {
-                Ok(codec_api) => Ok((mft, codec_api)),
-                Err(e) => {
-                    unsafe {
-                        let _ = MFShutdown();
-                        CoUninitialize();
-                    }
-                    Err(EncoderError::InitFailed(format!(
-                        "ICodecAPI cast failed: 0x{:08X}",
-                        e.code().0
-                    )))
-                }
-            }
-        }
+    // Steps 3–5: Enumerate IMFActivate candidates and probe each with full output-type
+    // negotiation. MFTEnumEx(MFT_ENUM_FLAG_HARDWARE) returns vendor MFTs even when
+    // their hardware is absent (e.g. AMD MFT on a non-AMD system). We must probe the
+    // full setup_mft output-type path to select the winner, not merely ActivateObject.
+    // Phase 0 v2 evidence: Host B has 3 candidates — pactivates[0] and [1] are
+    // AMDh264Encoder (no AMD GPU), [2] is NVIDIA H.264 Encoder MFT. Only [2] accepts
+    // strategy E (FRAME_SIZE + FRAME_RATE + AVG_BITRATE on cloned slot[0] type).
+    let result = match enumerate_activates() {
+        Ok(activates) => probe_and_select_mft(activates),
+        Err(e) => Err(e),
+    };
+
+    match result {
+        Ok((mft, codec_api)) => Ok((mft, codec_api)),
         Err(err) => {
             unsafe {
                 let _ = MFShutdown();
@@ -343,8 +337,12 @@ fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
     }
 }
 
-/// Enumerate hardware H.264 MFTs and activate the first one (steps 3–4).
-fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
+/// Enumerate hardware H.264 MFT candidates from MFTEnumEx (steps 3–4).
+///
+/// Returns all candidates as a `Vec<IMFActivate>` without activating them.
+/// The raw COM array is freed after cloning all references. If the array is
+/// empty or null, returns `EncoderError::InitFailed`.
+fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -357,7 +355,8 @@ fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
     let mut pactivates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
 
-    // SAFETY: MFTEnumEx writes a COM-allocated array to pactivates; must be freed via CoTaskMemFree.
+    // SAFETY: MFTEnumEx writes a COM-allocated array to pactivates; must be freed via
+    // CoTaskMemFree once we have cloned all IMFActivate refs into a Vec.
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -376,22 +375,250 @@ fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
         ));
     }
 
-    // Activate the first hardware MFT.
-    // SAFETY: pactivates[0] is a valid IMFActivate pointer when count > 0 (MFTEnumEx contract).
-    let mft: IMFTransform = unsafe {
-        let activate_opt = &*pactivates;
-        let activate = activate_opt.as_ref().ok_or_else(|| {
-            EncoderError::InitFailed("MFTEnumEx returned null IMFActivate[0]".into())
-        })?;
-        activate.ActivateObject().map_err(|e| {
-            EncoderError::InitFailed(format!("ActivateObject: 0x{:08X}", e.code().0))
-        })?
+    // Clone each IMFActivate from the raw array into a Vec (AddRef via clone).
+    // SAFETY: pactivates[0..count] are valid Option<IMFActivate> per MFTEnumEx contract.
+    let activates: Vec<IMFActivate> = unsafe {
+        let slice = std::slice::from_raw_parts(pactivates, count as usize);
+        slice.iter().filter_map(|opt| opt.clone()).collect()
     };
 
-    // SAFETY: pactivates was allocated by MFTEnumEx (CoTaskMemAlloc); free with CoTaskMemFree.
+    // SAFETY: pactivates was CoTaskMemAlloc'd by MFTEnumEx; free after cloning all refs.
     unsafe { CoTaskMemFree(Some(pactivates as *const _)) };
 
-    Ok(mft)
+    if activates.is_empty() {
+        return Err(EncoderError::InitFailed(
+            "MFTEnumEx returned only null IMFActivate entries".into(),
+        ));
+    }
+
+    Ok(activates)
+}
+
+/// Iterate IMFActivate candidates and return the first one that passes the full
+/// output-type negotiation probe (DD-A, DD-D, DD-E).
+///
+/// For each candidate:
+///   1. `ActivateObject::<IMFTransform>` — if Err, log + `ShutdownObject` + skip.
+///   2. `MF_TRANSFORM_ASYNC_UNLOCK = 1` — required before any other MFT call.
+///      Set here (not in `setup_mft`) so the probe uses the same activation state.
+///   3. `try_setup_output_type` — Strategy E probe (DD-B). If Err, log + `ShutdownObject` + skip.
+///   4. If Ok: cast to `ICodecAPI`; if Err, `ShutdownObject` + skip.
+///   5. Winner found — return `(IMFTransform, ICodecAPI)`.
+///
+/// If all candidates fail, returns `EncoderError::InitFailed` with the last error.
+fn probe_and_select_mft(
+    activates: Vec<IMFActivate>,
+) -> Result<(IMFTransform, ICodecAPI), EncoderError> {
+    // Placeholder dimensions for the probe. These must be valid (non-zero) so
+    // try_setup_output_type calls SetOutputType with a real resolution.
+    // We use 1920×1080 (the sentinel-zero fallback) and a standard config.
+    const PROBE_W: u32 = 1920;
+    const PROBE_H: u32 = 1080;
+    const PROBE_FPS: u32 = 30;
+    const PROBE_BPS: u32 = 4_000_000;
+
+    let count = activates.len();
+    let mut last_err = EncoderError::InitFailed("no hardware MFT candidates enumerated".into());
+
+    for (i, activate) in activates.iter().enumerate() {
+        // ── Log candidate identity for diagnostics ────────────────────────────
+
+        // Friendly name via GetAllocatedString (IMFActivate inherits IMFAttributes).
+        // SAFETY: GetAllocatedString allocates with CoTaskMemAlloc; freed with CoTaskMemFree.
+        let friendly_name: String = unsafe {
+            let mut pwstr = PWSTR::null();
+            let mut cch: u32 = 0;
+            match activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut pwstr, &mut cch) {
+                Ok(()) if !pwstr.is_null() => {
+                    let name = pwstr.to_string().unwrap_or_else(|_| "(utf16 error)".into());
+                    CoTaskMemFree(Some(pwstr.0 as *const _));
+                    name
+                }
+                _ => "(unknown)".into(),
+            }
+        };
+
+        // CLSID via GetGUID.
+        // SAFETY: GetGUID reads from the internal attribute store; no allocation.
+        let clsid_str: String = unsafe {
+            match activate.GetGUID(&MFT_TRANSFORM_CLSID_Attribute) {
+                Ok(guid) => format!(
+                    "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+                    guid.data1,
+                    guid.data2,
+                    guid.data3,
+                    guid.data4[0],
+                    guid.data4[1],
+                    guid.data4[2],
+                    guid.data4[3],
+                    guid.data4[4],
+                    guid.data4[5],
+                    guid.data4[6],
+                    guid.data4[7],
+                ),
+                Err(_) => "(no CLSID)".into(),
+            }
+        };
+
+        tracing::info!(
+            "probe_and_select_mft: candidate [{i}/{count}] \"{friendly_name}\" {clsid_str}"
+        );
+
+        // ── Step 1: ActivateObject ────────────────────────────────────────────
+        // SAFETY: ActivateObject is the documented way to instantiate an IMFTransform
+        // from an IMFActivate pointer obtained via MFTEnumEx.
+        let mft: IMFTransform = match unsafe { activate.ActivateObject() } {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "probe_and_select_mft: candidate [{i}] ActivateObject failed \
+                     (0x{:08X}); trying next",
+                    e.code().0
+                );
+                // ShutdownObject releases any partially-initialised GPU resources (DD-D).
+                // SAFETY: ShutdownObject on an activate that failed ActivateObject is a no-op
+                // per Windows docs (it can only free what was allocated).
+                let _ = unsafe { activate.ShutdownObject() };
+                last_err = EncoderError::InitFailed(format!(
+                    "ActivateObject[{i}] ({friendly_name}): 0x{:08X}",
+                    e.code().0
+                ));
+                continue;
+            }
+        };
+
+        // ── Step 2: MF_TRANSFORM_ASYNC_UNLOCK ────────────────────────────────
+        // Must be set before any other call on an async (hardware) MFT.
+        // Set here so the probe operates on the same activation state as production.
+        // setup_mft MUST NOT re-set this (it is already set by the time setup_mft runs).
+        let attrs = match unsafe { mft.GetAttributes() } {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    "probe_and_select_mft: candidate [{i}] GetAttributes failed \
+                     (0x{:08X}); trying next",
+                    e.code().0
+                );
+                let _ = unsafe { activate.ShutdownObject() };
+                last_err = EncoderError::InitFailed(format!(
+                    "GetAttributes[{i}] ({friendly_name}): 0x{:08X}",
+                    e.code().0
+                ));
+                continue;
+            }
+        };
+        if let Err(e) = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) } {
+            tracing::warn!(
+                "probe_and_select_mft: candidate [{i}] MF_TRANSFORM_ASYNC_UNLOCK failed \
+                 (0x{:08X}); trying next",
+                e.code().0
+            );
+            let _ = unsafe { activate.ShutdownObject() };
+            last_err = EncoderError::InitFailed(format!(
+                "MF_TRANSFORM_ASYNC_UNLOCK[{i}] ({friendly_name}): 0x{:08X}",
+                e.code().0
+            ));
+            continue;
+        }
+
+        // ── Step 3: Output-type negotiation probe (DD-B via DD-E helper) ─────
+        // Calls GetOutputAvailableType(0, 0) + overlay FRAME_SIZE + FRAME_RATE +
+        // AVG_BITRATE + SetOutputType. NVENC's slot[0] pre-sets INTERLACE_MODE=2
+        // (Progressive) and MPEG2_PROFILE=77 (Main); do NOT overlay them.
+        if let Err(e) = try_setup_output_type(&mft, PROBE_W, PROBE_H, PROBE_FPS, PROBE_BPS) {
+            tracing::warn!(
+                "probe_and_select_mft: candidate [{i}] \"{friendly_name}\" {clsid_str} \
+                 rejected output-type negotiation ({e}); trying next"
+            );
+            let _ = unsafe { activate.ShutdownObject() };
+            last_err = e;
+            continue;
+        }
+
+        // ── Step 4: Cast to ICodecAPI ─────────────────────────────────────────
+        // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
+        let codec_api = match mft.cast::<ICodecAPI>() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "probe_and_select_mft: candidate [{i}] \"{friendly_name}\" ICodecAPI cast \
+                     failed (0x{:08X}); trying next",
+                    e.code().0
+                );
+                let _ = unsafe { activate.ShutdownObject() };
+                last_err = EncoderError::InitFailed(format!(
+                    "ICodecAPI cast[{i}] ({friendly_name}): 0x{:08X}",
+                    e.code().0
+                ));
+                continue;
+            }
+        };
+
+        // ── Winner ────────────────────────────────────────────────────────────
+        tracing::info!(
+            "probe_and_select_mft: selected candidate [{i}] \"{friendly_name}\" {clsid_str}"
+        );
+        return Ok((mft, codec_api));
+    }
+
+    Err(last_err)
+}
+
+/// Output-type negotiation helper (DD-B / DD-E — single source of truth).
+///
+/// Phase 0 v2 evidence (Host B): NVENC's `GetOutputAvailableType(0, 0)` returns a base
+/// type with `INTERLACE_MODE = 2` (Progressive) and `MPEG2_PROFILE = 77` (Main) already
+/// set. Overlaying those attributes invalidates the negotiation envelope (AMD evidence:
+/// Strategy A–D all rejected on candidates without hardware). PAR is absent from the
+/// slot and must stay absent (NVENC infers 1:1). The only three caller-controlled
+/// attributes are `MF_MT_FRAME_SIZE`, `MF_MT_FRAME_RATE`, and `MF_MT_AVG_BITRATE`.
+///
+/// Called from:
+/// - `probe_and_select_mft` (DD-A probe step) — determines which candidate wins.
+/// - `setup_mft` (production path) — configures the selected MFT for the real session.
+///
+/// No retries. No `DeleteItem`. Strategy E is the contract (Phase 0 v2).
+fn try_setup_output_type(
+    mft: &IMFTransform,
+    w: u32,
+    h: u32,
+    framerate: u32,
+    bitrate_bps: u32,
+) -> Result<(), EncoderError> {
+    // Step 7b: Clone NVENC's advertised output type at slot 0 and overlay the three
+    // caller-controlled attributes (FRAME_SIZE, FRAME_RATE, AVG_BITRATE). Per Phase 0
+    // v2 evidence: NVENC's slot[0] pre-sets INTERLACE_MODE = 2 (Progressive) and
+    // MPEG2_PROFILE = 77 (Main); overlaying those would invalidate the negotiation
+    // envelope. PAR is absent and stays absent (NVENC infers 1:1).
+    let out_type: IMFMediaType = unsafe { mft.GetOutputAvailableType(0, 0) }.map_err(|e| {
+        EncoderError::InitFailed(format!(
+            "GetOutputAvailableType(0,0): 0x{:08X}",
+            e.code().0
+        ))
+    })?;
+
+    unsafe {
+        out_type
+            .SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | (h as u64))
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT64 FrameSize: 0x{:08X}", e.code().0))
+            })?;
+        out_type
+            .SetUINT64(&MF_MT_FRAME_RATE, ((framerate as u64) << 32) | 1)
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT64 FrameRate: 0x{:08X}", e.code().0))
+            })?;
+        out_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT32 Bitrate: 0x{:08X}", e.code().0))
+            })?;
+        mft.SetOutputType(0, &out_type, 0).map_err(|e| {
+            EncoderError::InitFailed(format!("SetOutputType: 0x{:08X}", e.code().0))
+        })?;
+    }
+
+    Ok(())
 }
 
 // ── Encoder thread ────────────────────────────────────────────────────────────
@@ -440,7 +667,8 @@ fn run_encoder_thread(
         config.bitrate_bps
     );
 
-    // Steps 7b–7h: Setup media types, unlock async, get event generator, send messages.
+    // Steps 7b–7h: Setup output/input media types and streaming messages.
+    // (MF_TRANSFORM_ASYNC_UNLOCK was already set during probe_and_select_mft.)
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
         // MFShutdown for the thread's MF context is not needed here because
@@ -508,76 +736,21 @@ fn effective_dimensions(config: &EncoderConfig) -> (u32, u32) {
 }
 
 /// Setup MFT media types and streaming messages (steps 7b–7h).
+///
+/// `MF_TRANSFORM_ASYNC_UNLOCK` is NOT set here — it is set once in
+/// `probe_and_select_mft` during the candidate probe (before `ActivateObject`
+/// returns the winning IMFTransform). Setting it again here would be idempotent
+/// on most MFTs but is cleaner to do once. See DD-A / DD-B.
 fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderError> {
-    use windows::Win32::Media::MediaFoundation::IMFMediaType;
-
     // Sentinel-zero triggers 1920×1080 fallback per DD3; production callers supply
     // real dimensions via EncoderConfig.width / EncoderConfig.height.
     // See effective_dimensions() for the fallback policy.
     let (w, h) = effective_dimensions(config);
 
-    // Step 7a: MF_TRANSFORM_ASYNC_UNLOCK MUST be set before any other call on a
-    // hardware (async) MFT. Per Microsoft Async MFT contract: "Before calling any
-    // other methods on the transform, the application must set
-    // MF_TRANSFORM_ASYNC_UNLOCK on the IMFAttributes attribute store of the
-    // transform." Setting it after SetInputType caused the HW MFT to reject the
-    // input type with MF_E_INVALIDMEDIATYPE (0xC00D6D77) — see discovery #592.
-    let attrs = unsafe { mft.GetAttributes() }
-        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
-    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
-        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
-    })?;
-
     // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
-    let out_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
-        EncoderError::InitFailed(format!("MFCreateMediaType(out): 0x{:08X}", e.code().0))
-    })?;
-
-    unsafe {
-        out_type
-            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetGUID Major(out): 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
-            .map_err(|e| EncoderError::InitFailed(format!("SetGUID H264: 0x{:08X}", e.code().0)))?;
-        out_type
-            .SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 bitrate: 0x{:08X}", e.code().0))
-            })?;
-        // MFSetAttributeSize encodes (w,h) into a u64: high 32 bits = w, low 32 bits = h.
-        out_type
-            .SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | (h as u64))
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 FrameSize: 0x{:08X}", e.code().0))
-            })?;
-        // MFSetAttributeRatio encodes (num,den) into a u64: high 32 = num, low 32 = den.
-        out_type
-            .SetUINT64(&MF_MT_FRAME_RATE, ((config.framerate as u64) << 32) | 1)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 FrameRate: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 PAR: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 Interlace: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_MAIN)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 Profile: 0x{:08X}", e.code().0))
-            })?;
-        mft.SetOutputType(0, &out_type, 0).map_err(|e| {
-            EncoderError::InitFailed(format!("SetOutputType: 0x{:08X}", e.code().0))
-        })?;
-    }
+    // Delegates to try_setup_output_type (DD-E single source of truth) using the
+    // real session config dimensions, framerate, and bitrate.
+    try_setup_output_type(mft, w, h, config.framerate, config.bitrate_bps)?;
 
     // Step 7c: SetInputType (NV12).
     let in_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
@@ -618,7 +791,7 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     }
 
     // Steps 7f–7h: Send streaming messages.
-    // (Async unlock was already set at Step 7a — see top of function.)
+    // (Async unlock was set in probe_and_select_mft during init — not repeated here.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
