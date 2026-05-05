@@ -192,7 +192,11 @@ impl VideoEncoder for WindowsMftH264Encoder {
         }
 
         // Synchronous MFT initialisation (design §5 steps 1–6).
-        let (mft, codec_api) = init_mft_sync()?;
+        // Pass the real config so the probe's SetOutputType uses the session's
+        // dimensions/framerate/bitrate — that is the ONLY SetOutputType call
+        // (the encoder thread does NOT re-negotiate; cross-thread re-negotiation
+        // corrupted NVENC state and AV'd in pump_loop, see phase0v3 trace).
+        let (mft, codec_api) = init_mft_sync(&config)?;
 
         Ok(Self {
             config,
@@ -346,7 +350,7 @@ impl Drop for WindowsMftH264Encoder {
 
 // ── Synchronous MFT initialisation (design §5 steps 1–6) ─────────────────────
 
-fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
+fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFTransform, ICodecAPI), EncoderError> {
     av_trace!("init_mft_sync: ENTER");
     // Step 1: CoInitializeEx on caller thread (MTA).
     // SAFETY: Paired with CoUninitialize in Drop.
@@ -392,7 +396,7 @@ fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
 
     av_trace!("init_mft_sync: before probe_and_select_mft");
     let result = match activates_result {
-        Ok(activates) => probe_and_select_mft(activates),
+        Ok(activates) => probe_and_select_mft(activates, config),
         Err(e) => Err(e),
     };
 
@@ -487,14 +491,16 @@ fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
 /// If all candidates fail, returns `EncoderError::InitFailed` with the last error.
 fn probe_and_select_mft(
     activates: Vec<IMFActivate>,
+    config: &EncoderConfig,
 ) -> Result<(IMFTransform, ICodecAPI), EncoderError> {
     // Placeholder dimensions for the probe. These must be valid (non-zero) so
-    // try_setup_output_type calls SetOutputType with a real resolution.
-    // We use 1920×1080 (the sentinel-zero fallback) and a standard config.
-    const PROBE_W: u32 = 1920;
-    const PROBE_H: u32 = 1080;
-    const PROBE_FPS: u32 = 30;
-    const PROBE_BPS: u32 = 4_000_000;
+    // try_setup_output_type calls SetOutputType with the SESSION's real config.
+    // After phase0v3 we no longer use placeholder PROBE_* constants — the probe
+    // IS the only SetOutputType call (setup_mft on the encoder thread does NOT
+    // re-negotiate, since cross-thread re-negotiation corrupted NVENC state).
+    let (probe_w, probe_h) = effective_dimensions(config);
+    let probe_fps = config.framerate;
+    let probe_bps = config.bitrate_bps;
 
     let count = activates.len();
     av_trace!("probe_and_select_mft: ENTER count={}", count);
@@ -626,7 +632,7 @@ fn probe_and_select_mft(
         // AVG_BITRATE + SetOutputType. NVENC's slot[0] pre-sets INTERLACE_MODE=2
         // (Progressive) and MPEG2_PROFILE=77 (Main); do NOT overlay them.
         av_trace!("probe[{i}]: before try_setup_output_type (probe pass)");
-        if let Err(e) = try_setup_output_type(&mft, PROBE_W, PROBE_H, PROBE_FPS, PROBE_BPS) {
+        if let Err(e) = try_setup_output_type(&mft, probe_w, probe_h, probe_fps, probe_bps) {
             av_trace!("probe[{i}]: try_setup_output_type FAILED: {e}");
             tracing::warn!(
                 "probe_and_select_mft: candidate [{i}] \"{friendly_name}\" {clsid_str} \
@@ -924,17 +930,14 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     let (w, h) = effective_dimensions(config);
     av_trace!("setup_mft: effective dims w={w} h={h} fps={} bps={}", config.framerate, config.bitrate_bps);
 
-    // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
-    // Delegates to try_setup_output_type (DD-E single source of truth) using the
-    // real session config dimensions, framerate, and bitrate.
-    // NOTE: probe_and_select_mft already called try_setup_output_type once (probe pass).
-    // This is the SECOND call — DOUBLE NEGOTIATION (H-AV2 suspect).
-    av_trace!("setup_mft: DOUBLE NEGOTIATION — calling try_setup_output_type again (2nd call after probe)");
-    if let Err(e) = try_setup_output_type(mft, w, h, config.framerate, config.bitrate_bps) {
-        av_trace!("setup_mft: try_setup_output_type FAILED: {e}");
-        return Err(e);
-    }
-    av_trace!("setup_mft: try_setup_output_type OK (2nd call)");
+    // Step 7b: SetOutputType was ALREADY done in probe_and_select_mft on the
+    // caller thread, with the session's real config. Per phase0v3 root cause
+    // (H-AV2 confirmed): a second SetOutputType from the encoder thread on the
+    // same IMFTransform corrupts NVENC's internal state and AVs the pump_loop.
+    // We must NOT re-negotiate the output type here. The IMFTransform we
+    // received via ComSend is already configured for the session.
+    av_trace!("setup_mft: skipping output-type negotiation (already done in caller-thread probe)");
+    let _ = (w, h); // silence unused after removing the call
 
     // Step 7c: SetInputType (NV12).
     av_trace!("setup_mft: before MFCreateMediaType (input type)");
