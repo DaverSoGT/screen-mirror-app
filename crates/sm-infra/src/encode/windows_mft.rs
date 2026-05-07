@@ -167,10 +167,10 @@ impl VideoEncoder for WindowsMftH264Encoder {
     /// Construct and validate an encoder configuration.
     ///
     /// Performs a synchronous DESTRUCTIVE probe on the caller's thread:
-    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate
-    /// (`ActivateObject` + `MF_TRANSFORM_ASYNC_UNLOCK` + `GetOutputAvailableType(0,0)`
-    /// + `SetOutputType` with Strategy E + `ShutdownObject`). The winning candidate's
-    /// `IMFTransform` is discarded after the probe; only the `IMFActivate` is retained.
+    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate probe
+    /// (`ActivateObject`, `MF_TRANSFORM_ASYNC_UNLOCK`, `GetOutputAvailableType(0,0)`,
+    /// `SetOutputType` with Strategy E, then `ShutdownObject`). The winning
+    /// candidate's `IMFTransform` is discarded after the probe; only the `IMFActivate` is retained.
     ///
     /// Returns:
     /// - `Err(InvalidConfig(_))` for `bitrate_bps == 0` or `framerate == 0`.
@@ -338,7 +338,9 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
     // Phase 0 v2 evidence: Host B has 3 candidates — pactivates[0] and [1] are
     // AMDh264Encoder (no AMD GPU), [2] is NVIDIA H.264 Encoder MFT. Only [2] accepts
     // strategy E (FRAME_SIZE + FRAME_RATE + AVG_BITRATE on cloned slot[0] type).
-    let result = match enumerate_activates() {
+    let activates_result = enumerate_activates();
+
+    let result = match activates_result {
         Ok(activates) => probe_and_select_mft(activates, config),
         Err(e) => Err(e),
     };
@@ -686,7 +688,7 @@ fn run_encoder_thread(
     // WHY: NVENC's IMFTransform AVs when used from a different thread than ActivateObject.
     // The caller thread (init_mft_sync / probe_and_select_mft) only validated the activate;
     // it ShutdownObject'd its probe IMFTransform immediately. This re-activation creates a
-    // new, thread-local IMFTransform with no cross-thread COM history.
+    // new, thread-local IMFTransform with no cross-thread COM history (phase0v3 H-AV3 fix).
     // SAFETY: ActivateObject is the documented way to instantiate an IMFTransform from
     // an IMFActivate obtained via MFTEnumEx. The activate is an MTA-registered factory;
     // both this thread and the caller thread are MTA — transfer is safe (see ComSend docs).
@@ -968,10 +970,15 @@ fn extract_bytes(
 
 /// Apply pending keyframe and bitrate codec settings before a ProcessInput call.
 ///
-/// Mechanical extraction from the NeedInput arm (design DD9). Module-private.
-fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) {
-    // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
-    if state.keyframe_pending.swap(false, Ordering::AcqRel) {
+/// Returns `true` when a keyframe was requested. The caller must also set
+/// `MFSampleExtension_CleanPoint = 1` on the input `IMFSample`: NVIDIA NVENC's
+/// MFT silently ignores `CODECAPI_AVEncVideoForceKeyFrame` and only respects
+/// the per-sample CleanPoint hint (Microsoft-documented force-IDR mechanism).
+/// We send both: SetValue covers Microsoft software encoder + AMD; CleanPoint
+/// covers NVENC.
+fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) -> bool {
+    let keyframe_pending = state.keyframe_pending.swap(false, Ordering::AcqRel);
+    if keyframe_pending {
         // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
         let v = make_variant_bool(true);
         unsafe {
@@ -993,6 +1000,8 @@ fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared)
             }
         }
     }
+
+    keyframe_pending
 }
 
 #[expect(
@@ -1158,7 +1167,7 @@ fn pump_loop(
 
         // ── Service NeedInput (submit frames) ─────────────────────────────────────
         while ni_count > 0 {
-            apply_pending_codec_settings(codec_api, state);
+            let force_keyframe = apply_pending_codec_settings(codec_api, state);
 
             // WHY: FRAME_RECV_TIMEOUT ≤50ms is load-bearing for T-NEW-2
             // (`mft_stop_during_active_encode_returns_within_deadline`). When stop()
@@ -1175,11 +1184,22 @@ fn pump_loop(
                         state.dropped.fetch_add(1, Ordering::Relaxed);
                         // Do NOT consume the NeedInput credit — break out so the next
                         // poll iteration re-evaluates and we don't busy-loop on bad input.
+                        // If we swallowed a keyframe request, restore it so the next
+                        // submitted frame still carries the IDR hint.
+                        if force_keyframe {
+                            state.keyframe_pending.store(true, Ordering::Release);
+                        }
                         break;
                     }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
-                    match submit_frame(mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
+                    match submit_frame(
+                        mft,
+                        &nv12_scratch,
+                        frame.timestamp,
+                        frame_dur_100ns,
+                        force_keyframe,
+                    ) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
@@ -1209,11 +1229,17 @@ fn pump_loop(
                     // No frame available within timeout — do NOT consume the NeedInput credit.
                     // The MFT retains the credit; we re-poll events on the next iteration.
                     // This path exits the inner loop so the top-of-loop stop check runs (DD2).
+                    if force_keyframe {
+                        state.keyframe_pending.store(true, Ordering::Release);
+                    }
                     break;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Upstream closed — drain MFT and continue looping (do NOT consume credit).
                     tracing::info!("pump_loop: frame channel disconnected, sending COMMAND_DRAIN");
+                    if force_keyframe {
+                        state.keyframe_pending.store(true, Ordering::Release);
+                    }
                     unsafe {
                         let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
                     }
@@ -1251,13 +1277,33 @@ fn pump_loop(
 }
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
+///
+/// When `force_keyframe` is `true`, sets `MFSampleExtension_CleanPoint = 1` on
+/// the input sample. This is the Microsoft-documented mechanism for requesting
+/// an IDR — required for NVIDIA NVENC, which silently ignores the alternative
+/// `CODECAPI_AVEncVideoForceKeyFrame` path.
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
     timestamp: std::time::Duration,
     duration_100ns: i64,
+    force_keyframe: bool,
 ) -> Result<(), EncoderError> {
     let sample = build_imfsample(&nv12.buf, timestamp, duration_100ns)?;
+    if force_keyframe {
+        // SAFETY: SetUINT32 on a valid IMFSample is safe; CleanPoint is a documented
+        // attribute on the IMFAttributes interface that IMFSample inherits.
+        unsafe {
+            sample
+                .SetUINT32(&MFSampleExtension_CleanPoint, 1)
+                .map_err(|e| {
+                    EncoderError::EncodeFailed(format!(
+                        "SetUINT32(CleanPoint): 0x{:08X}",
+                        e.code().0
+                    ))
+                })?;
+        }
+    }
     unsafe {
         mft.ProcessInput(0, &sample, 0)
             .map_err(|e| EncoderError::EncodeFailed(format!("ProcessInput: 0x{:08X}", e.code().0)))
@@ -1329,8 +1375,11 @@ fn collect_output(
     };
 
     // DD10: read is_keyframe from MFSampleExtension_CleanPoint attribute.
+    // Fallback: some vendor MFTs emit IDR access units without setting CleanPoint,
+    // so we also scan the Annex-B bitstream for an IDR NAL (type 5) as authoritative.
     // SAFETY: GetUINT32 on a valid IMFSample is always safe.
-    let is_keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) } != 0;
+    let clean_point = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) } != 0;
+    let is_keyframe = clean_point || annex_b_contains_idr(&annex_b);
 
     let pkt = EncodedPacket {
         data: Arc::from(annex_b.into_boxed_slice()),
@@ -1341,6 +1390,36 @@ fn collect_output(
     *seq += 1;
 
     Ok(Some(pkt))
+}
+
+/// Scan an Annex-B bitstream for an IDR NAL unit (type 5).
+///
+/// Used as a fallback when `MFSampleExtension_CleanPoint` is absent — some vendor
+/// MFTs (e.g. NVIDIA NVENC) emit forced IDR samples without setting that attribute.
+/// The bitstream is authoritative: H.264 emulation prevention guarantees that real
+/// start codes never appear inside NAL payloads, so a byte scan is correct.
+fn annex_b_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0x00 && data[i + 1] == 0x00 {
+            if data[i + 2] == 0x01 {
+                if data[i + 3] & 0x1F == 5 {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+            if data[i + 2] == 0x00 && i + 4 < data.len() && data[i + 3] == 0x01 {
+                if data[i + 4] & 0x1F == 5 {
+                    return true;
+                }
+                i += 5;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Rewrite AVCC (length-prefixed) NAL units to Annex-B (start-code-prefixed) format (§5b).
@@ -1416,14 +1495,13 @@ impl WindowsMftH264Encoder {
     /// # Safety
     /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
     /// which would be incorrect since COM was never initialised by this constructor.
-    /// `mft` and `codec_api` are `None`, so any call to `start()` will return
+    /// `winning_activate` is `None`, so any call to `start()` will return
     /// `Err(Internal(_))` rather than accessing an invalid COM pointer.
     fn new_for_validation_test() -> Self {
         Self {
             config: EncoderConfig::default(),
             state: Arc::new(MftEncoderShared::default()),
-            mft: None,
-            codec_api: None,
+            winning_activate: None,
             handle: None,
             com_initialized: false,
         }
@@ -1490,6 +1568,47 @@ mod tests {
             &[0x65u8, 0x88, 0x84, 0x00, 0x00],
             "AVCC→AnnexB must preserve NAL payload bytes"
         );
+    }
+
+    // ─── annex_b_contains_idr — fallback for vendor MFTs without CleanPoint ────
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_with_4byte_start_code() {
+        // 4-byte start code + NAL byte 0x65 (forbidden_zero=0, nal_ref_idc=3, type=5).
+        let data = vec![0x00u8, 0x00, 0x00, 0x01, 0x65, 0xAB, 0xCD];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_with_3byte_start_code() {
+        // 3-byte start code + NAL byte 0x25 (nal_ref_idc=1, type=5).
+        let data = vec![0x00u8, 0x00, 0x01, 0x25, 0xAB];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_after_sps_pps_prefix() {
+        // SPS (type 7) + PPS (type 8) + IDR slice (type 5) — typical IDR access unit.
+        let data = vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, // SPS (type 7)
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x00, // PPS (type 8)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR slice (type 5)
+        ];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_returns_false_for_p_frame_only() {
+        // Only NAL type 1 (non-IDR slice).
+        let data = vec![0x00u8, 0x00, 0x00, 0x01, 0x41, 0xAB, 0xCD, 0xEF];
+        assert!(!annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_returns_false_for_too_short_input() {
+        // Below minimum to hold a start code + NAL byte.
+        assert!(!annex_b_contains_idr(&[]));
+        assert!(!annex_b_contains_idr(&[0x00, 0x00, 0x01]));
     }
 
     // ─── T3a.1: new_rejects_zero_bitrate ──────────────────────────────────────
