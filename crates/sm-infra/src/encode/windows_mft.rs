@@ -673,10 +673,7 @@ fn renegotiate_output_type(
             })?;
 
         mft.SetOutputType(0, &out_type, 0).map_err(|e| {
-            EncoderError::EncodeFailed(format!(
-                "renegotiate: SetOutputType: 0x{:08X}",
-                e.code().0
-            ))
+            EncoderError::EncodeFailed(format!("renegotiate: SetOutputType: 0x{:08X}", e.code().0))
         })?;
     }
 
@@ -1163,7 +1160,16 @@ fn pump_loop(
         // HaveOutput credits must be consumed before NeedInput to prevent pipeline deadlock
         // on vendor MFTs that emit HaveOutput before the first NeedInput at startup.
         while ho_count > 0 {
-            match collect_output(mft, output_format_known, current_ts, &mut seq, cfg_w, cfg_h, config.framerate, config.bitrate_bps) {
+            match collect_output(
+                mft,
+                output_format_known,
+                current_ts,
+                &mut seq,
+                cfg_w,
+                cfg_h,
+                config.framerate,
+                config.bitrate_bps,
+            ) {
                 Ok(Some(pkt)) => {
                     // Decrement AFTER successful COM call (spec OQ-1, design DD2).
                     ho_count -= 1;
@@ -1375,11 +1381,7 @@ fn collect_output(
 
     match unsafe { mft.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status) } {
         Ok(()) => {
-            tracing::trace!(
-                dw_status = output.dwStatus,
-                status,
-                "ProcessOutput Ok"
-            );
+            tracing::trace!(dw_status = output.dwStatus, status, "ProcessOutput Ok");
         }
         Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
             tracing::trace!(
