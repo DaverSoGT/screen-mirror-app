@@ -142,8 +142,12 @@ fn mft_new_returns_init_failed_when_no_hardware_mft() {
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_encoded_packet_starts_with_annex_b_start_code() {
-    let mut enc = WindowsMftH264Encoder::new(EncoderConfig::default())
-        .expect("WindowsMftH264Encoder::new should succeed");
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
 
     let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
     let (pkt_tx, pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
@@ -264,8 +268,12 @@ fn mft_thirty_frame_smoke_emits_at_least_one_keyframe() {
 fn mft_encoded_packet_timestamp_matches_capture_frame() {
     const EXPECTED_TS: Duration = Duration::from_millis(500);
 
-    let mut enc = WindowsMftH264Encoder::new(EncoderConfig::default())
-        .expect("WindowsMftH264Encoder::new should succeed");
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
 
     let (frame_tx, frame_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
     let (pkt_tx, pkt_rx) = mpsc::sync_channel(sm_infra::encode::ENCODE_CHANNEL_CAPACITY);
@@ -299,8 +307,12 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
 
-    let mut enc = WindowsMftH264Encoder::new(EncoderConfig::default())
-        .expect("WindowsMftH264Encoder::new should succeed");
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
 
     let (frame_tx, frame_rx) = mpsc::sync_channel(16);
     let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
@@ -377,8 +389,12 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
 
-    let mut enc = WindowsMftH264Encoder::new(EncoderConfig::default())
-        .expect("WindowsMftH264Encoder::new should succeed");
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new should succeed");
 
     let (frame_tx, frame_rx) = mpsc::sync_channel(16);
     let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
@@ -434,6 +450,8 @@ fn mft_set_bitrate_updates_encoder_without_restart() {
     const HEIGHT: u32 = 480;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
         bitrate_bps: 4_000_000,
         ..EncoderConfig::default()
     })

@@ -4,16 +4,22 @@
 //! # Overview
 //!
 //! [`WindowsMftH264Encoder`] wraps an async `IMFTransform` behind the [`VideoEncoder`]
-//! domain trait. It selects the first hardware H.264 MFT returned by
-//! `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)`, returning
-//! `EncoderError::InitFailed` if none is available (so the factory can fall back
-//! to `WindowsOpenH264Encoder`).
+//! domain trait. It probes all hardware H.264 MFTs returned by
+//! `MFTEnumEx(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER)` and selects the
+//! first candidate whose output-type negotiation succeeds (strategy E: clone
+//! `GetOutputAvailableType(0,0)` and overlay `FRAME_SIZE + FRAME_RATE + AVG_BITRATE`).
+//! This handles systems where vendor MFTs (e.g. AMD) are registered but have no
+//! backing hardware. Returns `EncoderError::InitFailed` if no candidate succeeds.
 //!
 //! # Thread model
 //!
-//! - `new()`: validates config, performs synchronous MFT enumeration and activation
-//!   (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + `ActivateObject`).
-//! - `start(rx, tx)`: spawns one OS thread that owns the MFT pump loop.
+//! - `new()`: validates config, runs a DESTRUCTIVE probe on the caller thread
+//!   (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + per-candidate
+//!   `ActivateObject` + `try_setup_output_type` + `ShutdownObject`). The winning
+//!   `IMFActivate` is retained; its `IMFTransform` is discarded after the probe.
+//! - `start(rx, tx)`: transfers the `IMFActivate` to a spawned OS thread. The
+//!   encoder thread calls `ActivateObject` itself and owns the `IMFTransform`
+//!   entirely — no cross-thread COM transfer of `IMFTransform` or `ICodecAPI`.
 //! - `stop()`: idempotent. Sets stop flag and joins the handle.
 //! - `Drop`: calls `stop()` + `MFShutdown` + `CoUninitialize` on the caller thread.
 
@@ -25,24 +31,25 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFTransform, MEEndOfStream, METransformDrainComplete,
+    IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream, METransformDrainComplete,
     METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK,
-    MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
     MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
+    MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
-use windows::core::Interface;
+use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
 
@@ -66,7 +73,8 @@ impl<T> ComSend<T> {
 }
 
 // SAFETY: See safety contract on ComSend above — only used with MTA-registered
-// hardware MFT interfaces (IMFTransform, ICodecAPI).
+// hardware MFT factory pointers (IMFActivate). IMFTransform and ICodecAPI are
+// NOT transferred cross-thread; they live entirely on the encoder thread.
 unsafe impl<T> Send for ComSend<T> {}
 
 // ── Shared cross-thread state ─────────────────────────────────────────────────
@@ -94,12 +102,6 @@ impl Default for MftEncoderShared {
     }
 }
 
-// ── H264 profile constant ─────────────────────────────────────────────────────
-
-// DR4: eAVEncH264VProfile_Main = 77 (confirmed present in MediaFoundation 0.62.2).
-// Using the newtype value directly to be explicit about the integer.
-const H264_PROFILE_MAIN: u32 = eAVEncH264VProfile_Main.0 as u32;
-
 // ── Pump-loop timing constants ────────────────────────────────────────────────
 
 /// Sleep duration per idle iteration in the NO_WAIT polling loop.
@@ -122,10 +124,15 @@ const FRAME_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 pub struct WindowsMftH264Encoder {
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
-    /// COM interfaces obtained in `new()`, consumed by `start()`.
-    /// `None` after `start()` has transferred them to the encoder thread.
-    mft: Option<IMFTransform>,
-    codec_api: Option<ICodecAPI>,
+    /// The winning `IMFActivate` selected during the destructive probe in `new()`.
+    ///
+    /// `IMFActivate` is an MTA-registered COM factory pointer; it is safe to transfer
+    /// across MTA threads (see `ComSend` safety contract). Transferred to the encoder
+    /// thread in `start()` via `ComSend`. The encoder thread calls `ActivateObject` on
+    /// it to produce a fresh `IMFTransform` that lives ENTIRELY on that thread —
+    /// no cross-thread COM for `IMFTransform` or `ICodecAPI` (root cause of AVs in
+    /// commit ccd2e43, see sdd/.../phase0v3-final-root-cause).
+    winning_activate: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
     /// Tracks whether `new()` performed `CoInitializeEx` + `MFStartup`.
@@ -143,8 +150,10 @@ impl std::fmt::Debug for WindowsMftH264Encoder {
 }
 
 // SAFETY: `WindowsMftH264Encoder` is used from a single owner thread.
-// `mft` and `codec_api` (both `Option<COM interface>`) are transferred to the encoder
-// thread inside `start()` and set to `None` on the caller side immediately after.
+// `winning_activate` (`Option<IMFActivate>`) is transferred to the encoder thread
+// inside `start()` via `ComSend` and set to `None` on the caller side immediately
+// after. `IMFActivate` is an MTA-registered factory pointer; cross-thread transfer
+// is safe per Windows COM rules for MTA-registered objects (see `ComSend` docs).
 // Once `start()` has been called the struct never accesses these COM pointers again.
 // All remaining shared state (`state: Arc<MftEncoderShared>`) consists entirely of
 // atomics, which are `Send + Sync`. `JoinHandle<()>` and `EncoderConfig` are `Send`.
@@ -157,12 +166,15 @@ unsafe impl Sync for WindowsMftH264Encoder {}
 impl VideoEncoder for WindowsMftH264Encoder {
     /// Construct and validate an encoder configuration.
     ///
-    /// Performs synchronous MFT enumeration on the caller's thread:
-    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → `ActivateObject`.
+    /// Performs a synchronous DESTRUCTIVE probe on the caller's thread:
+    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate probe
+    /// (`ActivateObject`, `MF_TRANSFORM_ASYNC_UNLOCK`, `GetOutputAvailableType(0,0)`,
+    /// `SetOutputType` with Strategy E, then `ShutdownObject`). The winning
+    /// candidate's `IMFTransform` is discarded after the probe; only the `IMFActivate` is retained.
     ///
     /// Returns:
     /// - `Err(InvalidConfig(_))` for `bitrate_bps == 0` or `framerate == 0`.
-    /// - `Err(InitFailed(_))` if no hardware H.264 MFT is available.
+    /// - `Err(InitFailed(_))` if no hardware H.264 MFT candidate passes the probe.
     fn new(config: EncoderConfig) -> Result<Self, EncoderError>
     where
         Self: Sized,
@@ -177,14 +189,19 @@ impl VideoEncoder for WindowsMftH264Encoder {
             return Err(EncoderError::InvalidConfig("framerate must be > 0".into()));
         }
 
-        // Synchronous MFT initialisation (design §5 steps 1–6).
-        let (mft, codec_api) = init_mft_sync()?;
+        // Synchronous MFT probe (design §5 steps 1–5).
+        // Returns only the winning IMFActivate — the IMFTransform from the probe is
+        // ShutdownObject'd immediately. The encoder thread re-activates from the
+        // IMFActivate to produce a fresh IMFTransform that lives entirely on that thread.
+        // This eliminates cross-thread IMFTransform transfer, the root cause of AVs in
+        // commit ccd2e43 (phase0v3 trace: H-AV3 confirmed — NVENC singleton corruption
+        // when IMFTransform is used from a different thread than ActivateObject).
+        let activate = init_mft_sync(&config)?;
 
         Ok(Self {
             config,
             state: Arc::new(MftEncoderShared::default()),
-            mft: Some(mft),
-            codec_api: Some(codec_api),
+            winning_activate: Some(activate),
             handle: None,
             com_initialized: true,
         })
@@ -195,35 +212,25 @@ impl VideoEncoder for WindowsMftH264Encoder {
         rx: Receiver<sm_domain::CaptureFrame>,
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
-        let mft = self.mft.take().ok_or_else(|| {
-            EncoderError::Internal("start() called after IMFTransform was already consumed".into())
-        })?;
-        let codec_api = self.codec_api.take().ok_or_else(|| {
-            EncoderError::Internal("start() called after ICodecAPI was already consumed".into())
+        let activate = self.winning_activate.take().ok_or_else(|| {
+            EncoderError::Internal("start() called after IMFActivate was already consumed".into())
         })?;
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
 
         state.stop.store(false, Ordering::Release);
 
-        // Wrap COM interfaces in ComSend so the closure is Send.
-        // SAFETY: Both this thread and the encoder thread initialise as MTA
-        // (CoInitializeEx(COINIT_MULTITHREADED)), so MTA-registered hardware
-        // MFT interfaces cross thread boundaries safely (see ComSend docs).
-        let mft_send = ComSend(mft);
-        let codec_api_send = ComSend(codec_api);
+        // Wrap IMFActivate in ComSend so the closure is Send.
+        // SAFETY: IMFActivate is an MTA-registered COM factory; cross-thread transfer
+        // is safe when both threads join the MTA via CoInitializeEx(COINIT_MULTITHREADED).
+        // The encoder thread calls ActivateObject on the activate to produce a fresh
+        // IMFTransform that lives ENTIRELY on that thread — no cross-thread IMFTransform
+        // or ICodecAPI transfer (root cause of AVs in commit ccd2e43).
+        let activate_send = ComSend(activate);
 
         let handle = std::thread::spawn(move || {
-            // into_inner() unwraps ComSend<T> → T inside the thread.
-            // The closure captures ComSend<IMFTransform> and ComSend<ICodecAPI> (both Send).
-            run_encoder_thread(
-                mft_send.into_inner(),
-                codec_api_send.into_inner(),
-                config,
-                state,
-                rx,
-                tx,
-            );
+            // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
+            run_encoder_thread(activate_send.into_inner(), config, state, rx, tx);
         });
 
         self.handle = Some(handle);
@@ -262,17 +269,10 @@ impl Drop for WindowsMftH264Encoder {
         // Join encoder thread first. If start() was never called this is a no-op.
         let _ = self.stop();
 
-        // SAFETY: COM Release() on IMFTransform / ICodecAPI MUST execute while the
-        // Media Foundation runtime is still alive. Rust's automatic field-drop runs
-        // AFTER this Drop body returns, so we explicitly drop the Option<COMInterface>
-        // fields here. If we let MFShutdown() run first, the subsequent automatic
-        // Release() would land on memory torn down by MF → access violation 0xc0000005
-        // (see explore #583 Bucket B diagnosis).
-        drop(self.codec_api.take());
-        // SAFETY: same ordering contract as above for the IMFTransform handle.
-        // Order between codec_api and mft does not matter — both are sibling COM
-        // pointers; only their position relative to MFShutdown matters.
-        drop(self.mft.take());
+        // winning_activate: if start() was never called, the IMFActivate is still here.
+        // Drop it before MFShutdown to release the COM ref while MF is still alive.
+        // If start() was called, winning_activate is already None (transferred to thread).
+        drop(self.winning_activate.take());
 
         if self.com_initialized {
             unsafe {
@@ -291,7 +291,18 @@ impl Drop for WindowsMftH264Encoder {
 
 // ── Synchronous MFT initialisation (design §5 steps 1–6) ─────────────────────
 
-fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
+/// Caller-thread MFT probe. Returns the winning `IMFActivate` (not an `IMFTransform`).
+///
+/// Each candidate is activated, probed with `try_setup_output_type`, then immediately
+/// `ShutdownObject`'d — including the winner. The returned `IMFActivate` is transferred
+/// to the encoder thread in `start()`, which calls `ActivateObject` to produce a fresh
+/// `IMFTransform` that lives entirely on that thread.
+///
+/// WHY: NVENC's `IMFTransform` — despite MTA registration — AVs when used from a
+/// different thread than the one that called `ActivateObject` (phase0v3 trace: H-AV3
+/// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
+/// for `IMFTransform` and `ICodecAPI`.
+fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
     // Step 1: CoInitializeEx on caller thread (MTA).
     // SAFETY: Paired with CoUninitialize in Drop.
     // CoInitializeEx returns HRESULT directly (not Result).
@@ -314,25 +325,22 @@ fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
         )));
     }
 
-    // Steps 3–4: MFTEnumEx + ActivateObject.
-    match enumerate_and_activate() {
-        Ok(mft) => {
-            // Step 5: Cast to ICodecAPI.
-            // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
-            match mft.cast::<ICodecAPI>() {
-                Ok(codec_api) => Ok((mft, codec_api)),
-                Err(e) => {
-                    unsafe {
-                        let _ = MFShutdown();
-                        CoUninitialize();
-                    }
-                    Err(EncoderError::InitFailed(format!(
-                        "ICodecAPI cast failed: 0x{:08X}",
-                        e.code().0
-                    )))
-                }
-            }
-        }
+    // Steps 3–5: Enumerate IMFActivate candidates and probe each with full output-type
+    // negotiation. MFTEnumEx(MFT_ENUM_FLAG_HARDWARE) returns vendor MFTs even when
+    // their hardware is absent (e.g. AMD MFT on a non-AMD system). Probe selects the
+    // winner; winner's IMFTransform is ShutdownObject'd after probe.
+    // Phase 0 v2 evidence: Host B has 3 candidates — pactivates[0] and [1] are
+    // AMDh264Encoder (no AMD GPU), [2] is NVIDIA H.264 Encoder MFT. Only [2] accepts
+    // strategy E (FRAME_SIZE + FRAME_RATE + AVG_BITRATE on cloned slot[0] type).
+    let activates_result = enumerate_activates();
+
+    let result = match activates_result {
+        Ok(activates) => probe_and_select_mft(activates, config),
+        Err(e) => Err(e),
+    };
+
+    match result {
+        Ok(activate) => Ok(activate),
         Err(err) => {
             unsafe {
                 let _ = MFShutdown();
@@ -343,8 +351,12 @@ fn init_mft_sync() -> Result<(IMFTransform, ICodecAPI), EncoderError> {
     }
 }
 
-/// Enumerate hardware H.264 MFTs and activate the first one (steps 3–4).
-fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
+/// Enumerate hardware H.264 MFT candidates from MFTEnumEx (steps 3–4).
+///
+/// Returns all candidates as a `Vec<IMFActivate>` without activating them.
+/// The raw COM array is freed after cloning all references. If the array is
+/// empty or null, returns `EncoderError::InitFailed`.
+fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
     let input_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_NV12,
@@ -357,7 +369,8 @@ fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
     let mut pactivates: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count: u32 = 0;
 
-    // SAFETY: MFTEnumEx writes a COM-allocated array to pactivates; must be freed via CoTaskMemFree.
+    // SAFETY: MFTEnumEx writes a COM-allocated array to pactivates; must be freed via
+    // CoTaskMemFree once we have cloned all IMFActivate refs into a Vec.
     unsafe {
         MFTEnumEx(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -376,22 +389,244 @@ fn enumerate_and_activate() -> Result<IMFTransform, EncoderError> {
         ));
     }
 
-    // Activate the first hardware MFT.
-    // SAFETY: pactivates[0] is a valid IMFActivate pointer when count > 0 (MFTEnumEx contract).
-    let mft: IMFTransform = unsafe {
-        let activate_opt = &*pactivates;
-        let activate = activate_opt.as_ref().ok_or_else(|| {
-            EncoderError::InitFailed("MFTEnumEx returned null IMFActivate[0]".into())
-        })?;
-        activate.ActivateObject().map_err(|e| {
-            EncoderError::InitFailed(format!("ActivateObject: 0x{:08X}", e.code().0))
-        })?
+    // Clone each IMFActivate from the raw array into a Vec (AddRef via clone).
+    // SAFETY: pactivates[0..count] are valid Option<IMFActivate> per MFTEnumEx contract.
+    let activates: Vec<IMFActivate> = unsafe {
+        let slice = std::slice::from_raw_parts(pactivates, count as usize);
+        slice.iter().filter_map(|opt| opt.clone()).collect()
     };
 
-    // SAFETY: pactivates was allocated by MFTEnumEx (CoTaskMemAlloc); free with CoTaskMemFree.
+    // SAFETY: pactivates was CoTaskMemAlloc'd by MFTEnumEx; free after cloning all refs.
     unsafe { CoTaskMemFree(Some(pactivates as *const _)) };
 
-    Ok(mft)
+    if activates.is_empty() {
+        return Err(EncoderError::InitFailed(
+            "MFTEnumEx returned only null IMFActivate entries".into(),
+        ));
+    }
+
+    Ok(activates)
+}
+
+/// Iterate IMFActivate candidates and return the FIRST one that passes the full
+/// output-type negotiation probe (DD-A, DD-D, DD-E). This is a DESTRUCTIVE probe:
+/// the winner's `IMFTransform` is `ShutdownObject`'d after the probe, just like
+/// the rejected candidates. Only the `IMFActivate` (factory pointer) is returned.
+///
+/// For each candidate:
+///   1. `ActivateObject::<IMFTransform>` — if Err, log + `ShutdownObject` + skip.
+///   2. `MF_TRANSFORM_ASYNC_UNLOCK = 1` — required before any other MFT call.
+///   3. `try_setup_output_type` — Strategy E probe (DD-B). If Err, log + `ShutdownObject` + skip.
+///   4. Winner found — `ShutdownObject` the temporary IMFTransform, return the `IMFActivate`.
+///      The encoder thread will call `ActivateObject` again to get a fresh `IMFTransform`
+///      on its own thread, eliminating cross-thread COM transfer entirely.
+///
+/// If all candidates fail, returns `EncoderError::InitFailed` with the last error.
+///
+/// Note: `ICodecAPI` cast is NOT done here — it is done on the encoder thread after
+/// the fresh `ActivateObject` call, where the IMFTransform will actually be used.
+fn probe_and_select_mft(
+    activates: Vec<IMFActivate>,
+    config: &EncoderConfig,
+) -> Result<IMFActivate, EncoderError> {
+    // Use the session's real config dimensions for the probe so the
+    // SetOutputType call validates the actual session parameters.
+    let (probe_w, probe_h) = effective_dimensions(config);
+    let probe_fps = config.framerate;
+    let probe_bps = config.bitrate_bps;
+
+    let count = activates.len();
+    let mut last_err = EncoderError::InitFailed("no hardware MFT candidates enumerated".into());
+
+    for (i, activate) in activates.iter().enumerate() {
+        // ── Log candidate identity for diagnostics ────────────────────────────
+
+        // Friendly name via GetAllocatedString (IMFActivate inherits IMFAttributes).
+        // SAFETY: GetAllocatedString allocates with CoTaskMemAlloc; freed with CoTaskMemFree.
+        let friendly_name: String = unsafe {
+            let mut pwstr = PWSTR::null();
+            let mut cch: u32 = 0;
+            match activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut pwstr, &mut cch) {
+                Ok(()) if !pwstr.is_null() => {
+                    let name = pwstr.to_string().unwrap_or_else(|_| "(utf16 error)".into());
+                    CoTaskMemFree(Some(pwstr.0 as *const _));
+                    name
+                }
+                _ => "(unknown)".into(),
+            }
+        };
+
+        // CLSID via GetGUID.
+        // SAFETY: GetGUID reads from the internal attribute store; no allocation.
+        let clsid_str: String = unsafe {
+            match activate.GetGUID(&MFT_TRANSFORM_CLSID_Attribute) {
+                Ok(guid) => format!(
+                    "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+                    guid.data1,
+                    guid.data2,
+                    guid.data3,
+                    guid.data4[0],
+                    guid.data4[1],
+                    guid.data4[2],
+                    guid.data4[3],
+                    guid.data4[4],
+                    guid.data4[5],
+                    guid.data4[6],
+                    guid.data4[7],
+                ),
+                Err(_) => "(no CLSID)".into(),
+            }
+        };
+
+        tracing::info!(
+            "probe_and_select_mft: candidate [{i}/{count}] \"{friendly_name}\" {clsid_str}"
+        );
+
+        // ── Step 1: ActivateObject ────────────────────────────────────────────
+        // SAFETY: ActivateObject is the documented way to instantiate an IMFTransform
+        // from an IMFActivate pointer obtained via MFTEnumEx.
+        let mft: IMFTransform = match unsafe { activate.ActivateObject() } {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "probe_and_select_mft: candidate [{i}] ActivateObject failed \
+                     (0x{:08X}); trying next",
+                    e.code().0
+                );
+                // ShutdownObject releases any partially-initialised GPU resources (DD-D).
+                // SAFETY: ShutdownObject on an activate that failed ActivateObject is a no-op
+                // per Windows docs (it can only free what was allocated).
+                let _ = unsafe { activate.ShutdownObject() };
+                last_err = EncoderError::InitFailed(format!(
+                    "ActivateObject[{i}] ({friendly_name}): 0x{:08X}",
+                    e.code().0
+                ));
+                continue;
+            }
+        };
+
+        // ── Step 2: MF_TRANSFORM_ASYNC_UNLOCK ────────────────────────────────
+        // Must be set before any other call on an async (hardware) MFT.
+        // Set here so the probe operates on the same activation state as production.
+        // setup_mft MUST NOT re-set this (it is already set by the time setup_mft runs).
+        let attrs = match unsafe { mft.GetAttributes() } {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    "probe_and_select_mft: candidate [{i}] GetAttributes failed \
+                     (0x{:08X}); trying next",
+                    e.code().0
+                );
+                let _ = unsafe { activate.ShutdownObject() };
+                last_err = EncoderError::InitFailed(format!(
+                    "GetAttributes[{i}] ({friendly_name}): 0x{:08X}",
+                    e.code().0
+                ));
+                continue;
+            }
+        };
+        if let Err(e) = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) } {
+            tracing::warn!(
+                "probe_and_select_mft: candidate [{i}] MF_TRANSFORM_ASYNC_UNLOCK failed \
+                 (0x{:08X}); trying next",
+                e.code().0
+            );
+            let _ = unsafe { activate.ShutdownObject() };
+            last_err = EncoderError::InitFailed(format!(
+                "MF_TRANSFORM_ASYNC_UNLOCK[{i}] ({friendly_name}): 0x{:08X}",
+                e.code().0
+            ));
+            continue;
+        }
+
+        // ── Step 3: Output-type negotiation probe (DD-B via DD-E helper) ─────
+        // Calls GetOutputAvailableType(0, 0) + overlay FRAME_SIZE + FRAME_RATE +
+        // AVG_BITRATE + SetOutputType. NVENC's slot[0] pre-sets INTERLACE_MODE=2
+        // (Progressive) and MPEG2_PROFILE=77 (Main); do NOT overlay them.
+        if let Err(e) = try_setup_output_type(&mft, probe_w, probe_h, probe_fps, probe_bps) {
+            tracing::warn!(
+                "probe_and_select_mft: candidate [{i}] \"{friendly_name}\" {clsid_str} \
+                 rejected output-type negotiation ({e}); trying next"
+            );
+            let _ = unsafe { activate.ShutdownObject() };
+            last_err = e;
+            continue;
+        }
+
+        // ── Step 4 (WINNER) — destructive shutdown of the probe IMFTransform ──
+        // ShutdownObject releases the temporary IMFTransform obtained above.
+        // The encoder thread will call ActivateObject again to get a fresh
+        // IMFTransform that lives entirely on its own thread, eliminating cross-thread
+        // COM transfer of IMFTransform (root cause of AVs).
+        // ICodecAPI cast is NOT done here — it happens on the encoder thread.
+        // Drop mft first so the COM ref is released before ShutdownObject.
+        drop(mft);
+        let _ = unsafe { activate.ShutdownObject() };
+
+        tracing::info!(
+            "probe_and_select_mft: selected candidate [{i}] \"{friendly_name}\" {clsid_str}"
+        );
+        return Ok(activate.clone());
+    }
+
+    Err(last_err)
+}
+
+/// Output-type negotiation helper (DD-B / DD-E — single source of truth).
+///
+/// Phase 0 v2 evidence (Host B): NVENC's `GetOutputAvailableType(0, 0)` returns a base
+/// type with `INTERLACE_MODE = 2` (Progressive) and `MPEG2_PROFILE = 77` (Main) already
+/// set. Overlaying those attributes invalidates the negotiation envelope (AMD evidence:
+/// Strategy A–D all rejected on candidates without hardware). PAR is absent from the
+/// slot and must stay absent (NVENC infers 1:1). The only three caller-controlled
+/// attributes are `MF_MT_FRAME_SIZE`, `MF_MT_FRAME_RATE`, and `MF_MT_AVG_BITRATE`.
+///
+/// Called from:
+/// - `probe_and_select_mft` (DD-A probe step) — determines which candidate wins.
+/// - `setup_mft` (production path) — configures the selected MFT for the real session.
+///
+/// No retries. No `DeleteItem`. Strategy E is the contract (Phase 0 v2).
+fn try_setup_output_type(
+    mft: &IMFTransform,
+    w: u32,
+    h: u32,
+    framerate: u32,
+    bitrate_bps: u32,
+) -> Result<(), EncoderError> {
+    // Step 7b: Clone NVENC's advertised output type at slot 0 and overlay the three
+    // caller-controlled attributes (FRAME_SIZE, FRAME_RATE, AVG_BITRATE). Per Phase 0
+    // v2 evidence: NVENC's slot[0] pre-sets INTERLACE_MODE = 2 (Progressive) and
+    // MPEG2_PROFILE = 77 (Main); overlaying those would invalidate the negotiation
+    // envelope. PAR is absent and stays absent (NVENC infers 1:1).
+    let out_type: IMFMediaType = unsafe { mft.GetOutputAvailableType(0, 0) }.map_err(|e| {
+        EncoderError::InitFailed(format!("GetOutputAvailableType(0,0): 0x{:08X}", e.code().0))
+    })?;
+
+    unsafe {
+        out_type
+            .SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | (h as u64))
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT64 FrameSize: 0x{:08X}", e.code().0))
+            })?;
+
+        out_type
+            .SetUINT64(&MF_MT_FRAME_RATE, ((framerate as u64) << 32) | 1)
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT64 FrameRate: 0x{:08X}", e.code().0))
+            })?;
+
+        out_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
+            .map_err(|e| {
+                EncoderError::InitFailed(format!("SetUINT32 Bitrate: 0x{:08X}", e.code().0))
+            })?;
+
+        mft.SetOutputType(0, &out_type, 0).map_err(|e| {
+            EncoderError::InitFailed(format!("SetOutputType: 0x{:08X}", e.code().0))
+        })?;
+    }
+
+    Ok(())
 }
 
 // ── Encoder thread ────────────────────────────────────────────────────────────
@@ -411,13 +646,13 @@ impl Drop for CoUninitGuard {
 }
 
 fn run_encoder_thread(
-    mft: IMFTransform,
-    codec_api: ICodecAPI,
+    activate: IMFActivate,
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
+    // Step 1: CoInitializeEx on the encoder thread (MTA).
     // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
     // S_FALSE (1, already initialised on this apartment) both pass is_err() == false.
     // We install the CoUninitGuard BEFORE checking co_hr so the un-init runs even
@@ -440,7 +675,42 @@ fn run_encoder_thread(
         config.bitrate_bps
     );
 
-    // Steps 7b–7h: Setup media types, unlock async, get event generator, send messages.
+    // Step 2: ActivateObject — produce a fresh IMFTransform ENTIRELY ON THIS THREAD.
+    // WHY: NVENC's IMFTransform AVs when used from a different thread than ActivateObject.
+    // The caller thread (init_mft_sync / probe_and_select_mft) only validated the activate;
+    // it ShutdownObject'd its probe IMFTransform immediately. This re-activation creates a
+    // new, thread-local IMFTransform with no cross-thread COM history (phase0v3 H-AV3 fix).
+    // SAFETY: ActivateObject is the documented way to instantiate an IMFTransform from
+    // an IMFActivate obtained via MFTEnumEx. The activate is an MTA-registered factory;
+    // both this thread and the caller thread are MTA — transfer is safe (see ComSend docs).
+    let mft: IMFTransform = match unsafe { activate.ActivateObject() } {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("encoder thread ActivateObject failed: 0x{:08X}", e.code().0);
+            return;
+        }
+    };
+
+    // Step 3: MF_TRANSFORM_ASYNC_UNLOCK — required before any other call on an async MFT.
+    // Set here on the same thread that will use the MFT, NOT in the probe (the probe's
+    // IMFTransform was ShutdownObject'd; this is a fresh activation).
+    let attrs = match unsafe { mft.GetAttributes() } {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("encoder thread GetAttributes failed: 0x{:08X}", e.code().0);
+            return;
+        }
+    };
+    if let Err(e) = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) } {
+        tracing::error!(
+            "encoder thread MF_TRANSFORM_ASYNC_UNLOCK failed: 0x{:08X}",
+            e.code().0
+        );
+        return;
+    }
+
+    // Steps 4–6 (via setup_mft): output-type negotiation, input type, streaming messages.
+    // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
         // MFShutdown for the thread's MF context is not needed here because
@@ -448,6 +718,16 @@ fn run_encoder_thread(
         return;
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
+
+    // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
+    // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
+    let codec_api: ICodecAPI = match mft.cast() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("encoder thread ICodecAPI cast failed: 0x{:08X}", e.code().0);
+            return;
+        }
+    };
 
     let event_gen: IMFMediaEventGenerator = match mft.cast() {
         Ok(g) => g,
@@ -463,7 +743,7 @@ fn run_encoder_thread(
     // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
     let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
-    // Step 8: Pump loop.
+    // Step 8: Pump loop. mft, codec_api, event_gen all owned by this thread.
     pump_loop(
         &mft,
         &codec_api,
@@ -480,7 +760,7 @@ fn run_encoder_thread(
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
-    // mft, codec_api, event_gen are dropped here (COM Release via Drop).
+    // mft, codec_api, event_gen, activate are dropped here (COM Release via Drop).
     // MFShutdown for the thread is NOT called here — the caller thread's Drop handles it.
     // CoUninitGuard calls CoUninitialize when this function returns.
 }
@@ -508,76 +788,27 @@ fn effective_dimensions(config: &EncoderConfig) -> (u32, u32) {
 }
 
 /// Setup MFT media types and streaming messages (steps 7b–7h).
+///
+/// `MF_TRANSFORM_ASYNC_UNLOCK` is set by the encoder thread in `run_encoder_thread`
+/// BEFORE calling this function (using the fresh `IMFTransform` produced by
+/// `ActivateObject` on the encoder thread). This function starts with output-type
+/// negotiation (`try_setup_output_type`) — same-thread as the subsequent pump_loop,
+/// so no cross-thread COM state corruption is possible (contrast with commit ccd2e43
+/// where the output type was set on the caller thread and the pump ran on the encoder
+/// thread, triggering H-AV2 in the phase0v3 trace).
 fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderError> {
-    use windows::Win32::Media::MediaFoundation::IMFMediaType;
-
     // Sentinel-zero triggers 1920×1080 fallback per DD3; production callers supply
     // real dimensions via EncoderConfig.width / EncoderConfig.height.
     // See effective_dimensions() for the fallback policy.
     let (w, h) = effective_dimensions(config);
 
-    // Step 7a: MF_TRANSFORM_ASYNC_UNLOCK MUST be set before any other call on a
-    // hardware (async) MFT. Per Microsoft Async MFT contract: "Before calling any
-    // other methods on the transform, the application must set
-    // MF_TRANSFORM_ASYNC_UNLOCK on the IMFAttributes attribute store of the
-    // transform." Setting it after SetInputType caused the HW MFT to reject the
-    // input type with MF_E_INVALIDMEDIATYPE (0xC00D6D77) — see discovery #592.
-    let attrs = unsafe { mft.GetAttributes() }
-        .map_err(|e| EncoderError::InitFailed(format!("GetAttributes: 0x{:08X}", e.code().0)))?;
-    unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.map_err(|e| {
-        EncoderError::InitFailed(format!("MF_TRANSFORM_ASYNC_UNLOCK: 0x{:08X}", e.code().0))
-    })?;
-
-    // Step 7b: SetOutputType FIRST (MFT requirement: output before input).
-    let out_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
-        EncoderError::InitFailed(format!("MFCreateMediaType(out): 0x{:08X}", e.code().0))
-    })?;
-
-    unsafe {
-        out_type
-            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetGUID Major(out): 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
-            .map_err(|e| EncoderError::InitFailed(format!("SetGUID H264: 0x{:08X}", e.code().0)))?;
-        out_type
-            .SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_bps)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 bitrate: 0x{:08X}", e.code().0))
-            })?;
-        // MFSetAttributeSize encodes (w,h) into a u64: high 32 bits = w, low 32 bits = h.
-        out_type
-            .SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | (h as u64))
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 FrameSize: 0x{:08X}", e.code().0))
-            })?;
-        // MFSetAttributeRatio encodes (num,den) into a u64: high 32 = num, low 32 = den.
-        out_type
-            .SetUINT64(&MF_MT_FRAME_RATE, ((config.framerate as u64) << 32) | 1)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 FrameRate: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT64 PAR: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 Interlace: 0x{:08X}", e.code().0))
-            })?;
-        out_type
-            .SetUINT32(&MF_MT_MPEG2_PROFILE, H264_PROFILE_MAIN)
-            .map_err(|e| {
-                EncoderError::InitFailed(format!("SetUINT32 Profile: 0x{:08X}", e.code().0))
-            })?;
-        mft.SetOutputType(0, &out_type, 0).map_err(|e| {
-            EncoderError::InitFailed(format!("SetOutputType: 0x{:08X}", e.code().0))
-        })?;
-    }
+    // Step 7b: SetOutputType (output-type negotiation — SAME THREAD as pump_loop).
+    // WHY this is here (and not on the caller thread): the probe in probe_and_select_mft
+    // called try_setup_output_type and then IMMEDIATELY ShutdownObject'd the IMFTransform.
+    // This is a fresh IMFTransform (new ActivateObject call in run_encoder_thread); its
+    // output type must be negotiated here, on the thread that will drive the pump_loop.
+    // This is the ONLY SetOutputType call for this IMFTransform — no double-negotiation.
+    try_setup_output_type(mft, w, h, config.framerate, config.bitrate_bps)?;
 
     // Step 7c: SetInputType (NV12).
     let in_type: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|e| {
@@ -618,7 +849,7 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
     }
 
     // Steps 7f–7h: Send streaming messages.
-    // (Async unlock was already set at Step 7a — see top of function.)
+    // (Async unlock was set by run_encoder_thread before calling this function — not repeated here.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
@@ -721,10 +952,15 @@ fn extract_bytes(
 
 /// Apply pending keyframe and bitrate codec settings before a ProcessInput call.
 ///
-/// Mechanical extraction from the NeedInput arm (design DD9). Module-private.
-fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) {
-    // Apply pending keyframe request BEFORE ProcessInput (design §7, DD10).
-    if state.keyframe_pending.swap(false, Ordering::AcqRel) {
+/// Returns `true` when a keyframe was requested. The caller must also set
+/// `MFSampleExtension_CleanPoint = 1` on the input `IMFSample`: NVIDIA NVENC's
+/// MFT silently ignores `CODECAPI_AVEncVideoForceKeyFrame` and only respects
+/// the per-sample CleanPoint hint (Microsoft-documented force-IDR mechanism).
+/// We send both: SetValue covers Microsoft software encoder + AMD; CleanPoint
+/// covers NVENC.
+fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) -> bool {
+    let keyframe_pending = state.keyframe_pending.swap(false, Ordering::AcqRel);
+    if keyframe_pending {
         // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
         let v = make_variant_bool(true);
         unsafe {
@@ -746,6 +982,8 @@ fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared)
             }
         }
     }
+
+    keyframe_pending
 }
 
 #[expect(
@@ -776,6 +1014,12 @@ fn pump_loop(
     } else {
         333_333 // 30fps fallback
     };
+    // Configured frame dimensions (sentinel-zero → fallback). Frames whose dimensions
+    // don't match are DROPPED at submission time: NVENC's MFT trusts the input buffer
+    // size to match the negotiated output frame size, and a smaller-than-expected NV12
+    // buffer causes an out-of-bounds read inside the driver → 0xC0000005 AV. The guard
+    // is defensive — well-behaved producers send matching dims.
+    let (cfg_w, cfg_h) = effective_dimensions(config);
 
     // Dual-arm counters tracking pending MFT credits (spec R2, design DD1/DD2).
     // Stack-local — no atomics needed; only the pump thread reads/writes these.
@@ -905,7 +1149,7 @@ fn pump_loop(
 
         // ── Service NeedInput (submit frames) ─────────────────────────────────────
         while ni_count > 0 {
-            apply_pending_codec_settings(codec_api, state);
+            let force_keyframe = apply_pending_codec_settings(codec_api, state);
 
             // WHY: FRAME_RECV_TIMEOUT ≤50ms is load-bearing for T-NEW-2
             // (`mft_stop_during_active_encode_returns_within_deadline`). When stop()
@@ -914,9 +1158,33 @@ fn pump_loop(
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
                 Ok(frame) => {
+                    if frame.width != cfg_w || frame.height != cfg_h {
+                        tracing::warn!(
+                            "pump_loop: frame dim mismatch — configured {}x{}, got {}x{}; dropping frame to avoid NVENC driver AV",
+                            cfg_w,
+                            cfg_h,
+                            frame.width,
+                            frame.height
+                        );
+                        state.dropped.fetch_add(1, Ordering::Relaxed);
+                        // Do NOT consume the NeedInput credit — break out so the next
+                        // poll iteration re-evaluates and we don't busy-loop on bad input.
+                        // If we swallowed a keyframe request, restore it so the next
+                        // submitted frame still carries the IDR hint.
+                        if force_keyframe {
+                            state.keyframe_pending.store(true, Ordering::Release);
+                        }
+                        break;
+                    }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
-                    match submit_frame(mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
+                    match submit_frame(
+                        mft,
+                        &nv12_scratch,
+                        frame.timestamp,
+                        frame_dur_100ns,
+                        force_keyframe,
+                    ) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
@@ -946,11 +1214,17 @@ fn pump_loop(
                     // No frame available within timeout — do NOT consume the NeedInput credit.
                     // The MFT retains the credit; we re-poll events on the next iteration.
                     // This path exits the inner loop so the top-of-loop stop check runs (DD2).
+                    if force_keyframe {
+                        state.keyframe_pending.store(true, Ordering::Release);
+                    }
                     break;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Upstream closed — drain MFT and continue looping (do NOT consume credit).
                     tracing::info!("pump_loop: frame channel disconnected, sending COMMAND_DRAIN");
+                    if force_keyframe {
+                        state.keyframe_pending.store(true, Ordering::Release);
+                    }
                     unsafe {
                         let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
                     }
@@ -988,13 +1262,33 @@ fn pump_loop(
 }
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
+///
+/// When `force_keyframe` is `true`, sets `MFSampleExtension_CleanPoint = 1` on
+/// the input sample. This is the Microsoft-documented mechanism for requesting
+/// an IDR — required for NVIDIA NVENC, which silently ignores the alternative
+/// `CODECAPI_AVEncVideoForceKeyFrame` path.
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
     timestamp: std::time::Duration,
     duration_100ns: i64,
+    force_keyframe: bool,
 ) -> Result<(), EncoderError> {
     let sample = build_imfsample(&nv12.buf, timestamp, duration_100ns)?;
+    if force_keyframe {
+        // SAFETY: SetUINT32 on a valid IMFSample is safe; CleanPoint is a documented
+        // attribute on the IMFAttributes interface that IMFSample inherits.
+        unsafe {
+            sample
+                .SetUINT32(&MFSampleExtension_CleanPoint, 1)
+                .map_err(|e| {
+                    EncoderError::EncodeFailed(format!(
+                        "SetUINT32(CleanPoint): 0x{:08X}",
+                        e.code().0
+                    ))
+                })?;
+        }
+    }
     unsafe {
         mft.ProcessInput(0, &sample, 0)
             .map_err(|e| EncoderError::EncodeFailed(format!("ProcessInput: 0x{:08X}", e.code().0)))
@@ -1066,8 +1360,11 @@ fn collect_output(
     };
 
     // DD10: read is_keyframe from MFSampleExtension_CleanPoint attribute.
+    // Fallback: some vendor MFTs emit IDR access units without setting CleanPoint,
+    // so we also scan the Annex-B bitstream for an IDR NAL (type 5) as authoritative.
     // SAFETY: GetUINT32 on a valid IMFSample is always safe.
-    let is_keyframe = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) } != 0;
+    let clean_point = unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) } != 0;
+    let is_keyframe = clean_point || annex_b_contains_idr(&annex_b);
 
     let pkt = EncodedPacket {
         data: Arc::from(annex_b.into_boxed_slice()),
@@ -1078,6 +1375,36 @@ fn collect_output(
     *seq += 1;
 
     Ok(Some(pkt))
+}
+
+/// Scan an Annex-B bitstream for an IDR NAL unit (type 5).
+///
+/// Used as a fallback when `MFSampleExtension_CleanPoint` is absent — some vendor
+/// MFTs (e.g. NVIDIA NVENC) emit forced IDR samples without setting that attribute.
+/// The bitstream is authoritative: H.264 emulation prevention guarantees that real
+/// start codes never appear inside NAL payloads, so a byte scan is correct.
+fn annex_b_contains_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0x00 && data[i + 1] == 0x00 {
+            if data[i + 2] == 0x01 {
+                if data[i + 3] & 0x1F == 5 {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+            if data[i + 2] == 0x00 && i + 4 < data.len() && data[i + 3] == 0x01 {
+                if data[i + 4] & 0x1F == 5 {
+                    return true;
+                }
+                i += 5;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Rewrite AVCC (length-prefixed) NAL units to Annex-B (start-code-prefixed) format (§5b).
@@ -1153,14 +1480,13 @@ impl WindowsMftH264Encoder {
     /// # Safety
     /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
     /// which would be incorrect since COM was never initialised by this constructor.
-    /// `mft` and `codec_api` are `None`, so any call to `start()` will return
+    /// `winning_activate` is `None`, so any call to `start()` will return
     /// `Err(Internal(_))` rather than accessing an invalid COM pointer.
     fn new_for_validation_test() -> Self {
         Self {
             config: EncoderConfig::default(),
             state: Arc::new(MftEncoderShared::default()),
-            mft: None,
-            codec_api: None,
+            winning_activate: None,
             handle: None,
             com_initialized: false,
         }
@@ -1227,6 +1553,47 @@ mod tests {
             &[0x65u8, 0x88, 0x84, 0x00, 0x00],
             "AVCC→AnnexB must preserve NAL payload bytes"
         );
+    }
+
+    // ─── annex_b_contains_idr — fallback for vendor MFTs without CleanPoint ────
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_with_4byte_start_code() {
+        // 4-byte start code + NAL byte 0x65 (forbidden_zero=0, nal_ref_idc=3, type=5).
+        let data = vec![0x00u8, 0x00, 0x00, 0x01, 0x65, 0xAB, 0xCD];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_with_3byte_start_code() {
+        // 3-byte start code + NAL byte 0x25 (nal_ref_idc=1, type=5).
+        let data = vec![0x00u8, 0x00, 0x01, 0x25, 0xAB];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_detects_idr_after_sps_pps_prefix() {
+        // SPS (type 7) + PPS (type 8) + IDR slice (type 5) — typical IDR access unit.
+        let data = vec![
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x00, // SPS (type 7)
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x00, // PPS (type 8)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // IDR slice (type 5)
+        ];
+        assert!(annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_returns_false_for_p_frame_only() {
+        // Only NAL type 1 (non-IDR slice).
+        let data = vec![0x00u8, 0x00, 0x00, 0x01, 0x41, 0xAB, 0xCD, 0xEF];
+        assert!(!annex_b_contains_idr(&data));
+    }
+
+    #[test]
+    fn annex_b_contains_idr_returns_false_for_too_short_input() {
+        // Below minimum to hold a start code + NAL byte.
+        assert!(!annex_b_contains_idr(&[]));
+        assert!(!annex_b_contains_idr(&[0x00, 0x00, 0x01]));
     }
 
     // ─── T3a.1: new_rejects_zero_bitrate ──────────────────────────────────────

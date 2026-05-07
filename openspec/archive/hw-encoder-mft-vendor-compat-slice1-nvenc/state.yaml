@@ -1,0 +1,50 @@
+change_name: hw-encoder-mft-vendor-compat-slice1-nvenc
+archived_date: "2026-05-05"
+disposition: APPROVED_WITH_CARRY_FORWARD
+artifact_store_mode: hybrid
+engram_observation_ids:
+  proposal: 149
+  spec: 150
+  design: 153
+  tasks: 154
+  apply_progress: 151
+  verify_report: 177
+  vendor_discovery_force_idr: 176
+openspec_mirror_files:
+  - explore.md
+  - proposal.md
+  - spec.md
+  - design.md
+  - apply-progress.md
+  - tasks.md
+  - verify-report.md
+main_specs_synced:
+  - domain: windows-mft
+    file: openspec/specs/windows-mft/spec.md
+    action: CREATED (promoted from delta)
+    requirements_synced: R-NEW-1 through R-NEW-7
+predecessor_link:
+  change: hw-encoder-mft-rework
+  pr: "16"
+  commit: ee32ff4
+  disposition: APPROVED_WITH_CARRY_FORWARD
+carry_forward_items:
+  - scope: R-NEW-7 (runtime force-IDR semantics on NVENC)
+    target: Slice 2 or Slice 3 (NVENC SDK direct)
+    engram_topic: nvenc-mft/force-idr-limitation
+  - scope: Manifestation A (Intel QSV ProcessOutput AV)
+    target: hw-encoder-mft-vendor-compat-slice2-intel-qsv
+  - scope: Default feature flip
+    target: hw-encoder-default-on-flip (gated on both slices + 24h soak)
+verify_summary:
+  smoke_tests: 16/18 PASS (Host B, NVENC)
+  failing_tests:
+    - mft_request_keyframe_marks_next_packet_as_keyframe (T7.1) — force-IDR carry-forward
+    - mft_keyframe_flag_cleared_after_idr_emitted (T7.2) — force-IDR carry-forward
+  quality_gates: 6/7 GREEN (gate 2 doc-comment lint W1 is fixable)
+  predecessor_invariants: ALL PASS (pump-loop, counters, NO_WAIT polling)
+  public_api: FROZEN (byte-identical to PR #16)
+notes: |
+  Archive report captures full traceability. Spec synced to main openspec/specs/windows-mft/spec.md.
+  All Phase 0 diagnostic instrumentation removed before archive. Change is ready for PR merge after gate 2 doc-comment fix.
+  Carry-forward items explicitly documented in this state file for Slice 2 and follow-up changes to reference.
