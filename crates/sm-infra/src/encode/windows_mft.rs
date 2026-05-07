@@ -37,13 +37,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
+    MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -230,13 +230,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
         let handle = std::thread::spawn(move || {
             // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
-            run_encoder_thread(
-                activate_send.into_inner(),
-                config,
-                state,
-                rx,
-                tx,
-            );
+            run_encoder_thread(activate_send.into_inner(), config, state, rx, tx);
         });
 
         self.handle = Some(handle);
@@ -605,10 +599,7 @@ fn try_setup_output_type(
     // MPEG2_PROFILE = 77 (Main); overlaying those would invalidate the negotiation
     // envelope. PAR is absent and stays absent (NVENC infers 1:1).
     let out_type: IMFMediaType = unsafe { mft.GetOutputAvailableType(0, 0) }.map_err(|e| {
-        EncoderError::InitFailed(format!(
-            "GetOutputAvailableType(0,0): 0x{:08X}",
-            e.code().0
-        ))
+        EncoderError::InitFailed(format!("GetOutputAvailableType(0,0): 0x{:08X}", e.code().0))
     })?;
 
     unsafe {
@@ -695,10 +686,7 @@ fn run_encoder_thread(
     let mft: IMFTransform = match unsafe { activate.ActivateObject() } {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!(
-                "encoder thread ActivateObject failed: 0x{:08X}",
-                e.code().0
-            );
+            tracing::error!("encoder thread ActivateObject failed: 0x{:08X}", e.code().0);
             return;
         }
     };
@@ -709,10 +697,7 @@ fn run_encoder_thread(
     let attrs = match unsafe { mft.GetAttributes() } {
         Ok(a) => a,
         Err(e) => {
-            tracing::error!(
-                "encoder thread GetAttributes failed: 0x{:08X}",
-                e.code().0
-            );
+            tracing::error!("encoder thread GetAttributes failed: 0x{:08X}", e.code().0);
             return;
         }
     };
@@ -739,10 +724,7 @@ fn run_encoder_thread(
     let codec_api: ICodecAPI = match mft.cast() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(
-                "encoder thread ICodecAPI cast failed: 0x{:08X}",
-                e.code().0
-            );
+            tracing::error!("encoder thread ICodecAPI cast failed: 0x{:08X}", e.code().0);
             return;
         }
     };
@@ -1179,7 +1161,10 @@ fn pump_loop(
                     if frame.width != cfg_w || frame.height != cfg_h {
                         tracing::warn!(
                             "pump_loop: frame dim mismatch — configured {}x{}, got {}x{}; dropping frame to avoid NVENC driver AV",
-                            cfg_w, cfg_h, frame.width, frame.height
+                            cfg_w,
+                            cfg_h,
+                            frame.width,
+                            frame.height
                         );
                         state.dropped.fetch_add(1, Ordering::Relaxed);
                         // Do NOT consume the NeedInput credit — break out so the next
