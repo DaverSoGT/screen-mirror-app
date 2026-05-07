@@ -238,8 +238,8 @@ fn mft_thirty_frame_smoke_emits_at_least_one_keyframe() {
         }
     }
 
-    producer.join().expect("producer thread should not panic");
     enc.stop().expect("stop should succeed");
+    producer.join().expect("producer thread should not panic");
 
     let elapsed = t0.elapsed();
     println!(
