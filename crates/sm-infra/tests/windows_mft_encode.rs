@@ -158,6 +158,8 @@ fn mft_encoded_packet_starts_with_annex_b_start_code() {
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open");
 
+    enc.flush();
+
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet should arrive within 5 s");
@@ -284,6 +286,8 @@ fn mft_encoded_packet_timestamp_matches_capture_frame() {
         .send(make_synthetic_frame(640, 480, 500))
         .expect("frame_tx should be open");
 
+    enc.flush();
+
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet should arrive within 5 s");
@@ -330,6 +334,14 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
             .recv_timeout(Duration::from_secs(3))
             .expect("packet should arrive within 3 s")
     };
+
+    // CARRY-FORWARD: this test fails on master daa9522 with timeout (Intel QSV needs ≥3
+    // frames before producing output; first recv times out on single-frame submission).
+    // Slice 3's flush() does NOT address it because mid-stream codec_api manipulation
+    // (request_keyframe via apply_pending_codec_settings) triggers a separate pump_loop
+    // counter desync at windows_mft.rs:1266. Carry-forward to a future slice that
+    // addresses pump_loop NOTACCEPTING handling around codec_api operations.
+    // Reverted to master body (timeout failure mode is cleaner than encoder-thread panic).
 
     // Drain the initial IDR.
     send_frame(0);
@@ -413,6 +425,10 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
             .expect("packet should arrive within 3 s")
     };
 
+    // CARRY-FORWARD: same root cause as T7.1 — pump_loop counter desync when
+    // codec_api operations (request_keyframe) interleave with NeedInput credits.
+    // Reverted to master body. Will be addressed in a follow-up slice.
+
     // Drain initial IDR.
     send_frame(0);
     let _ = recv_pkt(); // initial IDR
@@ -461,6 +477,10 @@ fn mft_set_bitrate_updates_encoder_without_restart() {
     let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
+
+    // CARRY-FORWARD: same root cause as T7.1/T7.2 — pump_loop counter desync when
+    // codec_api operations (set_bitrate via ICodecAPI) interleave with NeedInput
+    // credits. Reverted to master body. Will be addressed in a follow-up slice.
 
     // Feed a few frames at 4 Mbps.
     for i in 0..3u64 {
@@ -525,6 +545,8 @@ fn mft_first_real_packet_is_annex_b() {
     frame_tx
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open");
+
+    enc.flush();
 
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
@@ -601,6 +623,8 @@ fn mft_setup_uses_config_dimensions_when_nonzero() {
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open — thread alive after start()");
 
+    enc.flush();
+
     let _pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet must arrive within 5 s — MFT accepted 640x480 frame");
@@ -630,6 +654,8 @@ fn mft_setup_falls_back_when_config_dimensions_zero() {
     frame_tx
         .send(make_synthetic_frame(1920, 1080, 0))
         .expect("frame_tx should be open — thread alive after start()");
+
+    enc.flush();
 
     let _pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
@@ -864,4 +890,125 @@ fn mft_drop_without_stop_does_not_leak_thread() {
         elapsed < Duration::from_secs(5),
         "drop() took {elapsed:?} — expected to complete within 5 s (thread may have leaked)"
     );
+}
+
+// ─── Phase 0 trace probes (Slice 3 — single-frame-flush) ─────────────────────
+//
+// Empirical OQ-1 from sdd/hw-encoder-mft-single-frame-flush/explore (#701):
+//   Does Intel QSV honor MFT_MESSAGE_COMMAND_DRAIN with 1 frame submitted?
+//
+// These tests are TRACE PROBES, not correctness assertions. They submit N frames,
+// drop frame_tx (triggering pump_loop's existing Disconnected → COMMAND_DRAIN
+// path at windows_mft.rs:1285-1294), wait for output, and print the outcome.
+//
+// Run on Host A (Intel QSV) with trace logging:
+//
+//   $env:RUST_LOG="sm_infra::encode=trace"
+//   cargo nextest run -p sm-infra --features hw-encoder `
+//     --test windows_mft_encode `
+//     -E 'test(/phase_0/)' `
+//     --run-ignored=all --test-threads=1 --no-fail-fast --nocapture `
+//     *> phase-0-trace.log
+//
+// Capture phase-0-trace.log and save to engram topic
+//   `sdd/hw-encoder-mft-single-frame-flush/phase-0-trace`
+// to unblock sdd-design.
+//
+// Decision tree (per #707 D6):
+//   1F GOOD (packet)              → Approach C clean for all 8 tests
+//   1F EMPTY  + 2F GOOD (packet)  → Approach C; tests 1-5 must submit ≥2 frames
+//   1F EMPTY  + 2F EMPTY          → re-explore (vendor requires ≥3 frames; alt mechanism)
+
+#[test]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV) only"]
+fn mft_one_frame_drain_probe_phase_0() {
+    init_tracing();
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    eprintln!("[PHASE_0_PROBE_1F] sending 1 frame (640x480 BGRA)");
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("frame_tx should be open");
+
+    eprintln!("[PHASE_0_PROBE_1F] dropping frame_tx → pump_loop fires COMMAND_DRAIN");
+    drop(frame_tx);
+
+    let started = Instant::now();
+    let outcome = pkt_rx.recv_timeout(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+
+    match &outcome {
+        Ok(pkt) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=GOOD — packet received in {:?} (len={}, is_keyframe={})",
+            elapsed,
+            pkt.data.len(),
+            pkt.is_keyframe
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=EMPTY_DRAIN — no packet within 10s (Intel QSV did NOT honor 1-frame DRAIN)"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=ENCODER_DIED — pkt_tx disconnected (encoder thread exited)"
+        ),
+    }
+
+    let _ = enc.stop();
+}
+
+#[test]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV) only"]
+fn mft_two_frame_drain_probe_phase_0() {
+    init_tracing();
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    eprintln!("[PHASE_0_PROBE_2F] sending 2 frames (640x480 BGRA)");
+    for i in 0..2u64 {
+        frame_tx
+            .send(make_synthetic_frame(640, 480, i * 33))
+            .expect("frame_tx should be open");
+    }
+
+    eprintln!("[PHASE_0_PROBE_2F] dropping frame_tx → pump_loop fires COMMAND_DRAIN");
+    drop(frame_tx);
+
+    let started = Instant::now();
+    let outcome = pkt_rx.recv_timeout(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+
+    match &outcome {
+        Ok(pkt) => eprintln!(
+            "[PHASE_0_PROBE_2F] OUTCOME=GOOD — packet received in {:?} (len={}, is_keyframe={})",
+            elapsed,
+            pkt.data.len(),
+            pkt.is_keyframe
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "[PHASE_0_PROBE_2F] OUTCOME=EMPTY_DRAIN — no packet within 10s (vendor needs ≥3 frames)"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("[PHASE_0_PROBE_2F] OUTCOME=ENCODER_DIED — pkt_tx disconnected")
+        }
+    }
+
+    let _ = enc.stop();
 }

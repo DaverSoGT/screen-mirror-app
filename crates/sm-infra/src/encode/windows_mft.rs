@@ -89,6 +89,11 @@ struct MftEncoderShared {
     dropped: AtomicU64,
     /// Set by `stop()` / `Drop`. Checked at the top of each pump-loop iteration.
     stop: AtomicBool,
+    /// Set by `flush()`; consumed by pump_loop via swap(false, AcqRel) after the NeedInput
+    /// inner loop. Fires exactly one MFT_MESSAGE_COMMAND_DRAIN per flag-set transition.
+    // allow: drain_pending only read by pump_loop under hw-encoder feature
+    #[allow(dead_code)]
+    drain_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -98,6 +103,7 @@ impl Default for MftEncoderShared {
             pending_bitrate: AtomicU32::new(0),
             dropped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            drain_pending: AtomicBool::new(false),
         }
     }
 }
@@ -1296,6 +1302,16 @@ fn pump_loop(
             }
         }
 
+        // DD3/DD4: consume explicit flush() signal — fires exactly one COMMAND_DRAIN per flag-set.
+        // swap(false, AcqRel) resets atomically; subsequent flush() after DrainComplete re-arms.
+        // WHY: explicit flush() vs disconnect-DRAIN — fires DRAIN exactly once via swap.
+        if state.drain_pending.swap(false, Ordering::AcqRel) {
+            tracing::info!("pump_loop: explicit flush() — sending COMMAND_DRAIN");
+            unsafe {
+                let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            }
+        }
+
         // ── Idle sleep — avoid busy-wait when nothing happened (spec R5, design DD6) ──
         if !event_opt && ni_count == 0 && ho_count == 0 {
             std::thread::sleep(POLLING_SLEEP);
@@ -1555,6 +1571,32 @@ fn make_variant_bool(value: bool) -> VARIANT {
             if value { VARIANT_TRUE } else { VARIANT_FALSE };
     }
     v
+}
+
+// ── Inherent methods ──────────────────────────────────────────────────────────
+
+impl WindowsMftH264Encoder {
+    /// Signal end-of-burst to the encoder pump loop, requesting a `MFT_MESSAGE_COMMAND_DRAIN`.
+    ///
+    /// **Single-shot**: After `COMMAND_DRAIN` fires, Intel QSV enters a non-accepting state
+    /// until `METransformDrainComplete` fires (~250 ms empirically, Phase 0 trace #710). The
+    /// encoder is effectively terminal per session on Intel QSV — do not call `flush()` mid-stream.
+    ///
+    /// **Async**: Returns immediately. The DRAIN fires on the next pump_loop iteration after the
+    /// NeedInput inner loop completes. Failures (e.g. vendor error) surface via `pkt_rx.recv_timeout`.
+    ///
+    /// **Concurrency-safe**: Backed by `Arc<AtomicBool>`. Multiple concurrent calls collapse to at
+    /// most one `COMMAND_DRAIN` per pump iteration (last `store(true)` wins; swap-once consumption).
+    ///
+    /// **Latency**: Empirically ~250 ms on Intel QSV (Host A, Phase 0 trace #710). Plan recv_timeout
+    /// deadlines accordingly (spec S11.x uses 3–5 s — sufficient margin).
+    ///
+    /// **Production callers MUST NOT call this method.** It is a test affordance for single-burst
+    /// short-stream tests. Production callers rely on the channel-disconnect DRAIN path at
+    /// pump_loop shutdown.
+    pub fn flush(&self) {
+        self.state.drain_pending.store(true, Ordering::Release);
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
