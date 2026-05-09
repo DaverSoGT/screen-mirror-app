@@ -865,3 +865,124 @@ fn mft_drop_without_stop_does_not_leak_thread() {
         "drop() took {elapsed:?} — expected to complete within 5 s (thread may have leaked)"
     );
 }
+
+// ─── Phase 0 trace probes (Slice 3 — single-frame-flush) ─────────────────────
+//
+// Empirical OQ-1 from sdd/hw-encoder-mft-single-frame-flush/explore (#701):
+//   Does Intel QSV honor MFT_MESSAGE_COMMAND_DRAIN with 1 frame submitted?
+//
+// These tests are TRACE PROBES, not correctness assertions. They submit N frames,
+// drop frame_tx (triggering pump_loop's existing Disconnected → COMMAND_DRAIN
+// path at windows_mft.rs:1285-1294), wait for output, and print the outcome.
+//
+// Run on Host A (Intel QSV) with trace logging:
+//
+//   $env:RUST_LOG="sm_infra::encode=trace"
+//   cargo nextest run -p sm-infra --features hw-encoder `
+//     --test windows_mft_encode `
+//     -E 'test(/phase_0/)' `
+//     --run-ignored=all --test-threads=1 --no-fail-fast --nocapture `
+//     *> phase-0-trace.log
+//
+// Capture phase-0-trace.log and save to engram topic
+//   `sdd/hw-encoder-mft-single-frame-flush/phase-0-trace`
+// to unblock sdd-design.
+//
+// Decision tree (per #707 D6):
+//   1F GOOD (packet)              → Approach C clean for all 8 tests
+//   1F EMPTY  + 2F GOOD (packet)  → Approach C; tests 1-5 must submit ≥2 frames
+//   1F EMPTY  + 2F EMPTY          → re-explore (vendor requires ≥3 frames; alt mechanism)
+
+#[test]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV) only"]
+fn mft_one_frame_drain_probe_phase_0() {
+    init_tracing();
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    eprintln!("[PHASE_0_PROBE_1F] sending 1 frame (640x480 BGRA)");
+    frame_tx
+        .send(make_synthetic_frame(640, 480, 0))
+        .expect("frame_tx should be open");
+
+    eprintln!("[PHASE_0_PROBE_1F] dropping frame_tx → pump_loop fires COMMAND_DRAIN");
+    drop(frame_tx);
+
+    let started = Instant::now();
+    let outcome = pkt_rx.recv_timeout(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+
+    match &outcome {
+        Ok(pkt) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=GOOD — packet received in {:?} (len={}, is_keyframe={})",
+            elapsed,
+            pkt.data.len(),
+            pkt.is_keyframe
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=EMPTY_DRAIN — no packet within 10s (Intel QSV did NOT honor 1-frame DRAIN)"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
+            "[PHASE_0_PROBE_1F] OUTCOME=ENCODER_DIED — pkt_tx disconnected (encoder thread exited)"
+        ),
+    }
+
+    let _ = enc.stop();
+}
+
+#[test]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV) only"]
+fn mft_two_frame_drain_probe_phase_0() {
+    init_tracing();
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: 640,
+        height: 480,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(8);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    eprintln!("[PHASE_0_PROBE_2F] sending 2 frames (640x480 BGRA)");
+    for i in 0..2u64 {
+        frame_tx
+            .send(make_synthetic_frame(640, 480, i * 33))
+            .expect("frame_tx should be open");
+    }
+
+    eprintln!("[PHASE_0_PROBE_2F] dropping frame_tx → pump_loop fires COMMAND_DRAIN");
+    drop(frame_tx);
+
+    let started = Instant::now();
+    let outcome = pkt_rx.recv_timeout(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+
+    match &outcome {
+        Ok(pkt) => eprintln!(
+            "[PHASE_0_PROBE_2F] OUTCOME=GOOD — packet received in {:?} (len={}, is_keyframe={})",
+            elapsed,
+            pkt.data.len(),
+            pkt.is_keyframe
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
+            "[PHASE_0_PROBE_2F] OUTCOME=EMPTY_DRAIN — no packet within 10s (vendor needs ≥3 frames)"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
+            "[PHASE_0_PROBE_2F] OUTCOME=ENCODER_DIED — pkt_tx disconnected"
+        ),
+    }
+
+    let _ = enc.stop();
+}
