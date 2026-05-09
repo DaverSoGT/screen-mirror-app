@@ -1384,3 +1384,362 @@ fn phase0_codec_api_after_processinput_no_notaccepting_and_idr_on_frame_4() {
     //   - no other keyframe indices (no spurious IDRs)
     let _ = enc.stop();
 }
+
+// ─── Phase 0 trace probes (Slice 5 — Intel QSV mid-stream IDR via drain+resume) ─
+//
+// Empirical gate for sdd/hw-encoder-mft-intel-qsv-mid-stream-idr:
+//
+//   OQ-1: Does the first frame after DrainComplete+BEGIN_STREAMING+START_OF_STREAM
+//         on Intel QSV always emit as IDR (NAL type 5)?  → C1 (PRIMARY DESIGN GATE)
+//   OQ-2: What is the actual drain+resume round-trip latency for a keyframe request?
+//         → C2 (informational; R2 sets ≤ 2s SHOULD)
+//
+// Run on Host A (Intel QSV) with trace logging:
+//
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run -p sm-infra --features hw-encoder `
+//     --test windows_mft_encode `
+//     -E 'test(/^phase0_intel_qsv_idr/)' `
+//     --run-ignored=ignored-only --test-threads=1 --no-fail-fast --no-capture `
+//     *> phase0-intel-qsv-idr-trace.log
+//
+// Capture phase0-intel-qsv-idr-trace.log and save to engram topic
+//   `sdd/hw-encoder-mft-intel-qsv-mid-stream-idr/phase-0-trace`
+// to unblock sdd-design (design is BLOCKED on C1 evidence — spec §7).
+//
+// Decision tree (per proposal D-PHASE0 / spec R7):
+//   C1 PASS (is_keyframe=true post-drain) → Mechanism C validated; proceed with sdd-design
+//   C1 FAIL (is_keyframe=false post-drain) → BLOCK design; escalate to Mechanism F / VPL
+//   C2 latency ≤ 1s                       → R2 (≤ 2s SHOULD) comfortably satisfied
+//   C2 latency 1–2s                        → flag for design review; informational
+//   C2 latency > 2s                        → hard-assert fires; reopen R2 threshold
+//
+// Both probes are retained as permanent #[ignore]-gated regression guards after
+// the fix lands (spec R7, proposal D-PROBES-RETENTION).
+
+/// C1 — confirm that Mechanism C (drain+resume) produces an IDR as first post-resume frame.
+///
+/// Hypothesis: after flushing (triggering `MFT_MESSAGE_COMMAND_DRAIN`) and the Slice 4
+/// DD17/F2 handler sends `BEGIN_STREAMING + START_OF_STREAM`, the first frame of the new
+/// stream session is an IDR by H.264 spec. This is vendor-agnostic — the stream restart
+/// guarantee comes from the codec, not from an `ICodecAPI` signal Intel QSV may ignore.
+///
+/// This probe validates Mechanism C WITHOUT calling `request_keyframe()` (the production
+/// trigger is not yet implemented). We manually execute the drain+resume cycle by calling
+/// `enc.flush()` twice — once to drain the priming batch and once to drain the IDR-target
+/// frame — and observe whether the packet produced in the second batch carries
+/// `is_keyframe == true`.
+///
+/// Cadence (two-batch flush):
+///   1. Push 3 priming frames (no recv) → `enc.flush()` → drain priming output.
+///   2. Submit 1 IDR-target frame → `enc.flush()` → recv IDR-target packet.
+///
+/// The second flush triggers a fresh DRAIN after F2 resumes the encoder. The first frame
+/// of the second session MUST be IDR — that is the C1 assertion.
+///
+/// Expected outcome (Mechanism C valid):
+///   - First batch: at least one packet received (≥ 1 priming frame emitted).
+///   - Second batch first packet: `is_keyframe == true`.
+///   - If FAIL: Mechanism C cannot guarantee IDR via drain+resume on this vendor → BLOCK.
+///
+/// On NVENC (Host B): expected to also PASS (R6 — vendor-uniform mechanism).
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV); confirms Mechanism C drain+resume IDR mechanism for sdd-design gate"]
+fn phase0_intel_qsv_idr_via_drain_resume_first_frame_is_idr() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // ── Batch 1: push 3 priming frames, flush, drain output ──────────────────
+    //
+    // Intel QSV does NOT emit packets without a DRAIN trigger. We batch-push first
+    // and drain with flush() — the same pattern as P0-A/P0-B and T8.2.
+    tracing::info!("[C1] batch-pushing 3 priming frames (no recv — pump pulls async)");
+    for i in 0..3u64 {
+        send_frame(i);
+    }
+
+    // First flush: triggers MFT_MESSAGE_COMMAND_DRAIN on priming frames. After
+    // METransformDrainComplete, the Slice 4 F2 handler sends BEGIN_STREAMING +
+    // START_OF_STREAM and the encoder auto-resumes — this is the load-bearing
+    // IDR mechanism we are validating.
+    tracing::info!("[C1] flush() #1 — drain priming batch (triggers COMMAND_DRAIN)");
+    enc.flush();
+
+    // Drain priming output. We expect ≥ 1 packet (at least the initial IDR).
+    // If Disconnected: encoder died — probe cannot continue, record and abort.
+    let mut priming_received = 0u32;
+    let mut priming_keyframe_indices: Vec<u32> = Vec::new();
+    loop {
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                tracing::info!(
+                    "[C1] priming pkt {} — is_keyframe={} len={}",
+                    priming_received,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                if pkt.is_keyframe {
+                    priming_keyframe_indices.push(priming_received);
+                }
+                priming_received += 1;
+                // Cap at 10 — we only submitted 3 frames.
+                if priming_received >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[C1] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
+                );
+                // Cannot continue — hard-assert so the probe fails visibly.
+                panic!("[C1] encoder died during priming drain; cannot validate Mechanism C");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_received == 0 {
+                    tracing::warn!(
+                        "[C1] OUTCOME=EMPTY_DRAIN — no priming packets before timeout; flush() may not have triggered DRAIN"
+                    );
+                } else {
+                    tracing::info!(
+                        "[C1] priming drain complete — {} packets received",
+                        priming_received
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[C1] priming batch summary — received={} keyframe_indices={:?} (expect [0] — initial IDR only)",
+        priming_received,
+        priming_keyframe_indices
+    );
+
+    // Priming must have produced at least 1 packet. If not, the encoder/harness is broken.
+    assert!(
+        priming_received >= 1,
+        "[C1] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
+    );
+
+    // ── Batch 2: submit 1 IDR-target frame, flush, recv and assert IDR ────────
+    //
+    // After F2 resumes the encoder with BEGIN_STREAMING+START_OF_STREAM, frame index 3
+    // (the first frame of the new stream session) MUST be IDR by H.264 spec. We do NOT
+    // call request_keyframe() here — the drain+resume itself is the IDR trigger.
+    tracing::info!(
+        "[C1] submitting IDR-target frame (frame index 3 — first of new session after resume)"
+    );
+    send_frame(3);
+
+    // Second flush: drain the IDR-target frame out of the encoder. ~250 ms latency.
+    tracing::info!("[C1] flush() #2 — drain IDR-target frame");
+    enc.flush();
+
+    // Receive the IDR-target packet. 5s timeout provides ample margin for the drain
+    // roundtrip (~250 ms empirical from Slice 3 #710 and Slice 4 #747).
+    let idr_result = recv_pkt(Duration::from_secs(5));
+
+    match &idr_result {
+        Ok(pkt) => {
+            tracing::info!(
+                "[C1] IDR-target pkt — is_keyframe={} len={}",
+                pkt.is_keyframe,
+                pkt.data.len()
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::error!("[C1] OUTCOME=ENCODER_DIED — pump thread exited after second flush");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::error!(
+                "[C1] OUTCOME=TIMEOUT — no IDR-target packet within 5s (DRAIN latency exceeded or harness broken)"
+            );
+        }
+    }
+
+    // PRIMARY GATE: the IDR-target packet MUST be is_keyframe == true.
+    // FAIL here → Mechanism C cannot guarantee IDR via drain+resume → block sdd-design.
+    let idr_pkt = idr_result.expect("[C1] expected IDR-target packet; got Disconnected or Timeout");
+    assert!(
+        idr_pkt.is_keyframe,
+        "[C1] MECHANISM C INVALID — first post-drain+resume packet is NOT an IDR (is_keyframe=false); escalate to Mechanism F"
+    );
+
+    tracing::info!(
+        "[C1] OUTCOME=PASS — Mechanism C validated: drain+resume produces IDR as first post-resume packet"
+    );
+
+    let _ = enc.stop();
+}
+
+/// C2 — measure the drain+resume latency for a keyframe request (informational).
+///
+/// Hypothesis: the round-trip from `enc.flush()` (COMMAND_DRAIN) to IDR-target packet
+/// arrival is ~250 ms on Intel QSV (Slice 3 Phase 0 trace #710, Slice 4 trace #747).
+/// R2 sets a ≤ 2s SHOULD bound. This probe captures the empirical latency to inform
+/// sdd-design of actual T7.1/T7.2 recv_timeout budgets.
+///
+/// Same cadence as C1 (batch 1 priming → flush → drain → batch 2 IDR-target → flush
+/// → recv) with `Instant::now()` timing placed around the second flush→recv step.
+///
+/// The assert threshold is 2000 ms (R2). If latency exceeds 2000 ms, sdd-design must
+/// revisit the recv_timeout values in T7.1/T7.2 and reconsider the feasibility of
+/// Mechanism C for real-time WebRTC use cases.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV); measures drain+resume IDR latency for R2 (≤ 2s SHOULD) and sdd-design recv_timeout budgets"]
+fn phase0_intel_qsv_idr_via_drain_resume_latency_measure() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // ── Batch 1: priming drain (same as C1) ──────────────────────────────────
+    tracing::info!("[C2] batch-pushing 3 priming frames (no recv — pump pulls async)");
+    for i in 0..3u64 {
+        send_frame(i);
+    }
+
+    tracing::info!("[C2] flush() #1 — drain priming batch");
+    enc.flush();
+
+    let mut priming_received = 0u32;
+    loop {
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(_pkt) => {
+                priming_received += 1;
+                if priming_received >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("[C2] encoder died during priming drain");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                break;
+            }
+        }
+    }
+
+    assert!(
+        priming_received >= 1,
+        "[C2] expected ≥ 1 priming packet; got 0 — harness misconfigured"
+    );
+
+    tracing::info!(
+        "[C2] priming drain complete — {} packets received",
+        priming_received
+    );
+
+    // ── Batch 2: IDR-target with latency measurement ──────────────────────────
+    //
+    // The clock starts immediately before flush() #2 — this is when the DRAIN
+    // request is armed. The clock stops when the IDR-target packet is received.
+    // This captures the full drain roundtrip: flush() → COMMAND_DRAIN → pump processes
+    // → METransformDrainComplete → F2 BEGIN_STREAMING+START_OF_STREAM → resume →
+    // ProcessInput(IDR-target) → METransformHaveOutput → collect_output → pkt_rx.
+    tracing::info!("[C2] submitting IDR-target frame (frame index 3 — first of new session)");
+    send_frame(3);
+
+    tracing::info!("[C2] flush() #2 — drain IDR-target; starting latency clock");
+    let drain_start = Instant::now();
+    enc.flush();
+
+    let idr_result = recv_pkt(Duration::from_secs(5));
+    let elapsed = drain_start.elapsed();
+
+    match &idr_result {
+        Ok(pkt) => {
+            tracing::info!(
+                "[C2] IDR-target pkt received — is_keyframe={} len={} elapsed={:?}",
+                pkt.is_keyframe,
+                pkt.data.len(),
+                elapsed
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::error!(
+                "[C2] OUTCOME=ENCODER_DIED after flush() #2 — elapsed={:?}",
+                elapsed
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::error!(
+                "[C2] OUTCOME=TIMEOUT — no IDR-target packet within 5s — elapsed={:?}",
+                elapsed
+            );
+        }
+    }
+
+    tracing::info!(
+        "[C2] LATENCY MEASUREMENT — drain+resume→IDR elapsed={:?} (R2 threshold: ≤ 2000ms SHOULD)",
+        elapsed
+    );
+
+    // R2 hard assert: latency MUST be < 2000ms. If this fires, sdd-design must
+    // revisit recv_timeout budgets in T7.1/T7.2 and re-examine Mechanism C viability.
+    assert!(
+        elapsed.as_millis() < 2000,
+        "[C2] R2 VIOLATED — drain+resume latency {}ms exceeds 2000ms threshold; sdd-design must revisit recv_timeout",
+        elapsed.as_millis()
+    );
+
+    // Also assert the IDR packet arrived and was correctly flagged (belt-and-suspenders
+    // with C1 — C2 is informational but still validates the mechanism).
+    let idr_pkt = idr_result.expect("[C2] IDR-target packet not received");
+    assert!(
+        idr_pkt.is_keyframe,
+        "[C2] first post-drain+resume packet is NOT IDR (is_keyframe=false)"
+    );
+
+    tracing::info!(
+        "[C2] OUTCOME=PASS — latency={}ms is_keyframe=true (R2 satisfied)",
+        elapsed.as_millis()
+    );
+
+    let _ = enc.stop();
+}
