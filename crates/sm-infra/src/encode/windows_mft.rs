@@ -1194,6 +1194,18 @@ fn pump_loop(
                         target: "sm_infra::encode::windows_mft",
                         "draining = false (DrainComplete)"
                     );
+                    // F2 (Mode 3, R16/DD17): wake MFT for new input. Intel QSV does NOT auto-emit
+                    // NeedInput post-DrainComplete; explicit BEGIN_STREAMING + START_OF_STREAM wakes
+                    // it up. This lets flush+continue cadence work (test cadence + production
+                    // long-running streams that flush periodically).
+                    unsafe {
+                        let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                        let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+                    }
+                    tracing::trace!(
+                        target: "sm_infra::encode::windows_mft",
+                        "post-drain: BEGIN_STREAMING + START_OF_STREAM sent — MFT resumed"
+                    );
                     tracing::info!(
                         old_ni_count = old_ni,
                         old_ho_count = old_ho,
