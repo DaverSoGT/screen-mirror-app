@@ -13,3 +13,10 @@ coverage/
 
 # Agent tooling — local skill registry cache
 .atl/
+
+# Claude Code runtime — local locks and scheduled task state
+.claude/
+
+# Smoke test ephemeral outputs — transcripts persist in engram
+smoke-*.log
+smoke-trace.ps1
