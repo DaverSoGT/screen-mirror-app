@@ -629,6 +629,57 @@ fn try_setup_output_type(
     Ok(())
 }
 
+// WHY: async MFT spec — no flush, no NOTIFY_BEGIN_STREAMING resend (R4/R5, DD8)
+fn renegotiate_output_type(
+    mft: &IMFTransform,
+    w: u32,
+    h: u32,
+    framerate: u32,
+    bitrate_bps: u32,
+) -> Result<(), EncoderError> {
+    let out_type: IMFMediaType = unsafe { mft.GetOutputAvailableType(0, 0) }.map_err(|e| {
+        EncoderError::EncodeFailed(format!(
+            "renegotiate: GetOutputAvailableType: 0x{:08X}",
+            e.code().0
+        ))
+    })?;
+
+    unsafe {
+        out_type
+            .SetUINT64(&MF_MT_FRAME_SIZE, ((w as u64) << 32) | (h as u64))
+            .map_err(|e| {
+                EncoderError::EncodeFailed(format!(
+                    "renegotiate: SetUINT64 FrameSize: 0x{:08X}",
+                    e.code().0
+                ))
+            })?;
+
+        out_type
+            .SetUINT64(&MF_MT_FRAME_RATE, ((framerate as u64) << 32) | 1)
+            .map_err(|e| {
+                EncoderError::EncodeFailed(format!(
+                    "renegotiate: SetUINT64 FrameRate: 0x{:08X}",
+                    e.code().0
+                ))
+            })?;
+
+        out_type
+            .SetUINT32(&MF_MT_AVG_BITRATE, bitrate_bps)
+            .map_err(|e| {
+                EncoderError::EncodeFailed(format!(
+                    "renegotiate: SetUINT32 Bitrate: 0x{:08X}",
+                    e.code().0
+                ))
+            })?;
+
+        mft.SetOutputType(0, &out_type, 0).map_err(|e| {
+            EncoderError::EncodeFailed(format!("renegotiate: SetOutputType: 0x{:08X}", e.code().0))
+        })?;
+    }
+
+    Ok(())
+}
+
 // ── Encoder thread ────────────────────────────────────────────────────────────
 
 /// RAII guard that calls `CoUninitialize` on drop (paired with encoder thread's CoInitializeEx).
@@ -1109,7 +1160,16 @@ fn pump_loop(
         // HaveOutput credits must be consumed before NeedInput to prevent pipeline deadlock
         // on vendor MFTs that emit HaveOutput before the first NeedInput at startup.
         while ho_count > 0 {
-            match collect_output(mft, output_format_known, current_ts, &mut seq) {
+            match collect_output(
+                mft,
+                output_format_known,
+                current_ts,
+                &mut seq,
+                cfg_w,
+                cfg_h,
+                config.framerate,
+                config.bitrate_bps,
+            ) {
                 Ok(Some(pkt)) => {
                     // Decrement AFTER successful COM call (spec OQ-1, design DD2).
                     ho_count -= 1;
@@ -1132,7 +1192,10 @@ fn pump_loop(
                     // Detect vendor-priming E_UNEXPECTED via string prefix match (design DD4,
                     // DR-NEW-2). Recognition: EncodeFailed reason starts with "ProcessOutput: 0x80004005".
                     let reason = e.to_string();
-                    if reason.contains("ProcessOutput: 0x80004005") {
+                    if reason.contains("renegotiate") {
+                        tracing::error!("pump_loop: renegotiation failed: {e}");
+                        return;
+                    } else if reason.contains("ProcessOutput: 0x80004005") {
                         // E_UNEXPECTED on vendor priming: consume credit, log warn, continue.
                         // This is expected during HW MFT startup before any frame is submitted.
                         tracing::warn!(
@@ -1302,20 +1365,51 @@ fn submit_frame(
 /// `Some(false)` = Annex-B (no rewrite) or `Some(true)` = AVCC (apply shim).
 /// Sniffing every packet while the cache is `None` self-corrects against
 /// partial first-packet (R-NEW-6).
+#[allow(clippy::too_many_arguments)] // WHY: DD3 passes 4 config scalars directly; &EncoderConfig rejected (sm-domain frozen, avoids coupling)
 fn collect_output(
     mft: &IMFTransform,
     output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     frame_timestamp: std::time::Duration,
     seq: &mut u64,
+    w: u32,
+    h: u32,
+    framerate: u32,
+    bitrate_bps: u32,
 ) -> Result<Option<EncodedPacket>, EncoderError> {
     let mut output = MFT_OUTPUT_DATA_BUFFER::default();
     let mut status: u32 = 0;
 
     match unsafe { mft.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status) } {
-        Ok(()) => {}
-        Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-        Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => return Ok(None),
+        Ok(()) => {
+            tracing::trace!(dw_status = output.dwStatus, status, "ProcessOutput Ok");
+        }
+        Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+            tracing::trace!(
+                dw_status = output.dwStatus,
+                status,
+                hr = format!("0x{:08X}", e.code().0).as_str(),
+                "ProcessOutput NEED_MORE_INPUT"
+            );
+            return Ok(None);
+        }
+        Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+            tracing::trace!(
+                dw_status = output.dwStatus,
+                status,
+                hr = format!("0x{:08X}", e.code().0).as_str(),
+                "ProcessOutput STREAM_CHANGE — renegotiating"
+            );
+            *output_format_known = None;
+            renegotiate_output_type(mft, w, h, framerate, bitrate_bps)?;
+            return Ok(None);
+        }
         Err(e) => {
+            tracing::trace!(
+                dw_status = output.dwStatus,
+                status,
+                hr = format!("0x{:08X}", e.code().0).as_str(),
+                "ProcessOutput Err"
+            );
             return Err(EncoderError::EncodeFailed(format!(
                 "ProcessOutput: 0x{:08X}",
                 e.code().0
