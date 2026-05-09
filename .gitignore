@@ -18,5 +18,5 @@ coverage/
 .claude/
 
 # Smoke test ephemeral outputs — transcripts persist in engram
-smoke-*.log
+*smoke*.log
 smoke-trace.ps1
