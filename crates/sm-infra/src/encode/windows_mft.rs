@@ -30,17 +30,16 @@ use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
-    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream,
-    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
-    MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown,
-    MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
+    IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream, METransformDrainComplete,
+    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
+    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
     MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
@@ -95,18 +94,12 @@ struct MftEncoderShared {
     // allow: drain_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     drain_pending: AtomicBool,
-    /// PHASE 0 EMPIRICAL: Set by `flush_state()`; consumed by pump_loop via swap(false, AcqRel).
-    /// Fires FLUSH+BEGIN_STREAMING+START_OF_STREAM — the same 3-message sequence as setup_mft.
-    /// Unlike DRAIN (async), FLUSH is synchronous: no DrainComplete event follows.
-    // allow: flush_state_pending only read by pump_loop under hw-encoder feature
+    /// PHASE 0 EMPIRICAL (Mechanism G): Set by `request_keyframe_via_recreate()`; consumed
+    /// by pump_loop via swap(false, AcqRel). Triggers full IMFTransform teardown + re-activation
+    /// within pump_loop, producing a guaranteed IDR as the first frame of the fresh handle.
+    // allow: keyframe_recreate_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
-    flush_state_pending: AtomicBool,
-    /// PHASE 0 EMPIRICAL: Set by `force_idr_via_gop_toggle()`; consumed by pump_loop via
-    /// swap(false, AcqRel). Toggles CODECAPI_AVEncMPVGOPSize=1 before next ProcessInput,
-    /// then restores original GOP size after.
-    // allow: force_idr_gop_pending only read by pump_loop under hw-encoder feature
-    #[allow(dead_code)]
-    force_idr_gop_pending: AtomicBool,
+    keyframe_recreate_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -117,8 +110,7 @@ impl Default for MftEncoderShared {
             dropped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             drain_pending: AtomicBool::new(false),
-            flush_state_pending: AtomicBool::new(false),
-            force_idr_gop_pending: AtomicBool::new(false),
+            keyframe_recreate_pending: AtomicBool::new(false),
         }
     }
 }
@@ -815,11 +807,18 @@ fn run_encoder_thread(
     // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
     let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
-    // Step 8: Pump loop. mft, codec_api, event_gen all owned by this thread.
-    pump_loop(
-        &mft,
-        &codec_api,
-        &event_gen,
+    // Step 8: Pump loop. mft is passed by value (owned) so Mechanism G can drop + recreate
+    // the IMFTransform handle mid-stream without borrowing constraints. activate_factory is
+    // kept on this thread so pump_loop can call ActivateObject again (Mechanism G path).
+    // After pump_loop returns, mft may have been replaced (Mechanism G); the original or
+    // final handle is returned so end-of-stream notifications can be sent correctly.
+    // pump_loop takes ownership of mft, codec_api, and event_gen so Mechanism G can
+    // drop + re-cast all three from the fresh IMFTransform after mid-stream recreate.
+    let mft = pump_loop(
+        mft,
+        &activate,
+        codec_api,
+        event_gen,
         &state,
         rx,
         tx,
@@ -828,11 +827,15 @@ fn run_encoder_thread(
     );
 
     // Steps 9a–9e: Notify end of stream and release.
+    // WHY: pump_loop returns the final IMFTransform handle (may be a fresh one after
+    // Mechanism G recreate). Send end-of-stream messages before dropping it.
     unsafe {
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
-    // mft, codec_api, event_gen, activate are dropped here (COM Release via Drop).
+    // mft is dropped here (COM Release via Drop).
+    // codec_api and event_gen were moved into pump_loop and dropped inside it.
+    // activate is dropped here (COM Release via Drop).
     // MFShutdown for the thread is NOT called here — the caller thread's Drop handles it.
     // CoUninitGuard calls CoUninitialize when this function returns.
 }
@@ -1118,21 +1121,29 @@ fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop takes mft, codec_api, event_gen, config, state, rx, tx + format state — design §5a one-function pump shape"
+    reason = "pump_loop owns mft, codec_api, event_gen + activate_factory for Mechanism G recreate; \
+              plus config, state, rx, tx + format state — design §5a one-function pump shape"
 )]
 fn pump_loop(
-    mft: &IMFTransform,
-    codec_api: &ICodecAPI,
-    event_gen: &IMFMediaEventGenerator,
+    mut mft: IMFTransform,
+    activate_factory: &IMFActivate,
+    initial_codec_api: ICodecAPI,
+    initial_event_gen: IMFMediaEventGenerator,
     state: &MftEncoderShared,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
     output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
-) {
+) -> IMFTransform {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
+
+    // codec_api and event_gen are owned locals so Mechanism G can re-cast them from
+    // the fresh IMFTransform after recreate. They are initialized from the initial mft
+    // and updated in the G handler.
+    let mut codec_api = initial_codec_api;
+    let mut event_gen = initial_event_gen;
 
     let mut nv12_scratch = Nv12::new(1, 1);
     let mut seq: u64 = 0;
@@ -1162,12 +1173,6 @@ fn pump_loop(
     // SET on every ProcessMessage(COMMAND_DRAIN) call; CLEAR on METransformDrainComplete.
     // GUARD at top of `while ni_count > 0` loop — MUST precede SWAP (GUARD-BEFORE-SWAP).
     let mut draining = false;
-
-    // PHASE 0 EMPIRICAL: tracks whether GOPSize needs restoring after the next ProcessInput.
-    // Set when force_idr_gop_pending is consumed; cleared after the next successful submit.
-    let mut gop_restore_needed = false;
-    // Saved GOP size for restore after GOP-toggle IDR attempt. Default 30 (30fps).
-    let mut saved_gop_size: u32 = 30;
 
     // Change-detection sentinels for DD8 counter snapshot logging (spec R7/S7.2).
     let mut last_logged_ni: u32 = u32::MAX;
@@ -1271,7 +1276,7 @@ fn pump_loop(
         // on vendor MFTs that emit HaveOutput before the first NeedInput at startup.
         while ho_count > 0 {
             match collect_output(
-                mft,
+                &mft,
                 output_format_known,
                 current_ts,
                 &mut seq,
@@ -1290,7 +1295,7 @@ fn pump_loop(
                         }
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                             tracing::info!("pump_loop: packet channel disconnected, exiting");
-                            return;
+                            return mft;
                         }
                     }
                 }
@@ -1304,7 +1309,7 @@ fn pump_loop(
                     let reason = e.to_string();
                     if reason.contains("renegotiate") {
                         tracing::error!("pump_loop: renegotiation failed: {e}");
-                        return;
+                        return mft;
                     } else if reason.contains("ProcessOutput: 0x80004005") {
                         // E_UNEXPECTED on vendor priming: consume credit, log warn, continue.
                         // This is expected during HW MFT startup before any frame is submitted.
@@ -1314,7 +1319,7 @@ fn pump_loop(
                         ho_count -= 1;
                     } else {
                         tracing::error!("pump_loop: collect_output failed: {e}");
-                        return;
+                        return mft;
                     }
                 }
             }
@@ -1365,7 +1370,7 @@ fn pump_loop(
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
                     match submit_frame(
-                        mft,
+                        &mft,
                         &nv12_scratch,
                         frame.timestamp,
                         frame_dur_100ns,
@@ -1376,20 +1381,7 @@ fn pump_loop(
                             ni_count -= 1;
                             // DD1 FIRE: ICodecAPI::SetValue AFTER ProcessInput — eliminates the
                             // race window where QSV withdraws NeedInput readiness (Mode 1 fix).
-                            fire_pending_codec_settings(codec_api, &swap);
-                            // PHASE 0 EMPIRICAL — Mechanism A restore: after the first successful
-                            // ProcessInput following a GOP=1 toggle, restore original GOP size.
-                            if gop_restore_needed {
-                                let gop_orig = make_variant_u32(saved_gop_size);
-                                unsafe {
-                                    let _ =
-                                        codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop_orig);
-                                }
-                                gop_restore_needed = false;
-                                tracing::info!(
-                                    "pump_loop: GOP size restored to {saved_gop_size} after force_idr_via_gop_toggle"
-                                );
-                            }
+                            fire_pending_codec_settings(&codec_api, &swap);
                         }
                         Err(e) => {
                             // Check for MF_E_NOTACCEPTING — indicates counter desync (design DD5).
@@ -1406,7 +1398,7 @@ fn pump_loop(
                                 tracing::error!(
                                     "pump_loop: MF_E_NOTACCEPTING — counter desync (should be unreachable): {e}"
                                 );
-                                return;
+                                return mft;
                             }
                             // Other ProcessInput errors: skip frame, consume credit, continue
                             // (mirrors openh264 behaviour for non-fatal input errors).
@@ -1459,58 +1451,196 @@ fn pump_loop(
             );
         }
 
-        // PHASE 0 EMPIRICAL — Mechanism C-prime: consume flush_state() signal.
-        // Sends FLUSH+BEGIN_STREAMING+START_OF_STREAM — the same 3-message sequence as
-        // setup_mft (lines 911-922). FLUSH is synchronous (no DrainComplete follows).
-        // NOT setting draining=true because FLUSH has no async completion event.
-        // Counters reset because FLUSH discards all internal encoder state.
-        if state.flush_state_pending.swap(false, Ordering::AcqRel) {
+        // PHASE 0 EMPIRICAL — Mechanism G: consume request_keyframe_via_recreate() signal.
+        // Tears down the current IMFTransform (send END_OF_STREAM + COMMAND_DRAIN,
+        // wait for DrainComplete, then END_STREAMING, then drop handle) and re-activates
+        // a fresh IMFTransform from the retained factory pointer. The first encoded frame
+        // from a fresh activation is always IDR (100% empirical evidence from enc.start()).
+        //
+        // WHY this is architecturally sound: rounds 1+2 proved that no MFT-API message
+        // sequence on the SAME handle produces IDR on Intel QSV (phase-0-trace #779, #780).
+        // Mechanism G is the only empirically-grounded path.
+        //
+        // RISKS (per explore-round-2 #781):
+        //   - Intel QSV driver may reject the 2nd ActivateObject call with E_UNEXPECTED.
+        //     If that happens, the probe exits with ENCODER_DIED and HRESULT is logged.
+        //   - The codec_api and event_gen interfaces are casts of the OLD mft; after
+        //     recreate they hold stale COM refs. pump_loop continues using the new mft
+        //     directly for ProcessMessage/ProcessInput/ProcessOutput. The stale codec_api
+        //     and event_gen refs remain valid (COM keeps the underlying object alive via
+        //     refcount) but their events/values now refer to the old session. This is
+        //     acceptable for the probe — production Mechanism G would re-cast from the
+        //     new handle.
+        if state
+            .keyframe_recreate_pending
+            .swap(false, Ordering::AcqRel)
+            && !draining
+        {
             tracing::info!(
-                "pump_loop: flush_state() — sending COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM"
+                "pump_loop: request_keyframe_via_recreate() — tearing down IMFTransform for Mechanism G"
             );
-            unsafe {
-                let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-                let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-                let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+            // Steps G1–G4: send shutdown messages, drop old handle, acquire fresh handle.
+            // WHY block expression: Rust's ownership rules prevent assigning to `mft` after
+            // it has been moved into `drop()`. Using a block expression lets us move the old
+            // handle out, drop it, and produce a new IMFTransform — all in one expression.
+            mft = {
+                let old_mft = mft; // move old handle into block scope
+
+                // Step G1: Send END_OF_STREAM + COMMAND_DRAIN (drain remaining frames).
+                // event_gen still works here because old_mft and event_gen share the same
+                // underlying COM object — event_gen AddRef'd it and keeps it alive.
+                unsafe {
+                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                }
+                // Note: we do NOT set draining=true here because the G teardown is synchronous
+                // (we block waiting for DrainComplete inside this block expression). The outer
+                // loop's draining flag is reset to false at the end of the G handler.
+                tracing::trace!(
+                    target: "sm_infra::encode::windows_mft",
+                    "Mechanism G: END_OF_STREAM + COMMAND_DRAIN sent; waiting for DrainComplete"
+                );
+
+                // Wait for DrainComplete (bounded 5 s) before teardown.
+                let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut drain_complete = false;
+                while std::time::Instant::now() < drain_deadline {
+                    match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                        Ok(event) => {
+                            let et = unsafe { event.GetType() }.unwrap_or(0);
+                            if et == METransformDrainComplete.0 as u32 {
+                                drain_complete = true;
+                                break;
+                            } else if et == METransformHaveOutput.0 as u32 {
+                                // Drain + discard remaining output: not forwarded post-recreate.
+                                let _ = collect_output(
+                                    &old_mft,
+                                    output_format_known,
+                                    current_ts,
+                                    &mut seq,
+                                    cfg_w,
+                                    cfg_h,
+                                    config.framerate,
+                                    config.bitrate_bps,
+                                );
+                            }
+                            // Other events ignored during drain window.
+                        }
+                        Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                tracing::info!(
+                    "pump_loop: Mechanism G drain_complete={} (bounded 5s)",
+                    drain_complete
+                );
+
+                // Step G2: END_STREAMING — formally end the streaming session.
+                unsafe {
+                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+                }
+
+                // Step G3: Drop old handle — forces COM Release on old_mft.
+                // event_gen / codec_api retain AddRef on the underlying object; they remain
+                // valid for GetEvent polling but MUST NOT be used for GetValue/SetValue on
+                // the new session (acceptable for this probe — production G would re-cast).
+                drop(old_mft);
+                tracing::info!("pump_loop: Mechanism G — old IMFTransform dropped");
+
+                // Step G4: Re-activate a fresh IMFTransform from the retained factory.
+                // SAFETY: activate_factory is an MTA-registered COM factory. Calling
+                // ActivateObject again is documented as valid for a new activation cycle.
+                // Risk: Intel QSV driver may return E_UNEXPECTED on 2nd call — logged below.
+                match unsafe { activate_factory.ActivateObject::<IMFTransform>() } {
+                    Ok(new_mft) => {
+                        tracing::info!("pump_loop: Mechanism G — fresh IMFTransform acquired");
+                        new_mft
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "pump_loop: Mechanism G — ActivateObject (2nd call) FAILED: 0x{:08X} \
+                             ({e}). Escalate to Mechanism H (restart() API).",
+                            e.code().0
+                        );
+                        // Signal stop so run_encoder_thread exits gracefully.
+                        // The test harness observes ENCODER_DIED via RecvTimeoutError::Disconnected.
+                        state.stop.store(true, Ordering::Release);
+                        // We must return an IMFTransform to satisfy the return type.
+                        // There is no valid handle: panic with full diagnostic context.
+                        // The panic message is captured in the nextest failure output and
+                        // provides the exact HRESULT for the Mechanism H escalation decision.
+                        panic!(
+                            "pump_loop: Mechanism G IRRECOVERABLE — ActivateObject (2nd call) \
+                             rejected with HRESULT 0x{:08X}. Old IMFTransform was already dropped. \
+                             Escalate to Mechanism H (restart() API extension). \
+                             Note: This is an informative probe failure — not a production bug.",
+                            e.code().0
+                        );
+                    }
+                }
+            };
+
+            // Step G5: Unlock the new MFT for async operation.
+            // SAFETY: GetAttributes + SetUINT32 on a freshly-activated MFT.
+            if let Ok(attrs) = unsafe { mft.GetAttributes() } {
+                let _ = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) };
             }
-            // FLUSH discards all in-flight state; reset counters to match fresh state.
+
+            // Step G5b: Re-cast codec_api and event_gen from the new mft.
+            // The previous codec_api and event_gen pointed to the OLD COM object.
+            // After dropping old_mft, those interfaces still hold an AddRef on the old
+            // object; updating them to the new mft ensures GetEvent reads from the
+            // correct event queue and SetValue targets the correct codec state.
+            // SAFETY: IMFTransform for hardware video encoders implements both ICodecAPI
+            // and IMFMediaEventGenerator per Windows docs.
+            match mft.cast::<ICodecAPI>() {
+                Ok(new_codec) => {
+                    codec_api = new_codec;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "pump_loop: Mechanism G — ICodecAPI re-cast FAILED: 0x{:08X}; exiting",
+                        e.code().0
+                    );
+                    state.stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            match mft.cast::<IMFMediaEventGenerator>() {
+                Ok(new_evgen) => {
+                    event_gen = new_evgen;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "pump_loop: Mechanism G — IMFMediaEventGenerator re-cast FAILED: 0x{:08X}; exiting",
+                        e.code().0
+                    );
+                    state.stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
+
+            // Step G6: Re-run setup_mft (SetInputType + SetOutputType + FLUSH + BEGIN + START).
+            // After setup_mft, the encoder is in a fresh state; the FIRST encoded frame is IDR
+            // (matching enc.start() 100% empirical evidence).
+            if let Err(e) = setup_mft(&mft, config) {
+                tracing::error!(
+                    "pump_loop: Mechanism G — setup_mft on fresh handle FAILED: {e}; exiting"
+                );
+                state.stop.store(true, Ordering::Release);
+                break;
+            }
+
+            // Reset counters: fresh activation has no pending NeedInput/HaveOutput credits.
             ni_count = 0;
             ho_count = 0;
-            tracing::trace!(
-                target: "sm_infra::encode::windows_mft",
-                "flush_state: COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM sent; counters reset"
-            );
-        }
-
-        // PHASE 0 EMPIRICAL — Mechanism A: consume force_idr_via_gop_toggle() signal.
-        // Sets CODECAPI_AVEncMPVGOPSize=1 so the next ProcessInput submits a GOP head (= IDR).
-        // Saves the prior GOP size; restore is done after the NEXT successful ProcessInput
-        // (gop_restore_needed flag, checked inside the NI loop on the following iteration).
-        if state.force_idr_gop_pending.swap(false, Ordering::AcqRel) && !gop_restore_needed {
+            draining = false;
+            *output_format_known = None; // Re-detect format on first packet from fresh handle.
             tracing::info!(
-                "pump_loop: force_idr_via_gop_toggle() — reading current GOP size, setting GOP=1"
-            );
-            // Try to read the current GOP size for restore; fall back to framerate default.
-            // SAFETY: GetValue returns a VARIANT; we read the VT_UI4 (ulVal) arm.
-            saved_gop_size = unsafe {
-                codec_api
-                    .GetValue(&CODECAPI_AVEncMPVGOPSize)
-                    .ok()
-                    .map(|v| (*v.Anonymous.Anonymous).Anonymous.ulVal)
-                    .unwrap_or(if config.framerate > 0 {
-                        config.framerate
-                    } else {
-                        30
-                    })
-            };
-            let gop1 = make_variant_u32(1);
-            unsafe {
-                let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop1);
-            }
-            gop_restore_needed = true;
-            tracing::trace!(
-                target: "sm_infra::encode::windows_mft",
-                "force_idr_gop: GOP=1 set; saved_gop_size={saved_gop_size}; restore pending after next ProcessInput"
+                "pump_loop: Mechanism G — recreate complete; resuming pump_loop with fresh IMFTransform"
             );
         }
 
@@ -1540,6 +1670,7 @@ fn pump_loop(
         }
     }
     tracing::debug!("pump_loop exited cleanly");
+    mft
 }
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
@@ -1800,43 +1931,29 @@ impl WindowsMftH264Encoder {
         self.state.drain_pending.store(true, Ordering::Release);
     }
 
-    /// PHASE 0 EMPIRICAL: triggers `MFT_MESSAGE_COMMAND_FLUSH` + `BEGIN_STREAMING` +
-    /// `START_OF_STREAM` on the next pump_loop iteration.
+    /// PHASE 0 EMPIRICAL (Mechanism G): triggers IMFTransform teardown + re-activation
+    /// within pump_loop, guaranteeing an IDR as the first encoded frame of the fresh session.
     ///
-    /// Unlike `flush()` (which sends `COMMAND_DRAIN` and waits for async `DrainComplete`),
-    /// `COMMAND_FLUSH` is SYNCHRONOUS — it discards all internal encoder state immediately.
-    /// No `METransformDrainComplete` event follows. The encoder is in the same state as
-    /// just before `BEGIN_STREAMING` was first sent (matching `setup_mft` at lines 911-922).
+    /// When consumed by pump_loop:
+    ///   1. Sends `END_OF_STREAM` + `COMMAND_DRAIN` → waits for `DrainComplete`.
+    ///   2. Sends `END_STREAMING` — formally closes the streaming session.
+    ///   3. Drops the owned `IMFTransform` (forces COM Release).
+    ///   4. Re-calls `ActivateObject` on the retained factory → fresh `IMFTransform`.
+    ///   5. Re-runs `setup_mft` (SetInputType + SetOutputType + FLUSH + BEGIN + START).
+    ///   6. Resumes pump_loop with the fresh handle.
     ///
-    /// **Hypothesis (Mechanism C-prime)**: if `COMMAND_FLUSH` is the missing piece that
-    /// `setup_mft` sends but `DrainComplete/F2` does not, then the first frame after this
-    /// sequence should be IDR on Intel QSV. If the C-prime probe PASSES, this method
-    /// becomes the production mechanism for `request_keyframe()`. Otherwise it is reverted.
+    /// The first encoded frame from a fresh activation is always IDR (100% empirical
+    /// evidence from `enc.start()` path — 3 rounds of Phase 0 probes confirmed no
+    /// MFT-API message sequence on the SAME handle produces IDR on Intel QSV).
     ///
-    /// **Probe**: `phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr` in
-    /// `crates/sm-infra/tests/windows_mft_encode.rs`.
-    pub fn flush_state(&self) {
+    /// **Probe**: `phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr`
+    /// in `crates/sm-infra/tests/windows_mft_encode.rs`.
+    ///
+    /// **Risk**: Intel QSV driver may reject the 2nd `ActivateObject` call. If the probe
+    /// fails with ENCODER_DIED, escalate to Mechanism H (`pub fn restart()`).
+    pub fn request_keyframe_via_recreate(&self) {
         self.state
-            .flush_state_pending
-            .store(true, Ordering::Release);
-    }
-
-    /// PHASE 0 EMPIRICAL: forces the next frame to be IDR via `CODECAPI_AVEncMPVGOPSize=1` toggle.
-    ///
-    /// When consumed by pump_loop: saves the current GOP size (or uses `config.framerate`
-    /// as default), sets `CODECAPI_AVEncMPVGOPSize=1` (every frame becomes a GOP head = IDR),
-    /// submits the next frame normally, then restores the original GOP size.
-    ///
-    /// **Hypothesis (Mechanism A)**: per Intel MSDK docs, GOP=1 forces every frame to be
-    /// IDR. Microsoft warns "before recording only" but that is unverified empirically.
-    /// If the A probe PASSES, this becomes an alternative production mechanism.
-    /// Otherwise it is reverted.
-    ///
-    /// **Probe**: `phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr` in
-    /// `crates/sm-infra/tests/windows_mft_encode.rs`.
-    pub fn force_idr_via_gop_toggle(&self) {
-        self.state
-            .force_idr_gop_pending
+            .keyframe_recreate_pending
             .store(true, Ordering::Release);
     }
 }

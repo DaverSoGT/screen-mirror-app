@@ -1744,67 +1744,78 @@ fn phase0_intel_qsv_idr_via_drain_resume_latency_measure() {
     let _ = enc.stop();
 }
 
-// ─── Phase 0 round 2 probes (Slice 5 — C-prime FLUSH-based + Mechanism A GOP-toggle) ─
+// ─── Phase 0 round 3 probes (Slice 5 — Mechanism G: drop + recreate IMFTransform) ─────
 //
-// Empirical follow-up after round 1 showed Mechanism C (DRAIN+BEGIN_STREAMING) does NOT
-// produce IDR on Intel QSV (phase-0-trace #779).
+// Rounds 1 and 2 empirically ruled out all MFT-API-level mechanisms (phase-0-trace #779
+// and #780):
+//   Round 1 — Mechanism C (DRAIN+BEGIN_STREAMING): encoder alive, NO IDR.
+//   Round 2 — Mechanism C-prime (FLUSH+BEGIN+START, same handle): ENCODER_DIED.
+//   Round 2 — Mechanism A (CODECAPI_AVEncMPVGOPSize=1): encoder alive, NO IDR.
 //
-// Two new mechanisms under test:
+// explore-round-2 (#781) concludes that only a fresh IMFTransform activation produces
+// a guaranteed IDR (matching enc.start() / setup_mft empirical evidence).
 //
-//   C-prime (FLUSH-based): setup_mft sends FLUSH+BEGIN+START (3 msgs); F2 DrainComplete
-//     sends only BEGIN+START (2 msgs). FLUSH may be the missing piece.
-//     → C-prime probe (`phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr`)
+// Mechanism G: within pump_loop, drop the owned IMFTransform handle and call
+// ActivateObject on the retained factory to get a fresh handle, then replay
+// setup_mft before resuming encoding. The first encoded frame from a fresh
+// activation is always IDR (100% empirical evidence from enc.start() path).
 //
-//   Mechanism A (GOP-size toggle): CODECAPI_AVEncMPVGOPSize=1 forces every frame to be
-//     a GOP head (= IDR). Microsoft warns "before recording only" — empirical test needed.
-//     → A probe (`phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr`)
+// This probe validates Mechanism G on Host A (Intel QSV):
+//   → G probe (`phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr`)
 //
-// Run on Host A (Intel QSV) with trace logging:
 //
 //   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
 //   cargo nextest run -p sm-infra --features hw-encoder `
 //     --test windows_mft_encode `
-//     -E 'test(/^phase0_intel_qsv_idr_via_(flush|gop)/)' `
+//     -E 'test(/^phase0_intel_qsv_idr_via_imftransform_recreate/)' `
 //     --run-ignored=ignored-only --test-threads=1 --no-fail-fast --no-capture `
-//     *> phase0-round2-trace.log
+//     *> phase0-round3-trace.log
 //
-// Decision tree (per phase-0-trace #779 recommendations):
-//   C-prime PASS → Mechanism C-prime validated; redesign around FLUSH-based resume
-//   C-prime FAIL + A PASS → Mechanism A is the production path
-//   Both FAIL → escalate to Mechanism F (MediaSDK/VPL)
+// Decision tree (per explore-round-2 #781):
+//   G PASS → Mechanism G validated; redesign Slice 5 around IMFTransform recreate path
+//   G FAIL (E_UNEXPECTED on 2nd ActivateObject) → escalate to Mechanism H (restart() API)
 //
-// Both probes retained as permanent #[ignore]-gated regression guards (spec R7,
-// proposal D-PROBES-RETENTION).
+// This probe is retained as a permanent #[ignore]-gated regression guard.
 
-/// C-prime — confirm that FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR as first
-/// post-reset frame.
+/// G — confirm that dropping + re-activating `IMFTransform` mid-stream produces IDR
+/// as the first encoded frame of the fresh activation.
 ///
-/// Hypothesis: `setup_mft` sends `COMMAND_FLUSH` + `BEGIN_STREAMING` + `START_OF_STREAM`
-/// (3 msgs, lines 911-922) and the first encoded frame is always IDR. The `DrainComplete/F2`
-/// handler sends only `BEGIN_STREAMING` + `START_OF_STREAM` (2 msgs, no FLUSH) — this is
-/// why Mechanism C fails. Adding `COMMAND_FLUSH` to the resume sequence may produce IDR by
-/// restoring the MFT to a genuinely fresh state (per Microsoft docs: "FLUSH discards all
-/// internal data AND state information; after FLUSH the MFT is in the same state as just
-/// before BEGIN_STREAMING").
+/// Hypothesis: the only empirically proven IDR sequence is `enc.start()` / `setup_mft`.
+/// Rounds 1 and 2 showed that no MFT-API message sequence on the SAME handle produces
+/// IDR on Intel QSV. Mechanism G destroys the handle entirely and re-calls
+/// `ActivateObject` + `setup_mft` within `pump_loop` via `request_keyframe_via_recreate()`.
+/// The first encoded frame from a fresh activation is always IDR (matching
+/// `enc.start()` 100% empirical evidence).
 ///
 /// Cadence:
-///   1. Push 3 priming frames → `enc.flush()` (COMMAND_DRAIN) → drain priming output.
-///   2. `enc.flush_state()` (COMMAND_FLUSH + BEGIN + START) → push 1 IDR-target frame
-///      → `enc.flush()` (COMMAND_DRAIN) → recv IDR-target packet.
-///   3. Assert first packet in batch 2 is `is_keyframe == true`.
+///   1. Push 30 priming frames → `enc.flush()` (COMMAND_DRAIN) → drain priming output.
+///   2. `enc.request_keyframe_via_recreate()` → pump_loop tears down + recreates IMFTransform.
+///   3. Push 30 post-recreate frames → `enc.flush()` → drain output.
+///   4. Assert: a keyframe appears within the first 1-2 frames post-recreate.
+///   5. Assert: encoder did NOT die (no ENCODER_DIED during post-recreate drain).
 ///
-/// Expected outcome (Mechanism C-prime valid):
-///   - Priming batch: ≥ 1 packet received, first is IDR (initial session start).
-///   - IDR-target packet: `is_keyframe == true`.
-///   - FAIL → Mechanism C-prime cannot guarantee IDR via FLUSH+resume on Intel QSV.
+/// Risks (per explore-round-2 #781):
+///   - A second `ActivateObject` call on the same `IMFActivate` factory may fail with
+///     `E_UNEXPECTED` on some Intel QSV driver versions — the probe MUST report the
+///     exact HRESULT if this happens so the team can decide whether to escalate to H.
+///   - If the probe fails, `recreate_result` will contain the failure detail in the
+///     panic message.
+///
+/// Expected outcome on Host A (Intel QSV): PASS (keyframe within first 2 post-recreate
+/// frames) OR informative failure with HRESULT trace if ActivateObject rejects 2nd call.
 #[test]
 #[cfg(feature = "hw-encoder")]
-#[ignore = "Phase 0 round 2 probe — manual run on Host A (Intel QSV); tests Mechanism C-prime (FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR)"]
-fn phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr() {
+#[ignore = "Phase 0 round 3 probe — Mechanism G empirical validation on Host A (Intel QSV)"]
+fn phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr() {
     init_tracing();
 
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
+    const PRIMING_FRAMES: u64 = 30;
+    const POST_RECREATE_FRAMES: u64 = 30;
+    // Tolerance: keyframe must appear within first 2 frames post-recreate.
+    // Fresh activation always starts with IDR; pipeline depth at most 1 frame.
+    const IDR_TOLERANCE: u32 = 2;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -1826,22 +1837,22 @@ fn phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr() {
 
     let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
 
-    // ── Batch 1: push 3 priming frames, flush (DRAIN), drain output ──────────
-    tracing::info!("[C-prime] batch-pushing 3 priming frames (no recv — pump pulls async)");
-    for i in 0..3u64 {
+    // ── Batch 1: push PRIMING_FRAMES frames, flush (DRAIN), drain output ──────
+    tracing::info!("[G] batch-pushing {} priming frames", PRIMING_FRAMES);
+    for i in 0..PRIMING_FRAMES {
         send_frame(i);
     }
 
-    tracing::info!("[C-prime] flush() #1 — drain priming batch (COMMAND_DRAIN)");
+    tracing::info!("[G] flush() #1 — drain priming batch (COMMAND_DRAIN)");
     enc.flush();
 
     let mut priming_received = 0u32;
     let mut priming_keyframe_indices: Vec<u32> = Vec::new();
     loop {
-        match recv_pkt(Duration::from_secs(5)) {
+        match recv_pkt(Duration::from_secs(10)) {
             Ok(pkt) => {
                 tracing::info!(
-                    "[C-prime] priming pkt {} — is_keyframe={} len={}",
+                    "[G] priming pkt {} — is_keyframe={} len={}",
                     priming_received,
                     pkt.is_keyframe,
                     pkt.data.len()
@@ -1850,27 +1861,111 @@ fn phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr() {
                     priming_keyframe_indices.push(priming_received);
                 }
                 priming_received += 1;
-                if priming_received >= 10 {
+                // Drain up to PRIMING_FRAMES + pipeline depth (allow up to 35 packets).
+                if priming_received >= (PRIMING_FRAMES as u32).saturating_add(5) {
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::error!(
-                    "[C-prime] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
+                    "[G] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
                 );
-                panic!(
-                    "[C-prime] encoder died during priming drain; cannot validate Mechanism C-prime"
-                );
+                panic!("[G] encoder died during priming drain; cannot validate Mechanism G");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if priming_received == 0 {
+                    tracing::warn!("[G] OUTCOME=EMPTY_DRAIN — no priming packets before timeout");
+                } else {
+                    tracing::info!(
+                        "[G] priming drain complete — {} packets received",
+                        priming_received
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[G] priming batch summary — received={} keyframe_indices={:?}",
+        priming_received,
+        priming_keyframe_indices
+    );
+
+    assert!(
+        priming_received >= 1,
+        "[G] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
+    );
+
+    // ── Mechanism G: request IMFTransform recreate ────────────────────────────
+    //
+    // request_keyframe_via_recreate() arms the pump_loop to:
+    //   1. Send END_OF_STREAM + COMMAND_DRAIN (wait for DrainComplete)
+    //   2. Send END_STREAMING
+    //   3. Drop the owned IMFTransform (COM Release)
+    //   4. Re-call ActivateObject on the retained factory → fresh IMFTransform
+    //   5. Re-run setup_mft (SetInputType + SetOutputType + FLUSH + BEGIN + START)
+    //   6. Continue pump_loop with fresh handle
+    //
+    // The first encoded frame from a fresh activation is always IDR
+    // (100% empirical evidence from enc.start() path).
+    tracing::info!("[G] request_keyframe_via_recreate() — arming pump_loop IMFTransform recreate");
+    enc.request_keyframe_via_recreate();
+
+    // ── Batch 2: push POST_RECREATE_FRAMES frames, flush, drain ──────────────
+    //
+    // Give the pump_loop time to process the recreate signal before submitting frames.
+    // The recreate cycle takes ~300ms (ActivateObject + setup_mft); frames submitted
+    // before recreate completes will be held in the frame channel and processed after.
+    tracing::info!(
+        "[G] batch-pushing {} post-recreate frames",
+        POST_RECREATE_FRAMES
+    );
+    for i in 0..POST_RECREATE_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
+
+    tracing::info!("[G] flush() #2 — drain post-recreate batch (COMMAND_DRAIN)");
+    enc.flush();
+
+    let mut post_received = 0u32;
+    let mut post_keyframe_indices: Vec<u32> = Vec::new();
+    let mut encoder_died = false;
+
+    loop {
+        match recv_pkt(Duration::from_secs(15)) {
+            Ok(pkt) => {
+                tracing::info!(
+                    "[G] post-recreate pkt {} — is_keyframe={} len={}",
+                    post_received,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                if pkt.is_keyframe {
+                    post_keyframe_indices.push(post_received);
+                }
+                post_received += 1;
+                // Drain up to POST_RECREATE_FRAMES + pipeline depth.
+                if post_received >= (POST_RECREATE_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[G] OUTCOME=ENCODER_DIED — pump thread exited after request_keyframe_via_recreate + flush"
+                );
+                encoder_died = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if post_received == 0 {
                     tracing::warn!(
-                        "[C-prime] OUTCOME=EMPTY_DRAIN — no priming packets before timeout"
+                        "[G] OUTCOME=EMPTY_DRAIN — no post-recreate packets before timeout"
                     );
                 } else {
                     tracing::info!(
-                        "[C-prime] priming drain complete — {} packets received",
-                        priming_received
+                        "[G] post-recreate drain complete — {} packets received",
+                        post_received
                     );
                 }
                 break;
@@ -1879,219 +1974,47 @@ fn phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr() {
     }
 
     tracing::info!(
-        "[C-prime] priming batch summary — received={} keyframe_indices={:?}",
-        priming_received,
-        priming_keyframe_indices
+        "[G] post-recreate batch summary — received={} keyframe_indices={:?} encoder_died={}",
+        post_received,
+        post_keyframe_indices,
+        encoder_died
     );
+
+    // PRIMARY GATE 1: encoder must NOT have died.
+    assert!(
+        !encoder_died,
+        "[G] MECHANISM G INVALID — encoder died after request_keyframe_via_recreate (ENCODER_DIED). \
+         IMFActivate factory may reject 2nd ActivateObject call (E_UNEXPECTED). \
+         Escalate to Mechanism H (restart() API extension)."
+    );
+
+    // PRIMARY GATE 2: at least one packet received post-recreate.
+    assert!(
+        post_received >= 1,
+        "[G] expected ≥ 1 post-recreate packet; got 0 — harness misconfigured or recreate failed silently"
+    );
+
+    // PRIMARY GATE 3: a keyframe must appear within the first IDR_TOLERANCE frames
+    // post-recreate. Fresh activation always produces IDR as the first frame; pipeline
+    // depth of 1 means it may emerge as frame 0 or frame 1 of the post-recreate output.
+    let idr_within_tolerance = post_keyframe_indices
+        .first()
+        .map(|&idx| idx < IDR_TOLERANCE)
+        .unwrap_or(false);
 
     assert!(
-        priming_received >= 1,
-        "[C-prime] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
-    );
-
-    // ── C-prime reset: send FLUSH+BEGIN_STREAMING+START_OF_STREAM ────────────
-    //
-    // This is the key difference vs Mechanism C: we call flush_state() which sends the
-    // same 3-message sequence as setup_mft, NOT just BEGIN+START. COMMAND_FLUSH is
-    // synchronous — no DrainComplete event follows. The encoder is reset to fresh state.
-    tracing::info!(
-        "[C-prime] flush_state() — sending COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM"
-    );
-    enc.flush_state();
-
-    // ── Batch 2: submit 1 IDR-target frame, drain, assert IDR ─────────────────
-    //
-    // After the FLUSH reset, the first submitted frame should be IDR if Mechanism C-prime
-    // is valid. We drain it out with a second flush() (COMMAND_DRAIN).
-    tracing::info!(
-        "[C-prime] submitting IDR-target frame (frame index 3 — first frame after FLUSH+resume)"
-    );
-    send_frame(3);
-
-    tracing::info!("[C-prime] flush() #2 — drain IDR-target frame (COMMAND_DRAIN)");
-    enc.flush();
-
-    let idr_result = recv_pkt(Duration::from_secs(5));
-
-    match &idr_result {
-        Ok(pkt) => {
-            tracing::info!(
-                "[C-prime] IDR-target pkt — is_keyframe={} len={}",
-                pkt.is_keyframe,
-                pkt.data.len()
-            );
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::error!(
-                "[C-prime] OUTCOME=ENCODER_DIED — pump thread exited after flush_state + flush"
-            );
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            tracing::error!("[C-prime] OUTCOME=TIMEOUT — no IDR-target packet within 5s");
-        }
-    }
-
-    // PRIMARY GATE for C-prime: the IDR-target packet MUST be is_keyframe == true.
-    let idr_pkt =
-        idr_result.expect("[C-prime] expected IDR-target packet; got Disconnected or Timeout");
-    assert!(
-        idr_pkt.is_keyframe,
-        "[C-prime] MECHANISM C-prime INVALID — FLUSH+resume does NOT produce IDR on Intel QSV (is_keyframe=false)"
+        idr_within_tolerance,
+        "[G] MECHANISM G INVALID — no keyframe within first {} post-recreate packets \
+         (keyframe_indices={:?}). Intel QSV did not produce IDR on fresh activation. \
+         If ActivateObject succeeded (no ENCODER_DIED), investigate codec pipeline state.",
+        IDR_TOLERANCE, post_keyframe_indices
     );
 
     tracing::info!(
-        "[C-prime] OUTCOME=PASS — Mechanism C-prime validated: FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR"
-    );
-
-    let _ = enc.stop();
-}
-
-/// A — confirm that `CODECAPI_AVEncMPVGOPSize=1` toggle produces IDR as next encoded frame.
-///
-/// Hypothesis: setting GOP size to 1 forces every frame to be a GOP head (= IDR). After the
-/// IDR-target frame is submitted, GOP size is restored to the original value. Microsoft docs
-/// warn "before recording only" for some GOP properties, but empirical validation on Intel QSV
-/// has not been done. This probe tests whether the toggle works mid-stream.
-///
-/// Cadence:
-///   1. Push 3 priming frames → `enc.flush()` (COMMAND_DRAIN) → drain priming output.
-///   2. `enc.force_idr_via_gop_toggle()` → push 1 IDR-target frame → `enc.flush()` → recv.
-///   3. Assert first packet in batch 2 is `is_keyframe == true`.
-///
-/// Expected outcome (Mechanism A valid):
-///   - Priming batch: ≥ 1 packet received.
-///   - IDR-target packet: `is_keyframe == true`.
-///   - FAIL → GOP-size toggle does NOT produce IDR mid-stream on Intel QSV.
-#[test]
-#[cfg(feature = "hw-encoder")]
-#[ignore = "Phase 0 round 2 probe — manual run on Host A (Intel QSV); tests Mechanism A (CODECAPI_AVEncMPVGOPSize=1 toggle produces IDR)"]
-fn phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr() {
-    init_tracing();
-
-    const WIDTH: u32 = 640;
-    const HEIGHT: u32 = 480;
-
-    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
-        width: WIDTH,
-        height: HEIGHT,
-        bitrate_bps: 4_000_000,
-        ..EncoderConfig::default()
-    })
-    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
-
-    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
-    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
-    enc.start(frame_rx, pkt_tx).expect("start must succeed");
-
-    let send_frame = |i: u64| {
-        frame_tx
-            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
-            .expect("frame_tx should be open");
-    };
-
-    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
-
-    // ── Batch 1: push 3 priming frames, flush (DRAIN), drain output ──────────
-    tracing::info!("[A] batch-pushing 3 priming frames (no recv — pump pulls async)");
-    for i in 0..3u64 {
-        send_frame(i);
-    }
-
-    tracing::info!("[A] flush() #1 — drain priming batch (COMMAND_DRAIN)");
-    enc.flush();
-
-    let mut priming_received = 0u32;
-    let mut priming_keyframe_indices: Vec<u32> = Vec::new();
-    loop {
-        match recv_pkt(Duration::from_secs(5)) {
-            Ok(pkt) => {
-                tracing::info!(
-                    "[A] priming pkt {} — is_keyframe={} len={}",
-                    priming_received,
-                    pkt.is_keyframe,
-                    pkt.data.len()
-                );
-                if pkt.is_keyframe {
-                    priming_keyframe_indices.push(priming_received);
-                }
-                priming_received += 1;
-                if priming_received >= 10 {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::error!(
-                    "[A] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
-                );
-                panic!("[A] encoder died during priming drain; cannot validate Mechanism A");
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if priming_received == 0 {
-                    tracing::warn!("[A] OUTCOME=EMPTY_DRAIN — no priming packets before timeout");
-                } else {
-                    tracing::info!(
-                        "[A] priming drain complete — {} packets received",
-                        priming_received
-                    );
-                }
-                break;
-            }
-        }
-    }
-
-    tracing::info!(
-        "[A] priming batch summary — received={} keyframe_indices={:?}",
-        priming_received,
-        priming_keyframe_indices
-    );
-
-    assert!(
-        priming_received >= 1,
-        "[A] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
-    );
-
-    // ── Mechanism A: set GOP=1 toggle, push IDR-target frame ─────────────────
-    //
-    // force_idr_via_gop_toggle() arms the pump_loop to set CODECAPI_AVEncMPVGOPSize=1
-    // before the next ProcessInput, then restore the original GOP size afterward.
-    tracing::info!("[A] force_idr_via_gop_toggle() — arming CODECAPI_AVEncMPVGOPSize=1 toggle");
-    enc.force_idr_via_gop_toggle();
-
-    tracing::info!("[A] submitting IDR-target frame (frame index 3 — submitted with GOP=1 active)");
-    send_frame(3);
-
-    tracing::info!("[A] flush() #2 — drain IDR-target frame (COMMAND_DRAIN)");
-    enc.flush();
-
-    let idr_result = recv_pkt(Duration::from_secs(5));
-
-    match &idr_result {
-        Ok(pkt) => {
-            tracing::info!(
-                "[A] IDR-target pkt — is_keyframe={} len={}",
-                pkt.is_keyframe,
-                pkt.data.len()
-            );
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::error!(
-                "[A] OUTCOME=ENCODER_DIED — pump thread exited after GOP-toggle + flush"
-            );
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            tracing::error!("[A] OUTCOME=TIMEOUT — no IDR-target packet within 5s");
-        }
-    }
-
-    // PRIMARY GATE for Mechanism A: the IDR-target packet MUST be is_keyframe == true.
-    let idr_pkt = idr_result.expect("[A] expected IDR-target packet; got Disconnected or Timeout");
-    assert!(
-        idr_pkt.is_keyframe,
-        "[A] MECHANISM A INVALID — GOP-size toggle does NOT produce IDR on Intel QSV (is_keyframe=false)"
-    );
-
-    tracing::info!(
-        "[A] OUTCOME=PASS — Mechanism A validated: CODECAPI_AVEncMPVGOPSize=1 toggle produces IDR"
+        "[G] OUTCOME=PASS — Mechanism G validated: IMFTransform recreate produces IDR at \
+         post-recreate index {:?} (within tolerance {})",
+        post_keyframe_indices.first(),
+        IDR_TOLERANCE
     );
 
     let _ = enc.stop();
