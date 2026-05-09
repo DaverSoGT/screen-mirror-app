@@ -353,11 +353,17 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
     // Drain all 5 packets in FIFO order.
     let first = recv_pkt();
     assert!(first.is_keyframe, "first packet must be an IDR");
-    println!("[T7.1] packet 0 (initial IDR): is_keyframe={}", first.is_keyframe);
+    println!(
+        "[T7.1] packet 0 (initial IDR): is_keyframe={}",
+        first.is_keyframe
+    );
 
     for i in 1..=3u64 {
         let pkt = recv_pkt();
-        println!("[T7.1] packet {i} (P-frame): is_keyframe={}", pkt.is_keyframe);
+        println!(
+            "[T7.1] packet {i} (P-frame): is_keyframe={}",
+            pkt.is_keyframe
+        );
     }
 
     let forced_idr = recv_pkt();
@@ -1007,9 +1013,9 @@ fn mft_two_frame_drain_probe_phase_0() {
         Err(mpsc::RecvTimeoutError::Timeout) => eprintln!(
             "[PHASE_0_PROBE_2F] OUTCOME=EMPTY_DRAIN — no packet within 10s (vendor needs ≥3 frames)"
         ),
-        Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!(
-            "[PHASE_0_PROBE_2F] OUTCOME=ENCODER_DIED — pkt_tx disconnected"
-        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("[PHASE_0_PROBE_2F] OUTCOME=ENCODER_DIED — pkt_tx disconnected")
+        }
     }
 
     let _ = enc.stop();
