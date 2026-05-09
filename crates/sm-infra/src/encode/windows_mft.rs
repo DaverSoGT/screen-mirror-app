@@ -1557,6 +1557,14 @@ fn make_variant_bool(value: bool) -> VARIANT {
     v
 }
 
+// ── Inherent methods ──────────────────────────────────────────────────────────
+
+impl WindowsMftH264Encoder {
+    /// Signal end-of-burst to the encoder pump loop.
+    // TODO: real impl in C2 (Slice 3 GREEN)
+    pub fn flush(&self) {}
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 // ── Test-only helpers ────────────────────────────────────────────────────────

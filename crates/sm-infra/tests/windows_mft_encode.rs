@@ -158,6 +158,8 @@ fn mft_encoded_packet_starts_with_annex_b_start_code() {
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open");
 
+    enc.flush();
+
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet should arrive within 5 s");
@@ -284,6 +286,8 @@ fn mft_encoded_packet_timestamp_matches_capture_frame() {
         .send(make_synthetic_frame(640, 480, 500))
         .expect("frame_tx should be open");
 
+    enc.flush();
+
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet should arrive within 5 s");
@@ -331,25 +335,34 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
             .expect("packet should arrive within 3 s")
     };
 
-    // Drain the initial IDR.
+    // Submit all frames upfront, then flush once, then drain all packets in FIFO order.
+    // WHY: OQ-2 LIKELY-TERMINAL — Intel QSV enters non-accepting state post-DRAIN;
+    // flush() must be called once at end of burst, not mid-stream. (DD6, Phase 0 trace #710)
     send_frame(0);
-    let first = recv_pkt();
-    assert!(first.is_keyframe, "first packet must be an IDR");
-
-    // Encode a few P-frames.
-    for i in 1..=3u64 {
-        send_frame(i);
-        let pkt = recv_pkt();
-        println!("[T7.1] P-frame {i}: is_keyframe={}", pkt.is_keyframe);
-    }
-
-    // Request a forced keyframe.
+    send_frame(1);
+    send_frame(2);
+    send_frame(3);
+    // Request forced keyframe BEFORE submitting frame 4 — keyframe_pending is set at
+    // submit time; IDR-marking happens when pump_loop processes frame 4. (DD6 semantic)
     enc.request_keyframe();
     send_frame(4);
 
+    // Single flush at end of burst — fires one COMMAND_DRAIN after NeedInput loop.
+    enc.flush();
+
+    // Drain all 5 packets in FIFO order.
+    let first = recv_pkt();
+    assert!(first.is_keyframe, "first packet must be an IDR");
+    println!("[T7.1] packet 0 (initial IDR): is_keyframe={}", first.is_keyframe);
+
+    for i in 1..=3u64 {
+        let pkt = recv_pkt();
+        println!("[T7.1] packet {i} (P-frame): is_keyframe={}", pkt.is_keyframe);
+    }
+
     let forced_idr = recv_pkt();
     println!(
-        "[T7.1] forced IDR: is_keyframe={} seq={}",
+        "[T7.1] packet 4 (forced IDR): is_keyframe={} seq={}",
         forced_idr.is_keyframe, forced_idr.sequence
     );
 
@@ -413,24 +426,28 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
             .expect("packet should arrive within 3 s")
     };
 
-    // Drain initial IDR.
+    // Submit all frames upfront, then flush once, then drain all packets in FIFO order.
+    // WHY: OQ-2 LIKELY-TERMINAL — Intel QSV non-accepting post-DRAIN; single flush at burst end.
     send_frame(0);
-    let _ = recv_pkt(); // initial IDR
-
-    // Encode P-frames then force an IDR.
-    for i in 1..=2u64 {
-        send_frame(i);
-        let _ = recv_pkt();
-    }
-
+    send_frame(1);
+    send_frame(2);
+    // Request forced keyframe BEFORE frame 3 — sets keyframe_pending at submit time.
     enc.request_keyframe();
-    send_frame(3);
-    let forced = recv_pkt();
+    send_frame(3); // forced IDR
+    send_frame(4); // after IDR — keyframe_pending should be cleared
+
+    // Single flush at end of burst.
+    enc.flush();
+
+    // Drain 5 packets in FIFO order.
+    let _ = recv_pkt(); // packet 0: initial IDR
+    let _ = recv_pkt(); // packet 1: P-frame
+    let _ = recv_pkt(); // packet 2: P-frame
+    let forced = recv_pkt(); // packet 3: forced IDR
     assert!(forced.is_keyframe, "forced IDR must be a keyframe");
 
     // The NEXT packet (after the IDR) must NOT be a keyframe — flag was cleared.
-    send_frame(4);
-    let after_idr = recv_pkt();
+    let after_idr = recv_pkt(); // packet 4: after IDR
     assert!(
         !after_idr.is_keyframe,
         "packet after forced IDR must have is_keyframe == false, got true"
@@ -462,34 +479,39 @@ fn mft_set_bitrate_updates_encoder_without_restart() {
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
 
-    // Feed a few frames at 4 Mbps.
+    // Submit all frames: batch 1 at 4 Mbps, set_bitrate MID-STREAM, batch 2 at 8 Mbps.
+    // WHY: set_bitrate during active encoding is the production-relevant invariant T8 verifies;
+    // flush() is called ONCE at end of burst (OQ-2 LIKELY-TERMINAL, DD6, Phase 0 trace #710).
     for i in 0..3u64 {
         frame_tx
             .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
             .expect("frame_tx open");
-        let _ = pkt_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive");
     }
 
-    // Update bitrate to 8 Mbps — must return Ok(()) without restarting.
+    // Update bitrate to 8 Mbps MID-STREAM — no flush before (preserves live-update invariant).
     let result = enc.set_bitrate(8_000_000);
     assert!(
         result.is_ok(),
         "set_bitrate(8_000_000) should return Ok(()), got {result:?}"
     );
 
-    // Continue encoding — encoder thread must still be alive (channel not disconnected).
+    // Continue submitting frames after bitrate update.
     for i in 3..6u64 {
         frame_tx
             .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
             .expect("frame_tx must still be open after set_bitrate");
+    }
+
+    // Single flush at end of burst — fires one COMMAND_DRAIN.
+    enc.flush();
+
+    // Drain all 6 packets in FIFO order.
+    for i in 0..6u64 {
         let pkt = pkt_rx
             .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive after bitrate update");
+            .expect("packet should arrive");
         println!(
-            "[T8.2] post-bitrate-update pkt {}: is_keyframe={} len={}",
-            i,
+            "[T8.2] pkt {i}: is_keyframe={} len={}",
             pkt.is_keyframe,
             pkt.data.len()
         );
@@ -525,6 +547,8 @@ fn mft_first_real_packet_is_annex_b() {
     frame_tx
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open");
+
+    enc.flush();
 
     let pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
@@ -601,6 +625,8 @@ fn mft_setup_uses_config_dimensions_when_nonzero() {
         .send(make_synthetic_frame(640, 480, 0))
         .expect("frame_tx should be open — thread alive after start()");
 
+    enc.flush();
+
     let _pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("encoded packet must arrive within 5 s — MFT accepted 640x480 frame");
@@ -630,6 +656,8 @@ fn mft_setup_falls_back_when_config_dimensions_zero() {
     frame_tx
         .send(make_synthetic_frame(1920, 1080, 0))
         .expect("frame_tx should be open — thread alive after start()");
+
+    enc.flush();
 
     let _pkt = pkt_rx
         .recv_timeout(Duration::from_secs(5))
