@@ -1054,9 +1054,15 @@ fn mft_two_frame_drain_probe_phase_0() {
 /// `MF_E_NOTACCEPTING` (0xC00D36B5), which fires the `debug_assert!(false)` at
 /// `windows_mft.rs:1266` and exits the pump thread.
 ///
-/// Cadence: 3 priming frames → `set_bitrate()` → frames 3+4 in tight succession.
-/// The tight succession (no sleep) maximises the chance the ICodecAPI call lands
-/// BEFORE the next ProcessInput credit is consumed — matching the live bug window.
+/// Cadence (batch-then-flush): push 5 priming frames into the channel (no recv) →
+/// `set_bitrate(8_000_000)` → push 5 more frames → `enc.flush()` → drain output.
+/// Intel QSV does NOT emit packets for short frame counts without a DRAIN trigger;
+/// using `enc.flush()` (sets `drain_pending` atomically, pump sends `COMMAND_DRAIN`
+/// on next NeedInput iteration) is required to obtain output — see Slice 3 #710.
+///
+/// If the pump dies mid-stream from MF_E_NOTACCEPTING, `pkt_rx` returns
+/// `Disconnected` — this is the ENCODER_DIED outcome (bug reproduced).
+/// If the pump tolerates the ordering (e.g. NVENC), we get packets back — SURVIVED.
 ///
 /// On NVENC (Host B): expected to PASS or produce no NOTACCEPTING event — NVENC
 /// tolerates the current ICodecAPI ordering. The probe prints the outcome either way.
@@ -1089,74 +1095,78 @@ fn phase0_codec_api_before_processinput_triggers_notaccepting() {
 
     let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
 
-    // Prime the encoder with 3 frames so NeedInput credits are in steady state.
-    // The desync surfaces under cadence pressure (explore #733: ni_count > 0 when
-    // ICodecAPI fires), so we must reach a live NeedInput window before triggering.
-    tracing::info!("P0-A: priming encoder with 3 frames");
-    for i in 0..3u64 {
+    // Push 5 priming frames into the channel without calling recv — pump_loop pulls
+    // them asynchronously. Intel QSV does NOT emit packets for short streams without
+    // a DRAIN trigger, so we must NOT call recv here (that's the C0 stall bug).
+    tracing::info!("P0-A: batch-pushing 5 priming frames (no recv — pump pulls async)");
+    for i in 0..5u64 {
         send_frame(i);
-        match recv_pkt(Duration::from_secs(5)) {
-            Ok(pkt) => tracing::info!(
-                "P0-A: priming pkt {} received — is_keyframe={} len={}",
-                i,
-                pkt.is_keyframe,
-                pkt.data.len()
-            ),
-            Err(e) => {
-                tracing::error!("P0-A: priming frame {} — recv_timeout error: {:?}", i, e);
-                return;
-            }
-        }
     }
 
-    // Call set_bitrate() to arm pending_bitrate — apply_pending_codec_settings()
-    // will fire ICodecAPI::SetValue(MeanBitRate) at the TOP of the NEXT NeedInput
-    // servicing iteration, BEFORE ProcessInput, triggering the desync on Intel QSV.
+    // Arm pending_bitrate — apply_pending_codec_settings() will fire
+    // ICodecAPI::SetValue(MeanBitRate) at the TOP of the NEXT NeedInput servicing
+    // iteration in pump_loop, BEFORE ProcessInput. This is the desync trigger on
+    // Intel QSV when ni_count > 0.
     tracing::info!("P0-A: calling set_bitrate(8_000_000) — arms pending_bitrate for ICodecAPI");
     let _ = enc.set_bitrate(8_000_000);
 
-    // Submit frames 3 and 4 in tight succession (no sleep) so the codec_api call
-    // races the NeedInput credit consumption window as in the live failure mode.
-    tracing::info!("P0-A: submitting frames 3 and 4 in tight succession");
-    let t_before = Instant::now();
-    send_frame(3);
-    send_frame(4);
+    // Push 5 more frames so pump_loop has work to do AFTER the codec_api fires.
+    tracing::info!("P0-A: batch-pushing frames 5–9 so codec_api races live NeedInput credits");
+    for i in 5..10u64 {
+        send_frame(i);
+    }
 
-    // Collect output. On Intel QSV with current code, the pump thread exits after
-    // MF_E_NOTACCEPTING — pkt_rx will return Disconnected. On NVENC it returns
-    // packets normally.
+    // Force emission via flush() (Slice 3 inherent method). Sets drain_pending
+    // atomically; pump sends COMMAND_DRAIN on next NeedInput servicing iteration.
+    // ~250 ms latency on Intel QSV (Phase 0 trace #710).
+    tracing::info!("P0-A: calling enc.flush() — arms drain_pending for COMMAND_DRAIN");
+    enc.flush();
+
+    // Drain output. If pump died from MF_E_NOTACCEPTING, recv returns Disconnected.
+    // Otherwise we collect packets until Timeout (no more output) or 20-packet cap.
     let mut received = 0u32;
-    let mut encoder_died = false;
-    for _ in 0..2 {
+    let mut died = false;
+    loop {
         match recv_pkt(Duration::from_secs(5)) {
             Ok(pkt) => {
-                let elapsed = t_before.elapsed();
                 tracing::info!(
-                    "P0-A: pkt {} received in {:?} — is_keyframe={} len={}",
+                    "P0-A: pkt {} — is_keyframe={} len={}",
                     received,
-                    elapsed,
                     pkt.is_keyframe,
                     pkt.data.len()
                 );
                 received += 1;
+                if received >= 20 {
+                    break;
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::error!(
                     "P0-A: OUTCOME=ENCODER_DIED — pkt_tx disconnected; pump thread exited after MF_E_NOTACCEPTING (counter desync confirmed on this vendor)"
                 );
-                encoder_died = true;
+                died = true;
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!(
-                    "P0-A: OUTCOME=TIMEOUT — no packet within deadline; pump thread may be stalled"
-                );
+                if received == 0 {
+                    tracing::warn!(
+                        "P0-A: OUTCOME=EMPTY_DRAIN — no packets before timeout (harness misconfig; flush() should have triggered output)"
+                    );
+                } else {
+                    tracing::warn!("P0-A: OUTCOME=NO_MORE_PACKETS — drained");
+                }
                 break;
             }
         }
     }
 
-    if !encoder_died {
+    tracing::info!(
+        "P0-A: SUMMARY — received={} died={} (SURVIVED={})",
+        received,
+        died,
+        !died
+    );
+    if !died {
         tracing::info!(
             "P0-A: OUTCOME=SURVIVED — received {} packets; ICodecAPI desync did NOT kill the pump (vendor likely tolerates current ordering, e.g. NVENC)",
             received
@@ -1169,7 +1179,7 @@ fn phase0_codec_api_before_processinput_triggers_notaccepting() {
 }
 
 /// P0-B — confirm that the planned Approach B reorder eliminates the desync
-/// AND that the forced IDR lands on frame 3 (T7.1 cadence after 3-frame prime).
+/// AND that the forced IDR lands on the expected frame index (OQ-3).
 ///
 /// This probe runs against MASTER production code (C0 commit). On Intel QSV it
 /// will likely show the same NOTACCEPTING failure as P0-A — because the production
@@ -1177,10 +1187,21 @@ fn phase0_codec_api_before_processinput_triggers_notaccepting() {
 /// CURRENT behaviour of a `request_keyframe()` scenario, which becomes the baseline
 /// for verifying the C2 (GREEN) fix when P0-B is re-run after the production reorder.
 ///
-/// Specifically, this probe traces WHICH frame index carries `is_keyframe == true`
-/// after `request_keyframe()`, resolving OQ-3 (spec §9). If frame 3 carries the IDR
-/// today (CleanPoint authoritative), `ICodecAPI::SetValue(ForceKeyFrame)` may be
-/// dropped post-fix. If the IDR slides to frame 4+, we retain both paths.
+/// Cadence (batch-then-flush): push 3 priming frames (no recv) →
+/// `request_keyframe()` → push 3 more frames (including the IDR target at index 3)
+/// → `enc.flush()` → drain output, recording which received-packet-index has
+/// `is_keyframe == true`. Intel QSV does NOT emit packets for short frame counts
+/// without a DRAIN trigger; see Slice 3 #710 and the flush() contract.
+///
+/// Per spec R3 / OQ-3 with this batch cadence, the IDR target is the 4th submitted
+/// frame (frame index 3, 0-indexed). If all 6 submitted frames produce output, we
+/// expect `is_keyframe == true` at received-packet-index 3.
+///
+/// Specifically, this probe traces WHICH received-packet-index carries
+/// `is_keyframe == true` after `request_keyframe()`, resolving OQ-3 (spec §9).
+/// If frame index 3 carries the IDR (CleanPoint authoritative), the
+/// `ICodecAPI::SetValue(ForceKeyFrame)` path may be dropped post-fix.
+/// If the IDR slides to index 4+, we retain both paths.
 #[test]
 #[cfg(feature = "hw-encoder")]
 #[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV); captures R2/R3 evidence for sdd-design gate"]
@@ -1210,85 +1231,89 @@ fn phase0_codec_api_after_processinput_no_notaccepting_and_idr_on_frame_4() {
 
     let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
 
-    // Prime with 3 frames (T7.1 cadence: frames 0–2, then request_keyframe, then frame 3).
-    tracing::info!("P0-B: priming encoder with 3 frames (T7.1 cadence)");
+    // Push 3 priming frames into the channel without calling recv. Intel QSV does
+    // NOT emit packets without a DRAIN trigger, so we must NOT call recv here
+    // (that's the C0 stall bug: one-frame-at-a-time recv stalls indefinitely).
+    tracing::info!("P0-B: batch-pushing 3 priming frames (no recv — pump pulls async)");
     for i in 0..3u64 {
         send_frame(i);
-        match recv_pkt(Duration::from_secs(5)) {
-            Ok(pkt) => tracing::info!(
-                "P0-B: priming pkt {} — is_keyframe={} len={}",
-                i,
-                pkt.is_keyframe,
-                pkt.data.len()
-            ),
-            Err(e) => {
-                tracing::error!("P0-B: priming frame {} — recv_timeout error: {:?}", i, e);
-                return;
-            }
-        }
     }
 
     // Arm keyframe_pending — submit_frame() will set MFSampleExtension_CleanPoint=1
-    // on the next sample (frame 3). Under Approach B, ICodecAPI::SetValue(ForceKeyFrame)
-    // fires AFTER ProcessInput; under current master code it fires BEFORE (desync trigger).
+    // on the next sample (frame index 3, the 4th submitted). Under Approach B,
+    // ICodecAPI::SetValue(ForceKeyFrame) fires AFTER ProcessInput; under current
+    // master code it fires BEFORE (desync trigger on Intel QSV).
     tracing::info!(
-        "P0-B: calling request_keyframe() — arms keyframe_pending; frame 3 is IDR target (OQ-3)"
+        "P0-B: calling request_keyframe() — arms keyframe_pending; frame index 3 is IDR target (OQ-3)"
     );
     enc.request_keyframe();
 
-    // Submit frame 3 — this is the IDR target frame under T7.1 semantics.
-    tracing::info!("P0-B: submitting frame 3 (IDR target)");
-    let t_idr = Instant::now();
-    send_frame(3);
-
-    // Observe: which frame index carries is_keyframe==true?
-    // On master code (C0), Intel QSV may die here (same NOTACCEPTING path as P0-A).
-    // That outcome is captured in the trace and is the expected RED state.
-    let idr_outcome = recv_pkt(Duration::from_secs(5));
-    match &idr_outcome {
-        Ok(pkt) => tracing::info!(
-            "P0-B: IDR candidate received in {:?} — is_keyframe={} len={} (OQ-3: IDR on frame-3 slot == {})",
-            t_idr.elapsed(),
-            pkt.is_keyframe,
-            pkt.data.len(),
-            pkt.is_keyframe,
-        ),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::error!(
-                "P0-B: OUTCOME=ENCODER_DIED — pump thread exited; ICodecAPI ForceKeyFrame BEFORE ProcessInput killed the encoder (master RED state confirmed)"
-            );
-            let _ = enc.stop();
-            return;
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            tracing::warn!("P0-B: OUTCOME=TIMEOUT — IDR candidate did not arrive within deadline");
-            let _ = enc.stop();
-            return;
-        }
+    // Push 3 more frames so pump_loop has work after the codec_api fires.
+    // Frame index 3 is the IDR target under T7.1/batch cadence semantics.
+    tracing::info!("P0-B: batch-pushing frames 3–5 (frame 3 is IDR target)");
+    for i in 3..6u64 {
+        send_frame(i);
     }
 
-    // Continue with frames 4 and 5 to observe post-IDR P-frame behaviour.
-    tracing::info!("P0-B: submitting frames 4 and 5 to observe post-IDR cadence");
-    for i in 4..6u64 {
-        send_frame(i);
+    // Force emission via flush() (Slice 3 inherent method). Sets drain_pending
+    // atomically; pump sends COMMAND_DRAIN on next NeedInput servicing iteration.
+    // ~250 ms latency on Intel QSV (Phase 0 trace #710).
+    tracing::info!("P0-B: calling enc.flush() — arms drain_pending for COMMAND_DRAIN");
+    enc.flush();
+
+    // Drain output. Track which received-packet-index carries is_keyframe==true.
+    // If pump died from MF_E_NOTACCEPTING, recv returns Disconnected (ENCODER_DIED).
+    let mut received = 0u32;
+    let mut died = false;
+    let mut keyframe_indices: Vec<u32> = Vec::new();
+    loop {
         match recv_pkt(Duration::from_secs(5)) {
-            Ok(pkt) => tracing::info!(
-                "P0-B: pkt for frame {} — is_keyframe={} len={}",
-                i,
-                pkt.is_keyframe,
-                pkt.data.len()
-            ),
-            Err(e) => {
-                tracing::warn!("P0-B: frame {} recv_timeout: {:?} (probe complete)", i, e);
+            Ok(pkt) => {
+                tracing::info!(
+                    "P0-B: pkt {} — is_keyframe={} len={}",
+                    received,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                if pkt.is_keyframe {
+                    keyframe_indices.push(received);
+                }
+                received += 1;
+                if received >= 20 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "P0-B: OUTCOME=ENCODER_DIED — pump thread exited; ICodecAPI ForceKeyFrame BEFORE ProcessInput killed the encoder (master RED state confirmed)"
+                );
+                died = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if received == 0 {
+                    tracing::warn!(
+                        "P0-B: OUTCOME=EMPTY_DRAIN — no packets before timeout (harness misconfig; flush() should have triggered output)"
+                    );
+                } else {
+                    tracing::warn!("P0-B: OUTCOME=NO_MORE_PACKETS — drained");
+                }
                 break;
             }
         }
     }
 
+    tracing::info!(
+        "P0-B: SUMMARY — received={} died={} keyframe_indices={:?} (OQ-3: expected IDR at index 3 under batch cadence)",
+        received,
+        died,
+        keyframe_indices
+    );
+
     // Observation-only probe: no assertion — the trace is the deliverable.
     // After C2 (GREEN) lands, re-run this probe to confirm:
     //   - no ENCODER_DIED outcome
-    //   - is_keyframe==true on the IDR candidate (frame-3 slot)
-    //   - is_keyframe==false on subsequent frames
+    //   - keyframe_indices contains 3 (IDR on the 4th submitted frame)
+    //   - no other keyframe indices (no spurious IDRs)
     let _ = enc.stop();
 }
