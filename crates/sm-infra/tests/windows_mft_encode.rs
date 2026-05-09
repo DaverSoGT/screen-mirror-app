@@ -1012,3 +1012,283 @@ fn mft_two_frame_drain_probe_phase_0() {
 
     let _ = enc.stop();
 }
+
+// ─── Phase 0 trace probes (Slice 4 — codec_api counter desync) ───────────────
+//
+// Empirical gate for sdd/hw-encoder-mft-codec-api-counter-desync:
+//
+//   OQ-1: Does ICodecAPI::SetValue BEFORE ProcessInput cause MF_E_NOTACCEPTING
+//         on Intel QSV when a NeedInput credit is outstanding?  → P0-A
+//   OQ-2: Does Approach B (reorder codec_api to AFTER ProcessInput) eliminate
+//         the desync?  → P0-B
+//   OQ-3: Does the forced IDR land on frame 4 (T7.1 cadence) under Approach B?
+//         → P0-B (observe which frame carries is_keyframe=true)
+//
+// Run on Host A (Intel QSV) with trace logging:
+//
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run -p sm-infra --features hw-encoder `
+//     --test windows_mft_encode `
+//     -E 'test(/^phase0_codec/)' `
+//     --run-ignored=ignored-only --test-threads=1 --no-fail-fast --no-capture `
+//     *> phase0-codec-api-trace.log
+//
+// Capture phase0-codec-api-trace.log and save to engram topic
+//   `sdd/hw-encoder-mft-codec-api-counter-desync/phase-0-trace`
+// to unblock sdd-design (design is BLOCKED on this evidence).
+//
+// Decision tree (per proposal D-PHASE0 / spec R1):
+//   P0-A triggers NOTACCEPTING → root cause confirmed; proceed with Approach B
+//   P0-A passes on NVENC       → expected (NVENC tolerates current ordering)
+//   P0-B IDR on frame 3        → CleanPoint is authoritative; ICodecAPI ForceKeyFrame may be dropped
+//   P0-B IDR on frame 4+       → ICodecAPI ForceKeyFrame must be retained post-ProcessInput
+//
+// Both probes are retained as permanent #[ignore]-gated regression guards after
+// the fix lands (spec R8, proposal D-PROBES-RETENTION).
+
+/// P0-A — reproduce the Intel QSV codec_api counter desync on master code.
+///
+/// Hypothesis: calling `ICodecAPI::SetValue` (via `apply_pending_codec_settings`)
+/// BEFORE `ProcessInput`, while a NeedInput credit is outstanding, causes Intel QSV
+/// to transiently enter non-accepting state. The subsequent `ProcessInput` returns
+/// `MF_E_NOTACCEPTING` (0xC00D36B5), which fires the `debug_assert!(false)` at
+/// `windows_mft.rs:1266` and exits the pump thread.
+///
+/// Cadence: 3 priming frames → `set_bitrate()` → frames 3+4 in tight succession.
+/// The tight succession (no sleep) maximises the chance the ICodecAPI call lands
+/// BEFORE the next ProcessInput credit is consumed — matching the live bug window.
+///
+/// On NVENC (Host B): expected to PASS or produce no NOTACCEPTING event — NVENC
+/// tolerates the current ICodecAPI ordering. The probe prints the outcome either way.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV); captures R1 evidence for sdd-design gate"]
+fn phase0_codec_api_before_processinput_triggers_notaccepting() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // Prime the encoder with 3 frames so NeedInput credits are in steady state.
+    // The desync surfaces under cadence pressure (explore #733: ni_count > 0 when
+    // ICodecAPI fires), so we must reach a live NeedInput window before triggering.
+    tracing::info!("P0-A: priming encoder with 3 frames");
+    for i in 0..3u64 {
+        send_frame(i);
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => tracing::info!(
+                "P0-A: priming pkt {} received — is_keyframe={} len={}",
+                i,
+                pkt.is_keyframe,
+                pkt.data.len()
+            ),
+            Err(e) => {
+                tracing::error!("P0-A: priming frame {} — recv_timeout error: {:?}", i, e);
+                return;
+            }
+        }
+    }
+
+    // Call set_bitrate() to arm pending_bitrate — apply_pending_codec_settings()
+    // will fire ICodecAPI::SetValue(MeanBitRate) at the TOP of the NEXT NeedInput
+    // servicing iteration, BEFORE ProcessInput, triggering the desync on Intel QSV.
+    tracing::info!("P0-A: calling set_bitrate(8_000_000) — arms pending_bitrate for ICodecAPI");
+    let _ = enc.set_bitrate(8_000_000);
+
+    // Submit frames 3 and 4 in tight succession (no sleep) so the codec_api call
+    // races the NeedInput credit consumption window as in the live failure mode.
+    tracing::info!("P0-A: submitting frames 3 and 4 in tight succession");
+    let t_before = Instant::now();
+    send_frame(3);
+    send_frame(4);
+
+    // Collect output. On Intel QSV with current code, the pump thread exits after
+    // MF_E_NOTACCEPTING — pkt_rx will return Disconnected. On NVENC it returns
+    // packets normally.
+    let mut received = 0u32;
+    let mut encoder_died = false;
+    for _ in 0..2 {
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                let elapsed = t_before.elapsed();
+                tracing::info!(
+                    "P0-A: pkt {} received in {:?} — is_keyframe={} len={}",
+                    received,
+                    elapsed,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                received += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "P0-A: OUTCOME=ENCODER_DIED — pkt_tx disconnected; pump thread exited after MF_E_NOTACCEPTING (counter desync confirmed on this vendor)"
+                );
+                encoder_died = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "P0-A: OUTCOME=TIMEOUT — no packet within deadline; pump thread may be stalled"
+                );
+                break;
+            }
+        }
+    }
+
+    if !encoder_died {
+        tracing::info!(
+            "P0-A: OUTCOME=SURVIVED — received {} packets; ICodecAPI desync did NOT kill the pump (vendor likely tolerates current ordering, e.g. NVENC)",
+            received
+        );
+    }
+
+    // Observation-only probe: no assertion — outcome is vendor-dependent.
+    // The trace log is the deliverable for the phase-0-trace engram topic.
+    let _ = enc.stop();
+}
+
+/// P0-B — confirm that the planned Approach B reorder eliminates the desync
+/// AND that the forced IDR lands on frame 3 (T7.1 cadence after 3-frame prime).
+///
+/// This probe runs against MASTER production code (C0 commit). On Intel QSV it
+/// will likely show the same NOTACCEPTING failure as P0-A — because the production
+/// fix has not landed yet. That is expected and intentional: the trace captures the
+/// CURRENT behaviour of a `request_keyframe()` scenario, which becomes the baseline
+/// for verifying the C2 (GREEN) fix when P0-B is re-run after the production reorder.
+///
+/// Specifically, this probe traces WHICH frame index carries `is_keyframe == true`
+/// after `request_keyframe()`, resolving OQ-3 (spec §9). If frame 3 carries the IDR
+/// today (CleanPoint authoritative), `ICodecAPI::SetValue(ForceKeyFrame)` may be
+/// dropped post-fix. If the IDR slides to frame 4+, we retain both paths.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 trace probe — manual run on Host A (Intel QSV); captures R2/R3 evidence for sdd-design gate"]
+fn phase0_codec_api_after_processinput_no_notaccepting_and_idr_on_frame_4() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // Prime with 3 frames (T7.1 cadence: frames 0–2, then request_keyframe, then frame 3).
+    tracing::info!("P0-B: priming encoder with 3 frames (T7.1 cadence)");
+    for i in 0..3u64 {
+        send_frame(i);
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => tracing::info!(
+                "P0-B: priming pkt {} — is_keyframe={} len={}",
+                i,
+                pkt.is_keyframe,
+                pkt.data.len()
+            ),
+            Err(e) => {
+                tracing::error!("P0-B: priming frame {} — recv_timeout error: {:?}", i, e);
+                return;
+            }
+        }
+    }
+
+    // Arm keyframe_pending — submit_frame() will set MFSampleExtension_CleanPoint=1
+    // on the next sample (frame 3). Under Approach B, ICodecAPI::SetValue(ForceKeyFrame)
+    // fires AFTER ProcessInput; under current master code it fires BEFORE (desync trigger).
+    tracing::info!(
+        "P0-B: calling request_keyframe() — arms keyframe_pending; frame 3 is IDR target (OQ-3)"
+    );
+    enc.request_keyframe();
+
+    // Submit frame 3 — this is the IDR target frame under T7.1 semantics.
+    tracing::info!("P0-B: submitting frame 3 (IDR target)");
+    let t_idr = Instant::now();
+    send_frame(3);
+
+    // Observe: which frame index carries is_keyframe==true?
+    // On master code (C0), Intel QSV may die here (same NOTACCEPTING path as P0-A).
+    // That outcome is captured in the trace and is the expected RED state.
+    let idr_outcome = recv_pkt(Duration::from_secs(5));
+    match &idr_outcome {
+        Ok(pkt) => tracing::info!(
+            "P0-B: IDR candidate received in {:?} — is_keyframe={} len={} (OQ-3: IDR on frame-3 slot == {})",
+            t_idr.elapsed(),
+            pkt.is_keyframe,
+            pkt.data.len(),
+            pkt.is_keyframe,
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::error!(
+                "P0-B: OUTCOME=ENCODER_DIED — pump thread exited; ICodecAPI ForceKeyFrame BEFORE ProcessInput killed the encoder (master RED state confirmed)"
+            );
+            let _ = enc.stop();
+            return;
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!("P0-B: OUTCOME=TIMEOUT — IDR candidate did not arrive within deadline");
+            let _ = enc.stop();
+            return;
+        }
+    }
+
+    // Continue with frames 4 and 5 to observe post-IDR P-frame behaviour.
+    tracing::info!("P0-B: submitting frames 4 and 5 to observe post-IDR cadence");
+    for i in 4..6u64 {
+        send_frame(i);
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => tracing::info!(
+                "P0-B: pkt for frame {} — is_keyframe={} len={}",
+                i,
+                pkt.is_keyframe,
+                pkt.data.len()
+            ),
+            Err(e) => {
+                tracing::warn!("P0-B: frame {} recv_timeout: {:?} (probe complete)", i, e);
+                break;
+            }
+        }
+    }
+
+    // Observation-only probe: no assertion — the trace is the deliverable.
+    // After C2 (GREEN) lands, re-run this probe to confirm:
+    //   - no ENCODER_DIED outcome
+    //   - is_keyframe==true on the IDR candidate (frame-3 slot)
+    //   - is_keyframe==false on subsequent frames
+    let _ = enc.stop();
+}
