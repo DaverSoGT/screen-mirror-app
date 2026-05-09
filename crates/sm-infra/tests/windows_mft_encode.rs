@@ -1743,3 +1743,356 @@ fn phase0_intel_qsv_idr_via_drain_resume_latency_measure() {
 
     let _ = enc.stop();
 }
+
+// ─── Phase 0 round 2 probes (Slice 5 — C-prime FLUSH-based + Mechanism A GOP-toggle) ─
+//
+// Empirical follow-up after round 1 showed Mechanism C (DRAIN+BEGIN_STREAMING) does NOT
+// produce IDR on Intel QSV (phase-0-trace #779).
+//
+// Two new mechanisms under test:
+//
+//   C-prime (FLUSH-based): setup_mft sends FLUSH+BEGIN+START (3 msgs); F2 DrainComplete
+//     sends only BEGIN+START (2 msgs). FLUSH may be the missing piece.
+//     → C-prime probe (`phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr`)
+//
+//   Mechanism A (GOP-size toggle): CODECAPI_AVEncMPVGOPSize=1 forces every frame to be
+//     a GOP head (= IDR). Microsoft warns "before recording only" — empirical test needed.
+//     → A probe (`phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr`)
+//
+// Run on Host A (Intel QSV) with trace logging:
+//
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run -p sm-infra --features hw-encoder `
+//     --test windows_mft_encode `
+//     -E 'test(/^phase0_intel_qsv_idr_via_(flush|gop)/)' `
+//     --run-ignored=ignored-only --test-threads=1 --no-fail-fast --no-capture `
+//     *> phase0-round2-trace.log
+//
+// Decision tree (per phase-0-trace #779 recommendations):
+//   C-prime PASS → Mechanism C-prime validated; redesign around FLUSH-based resume
+//   C-prime FAIL + A PASS → Mechanism A is the production path
+//   Both FAIL → escalate to Mechanism F (MediaSDK/VPL)
+//
+// Both probes retained as permanent #[ignore]-gated regression guards (spec R7,
+// proposal D-PROBES-RETENTION).
+
+/// C-prime — confirm that FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR as first
+/// post-reset frame.
+///
+/// Hypothesis: `setup_mft` sends `COMMAND_FLUSH` + `BEGIN_STREAMING` + `START_OF_STREAM`
+/// (3 msgs, lines 911-922) and the first encoded frame is always IDR. The `DrainComplete/F2`
+/// handler sends only `BEGIN_STREAMING` + `START_OF_STREAM` (2 msgs, no FLUSH) — this is
+/// why Mechanism C fails. Adding `COMMAND_FLUSH` to the resume sequence may produce IDR by
+/// restoring the MFT to a genuinely fresh state (per Microsoft docs: "FLUSH discards all
+/// internal data AND state information; after FLUSH the MFT is in the same state as just
+/// before BEGIN_STREAMING").
+///
+/// Cadence:
+///   1. Push 3 priming frames → `enc.flush()` (COMMAND_DRAIN) → drain priming output.
+///   2. `enc.flush_state()` (COMMAND_FLUSH + BEGIN + START) → push 1 IDR-target frame
+///      → `enc.flush()` (COMMAND_DRAIN) → recv IDR-target packet.
+///   3. Assert first packet in batch 2 is `is_keyframe == true`.
+///
+/// Expected outcome (Mechanism C-prime valid):
+///   - Priming batch: ≥ 1 packet received, first is IDR (initial session start).
+///   - IDR-target packet: `is_keyframe == true`.
+///   - FAIL → Mechanism C-prime cannot guarantee IDR via FLUSH+resume on Intel QSV.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 round 2 probe — manual run on Host A (Intel QSV); tests Mechanism C-prime (FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR)"]
+fn phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // ── Batch 1: push 3 priming frames, flush (DRAIN), drain output ──────────
+    tracing::info!("[C-prime] batch-pushing 3 priming frames (no recv — pump pulls async)");
+    for i in 0..3u64 {
+        send_frame(i);
+    }
+
+    tracing::info!("[C-prime] flush() #1 — drain priming batch (COMMAND_DRAIN)");
+    enc.flush();
+
+    let mut priming_received = 0u32;
+    let mut priming_keyframe_indices: Vec<u32> = Vec::new();
+    loop {
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                tracing::info!(
+                    "[C-prime] priming pkt {} — is_keyframe={} len={}",
+                    priming_received,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                if pkt.is_keyframe {
+                    priming_keyframe_indices.push(priming_received);
+                }
+                priming_received += 1;
+                if priming_received >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[C-prime] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
+                );
+                panic!(
+                    "[C-prime] encoder died during priming drain; cannot validate Mechanism C-prime"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_received == 0 {
+                    tracing::warn!(
+                        "[C-prime] OUTCOME=EMPTY_DRAIN — no priming packets before timeout"
+                    );
+                } else {
+                    tracing::info!(
+                        "[C-prime] priming drain complete — {} packets received",
+                        priming_received
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[C-prime] priming batch summary — received={} keyframe_indices={:?}",
+        priming_received,
+        priming_keyframe_indices
+    );
+
+    assert!(
+        priming_received >= 1,
+        "[C-prime] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
+    );
+
+    // ── C-prime reset: send FLUSH+BEGIN_STREAMING+START_OF_STREAM ────────────
+    //
+    // This is the key difference vs Mechanism C: we call flush_state() which sends the
+    // same 3-message sequence as setup_mft, NOT just BEGIN+START. COMMAND_FLUSH is
+    // synchronous — no DrainComplete event follows. The encoder is reset to fresh state.
+    tracing::info!(
+        "[C-prime] flush_state() — sending COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM"
+    );
+    enc.flush_state();
+
+    // ── Batch 2: submit 1 IDR-target frame, drain, assert IDR ─────────────────
+    //
+    // After the FLUSH reset, the first submitted frame should be IDR if Mechanism C-prime
+    // is valid. We drain it out with a second flush() (COMMAND_DRAIN).
+    tracing::info!(
+        "[C-prime] submitting IDR-target frame (frame index 3 — first frame after FLUSH+resume)"
+    );
+    send_frame(3);
+
+    tracing::info!("[C-prime] flush() #2 — drain IDR-target frame (COMMAND_DRAIN)");
+    enc.flush();
+
+    let idr_result = recv_pkt(Duration::from_secs(5));
+
+    match &idr_result {
+        Ok(pkt) => {
+            tracing::info!(
+                "[C-prime] IDR-target pkt — is_keyframe={} len={}",
+                pkt.is_keyframe,
+                pkt.data.len()
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::error!(
+                "[C-prime] OUTCOME=ENCODER_DIED — pump thread exited after flush_state + flush"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::error!("[C-prime] OUTCOME=TIMEOUT — no IDR-target packet within 5s");
+        }
+    }
+
+    // PRIMARY GATE for C-prime: the IDR-target packet MUST be is_keyframe == true.
+    let idr_pkt =
+        idr_result.expect("[C-prime] expected IDR-target packet; got Disconnected or Timeout");
+    assert!(
+        idr_pkt.is_keyframe,
+        "[C-prime] MECHANISM C-prime INVALID — FLUSH+resume does NOT produce IDR on Intel QSV (is_keyframe=false)"
+    );
+
+    tracing::info!(
+        "[C-prime] OUTCOME=PASS — Mechanism C-prime validated: FLUSH+BEGIN_STREAMING+START_OF_STREAM produces IDR"
+    );
+
+    let _ = enc.stop();
+}
+
+/// A — confirm that `CODECAPI_AVEncMPVGOPSize=1` toggle produces IDR as next encoded frame.
+///
+/// Hypothesis: setting GOP size to 1 forces every frame to be a GOP head (= IDR). After the
+/// IDR-target frame is submitted, GOP size is restored to the original value. Microsoft docs
+/// warn "before recording only" for some GOP properties, but empirical validation on Intel QSV
+/// has not been done. This probe tests whether the toggle works mid-stream.
+///
+/// Cadence:
+///   1. Push 3 priming frames → `enc.flush()` (COMMAND_DRAIN) → drain priming output.
+///   2. `enc.force_idr_via_gop_toggle()` → push 1 IDR-target frame → `enc.flush()` → recv.
+///   3. Assert first packet in batch 2 is `is_keyframe == true`.
+///
+/// Expected outcome (Mechanism A valid):
+///   - Priming batch: ≥ 1 packet received.
+///   - IDR-target packet: `is_keyframe == true`.
+///   - FAIL → GOP-size toggle does NOT produce IDR mid-stream on Intel QSV.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 round 2 probe — manual run on Host A (Intel QSV); tests Mechanism A (CODECAPI_AVEncMPVGOPSize=1 toggle produces IDR)"]
+fn phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    let recv_pkt = |deadline: Duration| pkt_rx.recv_timeout(deadline);
+
+    // ── Batch 1: push 3 priming frames, flush (DRAIN), drain output ──────────
+    tracing::info!("[A] batch-pushing 3 priming frames (no recv — pump pulls async)");
+    for i in 0..3u64 {
+        send_frame(i);
+    }
+
+    tracing::info!("[A] flush() #1 — drain priming batch (COMMAND_DRAIN)");
+    enc.flush();
+
+    let mut priming_received = 0u32;
+    let mut priming_keyframe_indices: Vec<u32> = Vec::new();
+    loop {
+        match recv_pkt(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                tracing::info!(
+                    "[A] priming pkt {} — is_keyframe={} len={}",
+                    priming_received,
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                if pkt.is_keyframe {
+                    priming_keyframe_indices.push(priming_received);
+                }
+                priming_received += 1;
+                if priming_received >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[A] OUTCOME=ENCODER_DIED during priming drain — pump thread exited unexpectedly"
+                );
+                panic!("[A] encoder died during priming drain; cannot validate Mechanism A");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_received == 0 {
+                    tracing::warn!("[A] OUTCOME=EMPTY_DRAIN — no priming packets before timeout");
+                } else {
+                    tracing::info!(
+                        "[A] priming drain complete — {} packets received",
+                        priming_received
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[A] priming batch summary — received={} keyframe_indices={:?}",
+        priming_received,
+        priming_keyframe_indices
+    );
+
+    assert!(
+        priming_received >= 1,
+        "[A] expected ≥ 1 priming packet; got 0 — harness misconfigured or flush() broken"
+    );
+
+    // ── Mechanism A: set GOP=1 toggle, push IDR-target frame ─────────────────
+    //
+    // force_idr_via_gop_toggle() arms the pump_loop to set CODECAPI_AVEncMPVGOPSize=1
+    // before the next ProcessInput, then restore the original GOP size afterward.
+    tracing::info!("[A] force_idr_via_gop_toggle() — arming CODECAPI_AVEncMPVGOPSize=1 toggle");
+    enc.force_idr_via_gop_toggle();
+
+    tracing::info!("[A] submitting IDR-target frame (frame index 3 — submitted with GOP=1 active)");
+    send_frame(3);
+
+    tracing::info!("[A] flush() #2 — drain IDR-target frame (COMMAND_DRAIN)");
+    enc.flush();
+
+    let idr_result = recv_pkt(Duration::from_secs(5));
+
+    match &idr_result {
+        Ok(pkt) => {
+            tracing::info!(
+                "[A] IDR-target pkt — is_keyframe={} len={}",
+                pkt.is_keyframe,
+                pkt.data.len()
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::error!(
+                "[A] OUTCOME=ENCODER_DIED — pump thread exited after GOP-toggle + flush"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::error!("[A] OUTCOME=TIMEOUT — no IDR-target packet within 5s");
+        }
+    }
+
+    // PRIMARY GATE for Mechanism A: the IDR-target packet MUST be is_keyframe == true.
+    let idr_pkt = idr_result.expect("[A] expected IDR-target packet; got Disconnected or Timeout");
+    assert!(
+        idr_pkt.is_keyframe,
+        "[A] MECHANISM A INVALID — GOP-size toggle does NOT produce IDR on Intel QSV (is_keyframe=false)"
+    );
+
+    tracing::info!(
+        "[A] OUTCOME=PASS — Mechanism A validated: CODECAPI_AVEncMPVGOPSize=1 toggle produces IDR"
+    );
+
+    let _ = enc.stop();
+}

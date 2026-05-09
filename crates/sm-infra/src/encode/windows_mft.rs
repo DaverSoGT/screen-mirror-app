@@ -30,16 +30,17 @@ use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream, METransformDrainComplete,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
+    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown,
+    MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
     MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
@@ -94,6 +95,18 @@ struct MftEncoderShared {
     // allow: drain_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     drain_pending: AtomicBool,
+    /// PHASE 0 EMPIRICAL: Set by `flush_state()`; consumed by pump_loop via swap(false, AcqRel).
+    /// Fires FLUSH+BEGIN_STREAMING+START_OF_STREAM — the same 3-message sequence as setup_mft.
+    /// Unlike DRAIN (async), FLUSH is synchronous: no DrainComplete event follows.
+    // allow: flush_state_pending only read by pump_loop under hw-encoder feature
+    #[allow(dead_code)]
+    flush_state_pending: AtomicBool,
+    /// PHASE 0 EMPIRICAL: Set by `force_idr_via_gop_toggle()`; consumed by pump_loop via
+    /// swap(false, AcqRel). Toggles CODECAPI_AVEncMPVGOPSize=1 before next ProcessInput,
+    /// then restores original GOP size after.
+    // allow: force_idr_gop_pending only read by pump_loop under hw-encoder feature
+    #[allow(dead_code)]
+    force_idr_gop_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -104,6 +117,8 @@ impl Default for MftEncoderShared {
             dropped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             drain_pending: AtomicBool::new(false),
+            flush_state_pending: AtomicBool::new(false),
+            force_idr_gop_pending: AtomicBool::new(false),
         }
     }
 }
@@ -1148,6 +1163,12 @@ fn pump_loop(
     // GUARD at top of `while ni_count > 0` loop — MUST precede SWAP (GUARD-BEFORE-SWAP).
     let mut draining = false;
 
+    // PHASE 0 EMPIRICAL: tracks whether GOPSize needs restoring after the next ProcessInput.
+    // Set when force_idr_gop_pending is consumed; cleared after the next successful submit.
+    let mut gop_restore_needed = false;
+    // Saved GOP size for restore after GOP-toggle IDR attempt. Default 30 (30fps).
+    let mut saved_gop_size: u32 = 30;
+
     // Change-detection sentinels for DD8 counter snapshot logging (spec R7/S7.2).
     let mut last_logged_ni: u32 = u32::MAX;
     let mut last_logged_ho: u32 = u32::MAX;
@@ -1356,6 +1377,19 @@ fn pump_loop(
                             // DD1 FIRE: ICodecAPI::SetValue AFTER ProcessInput — eliminates the
                             // race window where QSV withdraws NeedInput readiness (Mode 1 fix).
                             fire_pending_codec_settings(codec_api, &swap);
+                            // PHASE 0 EMPIRICAL — Mechanism A restore: after the first successful
+                            // ProcessInput following a GOP=1 toggle, restore original GOP size.
+                            if gop_restore_needed {
+                                let gop_orig = make_variant_u32(saved_gop_size);
+                                unsafe {
+                                    let _ =
+                                        codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop_orig);
+                                }
+                                gop_restore_needed = false;
+                                tracing::info!(
+                                    "pump_loop: GOP size restored to {saved_gop_size} after force_idr_via_gop_toggle"
+                                );
+                            }
                         }
                         Err(e) => {
                             // Check for MF_E_NOTACCEPTING — indicates counter desync (design DD5).
@@ -1422,6 +1456,61 @@ fn pump_loop(
             tracing::trace!(
                 target: "sm_infra::encode::windows_mft",
                 "draining = true (explicit flush)"
+            );
+        }
+
+        // PHASE 0 EMPIRICAL — Mechanism C-prime: consume flush_state() signal.
+        // Sends FLUSH+BEGIN_STREAMING+START_OF_STREAM — the same 3-message sequence as
+        // setup_mft (lines 911-922). FLUSH is synchronous (no DrainComplete follows).
+        // NOT setting draining=true because FLUSH has no async completion event.
+        // Counters reset because FLUSH discards all internal encoder state.
+        if state.flush_state_pending.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                "pump_loop: flush_state() — sending COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM"
+            );
+            unsafe {
+                let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+                let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            }
+            // FLUSH discards all in-flight state; reset counters to match fresh state.
+            ni_count = 0;
+            ho_count = 0;
+            tracing::trace!(
+                target: "sm_infra::encode::windows_mft",
+                "flush_state: COMMAND_FLUSH + BEGIN_STREAMING + START_OF_STREAM sent; counters reset"
+            );
+        }
+
+        // PHASE 0 EMPIRICAL — Mechanism A: consume force_idr_via_gop_toggle() signal.
+        // Sets CODECAPI_AVEncMPVGOPSize=1 so the next ProcessInput submits a GOP head (= IDR).
+        // Saves the prior GOP size; restore is done after the NEXT successful ProcessInput
+        // (gop_restore_needed flag, checked inside the NI loop on the following iteration).
+        if state.force_idr_gop_pending.swap(false, Ordering::AcqRel) && !gop_restore_needed {
+            tracing::info!(
+                "pump_loop: force_idr_via_gop_toggle() — reading current GOP size, setting GOP=1"
+            );
+            // Try to read the current GOP size for restore; fall back to framerate default.
+            // SAFETY: GetValue returns a VARIANT; we read the VT_UI4 (ulVal) arm.
+            saved_gop_size = unsafe {
+                codec_api
+                    .GetValue(&CODECAPI_AVEncMPVGOPSize)
+                    .ok()
+                    .map(|v| (*v.Anonymous.Anonymous).Anonymous.ulVal)
+                    .unwrap_or(if config.framerate > 0 {
+                        config.framerate
+                    } else {
+                        30
+                    })
+            };
+            let gop1 = make_variant_u32(1);
+            unsafe {
+                let _ = codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop1);
+            }
+            gop_restore_needed = true;
+            tracing::trace!(
+                target: "sm_infra::encode::windows_mft",
+                "force_idr_gop: GOP=1 set; saved_gop_size={saved_gop_size}; restore pending after next ProcessInput"
             );
         }
 
@@ -1709,6 +1798,46 @@ impl WindowsMftH264Encoder {
     /// pump_loop shutdown.
     pub fn flush(&self) {
         self.state.drain_pending.store(true, Ordering::Release);
+    }
+
+    /// PHASE 0 EMPIRICAL: triggers `MFT_MESSAGE_COMMAND_FLUSH` + `BEGIN_STREAMING` +
+    /// `START_OF_STREAM` on the next pump_loop iteration.
+    ///
+    /// Unlike `flush()` (which sends `COMMAND_DRAIN` and waits for async `DrainComplete`),
+    /// `COMMAND_FLUSH` is SYNCHRONOUS — it discards all internal encoder state immediately.
+    /// No `METransformDrainComplete` event follows. The encoder is in the same state as
+    /// just before `BEGIN_STREAMING` was first sent (matching `setup_mft` at lines 911-922).
+    ///
+    /// **Hypothesis (Mechanism C-prime)**: if `COMMAND_FLUSH` is the missing piece that
+    /// `setup_mft` sends but `DrainComplete/F2` does not, then the first frame after this
+    /// sequence should be IDR on Intel QSV. If the C-prime probe PASSES, this method
+    /// becomes the production mechanism for `request_keyframe()`. Otherwise it is reverted.
+    ///
+    /// **Probe**: `phase0_intel_qsv_idr_via_flush_resume_first_frame_is_idr` in
+    /// `crates/sm-infra/tests/windows_mft_encode.rs`.
+    pub fn flush_state(&self) {
+        self.state
+            .flush_state_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// PHASE 0 EMPIRICAL: forces the next frame to be IDR via `CODECAPI_AVEncMPVGOPSize=1` toggle.
+    ///
+    /// When consumed by pump_loop: saves the current GOP size (or uses `config.framerate`
+    /// as default), sets `CODECAPI_AVEncMPVGOPSize=1` (every frame becomes a GOP head = IDR),
+    /// submits the next frame normally, then restores the original GOP size.
+    ///
+    /// **Hypothesis (Mechanism A)**: per Intel MSDK docs, GOP=1 forces every frame to be
+    /// IDR. Microsoft warns "before recording only" but that is unverified empirically.
+    /// If the A probe PASSES, this becomes an alternative production mechanism.
+    /// Otherwise it is reverted.
+    ///
+    /// **Probe**: `phase0_intel_qsv_idr_via_gop_toggle_first_frame_is_idr` in
+    /// `crates/sm-infra/tests/windows_mft_encode.rs`.
+    pub fn force_idr_via_gop_toggle(&self) {
+        self.state
+            .force_idr_gop_pending
+            .store(true, Ordering::Release);
     }
 }
 
