@@ -305,11 +305,24 @@ fn mft_encoded_packet_timestamp_matches_capture_frame() {
 // ─── T7.1 / T7.2: request_keyframe ───────────────────────────────────────────
 
 /// T7.1 — `request_keyframe()` causes the next encoded packet to be a keyframe.
+///
+/// Cadence: batch-push 3 priming frames → `enc.flush()` → drain (assert initial IDR
+/// received and ≥1 P-frame) → `request_keyframe()` → push 1 IDR-target frame →
+/// `enc.flush()` → drain → assert at least one received packet after the request has
+/// `is_keyframe == true` and begins with NAL type 7 (SPS).
+///
+/// On Intel QSV (Host A) at C1 RED this test FAILS — `apply_pending_codec_settings`
+/// fires ICodecAPI ForceKeyFrame BEFORE ProcessInput, Intel QSV returns
+/// MF_E_NOTACCEPTING, `debug_assert!(false)` at `windows_mft.rs:1266` kills the pump
+/// thread, and the drain loop returns `Disconnected`.  C2 GREEN (SWAP-FIRE split) will
+/// make it PASS.  Maps R3, R5, R9, spec S4.
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_request_keyframe_marks_next_packet_as_keyframe() {
+    init_tracing();
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
+    const PRIMING_COUNT: u64 = 3;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -329,48 +342,82 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
             .expect("frame_tx should be open");
     };
 
-    let recv_pkt = || {
-        pkt_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive within 3 s")
-    };
-
-    // CARRY-FORWARD: this test fails on master daa9522 with timeout (Intel QSV needs ≥3
-    // frames before producing output; first recv times out on single-frame submission).
-    // Slice 3's flush() does NOT address it because mid-stream codec_api manipulation
-    // (request_keyframe via apply_pending_codec_settings) triggers a separate pump_loop
-    // counter desync at windows_mft.rs:1266. Carry-forward to a future slice that
-    // addresses pump_loop NOTACCEPTING handling around codec_api operations.
-    // Reverted to master body (timeout failure mode is cleaner than encoder-thread panic).
-
-    // Drain the initial IDR.
-    send_frame(0);
-    let first = recv_pkt();
-    assert!(first.is_keyframe, "first packet must be an IDR");
-
-    // Encode a few P-frames.
-    for i in 1..=3u64 {
+    // Batch-push priming frames and flush — Intel QSV requires a DRAIN trigger
+    // before emitting any output (Slice 3 discovery #710).
+    for i in 0..PRIMING_COUNT {
         send_frame(i);
-        let pkt = recv_pkt();
-        println!("[T7.1] P-frame {i}: is_keyframe={}", pkt.is_keyframe);
+    }
+    enc.flush();
+
+    // Drain priming output.  Expect at least an IDR + 1 P-frame; cap at 20 packets.
+    let mut priming_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                priming_pkts.push(pkt);
+                if priming_pkts.len() >= PRIMING_COUNT as usize {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("encoder died during priming drain — pump thread exited unexpectedly")
+            }
+        }
+        if priming_pkts.len() >= 20 {
+            break;
+        }
+    }
+    assert!(
+        !priming_pkts.is_empty(),
+        "expected at least one priming packet, got none"
+    );
+    assert!(
+        priming_pkts[0].is_keyframe,
+        "first priming packet must be an IDR (initial keyframe)"
+    );
+    println!(
+        "[T7.1] priming drain: {} packets, first is_keyframe={}",
+        priming_pkts.len(),
+        priming_pkts[0].is_keyframe
+    );
+
+    // Request a forced keyframe, then push one IDR-target frame and flush.
+    enc.request_keyframe();
+    send_frame(PRIMING_COUNT); // frame index = PRIMING_COUNT (the IDR target)
+    enc.flush();
+
+    // Drain post-request output.  At least one packet must have is_keyframe == true.
+    let mut post_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                println!(
+                    "[T7.1] post-request pkt {}: is_keyframe={} len={}",
+                    post_pkts.len(),
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                post_pkts.push(pkt);
+                if post_pkts.len() >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "encoder died after request_keyframe() — codec_api desync (C1 RED expected on Intel QSV)"
+                )
+            }
+        }
     }
 
-    // Request a forced keyframe.
-    enc.request_keyframe();
-    send_frame(4);
-
-    let forced_idr = recv_pkt();
-    println!(
-        "[T7.1] forced IDR: is_keyframe={} seq={}",
-        forced_idr.is_keyframe, forced_idr.sequence
-    );
-
-    // Spec R7: the next packet after request_keyframe() MUST be a keyframe
-    // and its data MUST begin with NAL type 7 (SPS) = 0x00 0x00 0x00 0x01 0x67.
-    assert!(
-        forced_idr.is_keyframe,
-        "packet after request_keyframe() must have is_keyframe == true"
-    );
+    // Spec R3, R5: at least one packet after request_keyframe() must be a keyframe,
+    // and it must begin with NAL type 7 (SPS) — Annex-B IDR marker.
+    let forced_idr = post_pkts
+        .iter()
+        .find(|p| p.is_keyframe)
+        .expect("at least one packet after request_keyframe() must have is_keyframe == true");
     assert!(
         forced_idr.data.len() >= 5,
         "forced IDR packet too short: {} bytes",
@@ -395,11 +442,22 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
 
 /// T7.2 — After a forced IDR is emitted, the `request_keyframe` flag is cleared
 /// so the following packet is a P-frame.
+///
+/// Cadence: batch-push 3 priming frames → `enc.flush()` → drain → `request_keyframe()`
+/// → push IDR-target frame → push one more P-frame → `enc.flush()` → drain → assert
+/// the forced IDR has `is_keyframe == true` and the packet after it has
+/// `is_keyframe == false` (flag cleared exactly once per R5).
+///
+/// On Intel QSV (Host A) at C1 RED this test FAILS — the pump thread dies from the
+/// codec_api desync panic at `windows_mft.rs:1266`.  C2 GREEN will make it PASS.
+/// Maps R5, R9, spec S5.
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_keyframe_flag_cleared_after_idr_emitted() {
+    init_tracing();
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
+    const PRIMING_COUNT: u64 = 3;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -419,37 +477,88 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
             .expect("frame_tx should be open");
     };
 
-    let recv_pkt = || {
-        pkt_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive within 3 s")
-    };
-
-    // CARRY-FORWARD: same root cause as T7.1 — pump_loop counter desync when
-    // codec_api operations (request_keyframe) interleave with NeedInput credits.
-    // Reverted to master body. Will be addressed in a follow-up slice.
-
-    // Drain initial IDR.
-    send_frame(0);
-    let _ = recv_pkt(); // initial IDR
-
-    // Encode P-frames then force an IDR.
-    for i in 1..=2u64 {
+    // Batch-push priming frames and flush.
+    for i in 0..PRIMING_COUNT {
         send_frame(i);
-        let _ = recv_pkt();
+    }
+    enc.flush();
+
+    // Drain priming output.
+    let mut priming_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                priming_pkts.push(pkt);
+                if priming_pkts.len() >= PRIMING_COUNT as usize {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("encoder died during priming drain — pump thread exited unexpectedly")
+            }
+        }
+        if priming_pkts.len() >= 20 {
+            break;
+        }
+    }
+    assert!(
+        !priming_pkts.is_empty(),
+        "expected at least one priming packet, got none"
+    );
+    println!("[T7.2] priming drain: {} packets", priming_pkts.len());
+
+    // Request a forced keyframe, push the IDR-target frame plus one more P-frame,
+    // then flush to drain both.
+    enc.request_keyframe();
+    send_frame(PRIMING_COUNT); // IDR target
+    send_frame(PRIMING_COUNT + 1); // P-frame after IDR
+    enc.flush();
+
+    // Drain post-request output.
+    let mut post_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                println!(
+                    "[T7.2] post-request pkt {}: is_keyframe={} len={}",
+                    post_pkts.len(),
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                post_pkts.push(pkt);
+                if post_pkts.len() >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "encoder died after request_keyframe() — codec_api desync (C1 RED expected on Intel QSV)"
+                )
+            }
+        }
     }
 
-    enc.request_keyframe();
-    send_frame(3);
-    let forced = recv_pkt();
-    assert!(forced.is_keyframe, "forced IDR must be a keyframe");
-
-    // The NEXT packet (after the IDR) must NOT be a keyframe — flag was cleared.
-    send_frame(4);
-    let after_idr = recv_pkt();
+    // Spec R5: forced IDR must be present and the packet immediately after it must
+    // have is_keyframe == false (flag cleared exactly once per request).
+    let idr_pos = post_pkts
+        .iter()
+        .position(|p| p.is_keyframe)
+        .expect("at least one packet after request_keyframe() must have is_keyframe == true");
     assert!(
-        !after_idr.is_keyframe,
-        "packet after forced IDR must have is_keyframe == false, got true"
+        post_pkts[idr_pos].is_keyframe,
+        "forced IDR packet must have is_keyframe == true"
+    );
+    // Verify the flag was cleared: the packet after the IDR must be a P-frame.
+    assert!(
+        idr_pos + 1 < post_pkts.len(),
+        "expected a P-frame packet after the forced IDR, but drain produced only {} post-request packet(s)",
+        post_pkts.len()
+    );
+    assert!(
+        !post_pkts[idr_pos + 1].is_keyframe,
+        "packet after forced IDR must have is_keyframe == false (flag cleared after first IDR)"
     );
 
     drop(frame_tx);
@@ -459,11 +568,23 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
 // ─── T8.2: set_bitrate runtime update ────────────────────────────────────────
 
 /// T8.2 — `set_bitrate()` updates the encoder at runtime without restarting the thread.
+///
+/// Cadence: batch-push 3 priming frames → `enc.flush()` → drain → `set_bitrate(8_000_000)`
+/// returns `Ok(())` → push 3 more frames → `enc.flush()` → drain → all packets arrive
+/// without `Disconnected` (encoder thread alive throughout).
+///
+/// The PASS criterion is encoder thread survival: `frame_tx.send()` after `set_bitrate()`
+/// must succeed and packets must continue to arrive.  Maps R4, R6, R9, spec S6.
+///
+/// On Intel QSV (Host A) at C1 RED this test FAILS — the pump thread dies from the
+/// codec_api desync panic at `windows_mft.rs:1266`.  C2 GREEN will make it PASS.
 #[test]
 #[ignore = "hardware H.264 MFT required — run manually on a GPU-capable host"]
 fn mft_set_bitrate_updates_encoder_without_restart() {
+    init_tracing();
     const WIDTH: u32 = 640;
     const HEIGHT: u32 = 480;
+    const PRIMING_COUNT: u64 = 3;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -478,42 +599,89 @@ fn mft_set_bitrate_updates_encoder_without_restart() {
 
     enc.start(frame_rx, pkt_tx).expect("start should succeed");
 
-    // CARRY-FORWARD: same root cause as T7.1/T7.2 — pump_loop counter desync when
-    // codec_api operations (set_bitrate via ICodecAPI) interleave with NeedInput
-    // credits. Reverted to master body. Will be addressed in a follow-up slice.
-
-    // Feed a few frames at 4 Mbps.
-    for i in 0..3u64 {
+    let send_frame = |i: u64| {
         frame_tx
             .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
-            .expect("frame_tx open");
-        let _ = pkt_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive");
-    }
+            .expect("frame_tx should be open");
+    };
 
-    // Update bitrate to 8 Mbps — must return Ok(()) without restarting.
+    // Batch-push priming frames and flush.
+    for i in 0..PRIMING_COUNT {
+        send_frame(i);
+    }
+    enc.flush();
+
+    // Drain priming output.
+    let mut priming_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                priming_pkts.push(pkt);
+                if priming_pkts.len() >= PRIMING_COUNT as usize {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("encoder died during priming drain — pump thread exited unexpectedly")
+            }
+        }
+        if priming_pkts.len() >= 20 {
+            break;
+        }
+    }
+    assert!(
+        !priming_pkts.is_empty(),
+        "expected at least one priming packet, got none"
+    );
+    println!("[T8.2] priming drain: {} packets", priming_pkts.len());
+
+    // Update bitrate — must return Ok(()) without restarting the encoder thread.
     let result = enc.set_bitrate(8_000_000);
     assert!(
         result.is_ok(),
         "set_bitrate(8_000_000) should return Ok(()), got {result:?}"
     );
 
-    // Continue encoding — encoder thread must still be alive (channel not disconnected).
-    for i in 3..6u64 {
-        frame_tx
-            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
-            .expect("frame_tx must still be open after set_bitrate");
-        let pkt = pkt_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("packet should arrive after bitrate update");
-        println!(
-            "[T8.2] post-bitrate-update pkt {}: is_keyframe={} len={}",
-            i,
-            pkt.is_keyframe,
-            pkt.data.len()
-        );
+    // Push 3 more frames and flush. If the encoder is alive, frame_tx.send() succeeds
+    // and the drain loop returns packets.  If the thread died from codec_api desync,
+    // send() panics (Disconnected) or the drain loop returns Disconnected immediately.
+    for i in PRIMING_COUNT..PRIMING_COUNT + 3 {
+        send_frame(i);
     }
+    enc.flush();
+
+    // Drain post-bitrate-update output.
+    let mut post_pkts: Vec<_> = Vec::new();
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(pkt) => {
+                println!(
+                    "[T8.2] post-bitrate pkt {}: is_keyframe={} len={}",
+                    post_pkts.len(),
+                    pkt.is_keyframe,
+                    pkt.data.len()
+                );
+                post_pkts.push(pkt);
+                if post_pkts.len() >= 10 {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "encoder died after set_bitrate() — codec_api desync (C1 RED expected on Intel QSV)"
+                )
+            }
+        }
+    }
+
+    // Spec R4, R6: encoder thread must be alive — verified by receiving packets after
+    // the bitrate update (no Disconnected above means thread survived).
+    assert!(
+        !post_pkts.is_empty(),
+        "expected at least one packet after set_bitrate(), got none — encoder may have died"
+    );
 
     drop(frame_tx);
     enc.stop().expect("stop should succeed");
