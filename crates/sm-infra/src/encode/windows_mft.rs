@@ -28,27 +28,65 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-use windows::Win32::Foundation::{VARIANT_FALSE, VARIANT_TRUE};
+// (No Win32::Foundation imports needed after DD10 deletion of VARIANT_TRUE/VARIANT_FALSE.)
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
-    IMFMediaEventGenerator, IMFMediaType, IMFTransform, MEEndOfStream, METransformDrainComplete,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_SHUTDOWN,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
-    MFT_TRANSFORM_CLSID_Attribute, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    CODECAPI_AVEncCommonMeanBitRate,
+    ICodecAPI,
+    IMFActivate,
+    IMFMediaEventGenerator,
+    IMFMediaType,
+    IMFTransform,
+    MEEndOfStream,
+    METransformDrainComplete,
+    METransformHaveOutput,
+    METransformNeedInput,
+    MF_E_NO_EVENTS_AVAILABLE,
+    MF_E_SHUTDOWN,
+    MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_EVENT_FLAG_NO_WAIT,
+    MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION,
+    MFCreateMediaType,
+    MFCreateMemoryBuffer,
+    MFCreateSample,
+    MFMediaType_Video,
+    MFSTARTUP_FULL,
+    // MFSampleExtension_CleanPoint: kept for the READ path in collect_output (IDR detection).
+    // The WRITE path (forcing CleanPoint=1 on input samples) is deleted by DD10.
+    MFSampleExtension_CleanPoint,
+    MFShutdown,
+    MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG,
+    MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_OUTPUT_DATA_BUFFER,
+    MFT_REGISTER_TYPE_INFO,
+    MFT_TRANSFORM_CLSID_Attribute,
+    MFTEnumEx,
+    MFVideoFormat_H264,
+    MFVideoFormat_NV12,
     MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
-use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
+use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
@@ -81,8 +119,6 @@ unsafe impl<T> Send for ComSend<T> {}
 
 /// Shared atomics between the caller and the encoder OS thread.
 struct MftEncoderShared {
-    /// Set by `request_keyframe()`; cleared (swap → false) before the next `ProcessInput`.
-    keyframe_pending: AtomicBool,
     /// Non-zero means a new target bitrate is pending. 0 = no change.
     pending_bitrate: AtomicU32,
     /// Monotonically increasing count of encoded packets dropped due to backpressure.
@@ -94,9 +130,12 @@ struct MftEncoderShared {
     // allow: drain_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     drain_pending: AtomicBool,
-    /// PHASE 0 EMPIRICAL (Mechanism G): Set by `request_keyframe_via_recreate()`; consumed
-    /// by pump_loop via swap(false, AcqRel). Triggers full IMFTransform teardown + re-activation
-    /// within pump_loop, producing a guaranteed IDR as the first frame of the fresh handle.
+    /// Set by `request_keyframe_via_recreate()` (Mechanism G); consumed by pump_loop via
+    /// swap(false, AcqRel). Triggers full IMFTransform teardown + re-activation within
+    /// pump_loop, producing a guaranteed IDR as the first frame of the fresh handle.
+    ///
+    /// DD10: `keyframe_pending` (CleanPoint/ForceKeyFrame channel) is deleted. This field
+    /// (`keyframe_recreate_pending`) is the ONLY mid-stream IDR signal on this struct.
     // allow: keyframe_recreate_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     keyframe_recreate_pending: AtomicBool,
@@ -105,7 +144,6 @@ struct MftEncoderShared {
 impl Default for MftEncoderShared {
     fn default() -> Self {
         Self {
-            keyframe_pending: AtomicBool::new(false),
             pending_bitrate: AtomicU32::new(0),
             dropped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
@@ -259,7 +297,9 @@ impl VideoEncoder for WindowsMftH264Encoder {
     }
 
     fn request_keyframe(&self) {
-        self.state.keyframe_pending.store(true, Ordering::Release);
+        // DD9: route through Mechanism G (IMFTransform recreate) — the only
+        // empirically-validated mid-stream IDR path on Intel QSV (Phase 0 rounds 1–3).
+        self.request_keyframe_via_recreate()
     }
 
     fn set_bitrate(&self, bps: u32) -> Result<(), EncoderError> {
@@ -1030,45 +1070,45 @@ fn extract_bytes(
 ///
 /// The struct is `Copy` so callers can pass it by value to `fire_pending_codec_settings`
 /// and `restore_pending_codec` without lifetime concerns.
+///
+/// DD10: `force_keyframe` field removed — CleanPoint and `CODECAPI_AVEncVideoForceKeyFrame`
+/// paths are deleted. Mid-stream IDR is handled exclusively via Mechanism G (IMFTransform
+/// recreate). This struct now carries only the bitrate-change channel.
 #[derive(Copy, Clone)]
 struct CodecApiSwap {
-    /// `true` when `request_keyframe()` was pending at SWAP time.
-    force_keyframe: bool,
     /// `Some(bps)` when a `set_bitrate(bps)` was pending at SWAP time; `None` otherwise.
     new_bitrate: Option<u32>,
 }
 
 /// SWAP step (DD1): read pending codec atomics BEFORE `ProcessInput`.
 ///
-/// Clears `keyframe_pending` and `pending_bitrate` via `swap` so that each
-/// pending request is consumed exactly once. The caller must call
-/// [`fire_pending_codec_settings`] AFTER `ProcessInput` returns `Ok(())`.
+/// Clears `pending_bitrate` via `swap` so that each pending request is consumed
+/// exactly once. The caller must call [`fire_pending_codec_settings`] AFTER
+/// `ProcessInput` returns `Ok(())`.
+///
+/// DD10: `keyframe_pending` swap removed — the force-keyframe channel is deleted.
+/// Mid-stream IDR is produced exclusively by Mechanism G (IMFTransform recreate);
+/// `force_keyframe` was a no-op on Intel QSV and is now gone from this path.
 fn swap_pending_codec_settings(state: &MftEncoderShared) -> CodecApiSwap {
-    let force_keyframe = state.keyframe_pending.swap(false, Ordering::AcqRel);
     let raw_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
     let new_bitrate = if raw_bps != 0 { Some(raw_bps) } else { None };
     tracing::trace!(
         target: "sm_infra::encode::windows_mft",
-        force_keyframe,
         new_bitrate = ?new_bitrate,
-        "pump_loop: swap captured force_keyframe={} new_bitrate={:?}",
-        force_keyframe,
+        "pump_loop: swap captured new_bitrate={:?}",
         new_bitrate
     );
-    CodecApiSwap {
-        force_keyframe,
-        new_bitrate,
-    }
+    CodecApiSwap { new_bitrate }
 }
 
 /// FIRE step (DD1): invoke `ICodecAPI::SetValue` calls AFTER `ProcessInput` succeeds.
 ///
-/// Order: bitrate first, then keyframe — matches original `apply_pending_codec_settings`
-/// ordering. Bitrate rejection is non-fatal (warn + continue). Keyframe SetValue failure
-/// is also non-fatal — `MFSampleExtension_CleanPoint` is the authoritative IDR trigger
-/// for NVENC (DD2).
+/// Bitrate rejection is non-fatal (warn + continue).
+///
+/// DD10: `CODECAPI_AVEncVideoForceKeyFrame` SetValue branch removed — Intel QSV does
+/// not honor mid-stream ICodecAPI ForceKeyFrame; NVENC honored CleanPoint instead.
+/// Both are deleted. Mid-stream IDR is produced exclusively by Mechanism G.
 fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
-    // Bitrate first (matches original ordering).
     if let Some(bps) = swap.new_bitrate {
         let v = make_variant_u32(bps);
         unsafe {
@@ -1082,14 +1122,6 @@ fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
             }
         }
     }
-    // Keyframe second.
-    if swap.force_keyframe {
-        // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
-        let v = make_variant_bool(true);
-        unsafe {
-            let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
-        }
-    }
     tracing::trace!(
         target: "sm_infra::encode::windows_mft",
         "pump_loop: fire applied"
@@ -1099,14 +1131,13 @@ fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
 /// RESTORE step (DD3): re-arm pending codec atomics on early-return paths where
 /// `ProcessInput` was NOT called (frame dropped, timeout, disconnect-without-drain).
 ///
-/// - `keyframe_pending`: unconditional `store(true, Release)` — idempotent re-arm.
 /// - `pending_bitrate`: `compare_exchange(0, bps, AcqRel, Acquire)` — only restores
 ///   if the slot is still empty (no newer `set_bitrate` call); preserves last-write-wins
 ///   semantics (R6).
+///
+/// DD10: `keyframe_pending` restore branch removed — field deleted. Mid-stream IDR
+/// requests do not flow through this SWAP-FIRE path.
 fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
-    if swap.force_keyframe {
-        state.keyframe_pending.store(true, Ordering::Release);
-    }
     if let Some(bps) = swap.new_bitrate {
         // Only restore if no newer set_bitrate() overwrote the slot.
         let _ = state
@@ -1369,13 +1400,7 @@ fn pump_loop(
                     }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
-                    match submit_frame(
-                        &mft,
-                        &nv12_scratch,
-                        frame.timestamp,
-                        frame_dur_100ns,
-                        swap.force_keyframe,
-                    ) {
+                    match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
@@ -1451,26 +1476,17 @@ fn pump_loop(
             );
         }
 
-        // PHASE 0 EMPIRICAL — Mechanism G: consume request_keyframe_via_recreate() signal.
-        // Tears down the current IMFTransform (send END_OF_STREAM + COMMAND_DRAIN,
-        // wait for DrainComplete, then END_STREAMING, then drop handle) and re-activates
-        // a fresh IMFTransform from the retained factory pointer. The first encoded frame
-        // from a fresh activation is always IDR (100% empirical evidence from enc.start()).
+        // Mechanism G: consume request_keyframe_via_recreate() signal (DD3, DD6).
+        // Tears down the current IMFTransform (END_OF_STREAM + COMMAND_DRAIN, wait
+        // DrainComplete, END_STREAMING, drop handle) and re-activates a fresh handle
+        // from the retained factory pointer. The first encoded frame from a fresh
+        // activation is always IDR — setup-sequence guarantee (Phase 0 round 3 #783).
         //
-        // WHY this is architecturally sound: rounds 1+2 proved that no MFT-API message
-        // sequence on the SAME handle produces IDR on Intel QSV (phase-0-trace #779, #780).
-        // Mechanism G is the only empirically-grounded path.
-        //
-        // RISKS (per explore-round-2 #781):
-        //   - Intel QSV driver may reject the 2nd ActivateObject call with E_UNEXPECTED.
-        //     If that happens, the probe exits with ENCODER_DIED and HRESULT is logged.
-        //   - The codec_api and event_gen interfaces are casts of the OLD mft; after
-        //     recreate they hold stale COM refs. pump_loop continues using the new mft
-        //     directly for ProcessMessage/ProcessInput/ProcessOutput. The stale codec_api
-        //     and event_gen refs remain valid (COM keeps the underlying object alive via
-        //     refcount) but their events/values now refer to the old session. This is
-        //     acceptable for the probe — production Mechanism G would re-cast from the
-        //     new handle.
+        // WHY: Phase 0 rounds 1+2 proved no MFT-API message on the SAME handle produces
+        // IDR on Intel QSV (#779, #780). Mechanism G is the only empirically-grounded path.
+        // Round 3 (#783) validated G: 2nd ActivateObject succeeds, IDR at index 0, encoder
+        // alive. codec_api and event_gen are re-cast from the fresh handle after recreate
+        // (Step G5b) — no stale COM refs in the resumed pump_loop.
         if state
             .keyframe_recreate_pending
             .swap(false, Ordering::AcqRel)
@@ -1545,15 +1561,15 @@ fn pump_loop(
 
                 // Step G3: Drop old handle — forces COM Release on old_mft.
                 // event_gen / codec_api retain AddRef on the underlying object; they remain
-                // valid for GetEvent polling but MUST NOT be used for GetValue/SetValue on
-                // the new session (acceptable for this probe — production G would re-cast).
+                // valid for GetEvent polling in the drain window above. After G3, both are
+                // re-cast from the fresh IMFTransform in Step G5b before resuming pump_loop.
                 drop(old_mft);
                 tracing::info!("pump_loop: Mechanism G — old IMFTransform dropped");
 
                 // Step G4: Re-activate a fresh IMFTransform from the retained factory.
                 // SAFETY: activate_factory is an MTA-registered COM factory. Calling
                 // ActivateObject again is documented as valid for a new activation cycle.
-                // Risk: Intel QSV driver may return E_UNEXPECTED on 2nd call — logged below.
+                // Empirical: 2nd ActivateObject succeeds on Intel QSV (Phase 0 round 3 #783).
                 match unsafe { activate_factory.ActivateObject::<IMFTransform>() } {
                     Ok(new_mft) => {
                         tracing::info!("pump_loop: Mechanism G — fresh IMFTransform acquired");
@@ -1575,8 +1591,7 @@ fn pump_loop(
                         panic!(
                             "pump_loop: Mechanism G IRRECOVERABLE — ActivateObject (2nd call) \
                              rejected with HRESULT 0x{:08X}. Old IMFTransform was already dropped. \
-                             Escalate to Mechanism H (restart() API extension). \
-                             Note: This is an informative probe failure — not a production bug.",
+                             Escalate to Mechanism H (restart() API extension).",
                             e.code().0
                         );
                     }
@@ -1634,6 +1649,24 @@ fn pump_loop(
                 break;
             }
 
+            // DD4: re-apply pending bitrate on the fresh ICodecAPI AFTER setup_mft succeeds
+            // but BEFORE resuming ProcessInput. The new IMFTransform's ICodecAPI starts at
+            // EncoderConfig defaults (fresh COM object); callers who called set_bitrate(N)
+            // expect the value to persist across any recreate boundary.
+            //
+            // WHY SWAP-FIRE and not a direct read: if a concurrent set_bitrate(N) arrived
+            // between the G drain start and this point, the SWAP atomically captures the
+            // latest value. If it arrived after our SWAP, it sits in pending_bitrate and the
+            // NEXT pump_loop iteration's normal SWAP picks it up — no loss, no double-apply.
+            // This is the same compare_exchange semantics from Slice 4 DD3, applied here to
+            // preserve the caller contract "set_bitrate value persists until next call or stop".
+            //
+            // DD10: force_keyframe is absent from CodecApiSwap — the recreate IS the keyframe.
+            {
+                let bitrate_swap = swap_pending_codec_settings(state);
+                fire_pending_codec_settings(&codec_api, &bitrate_swap);
+            }
+
             // Reset counters: fresh activation has no pending NeedInput/HaveOutput credits.
             ni_count = 0;
             ho_count = 0;
@@ -1675,32 +1708,19 @@ fn pump_loop(
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
 ///
-/// When `force_keyframe` is `true`, sets `MFSampleExtension_CleanPoint = 1` on
-/// the input sample. This is the Microsoft-documented mechanism for requesting
-/// an IDR — required for NVIDIA NVENC, which silently ignores the alternative
-/// `CODECAPI_AVEncVideoForceKeyFrame` path.
+/// DD10: `force_keyframe` parameter and `MFSampleExtension_CleanPoint` write path
+/// are removed. Intel QSV does not honor CleanPoint mid-stream; NVENC's CleanPoint
+/// path was valid but is superseded by Mechanism G (IMFTransform recreate) which
+/// produces a vendor-uniform IDR at the first frame of a fresh activation.
+/// `MFSampleExtension_CleanPoint` is still READ in `collect_output` for IDR detection
+/// — the read path is unchanged.
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
     timestamp: std::time::Duration,
     duration_100ns: i64,
-    force_keyframe: bool,
 ) -> Result<(), EncoderError> {
     let sample = build_imfsample(&nv12.buf, timestamp, duration_100ns)?;
-    if force_keyframe {
-        // SAFETY: SetUINT32 on a valid IMFSample is safe; CleanPoint is a documented
-        // attribute on the IMFAttributes interface that IMFSample inherits.
-        unsafe {
-            sample
-                .SetUINT32(&MFSampleExtension_CleanPoint, 1)
-                .map_err(|e| {
-                    EncoderError::EncodeFailed(format!(
-                        "SetUINT32(CleanPoint): 0x{:08X}",
-                        e.code().0
-                    ))
-                })?;
-        }
-    }
     unsafe {
         mft.ProcessInput(0, &sample, 0)
             .map_err(|e| EncoderError::EncodeFailed(format!("ProcessInput: 0x{:08X}", e.code().0)))
@@ -1889,68 +1909,65 @@ fn make_variant_u32(value: u32) -> VARIANT {
     v
 }
 
-/// Construct a `VARIANT` with type `VT_BOOL` (bool value).
-/// Used for `CODECAPI_AVEncVideoForceKeyFrame`.
-///
-/// # Safety contract
-/// The VARIANT layout is: vt=VT_BOOL (11), boolVal = VARIANT_TRUE (-1) or VARIANT_FALSE (0).
-fn make_variant_bool(value: bool) -> VARIANT {
-    let mut v = VARIANT::default();
-    // SAFETY: VARIANT is a union backed by ManuallyDrop fields.
-    // We set vt to VT_BOOL and write the boolVal union arm (VARIANT_BOOL newtype).
-    unsafe {
-        (*v.Anonymous.Anonymous).vt = VT_BOOL;
-        (*v.Anonymous.Anonymous).Anonymous.boolVal =
-            if value { VARIANT_TRUE } else { VARIANT_FALSE };
-    }
-    v
-}
+// DD10: make_variant_bool() deleted — was used exclusively for CODECAPI_AVEncVideoForceKeyFrame.
+// That SetValue call is removed; VT_BOOL is no longer needed.
 
 // ── Inherent methods ──────────────────────────────────────────────────────────
 
 impl WindowsMftH264Encoder {
     /// Signal end-of-burst to the encoder pump loop, requesting a `MFT_MESSAGE_COMMAND_DRAIN`.
     ///
-    /// **Single-shot**: After `COMMAND_DRAIN` fires, Intel QSV enters a non-accepting state
-    /// until `METransformDrainComplete` fires (~250 ms empirically, Phase 0 trace #710). The
-    /// encoder is effectively terminal per session on Intel QSV — do not call `flush()` mid-stream.
+    /// `flush()` triggers `MFT_MESSAGE_COMMAND_DRAIN`. After `METransformDrainComplete`,
+    /// pump_loop resumes via `BEGIN_STREAMING + START_OF_STREAM` (Slice 4 DD17/F2) —
+    /// `flush()` is **SAFE mid-stream** and is **NOT terminal** on Intel QSV.
     ///
-    /// **Async**: Returns immediately. The DRAIN fires on the next pump_loop iteration after the
-    /// NeedInput inner loop completes. Failures (e.g. vendor error) surface via `pkt_rx.recv_timeout`.
+    /// **Latency**: Empirically ~250 ms drain roundtrip (Phase 0 trace #710). Plan
+    /// `recv_timeout` deadlines accordingly.
     ///
-    /// **Concurrency-safe**: Backed by `Arc<AtomicBool>`. Multiple concurrent calls collapse to at
-    /// most one `COMMAND_DRAIN` per pump iteration (last `store(true)` wins; swap-once consumption).
+    /// **For forced mid-stream IDR**, use `request_keyframe_via_recreate()` (Slice 5 —
+    /// Mechanism G). `flush()` alone does NOT produce an IDR on Intel QSV (Phase 0
+    /// round 1 evidence, probe #779).
     ///
-    /// **Latency**: Empirically ~250 ms on Intel QSV (Host A, Phase 0 trace #710). Plan recv_timeout
-    /// deadlines accordingly (spec S11.x uses 3–5 s — sufficient margin).
+    /// **Production callers MUST NOT call this method.** It is a test affordance for
+    /// single-burst short-stream tests. Production callers force IDR via
+    /// `request_keyframe_via_recreate()` and rely on the channel-disconnect DRAIN path
+    /// at pump_loop shutdown.
     ///
-    /// **Production callers MUST NOT call this method.** It is a test affordance for single-burst
-    /// short-stream tests. Production callers rely on the channel-disconnect DRAIN path at
-    /// pump_loop shutdown.
+    /// **Async**: Returns immediately. The DRAIN fires on the next pump_loop iteration
+    /// after the NeedInput inner loop completes.
+    ///
+    /// **Concurrency-safe**: Backed by `Arc<AtomicBool>`. Multiple concurrent calls collapse
+    /// to at most one `COMMAND_DRAIN` per pump iteration (swap-once consumption).
     pub fn flush(&self) {
         self.state.drain_pending.store(true, Ordering::Release);
     }
 
-    /// PHASE 0 EMPIRICAL (Mechanism G): triggers IMFTransform teardown + re-activation
-    /// within pump_loop, guaranteeing an IDR as the first encoded frame of the fresh session.
+    /// Request a forced mid-stream IDR by tearing down and recreating the `IMFTransform`.
     ///
-    /// When consumed by pump_loop:
-    ///   1. Sends `END_OF_STREAM` + `COMMAND_DRAIN` → waits for `DrainComplete`.
-    ///   2. Sends `END_STREAMING` — formally closes the streaming session.
-    ///   3. Drops the owned `IMFTransform` (forces COM Release).
-    ///   4. Re-calls `ActivateObject` on the retained factory → fresh `IMFTransform`.
-    ///   5. Re-runs `setup_mft` (SetInputType + SetOutputType + FLUSH + BEGIN + START).
-    ///   6. Resumes pump_loop with the fresh handle.
+    /// **Mechanism G** — the only empirically-validated mid-stream IDR path on Intel QSV.
+    /// Phase 0 rounds 1–3 confirmed that no MFT-API message sequence on the SAME handle
+    /// produces IDR on Intel QSV; the round 3 probe (#783) validated G with IDR at
+    /// post-recreate index 0 and encoder alive after the transition.
     ///
-    /// The first encoded frame from a fresh activation is always IDR (100% empirical
-    /// evidence from `enc.start()` path — 3 rounds of Phase 0 probes confirmed no
-    /// MFT-API message sequence on the SAME handle produces IDR on Intel QSV).
+    /// **Latency profile** (empirical — Phase 0 round 3 trace #783):
+    /// - In-flight batch drain: variable, ~50–300 ms (depends on priming batch size and
+    ///   COMMAND_DRAIN round-trip; 30-frame priming batch ≈ 250 ms).
+    /// - Tear-down + ActivateObject + setup_mft: ~9 ms.
+    /// - Total from call to first IDR packet: ~60–310 ms typical.
     ///
-    /// **Probe**: `phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr`
-    /// in `crates/sm-infra/tests/windows_mft_encode.rs`.
+    /// **IDR guarantee**: The first encoded frame from a fresh activation is always IDR
+    /// (setup-sequence guarantee; vendor-uniform across Intel QSV and NVENC).
     ///
-    /// **Risk**: Intel QSV driver may reject the 2nd `ActivateObject` call. If the probe
-    /// fails with ENCODER_DIED, escalate to Mechanism H (`pub fn restart()`).
+    /// **Concurrency**: Backed by `AtomicBool::store(true, Release)`. Concurrent calls
+    /// are idempotent — multiple stores collapse to a single recreate (AcqRel swap in
+    /// pump_loop consumes the flag exactly once per G handler invocation).
+    ///
+    /// **Name signals cost**: callers who need predictable IDR timing must factor in drain
+    /// latency. "Next frame is keyframe" is misleading without accounting for the drain
+    /// window; use `request_keyframe_via_recreate()` explicitly when the cost is acceptable.
+    ///
+    /// **Regression probe**: `phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr`
+    /// in `crates/sm-infra/tests/windows_mft_encode.rs` (`#[ignore]`-gated, Host A).
     pub fn request_keyframe_via_recreate(&self) {
         self.state
             .keyframe_recreate_pending
