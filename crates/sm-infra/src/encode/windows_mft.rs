@@ -1007,40 +1007,98 @@ fn extract_bytes(
 
 // ── Pump loop (design §5a) ────────────────────────────────────────────────────
 
-/// Apply pending keyframe and bitrate codec settings before a ProcessInput call.
+/// Snapshot of pending codec settings read atomically from [`MftEncoderShared`]
+/// before a `ProcessInput` call (DD1 SWAP step).
 ///
-/// Returns `true` when a keyframe was requested. The caller must also set
-/// `MFSampleExtension_CleanPoint = 1` on the input `IMFSample`: NVIDIA NVENC's
-/// MFT silently ignores `CODECAPI_AVEncVideoForceKeyFrame` and only respects
-/// the per-sample CleanPoint hint (Microsoft-documented force-IDR mechanism).
-/// We send both: SetValue covers Microsoft software encoder + AMD; CleanPoint
-/// covers NVENC.
-fn apply_pending_codec_settings(codec_api: &ICodecAPI, state: &MftEncoderShared) -> bool {
-    let keyframe_pending = state.keyframe_pending.swap(false, Ordering::AcqRel);
-    if keyframe_pending {
-        // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
-        let v = make_variant_bool(true);
-        unsafe {
-            let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
-        }
-    }
+/// The struct is `Copy` so callers can pass it by value to `fire_pending_codec_settings`
+/// and `restore_pending_codec` without lifetime concerns.
+#[derive(Copy, Clone)]
+struct CodecApiSwap {
+    /// `true` when `request_keyframe()` was pending at SWAP time.
+    force_keyframe: bool,
+    /// `Some(bps)` when a `set_bitrate(bps)` was pending at SWAP time; `None` otherwise.
+    new_bitrate: Option<u32>,
+}
 
-    // Apply pending bitrate change (design §7, DD11).
-    let new_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
-    if new_bps != 0 {
-        let v = make_variant_u32(new_bps);
+/// SWAP step (DD1): read pending codec atomics BEFORE `ProcessInput`.
+///
+/// Clears `keyframe_pending` and `pending_bitrate` via `swap` so that each
+/// pending request is consumed exactly once. The caller must call
+/// [`fire_pending_codec_settings`] AFTER `ProcessInput` returns `Ok(())`.
+fn swap_pending_codec_settings(state: &MftEncoderShared) -> CodecApiSwap {
+    let force_keyframe = state.keyframe_pending.swap(false, Ordering::AcqRel);
+    let raw_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
+    let new_bitrate = if raw_bps != 0 { Some(raw_bps) } else { None };
+    tracing::trace!(
+        target: "sm_infra::encode::windows_mft",
+        force_keyframe,
+        new_bitrate = ?new_bitrate,
+        "pump_loop: swap captured force_keyframe={} new_bitrate={:?}",
+        force_keyframe,
+        new_bitrate
+    );
+    CodecApiSwap {
+        force_keyframe,
+        new_bitrate,
+    }
+}
+
+/// FIRE step (DD1): invoke `ICodecAPI::SetValue` calls AFTER `ProcessInput` succeeds.
+///
+/// Order: bitrate first, then keyframe — matches original `apply_pending_codec_settings`
+/// ordering. Bitrate rejection is non-fatal (warn + continue). Keyframe SetValue failure
+/// is also non-fatal — `MFSampleExtension_CleanPoint` is the authoritative IDR trigger
+/// for NVENC (DD2).
+fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
+    // Bitrate first (matches original ordering).
+    if let Some(bps) = swap.new_bitrate {
+        let v = make_variant_u32(bps);
         unsafe {
             if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &v) {
-                // Log warn but do NOT crash — driver rejection is non-fatal (DD11).
+                // Non-fatal — driver rejection is acceptable (DD13).
                 tracing::warn!(
+                    target: "sm_infra::encode::windows_mft",
                     "ICodecAPI::SetValue(bitrate) rejected: 0x{:08X}",
                     e.code().0
                 );
             }
         }
     }
+    // Keyframe second.
+    if swap.force_keyframe {
+        // SAFETY: VARIANT constructed with VT_BOOL type per CODECAPI contract.
+        let v = make_variant_bool(true);
+        unsafe {
+            let _ = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v);
+        }
+    }
+    tracing::trace!(
+        target: "sm_infra::encode::windows_mft",
+        "pump_loop: fire applied"
+    );
+}
 
-    keyframe_pending
+/// RESTORE step (DD3): re-arm pending codec atomics on early-return paths where
+/// `ProcessInput` was NOT called (frame dropped, timeout, disconnect-without-drain).
+///
+/// - `keyframe_pending`: unconditional `store(true, Release)` — idempotent re-arm.
+/// - `pending_bitrate`: `compare_exchange(0, bps, AcqRel, Acquire)` — only restores
+///   if the slot is still empty (no newer `set_bitrate` call); preserves last-write-wins
+///   semantics (R6).
+fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
+    if swap.force_keyframe {
+        state.keyframe_pending.store(true, Ordering::Release);
+    }
+    if let Some(bps) = swap.new_bitrate {
+        // Only restore if no newer set_bitrate() overwrote the slot.
+        let _ = state
+            .pending_bitrate
+            .compare_exchange(0, bps, Ordering::AcqRel, Ordering::Acquire);
+    }
+    tracing::trace!(
+        target: "sm_infra::encode::windows_mft",
+        "pump_loop: restore_pending_codec on early-return"
+    );
 }
 
 #[expect(
@@ -1083,6 +1141,13 @@ fn pump_loop(
     let mut ni_count: u32 = 0; // pending METransformNeedInput credits
     let mut ho_count: u32 = 0; // pending METransformHaveOutput credits
 
+    // F1 drain-state guard (DD14, R16): tracks whether the MFT is currently between
+    // MFT_MESSAGE_COMMAND_DRAIN and the corresponding METransformDrainComplete event.
+    // Stack-local — sole owner is pump_loop; no struct field needed (DD9 preserved).
+    // SET on every ProcessMessage(COMMAND_DRAIN) call; CLEAR on METransformDrainComplete.
+    // GUARD at top of `while ni_count > 0` loop — MUST precede SWAP (GUARD-BEFORE-SWAP).
+    let mut draining = false;
+
     // Change-detection sentinels for DD8 counter snapshot logging (spec R7/S7.2).
     let mut last_logged_ni: u32 = u32::MAX;
     let mut last_logged_ho: u32 = u32::MAX;
@@ -1123,6 +1188,12 @@ fn pump_loop(
                     let old_ho = ho_count;
                     ni_count = 0;
                     ho_count = 0;
+                    // DD14 CLEAR: drain window is closed; NeedInput credits are safe to service again.
+                    draining = false;
+                    tracing::trace!(
+                        target: "sm_infra::encode::windows_mft",
+                        "draining = false (DrainComplete)"
+                    );
                     tracing::info!(
                         old_ni_count = old_ni,
                         old_ho_count = old_ho,
@@ -1218,7 +1289,22 @@ fn pump_loop(
 
         // ── Service NeedInput (submit frames) ─────────────────────────────────────
         while ni_count > 0 {
-            let force_keyframe = apply_pending_codec_settings(codec_api, state);
+            // DD14 F1 GUARD (R16): if the MFT is between COMMAND_DRAIN and DrainComplete,
+            // discard accumulated NeedInput credits — ProcessInput returns MF_E_NOTACCEPTING
+            // during this window. The MFT re-emits NeedInput after DrainComplete per the
+            // Microsoft MFT contract. GUARD MUST precede SWAP (GUARD-BEFORE-SWAP ordering):
+            // atomics remain armed for the first post-DrainComplete NeedInput credit.
+            if draining {
+                tracing::trace!(
+                    target: "sm_infra::encode::windows_mft",
+                    "pump_loop: skipping NeedInput credits during drain"
+                );
+                ni_count = 0;
+                break;
+            }
+
+            // DD1 SWAP: read pending codec atomics BEFORE ProcessInput.
+            let swap = swap_pending_codec_settings(state);
 
             // WHY: FRAME_RECV_TIMEOUT ≤50ms is load-bearing for T-NEW-2
             // (`mft_stop_during_active_encode_returns_within_deadline`). When stop()
@@ -1238,11 +1324,9 @@ fn pump_loop(
                         state.dropped.fetch_add(1, Ordering::Relaxed);
                         // Do NOT consume the NeedInput credit — break out so the next
                         // poll iteration re-evaluates and we don't busy-loop on bad input.
-                        // If we swallowed a keyframe request, restore it so the next
-                        // submitted frame still carries the IDR hint.
-                        if force_keyframe {
-                            state.keyframe_pending.store(true, Ordering::Release);
-                        }
+                        // Restore both codec atomics (DD3) so the next submitted frame
+                        // still carries the IDR hint and pending bitrate change.
+                        restore_pending_codec(state, &swap);
                         break;
                     }
                     current_ts = frame.timestamp;
@@ -1252,17 +1336,23 @@ fn pump_loop(
                         &nv12_scratch,
                         frame.timestamp,
                         frame_dur_100ns,
-                        force_keyframe,
+                        swap.force_keyframe,
                     ) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
+                            // DD1 FIRE: ICodecAPI::SetValue AFTER ProcessInput — eliminates the
+                            // race window where QSV withdraws NeedInput readiness (Mode 1 fix).
+                            fire_pending_codec_settings(codec_api, &swap);
                         }
                         Err(e) => {
                             // Check for MF_E_NOTACCEPTING — indicates counter desync (design DD5).
                             let reason = e.to_string();
                             if reason.contains("ProcessInput: 0xC00D36B5") {
-                                // MF_E_NOTACCEPTING should NEVER happen when counters are correct.
+                                // MF_E_NOTACCEPTING should NEVER happen when counters are correct
+                                // AND the drain-state guard (DD14) is active. Under DD1+DD14 this
+                                // assert is sound for both Mode 1 (codec_api race) and Mode 2
+                                // (flush+continue ProcessInput) — both are eliminated by this commit.
                                 debug_assert!(
                                     false,
                                     "MF_E_NOTACCEPTING on serviced NeedInput credit — counter logic wrong"
@@ -1283,20 +1373,25 @@ fn pump_loop(
                     // No frame available within timeout — do NOT consume the NeedInput credit.
                     // The MFT retains the credit; we re-poll events on the next iteration.
                     // This path exits the inner loop so the top-of-loop stop check runs (DD2).
-                    if force_keyframe {
-                        state.keyframe_pending.store(true, Ordering::Release);
-                    }
+                    // Restore both codec atomics (DD3) so the next submitted frame carries
+                    // the pending IDR hint and bitrate change.
+                    restore_pending_codec(state, &swap);
                     break;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Upstream closed — drain MFT and continue looping (do NOT consume credit).
+                    // Restore both codec atomics (DD3) — encoder shutting down, but be consistent.
                     tracing::info!("pump_loop: frame channel disconnected, sending COMMAND_DRAIN");
-                    if force_keyframe {
-                        state.keyframe_pending.store(true, Ordering::Release);
-                    }
+                    restore_pending_codec(state, &swap);
                     unsafe {
                         let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
                     }
+                    // DD14 SET site #2: mark drain window open BEFORE break.
+                    draining = true;
+                    tracing::trace!(
+                        target: "sm_infra::encode::windows_mft",
+                        "draining = true (disconnect)"
+                    );
                     break;
                 }
             }
@@ -1310,6 +1405,12 @@ fn pump_loop(
             unsafe {
                 let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             }
+            // DD14 SET site #1: mark drain window open (explicit flush path).
+            draining = true;
+            tracing::trace!(
+                target: "sm_infra::encode::windows_mft",
+                "draining = true (explicit flush)"
+            );
         }
 
         // ── Idle sleep — avoid busy-wait when nothing happened (spec R5, design DD6) ──
