@@ -28,9 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-// (No Win32::Foundation imports needed after DD10 deletion of VARIANT_TRUE/VARIANT_FALSE.)
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncVideoForceKeyFrame,
     ICodecAPI,
     IMFActivate,
     IMFMediaEventGenerator,
@@ -59,8 +59,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateSample,
     MFMediaType_Video,
     MFSTARTUP_FULL,
-    // MFSampleExtension_CleanPoint: kept for the READ path in collect_output (IDR detection).
-    // The WRITE path (forcing CleanPoint=1 on input samples) is deleted by DD10.
+    // MFSampleExtension_CleanPoint: READ path in collect_output for IDR detection
+    // (defense-in-depth alongside annex_b_contains_idr byte scanning). DD7: the write
+    // path (CleanPoint=1 on input sample) was deleted — falsified by P1 probe (#807).
     MFSampleExtension_CleanPoint,
     MFShutdown,
     MFStartup,
@@ -115,6 +116,46 @@ impl<T> ComSend<T> {
 // NOT transferred cross-thread; they live entirely on the encoder thread.
 unsafe impl<T> Send for ComSend<T> {}
 
+// ── Encoder vendor identity ───────────────────────────────────────────────────
+
+/// Identity of the winning hardware encoder MFT, detected at probe time.
+///
+/// Determined by matching the MFT CLSID obtained from `MFT_TRANSFORM_CLSID_Attribute`
+/// during `probe_and_select_mft`. Retained for INFO/WARN diagnostic logging only —
+/// does NOT drive IDR mechanism dispatch (DD5, Slice 6 R2).
+///
+/// Mid-stream IDR is vendor-uniform via `CODECAPI_AVEncVideoForceKeyFrame` (VT_UI4=1)
+/// called BEFORE `ProcessInput`. See P2 evidence #809.
+///
+/// See explore #803 and design DD5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderVendor {
+    /// Intel Quick Sync Video H.264 MFT — CLSID `{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}`.
+    IntelQsv,
+    /// NVIDIA NVENC H.264 MFT — CLSID `{60F44560-5A20-4857-BFEF-D29773CB8040}`.
+    NvidiaNvenc,
+    /// Any other vendor (AMD, fallback). Treated as IntelQsv for mechanism routing.
+    Unknown,
+}
+
+impl EncoderVendor {
+    /// Detect vendor from the CLSID string formatted by `probe_and_select_mft`.
+    ///
+    /// The CLSID is formatted as `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (upper-case hex).
+    /// Matching on prefix is sufficient because the leading data1 component is unique per vendor.
+    fn from_clsid_str(clsid_str: &str) -> Self {
+        // NVENC: {60F44560-5A20-4857-BFEF-D29773CB8040} — confirmed in C0/C0.b probe logs (Slice 6).
+        if clsid_str.starts_with("{60F44560-") {
+            return Self::NvidiaNvenc;
+        }
+        // Intel QSV: {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471} — from Slice 4 archive explore.
+        if clsid_str.starts_with("{4BE8D3C0-") {
+            return Self::IntelQsv;
+        }
+        Self::Unknown
+    }
+}
+
 // ── Shared cross-thread state ─────────────────────────────────────────────────
 
 /// Shared atomics between the caller and the encoder OS thread.
@@ -130,15 +171,32 @@ struct MftEncoderShared {
     // allow: drain_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     drain_pending: AtomicBool,
-    /// Set by `request_keyframe_via_recreate()` (Mechanism G); consumed by pump_loop via
-    /// swap(false, AcqRel). Triggers full IMFTransform teardown + re-activation within
-    /// pump_loop, producing a guaranteed IDR as the first frame of the fresh handle.
+    /// Set by `request_keyframe_via_force_keyframe_icodecapi()` (Slice 6 R2).
     ///
-    /// DD10: `keyframe_pending` (CleanPoint/ForceKeyFrame channel) is deleted. This field
-    /// (`keyframe_recreate_pending`) is the ONLY mid-stream IDR signal on this struct.
-    // allow: keyframe_recreate_pending only read by pump_loop under hw-encoder feature
+    /// Consumed by pump_loop in the NeedInput service path: BEFORE calling `submit_frame()`,
+    /// swap(false, AcqRel) to consume the flag; if true, call
+    /// `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` on the encoder's
+    /// ICodecAPI interface.
+    ///
+    /// WHY BEFORE ProcessInput: Per Chromium `media_foundation_video_encode_accelerator_win.cc`
+    /// lines 2299-2307 and FFmpeg `libavcodec/mfenc.c::mf_send_frame()`, the canonical
+    /// production sequence calls SetValue(CODECAPI_AVEncVideoForceKeyFrame) BEFORE the
+    /// ProcessInput call for the target frame. The Slice 4 SWAP-FIRE pattern used AFTER
+    /// ProcessInput — that is the known-wrong timing this probe corrects.
+    ///
+    /// VT_UI4 (not VT_BOOL): per research #808, the correct VARIANT type is VT_UI4=1.
+    /// Slice 4 used VT_BOOL, which may also have contributed to falsification on Intel QSV.
+    ///
+    /// CODECAPI_AVEncVideoForceKeyFrame is a REQUIRED HCK Win8+ certification property for
+    /// hardware encoder MFTs (Microsoft docs). NVENC MUST implement it to be certified.
+    ///
+    /// The property auto-resets to 0 after the next ProcessInput per MS docs — no manual
+    /// cleanup needed after the call.
+    ///
+    /// SetValue rejection is non-fatal (warn + continue) per DD13 convention.
+    // allow: force_keyframe_icodecapi_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
-    keyframe_recreate_pending: AtomicBool,
+    force_keyframe_icodecapi_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -148,7 +206,7 @@ impl Default for MftEncoderShared {
             dropped: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             drain_pending: AtomicBool::new(false),
-            keyframe_recreate_pending: AtomicBool::new(false),
+            force_keyframe_icodecapi_pending: AtomicBool::new(false),
         }
     }
 }
@@ -175,6 +233,18 @@ const FRAME_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 pub struct WindowsMftH264Encoder {
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
+    /// Vendor identity of the winning MFT, detected during `new()` via CLSID matching.
+    ///
+    /// Retained for INFO/WARN diagnostic logging only. Does NOT drive IDR mechanism
+    /// dispatch — mid-stream IDR is vendor-uniform via `CODECAPI_AVEncVideoForceKeyFrame`
+    /// (P2 evidence #809, design DD5). See `EncoderVendor`.
+    // WHY: field is kept for future diagnostic use (vendor-specific quirk flags, metrics)
+    // and is populated by new() from CLSID detection; not yet read back in Slice 6 R2.
+    #[expect(
+        dead_code,
+        reason = "populated for future diagnostic use; no behavioral consumer in Slice 6 R2"
+    )]
+    vendor: EncoderVendor,
     /// The winning `IMFActivate` selected during the destructive probe in `new()`.
     ///
     /// `IMFActivate` is an MTA-registered COM factory pointer; it is safe to transfer
@@ -247,11 +317,13 @@ impl VideoEncoder for WindowsMftH264Encoder {
         // This eliminates cross-thread IMFTransform transfer, the root cause of AVs in
         // commit ccd2e43 (phase0v3 trace: H-AV3 confirmed — NVENC singleton corruption
         // when IMFTransform is used from a different thread than ActivateObject).
-        let activate = init_mft_sync(&config)?;
+        // Vendor identity is returned alongside the activate for diagnostic logging.
+        let (activate, vendor) = init_mft_sync(&config)?;
 
         Ok(Self {
             config,
             state: Arc::new(MftEncoderShared::default()),
+            vendor,
             mft_activate_factory: Some(activate),
             handle: None,
             com_initialized: true,
@@ -296,10 +368,22 @@ impl VideoEncoder for WindowsMftH264Encoder {
         Ok(())
     }
 
+    /// Request a forced mid-stream IDR frame.
+    ///
+    /// Arms `force_keyframe_icodecapi_pending`; pump_loop consumes the flag with
+    /// `swap(false, AcqRel)` on the next NeedInput credit and calls
+    /// `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` BEFORE
+    /// `ProcessInput`.
+    ///
+    /// **Latency**: ~0ms on NVENC (IDR at idx 0); ~33ms on Intel QSV (IDR at idx 1,
+    /// 1 in-flight frame latency at 30fps). Both within `assert_keyframe_within_next_n_frames(30)`
+    /// tolerance. Vendor-uniform via `CODECAPI_AVEncVideoForceKeyFrame`; see Phase 0 P2
+    /// evidence (engram #809), research finding (engram #808), Microsoft HCK property table
+    /// for Win8+ hardware MFTs.
     fn request_keyframe(&self) {
-        // DD9: route through Mechanism G (IMFTransform recreate) — the only
-        // empirically-validated mid-stream IDR path on Intel QSV (Phase 0 rounds 1–3).
-        self.request_keyframe_via_recreate()
+        self.state
+            .force_keyframe_icodecapi_pending
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn set_bitrate(&self, bps: u32) -> Result<(), EncoderError> {
@@ -355,7 +439,7 @@ impl Drop for WindowsMftH264Encoder {
 /// different thread than the one that called `ActivateObject` (phase0v3 trace: H-AV3
 /// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
 /// for `IMFTransform` and `ICodecAPI`.
-fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
+fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
     // Step 1: CoInitializeEx on caller thread (MTA).
     // SAFETY: Paired with CoUninitialize in Drop.
     // CoInitializeEx returns HRESULT directly (not Result).
@@ -393,7 +477,7 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
     };
 
     match result {
-        Ok(activate) => Ok(activate),
+        Ok((activate, vendor)) => Ok((activate, vendor)),
         Err(err) => {
             unsafe {
                 let _ = MFShutdown();
@@ -481,7 +565,7 @@ fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
 fn probe_and_select_mft(
     activates: Vec<IMFActivate>,
     config: &EncoderConfig,
-) -> Result<IMFActivate, EncoderError> {
+) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
     // Use the session's real config dimensions for the probe so the
     // SetOutputType call validates the actual session parameters.
     let (probe_w, probe_h) = effective_dimensions(config);
@@ -616,10 +700,34 @@ fn probe_and_select_mft(
         drop(mft);
         let _ = unsafe { activate.ShutdownObject() };
 
+        // ── Vendor detection (Slice 6 R2) ────────────────────────────────────
+        // Match CLSID string to EncoderVendor for diagnostic logging only.
+        // Mid-stream IDR is vendor-uniform via CODECAPI_AVEncVideoForceKeyFrame (P2 #809).
+        // See explore #803 and design DD5.
+        let vendor = EncoderVendor::from_clsid_str(&clsid_str);
+        match vendor {
+            EncoderVendor::NvidiaNvenc => {
+                tracing::info!(
+                    "probe_and_select_mft: detected vendor=NvidiaNvenc for [{i}] \"{friendly_name}\" {clsid_str}"
+                );
+            }
+            EncoderVendor::IntelQsv => {
+                tracing::info!(
+                    "probe_and_select_mft: detected vendor=IntelQsv for [{i}] \"{friendly_name}\" {clsid_str}"
+                );
+            }
+            EncoderVendor::Unknown => {
+                tracing::warn!(
+                    "probe_and_select_mft: vendor Unknown for [{i}] \"{friendly_name}\" {clsid_str} \
+                     — CLSID not in known-vendor table"
+                );
+            }
+        }
+
         tracing::info!(
             "probe_and_select_mft: selected candidate [{i}] \"{friendly_name}\" {clsid_str}"
         );
-        return Ok(activate.clone());
+        return Ok((activate.clone(), vendor));
     }
 
     Err(last_err)
@@ -847,16 +955,10 @@ fn run_encoder_thread(
     // hardware encoders (see explore #583 Bucket A diagnosis). Removed in Phase 4.
     let mut output_format_known: Option<bool> = None; // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
 
-    // Step 8: Pump loop. mft is passed by value (owned) so Mechanism G can drop + recreate
-    // the IMFTransform handle mid-stream without borrowing constraints. activate_factory is
-    // kept on this thread so pump_loop can call ActivateObject again (Mechanism G path).
-    // After pump_loop returns, mft may have been replaced (Mechanism G); the original or
-    // final handle is returned so end-of-stream notifications can be sent correctly.
-    // pump_loop takes ownership of mft, codec_api, and event_gen so Mechanism G can
-    // drop + re-cast all three from the fresh IMFTransform after mid-stream recreate.
+    // Step 8: Pump loop. mft is passed by value (owned) so it can be returned after
+    // the stream ends. pump_loop takes ownership of mft, codec_api, and event_gen.
     let mft = pump_loop(
         mft,
-        &activate,
         codec_api,
         event_gen,
         &state,
@@ -867,8 +969,8 @@ fn run_encoder_thread(
     );
 
     // Steps 9a–9e: Notify end of stream and release.
-    // WHY: pump_loop returns the final IMFTransform handle (may be a fresh one after
-    // Mechanism G recreate). Send end-of-stream messages before dropping it.
+    // WHY: pump_loop returns the IMFTransform handle. Send end-of-stream messages
+    // before dropping it to cleanly finalize the encoder session.
     unsafe {
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
@@ -1071,9 +1173,10 @@ fn extract_bytes(
 /// The struct is `Copy` so callers can pass it by value to `fire_pending_codec_settings`
 /// and `restore_pending_codec` without lifetime concerns.
 ///
-/// DD10: `force_keyframe` field removed — CleanPoint and `CODECAPI_AVEncVideoForceKeyFrame`
-/// paths are deleted. Mid-stream IDR is handled exclusively via Mechanism G (IMFTransform
-/// recreate). This struct now carries only the bitrate-change channel.
+/// Snapshot of pending codec settings for the SWAP-FIRE pattern (bitrate change channel).
+///
+/// The struct is `Copy` so callers can pass it by value to `fire_pending_codec_settings`
+/// and `restore_pending_codec` without lifetime concerns.
 #[derive(Copy, Clone)]
 struct CodecApiSwap {
     /// `Some(bps)` when a `set_bitrate(bps)` was pending at SWAP time; `None` otherwise.
@@ -1085,10 +1188,6 @@ struct CodecApiSwap {
 /// Clears `pending_bitrate` via `swap` so that each pending request is consumed
 /// exactly once. The caller must call [`fire_pending_codec_settings`] AFTER
 /// `ProcessInput` returns `Ok(())`.
-///
-/// DD10: `keyframe_pending` swap removed — the force-keyframe channel is deleted.
-/// Mid-stream IDR is produced exclusively by Mechanism G (IMFTransform recreate);
-/// `force_keyframe` was a no-op on Intel QSV and is now gone from this path.
 fn swap_pending_codec_settings(state: &MftEncoderShared) -> CodecApiSwap {
     let raw_bps = state.pending_bitrate.swap(0, Ordering::AcqRel);
     let new_bitrate = if raw_bps != 0 { Some(raw_bps) } else { None };
@@ -1105,9 +1204,14 @@ fn swap_pending_codec_settings(state: &MftEncoderShared) -> CodecApiSwap {
 ///
 /// Bitrate rejection is non-fatal (warn + continue).
 ///
-/// DD10: `CODECAPI_AVEncVideoForceKeyFrame` SetValue branch removed — Intel QSV does
-/// not honor mid-stream ICodecAPI ForceKeyFrame; NVENC honored CleanPoint instead.
-/// Both are deleted. Mid-stream IDR is produced exclusively by Mechanism G.
+/// Mid-stream IDR mechanism (Slice 6 R2 — replaces Slice 5 Mechanism G):
+/// Vendor-uniform via `CODECAPI_AVEncVideoForceKeyFrame` (VT_UI4=1) called
+/// BEFORE `IMFTransform::ProcessInput`. Empirical evidence: Phase 0 P2
+/// (engram #809) — IDR at idx 0 on NVENC, idx 1 on Intel QSV (1-frame
+/// in-flight latency, within `assert_keyframe_within_next_n_frames(30)`).
+/// Reference: Microsoft HCK property table for Win8+ hardware encoder MFTs.
+/// Production refs: Chromium media_foundation_video_encode_accelerator_win.cc
+/// and FFmpeg libavcodec/mfenc.c::mf_send_frame() use the same sequence.
 fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
     if let Some(bps) = swap.new_bitrate {
         let v = make_variant_u32(bps);
@@ -1134,9 +1238,6 @@ fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
 /// - `pending_bitrate`: `compare_exchange(0, bps, AcqRel, Acquire)` — only restores
 ///   if the slot is still empty (no newer `set_bitrate` call); preserves last-write-wins
 ///   semantics (R6).
-///
-/// DD10: `keyframe_pending` restore branch removed — field deleted. Mid-stream IDR
-/// requests do not flow through this SWAP-FIRE path.
 fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
     if let Some(bps) = swap.new_bitrate {
         // Only restore if no newer set_bitrate() overwrote the slot.
@@ -1152,12 +1253,11 @@ fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop owns mft, codec_api, event_gen + activate_factory for Mechanism G recreate; \
-              plus config, state, rx, tx + format state — design §5a one-function pump shape"
+    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx and format state \
+              — design §5a one-function pump shape; 8 args accepted over struct decomposition for clarity"
 )]
 fn pump_loop(
-    mut mft: IMFTransform,
-    activate_factory: &IMFActivate,
+    mft: IMFTransform,
     initial_codec_api: ICodecAPI,
     initial_event_gen: IMFMediaEventGenerator,
     state: &MftEncoderShared,
@@ -1170,11 +1270,8 @@ fn pump_loop(
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Duration;
 
-    // codec_api and event_gen are owned locals so Mechanism G can re-cast them from
-    // the fresh IMFTransform after recreate. They are initialized from the initial mft
-    // and updated in the G handler.
-    let mut codec_api = initial_codec_api;
-    let mut event_gen = initial_event_gen;
+    let codec_api = initial_codec_api;
+    let event_gen = initial_event_gen;
 
     let mut nv12_scratch = Nv12::new(1, 1);
     let mut seq: u64 = 0;
@@ -1400,6 +1497,40 @@ fn pump_loop(
                     }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
+
+                    // Consume force_keyframe_icodecapi_pending BEFORE submit_frame /
+                    // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).
+                    // Vendor-uniform: both NVENC (IDR idx 0) and Intel QSV (IDR idx 1) honor
+                    // this property BEFORE ProcessInput; P2 evidence in engram #809.
+                    // The property auto-resets to 0 after ProcessInput per MS docs.
+                    if state
+                        .force_keyframe_icodecapi_pending
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        let v = make_variant_u32(1);
+                        // SAFETY: SetValue on a valid ICodecAPI is always safe;
+                        // the VARIANT is stack-allocated and correctly typed VT_UI4.
+                        unsafe {
+                            if let Err(e) =
+                                codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v)
+                            {
+                                // Non-fatal — driver rejection is acceptable (DD13 convention).
+                                tracing::warn!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
+                                     rejected: 0x{:08X} (non-fatal, encoding continues)",
+                                    e.code().0
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
+                                     VT_UI4=1) issued BEFORE ProcessInput"
+                                );
+                            }
+                        }
+                    }
+
                     match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
@@ -1476,215 +1607,6 @@ fn pump_loop(
             );
         }
 
-        // Mechanism G: consume request_keyframe_via_recreate() signal (DD3, DD6).
-        // Tears down the current IMFTransform (END_OF_STREAM + COMMAND_DRAIN, wait
-        // DrainComplete, END_STREAMING, drop handle) and re-activates a fresh handle
-        // from the retained factory pointer. The first encoded frame from a fresh
-        // activation is always IDR — setup-sequence guarantee (Phase 0 round 3 #783).
-        //
-        // WHY: Phase 0 rounds 1+2 proved no MFT-API message on the SAME handle produces
-        // IDR on Intel QSV (#779, #780). Mechanism G is the only empirically-grounded path.
-        // Round 3 (#783) validated G: 2nd ActivateObject succeeds, IDR at index 0, encoder
-        // alive. codec_api and event_gen are re-cast from the fresh handle after recreate
-        // (Step G5b) — no stale COM refs in the resumed pump_loop.
-        //
-        // ORDERING: check `!draining` FIRST so the swap is short-circuited when we
-        // can't process the recreate this iteration. If we swapped unconditionally and
-        // then tested `!draining`, a swap during the drain window would consume the
-        // flag and silently drop the keyframe request (race observed empirically when
-        // a caller does `flush(); request_keyframe();` in quick succession — Slice 5
-        // C2 GREEN Host A trace #786). With this ordering the flag persists across
-        // drain iterations and is consumed only when we commit to the recreate.
-        if !draining
-            && state
-                .keyframe_recreate_pending
-                .swap(false, Ordering::AcqRel)
-        {
-            tracing::info!(
-                "pump_loop: request_keyframe_via_recreate() — tearing down IMFTransform for Mechanism G"
-            );
-
-            // Steps G1–G4: send shutdown messages, drop old handle, acquire fresh handle.
-            // WHY block expression: Rust's ownership rules prevent assigning to `mft` after
-            // it has been moved into `drop()`. Using a block expression lets us move the old
-            // handle out, drop it, and produce a new IMFTransform — all in one expression.
-            mft = {
-                let old_mft = mft; // move old handle into block scope
-
-                // Step G1: Send END_OF_STREAM + COMMAND_DRAIN (drain remaining frames).
-                // event_gen still works here because old_mft and event_gen share the same
-                // underlying COM object — event_gen AddRef'd it and keeps it alive.
-                unsafe {
-                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-                }
-                // Note: we do NOT set draining=true here because the G teardown is synchronous
-                // (we block waiting for DrainComplete inside this block expression). The outer
-                // loop's draining flag is reset to false at the end of the G handler.
-                tracing::trace!(
-                    target: "sm_infra::encode::windows_mft",
-                    "Mechanism G: END_OF_STREAM + COMMAND_DRAIN sent; waiting for DrainComplete"
-                );
-
-                // Wait for DrainComplete (bounded 5 s) before teardown.
-                let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let mut drain_complete = false;
-                while std::time::Instant::now() < drain_deadline {
-                    match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                        Ok(event) => {
-                            let et = unsafe { event.GetType() }.unwrap_or(0);
-                            if et == METransformDrainComplete.0 as u32 {
-                                drain_complete = true;
-                                break;
-                            } else if et == METransformHaveOutput.0 as u32 {
-                                // Drain + discard remaining output: not forwarded post-recreate.
-                                let _ = collect_output(
-                                    &old_mft,
-                                    output_format_known,
-                                    current_ts,
-                                    &mut seq,
-                                    cfg_w,
-                                    cfg_h,
-                                    config.framerate,
-                                    config.bitrate_bps,
-                                );
-                            }
-                            // Other events ignored during drain window.
-                        }
-                        Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-                tracing::info!(
-                    "pump_loop: Mechanism G drain_complete={} (bounded 5s)",
-                    drain_complete
-                );
-
-                // Step G2: END_STREAMING — formally end the streaming session.
-                unsafe {
-                    let _ = old_mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-                }
-
-                // Step G3: Drop old handle — forces COM Release on old_mft.
-                // event_gen / codec_api retain AddRef on the underlying object; they remain
-                // valid for GetEvent polling in the drain window above. After G3, both are
-                // re-cast from the fresh IMFTransform in Step G5b before resuming pump_loop.
-                drop(old_mft);
-                tracing::info!("pump_loop: Mechanism G — old IMFTransform dropped");
-
-                // Step G4: Re-activate a fresh IMFTransform from the retained factory.
-                // SAFETY: activate_factory is an MTA-registered COM factory. Calling
-                // ActivateObject again is documented as valid for a new activation cycle.
-                // Empirical: 2nd ActivateObject succeeds on Intel QSV (Phase 0 round 3 #783).
-                match unsafe { activate_factory.ActivateObject::<IMFTransform>() } {
-                    Ok(new_mft) => {
-                        tracing::info!("pump_loop: Mechanism G — fresh IMFTransform acquired");
-                        new_mft
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "pump_loop: Mechanism G — ActivateObject (2nd call) FAILED: 0x{:08X} \
-                             ({e}). Escalate to Mechanism H (restart() API).",
-                            e.code().0
-                        );
-                        // Signal stop so run_encoder_thread exits gracefully.
-                        // The test harness observes ENCODER_DIED via RecvTimeoutError::Disconnected.
-                        state.stop.store(true, Ordering::Release);
-                        // We must return an IMFTransform to satisfy the return type.
-                        // There is no valid handle: panic with full diagnostic context.
-                        // The panic message is captured in the nextest failure output and
-                        // provides the exact HRESULT for the Mechanism H escalation decision.
-                        panic!(
-                            "pump_loop: Mechanism G IRRECOVERABLE — ActivateObject (2nd call) \
-                             rejected with HRESULT 0x{:08X}. Old IMFTransform was already dropped. \
-                             Escalate to Mechanism H (restart() API extension).",
-                            e.code().0
-                        );
-                    }
-                }
-            };
-
-            // Step G5: Unlock the new MFT for async operation.
-            // SAFETY: GetAttributes + SetUINT32 on a freshly-activated MFT.
-            if let Ok(attrs) = unsafe { mft.GetAttributes() } {
-                let _ = unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) };
-            }
-
-            // Step G5b: Re-cast codec_api and event_gen from the new mft.
-            // The previous codec_api and event_gen pointed to the OLD COM object.
-            // After dropping old_mft, those interfaces still hold an AddRef on the old
-            // object; updating them to the new mft ensures GetEvent reads from the
-            // correct event queue and SetValue targets the correct codec state.
-            // SAFETY: IMFTransform for hardware video encoders implements both ICodecAPI
-            // and IMFMediaEventGenerator per Windows docs.
-            match mft.cast::<ICodecAPI>() {
-                Ok(new_codec) => {
-                    codec_api = new_codec;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "pump_loop: Mechanism G — ICodecAPI re-cast FAILED: 0x{:08X}; exiting",
-                        e.code().0
-                    );
-                    state.stop.store(true, Ordering::Release);
-                    break;
-                }
-            }
-            match mft.cast::<IMFMediaEventGenerator>() {
-                Ok(new_evgen) => {
-                    event_gen = new_evgen;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "pump_loop: Mechanism G — IMFMediaEventGenerator re-cast FAILED: 0x{:08X}; exiting",
-                        e.code().0
-                    );
-                    state.stop.store(true, Ordering::Release);
-                    break;
-                }
-            }
-
-            // Step G6: Re-run setup_mft (SetInputType + SetOutputType + FLUSH + BEGIN + START).
-            // After setup_mft, the encoder is in a fresh state; the FIRST encoded frame is IDR
-            // (matching enc.start() 100% empirical evidence).
-            if let Err(e) = setup_mft(&mft, config) {
-                tracing::error!(
-                    "pump_loop: Mechanism G — setup_mft on fresh handle FAILED: {e}; exiting"
-                );
-                state.stop.store(true, Ordering::Release);
-                break;
-            }
-
-            // DD4: re-apply pending bitrate on the fresh ICodecAPI AFTER setup_mft succeeds
-            // but BEFORE resuming ProcessInput. The new IMFTransform's ICodecAPI starts at
-            // EncoderConfig defaults (fresh COM object); callers who called set_bitrate(N)
-            // expect the value to persist across any recreate boundary.
-            //
-            // WHY SWAP-FIRE and not a direct read: if a concurrent set_bitrate(N) arrived
-            // between the G drain start and this point, the SWAP atomically captures the
-            // latest value. If it arrived after our SWAP, it sits in pending_bitrate and the
-            // NEXT pump_loop iteration's normal SWAP picks it up — no loss, no double-apply.
-            // This is the same compare_exchange semantics from Slice 4 DD3, applied here to
-            // preserve the caller contract "set_bitrate value persists until next call or stop".
-            //
-            // DD10: force_keyframe is absent from CodecApiSwap — the recreate IS the keyframe.
-            {
-                let bitrate_swap = swap_pending_codec_settings(state);
-                fire_pending_codec_settings(&codec_api, &bitrate_swap);
-            }
-
-            // Reset counters: fresh activation has no pending NeedInput/HaveOutput credits.
-            ni_count = 0;
-            ho_count = 0;
-            draining = false;
-            *output_format_known = None; // Re-detect format on first packet from fresh handle.
-            tracing::info!(
-                "pump_loop: Mechanism G — recreate complete; resuming pump_loop with fresh IMFTransform"
-            );
-        }
-
         // ── Idle sleep — avoid busy-wait when nothing happened (spec R5, design DD6) ──
         if !event_opt && ni_count == 0 && ho_count == 0 {
             std::thread::sleep(POLLING_SLEEP);
@@ -1716,12 +1638,12 @@ fn pump_loop(
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
 ///
-/// DD10: `force_keyframe` parameter and `MFSampleExtension_CleanPoint` write path
-/// are removed. Intel QSV does not honor CleanPoint mid-stream; NVENC's CleanPoint
-/// path was valid but is superseded by Mechanism G (IMFTransform recreate) which
-/// produces a vendor-uniform IDR at the first frame of a fresh activation.
-/// `MFSampleExtension_CleanPoint` is still READ in `collect_output` for IDR detection
-/// — the read path is unchanged.
+/// The caller is responsible for firing any pending `ICodecAPI::SetValue` calls
+/// (e.g. `CODECAPI_AVEncVideoForceKeyFrame`) BEFORE calling this function, following
+/// the canonical Chromium + FFmpeg ordering (research #808).
+///
+/// The `MFSampleExtension_CleanPoint` attribute is READ (not written) in `collect_output`
+/// for IDR detection — the output-side read path is unchanged (DD7).
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
@@ -1917,8 +1839,9 @@ fn make_variant_u32(value: u32) -> VARIANT {
     v
 }
 
-// DD10: make_variant_bool() deleted — was used exclusively for CODECAPI_AVEncVideoForceKeyFrame.
-// That SetValue call is removed; VT_BOOL is no longer needed.
+// make_variant_bool() remains deleted — VT_BOOL is not used anywhere.
+// CODECAPI_AVEncVideoForceKeyFrame uses make_variant_u32(1) (VT_UI4=1, the correct
+// VARIANT type per MS docs and research #808).
 
 // ── Inherent methods ──────────────────────────────────────────────────────────
 
@@ -1932,14 +1855,9 @@ impl WindowsMftH264Encoder {
     /// **Latency**: Empirically ~250 ms drain roundtrip (Phase 0 trace #710). Plan
     /// `recv_timeout` deadlines accordingly.
     ///
-    /// **For forced mid-stream IDR**, use `request_keyframe_via_recreate()` (Slice 5 —
-    /// Mechanism G). `flush()` alone does NOT produce an IDR on Intel QSV (Phase 0
-    /// round 1 evidence, probe #779).
-    ///
     /// **Production callers MUST NOT call this method.** It is a test affordance for
     /// single-burst short-stream tests. Production callers force IDR via
-    /// `request_keyframe_via_recreate()` and rely on the channel-disconnect DRAIN path
-    /// at pump_loop shutdown.
+    /// `request_keyframe()` and rely on the channel-disconnect DRAIN path at shutdown.
     ///
     /// **Async**: Returns immediately. The DRAIN fires on the next pump_loop iteration
     /// after the NeedInput inner loop completes.
@@ -1950,35 +1868,27 @@ impl WindowsMftH264Encoder {
         self.state.drain_pending.store(true, Ordering::Release);
     }
 
-    /// Request a forced mid-stream IDR by tearing down and recreating the `IMFTransform`.
+    /// Force an IDR frame via `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)`
+    /// called BEFORE the next `ProcessInput`.
     ///
-    /// **Mechanism G** — the only empirically-validated mid-stream IDR path on Intel QSV.
-    /// Phase 0 rounds 1–3 confirmed that no MFT-API message sequence on the SAME handle
-    /// produces IDR on Intel QSV; the round 3 probe (#783) validated G with IDR at
-    /// post-recreate index 0 and encoder alive after the transition.
+    /// This is the production mid-stream IDR mechanism for the Slice 6 R2 architecture.
+    /// It is identical to the trait `request_keyframe()` impl but named explicitly for
+    /// direct use in Phase 0 probes (which live in a separate integration-test crate and
+    /// cannot access `pub(crate)` items). Production callers SHOULD prefer the trait method.
     ///
-    /// **Latency profile** (empirical — Phase 0 round 3 trace #783):
-    /// - In-flight batch drain: variable, ~50–300 ms (depends on priming batch size and
-    ///   COMMAND_DRAIN round-trip; 30-frame priming batch ≈ 250 ms).
-    /// - Tear-down + ActivateObject + setup_mft: ~9 ms.
-    /// - Total from call to first IDR packet: ~60–310 ms typical.
+    /// **Latency**: ~0ms on NVENC (IDR at idx 0); ~33ms on Intel QSV (IDR at idx 1).
+    /// Both within `assert_keyframe_within_next_n_frames(30)` tolerance (P2 evidence #809).
     ///
-    /// **IDR guarantee**: The first encoded frame from a fresh activation is always IDR
-    /// (setup-sequence guarantee; vendor-uniform across Intel QSV and NVENC).
+    /// **HCK compliance**: `CODECAPI_AVEncVideoForceKeyFrame` is a REQUIRED Win8+ hardware
+    /// encoder MFT certification property (research #808). Both NVENC and Intel QSV implement
+    /// it. SetValue rejection is non-fatal — pump_loop WARNs and continues.
     ///
-    /// **Concurrency**: Backed by `AtomicBool::store(true, Release)`. Concurrent calls
-    /// are idempotent — multiple stores collapse to a single recreate (AcqRel swap in
-    /// pump_loop consumes the flag exactly once per G handler invocation).
-    ///
-    /// **Name signals cost**: callers who need predictable IDR timing must factor in drain
-    /// latency. "Next frame is keyframe" is misleading without accounting for the drain
-    /// window; use `request_keyframe_via_recreate()` explicitly when the cost is acceptable.
-    ///
-    /// **Regression probe**: `phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr`
-    /// in `crates/sm-infra/tests/windows_mft_encode.rs` (`#[ignore]`-gated, Host A).
-    pub fn request_keyframe_via_recreate(&self) {
+    /// **Phase 0 probes**: `phase0_nvenc_force_keyframe_via_codecapi_before_processinput`
+    /// and `phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput`
+    /// in `crates/sm-infra/tests/windows_mft_encode.rs` (`#[ignore]`-gated).
+    pub fn request_keyframe_via_force_keyframe_icodecapi(&self) {
         self.state
-            .keyframe_recreate_pending
+            .force_keyframe_icodecapi_pending
             .store(true, Ordering::Release);
     }
 }
@@ -2000,12 +1910,13 @@ impl WindowsMftH264Encoder {
     /// # Safety
     /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
     /// which would be incorrect since COM was never initialised by this constructor.
-    /// `mft_activate_factory` is `None`, so any call to `start()` will return
-    /// `Err(Internal(_))` rather than accessing an invalid COM pointer.
+    /// `mft_activate_factory: None` means `start()` returns `Err(Internal(_))` rather
+    /// than accessing an invalid COM pointer. The test encoder MUST NOT be started.
     fn new_for_validation_test() -> Self {
         Self {
             config: EncoderConfig::default(),
             state: Arc::new(MftEncoderShared::default()),
+            vendor: EncoderVendor::Unknown,
             mft_activate_factory: None,
             handle: None,
             com_initialized: false,
@@ -2163,6 +2074,57 @@ mod tests {
         assert!(
             matches!(err, EncoderError::InvalidConfig(_)),
             "expected InvalidConfig for set_bitrate(0), got {err:?}"
+        );
+    }
+
+    // ─── Slice 6 R2: ForceKeyFrame atomic flag semantics (spec R18, S19-S21) ──
+    //
+    // CI-runnable: new_for_validation_test() bypasses COM/MFT init.
+    // Tests verify the AtomicBool mechanics powering the vendor-uniform IDR mechanism.
+
+    // S19 — flag defaults to false on construction.
+    #[test]
+    fn force_keyframe_icodecapi_pending_defaults_to_false_on_construction() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        assert!(
+            !enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "force_keyframe_icodecapi_pending must be false immediately after construction"
+        );
+    }
+
+    // S20 — calling request_keyframe() sets the flag to true.
+    #[test]
+    fn request_keyframe_sets_force_keyframe_icodecapi_pending_to_true() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        enc.request_keyframe();
+        assert!(
+            enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "force_keyframe_icodecapi_pending must be true after request_keyframe()"
+        );
+    }
+
+    // S21 — swap(false, AcqRel) returns true (was set) and leaves false (consumed once).
+    #[test]
+    fn force_keyframe_icodecapi_pending_swap_consumes_to_false() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        enc.request_keyframe(); // arm the flag
+        let previous = enc
+            .state
+            .force_keyframe_icodecapi_pending
+            .swap(false, Ordering::AcqRel); // simulate pump_loop NeedInput consume
+        assert!(
+            previous,
+            "swap must return true (flag was set by request_keyframe)"
+        );
+        assert!(
+            !enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "flag must be false after swap consume (one-shot semantics)"
         );
     }
 }
