@@ -2993,3 +2993,582 @@ fn phase0_nvenc_cleanpoint_idr_via_input_sample_attribute() {
     //                                  or P3 (Hybrid Mechanism G + CleanPoint on first post-recreate frame).
     let _ = enc.stop();
 }
+
+// ─── Phase 0 Probe P2-NVENC: CODECAPI_AVEncVideoForceKeyFrame BEFORE ProcessInput ─
+//
+// WHY this probe exists:
+//
+// P1 (`phase0_nvenc_cleanpoint_idr_via_input_sample_attribute`) FALSIFIED Candidate A
+// on Host B (NVENC, current driver, branch tip `aee5750`): 30/30 P-frames post-request,
+// zero IDR (engram #807).
+//
+// This probe tests CANDIDATE B (research #808):
+//   `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` called BEFORE
+//   ProcessInput for the target frame — the canonical Chromium + FFmpeg production sequence.
+//
+// WHY this is NOT the Slice 4 SWAP-FIRE pattern:
+//   - Slice 4 (DD1) called SetValue AFTER ProcessInput ("FIRE" step).
+//   - Chromium `media_foundation_video_encode_accelerator_win.cc:2299-2307` and FFmpeg
+//     `libavcodec/mfenc.c::mf_send_frame()` call SetValue BEFORE ProcessInput.
+//   - This timing difference may explain Slice 4's failure on Intel QSV.
+//
+// WHY VT_UI4 (not VT_BOOL):
+//   - Slice 4 used VT_BOOL; the MS-documented type is VT_UI4=1 (research #808).
+//   - NVENC is a required HCK Win8+ certification property: NVENC MUST implement it.
+//
+// Cadence (same as P1 for cross-probe comparability):
+//   1. Create encoder (vendor detection logs NvidiaNvenc at INFO).
+//   2. Start, submit 5 priming frames → `enc.flush()` → drain (log every packet).
+//   3. Call `enc.request_keyframe_via_force_keyframe_icodecapi()` — arms the pending flag.
+//      pump_loop consumes it BEFORE ProcessInput on the next NeedInput credit.
+//   4. Submit 30 post-request frames → `enc.flush()` → drain (log every packet).
+//   5. Print SUMMARY block: totals, first post-request packet index / is_keyframe / raw_prefix.
+//
+// No assertions — observation-only. Results feed the P2 decision tree:
+//   P2-NVENC PASS + P2-Intel-QSV PASS → Candidate B is vendor-uniform (replace Mechanism G entirely).
+//   P2-NVENC PASS + P2-Intel-QSV FAIL → Candidate B is NVENC-only (dispatch NVENC→B, Intel→G).
+//   P2-NVENC FAIL + P2-Intel-QSV PASS → Candidate B is Intel-only (unlikely; escalate to P3).
+//   P2-NVENC FAIL + P2-Intel-QSV FAIL → Escalate to Candidate C (GOP toggle) or P3.
+//
+// Run on Host B (NVIDIA NVENC):
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run --release --features hw-encoder -p sm-infra `
+//     --test windows_mft_encode phase0_nvenc_force_keyframe_via_codecapi_before_processinput `
+//     --run-ignored only --no-capture
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 Slice 6 R2 P2-NVENC — ForceKeyFrame via ICodecAPI BEFORE ProcessInput on Host B (NVIDIA); no assertions"]
+fn phase0_nvenc_force_keyframe_via_codecapi_before_processinput() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    // 5 priming frames: establishes a healthy encoder session with setup-sequence IDR at idx 0.
+    const PRIMING_FRAMES: u64 = 5;
+    // 30 post-request frames: matches the canonical probe cadence (P1, C0.b, Slice 5 round 3).
+    // ForceKeyFrame should produce IDR at index 0 or 1 if NVENC honours it; 30 ensures we see all.
+    const POST_REQUEST_FRAMES: u64 = 30;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    // Inline packet logger — same format as P1 for cross-probe comparability.
+    let log_pkt = |tag: &str, idx: u32, pkt: &EncodedPacket| {
+        let len = pkt.data.len();
+        let prefix_len = len.min(8);
+        let prefix = &pkt.data[..prefix_len];
+        let has_3byte_start = len >= 3
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x01;
+        let has_4byte_start = len >= 4
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x00
+            && pkt.data[3] == 0x01;
+        tracing::info!(
+            "[NVENC-P2] {} pkt {} — len={} is_keyframe={} \
+             raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+        println!(
+            "[NVENC-P2] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+    };
+
+    // ── Batch 1: priming drain ────────────────────────────────────────────────
+    tracing::info!("[NVENC-P2] submitting {} priming frames", PRIMING_FRAMES);
+    for i in 0..PRIMING_FRAMES {
+        send_frame(i);
+    }
+
+    tracing::info!("[NVENC-P2] flush() #1 — COMMAND_DRAIN to collect priming packets");
+    enc.flush();
+
+    let mut priming_count = 0u32;
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(pkt) => {
+                log_pkt("PRIMING", priming_count, &pkt);
+                priming_count += 1;
+                if priming_count >= (PRIMING_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P2] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                println!(
+                    "[NVENC-P2] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                let _ = enc.stop();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P2] OUTCOME=EMPTY_DRAIN — no priming packets before 10s timeout"
+                    );
+                    println!("[NVENC-P2] OUTCOME=EMPTY_DRAIN — no priming packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P2] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                    println!(
+                        "[NVENC-P2] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[NVENC-P2] PRIMING SUMMARY — total_priming={}",
+        priming_count
+    );
+    println!("[NVENC-P2] PRIMING SUMMARY total_priming={}", priming_count);
+
+    // ── Candidate B: arm ForceKeyFrame via request_keyframe_via_force_keyframe_icodecapi() ──
+    //
+    // Sets `force_keyframe_icodecapi_pending=true` (atomic Release store).
+    // pump_loop consumes it on the next NeedInput credit:
+    //   swaps to false (AcqRel) → calls
+    //   `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)`
+    //   BEFORE submit_frame / ProcessInput (canonical Chromium + FFmpeg ordering).
+    //
+    // Bypasses vendor dispatch in request_keyframe() — directly arms Candidate B
+    // regardless of EncoderVendor. This is intentional: probe tests the raw mechanism.
+    tracing::info!(
+        "[NVENC-P2] request_keyframe_via_force_keyframe_icodecapi() — arming Candidate B \
+         (ICodecAPI::SetValue BEFORE ProcessInput, VT_UI4=1)"
+    );
+    enc.request_keyframe_via_force_keyframe_icodecapi();
+
+    // ── Batch 2: post-request drain ───────────────────────────────────────────
+    tracing::info!(
+        "[NVENC-P2] submitting {} post-request frames",
+        POST_REQUEST_FRAMES
+    );
+    for i in 0..POST_REQUEST_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
+
+    tracing::info!("[NVENC-P2] flush() #2 — COMMAND_DRAIN to collect post-request packets");
+    enc.flush();
+
+    let mut post_count = 0u32;
+    let mut first_post_is_keyframe: Option<bool> = None;
+    let mut first_post_raw_prefix: Option<Vec<u8>> = None;
+    let mut first_post_len: Option<usize> = None;
+
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(pkt) => {
+                if post_count == 0 {
+                    first_post_is_keyframe = Some(pkt.is_keyframe);
+                    first_post_len = Some(pkt.data.len());
+                    first_post_raw_prefix = Some(pkt.data[..pkt.data.len().min(8)].to_vec());
+                }
+                log_pkt("POST-REQUEST", post_count, &pkt);
+                post_count += 1;
+                if post_count >= (POST_REQUEST_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P2] OUTCOME=ENCODER_DIED — pump thread exited after \
+                     request_keyframe_via_force_keyframe_icodecapi + flush; \
+                     {} post-request packets received",
+                    post_count
+                );
+                println!(
+                    "[NVENC-P2] OUTCOME=ENCODER_DIED after {} post-request packets",
+                    post_count
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if post_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P2] OUTCOME=EMPTY_DRAIN — no post-request packets before 15s timeout; \
+                         pump may have failed to deliver frames after ForceKeyFrame SetValue"
+                    );
+                    println!("[NVENC-P2] OUTCOME=EMPTY_DRAIN — no post-request packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P2] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                    println!(
+                        "[NVENC-P2] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // ── SUMMARY block ─────────────────────────────────────────────────────────
+    //
+    // Compare first_post_request_is_keyframe against P1 result and Intel QSV P2 result.
+    // Decision tree:
+    //   PASS (is_keyframe=true)  → Candidate B works on NVENC; compare with Intel QSV P2.
+    //   FAIL (is_keyframe=false) → Candidate B does not produce IDR on NVENC; escalate to P3.
+    let first_post_idx = if post_count > 0 { Some(0u32) } else { None };
+
+    tracing::info!(
+        "[NVENC-P2] SUMMARY — \
+         total_priming={} \
+         total_post_request={} \
+         first_post_request_idx={:?} \
+         first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} \
+         first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+    println!(
+        "[NVENC-P2] SUMMARY total_priming={} total_post_request={} \
+         first_post_request_idx={:?} first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+
+    // Observation-only probe: no assertions.
+    let _ = enc.stop();
+}
+
+// ─── Phase 0 Probe P2-Intel QSV: CODECAPI_AVEncVideoForceKeyFrame BEFORE ProcessInput ─
+//
+// WHY this probe exists:
+//
+// Slice 4 DD10 comment states: "Intel QSV does not honor mid-stream ICodecAPI ForceKeyFrame."
+// That verdict was reached using the SWAP-FIRE pattern (SetValue AFTER ProcessInput, VT_BOOL).
+// Research #808 identifies TWO defects in the Slice 4 test:
+//   1. TIMING WRONG: Called AFTER ProcessInput, not BEFORE (Chromium calls it BEFORE).
+//   2. VARIANT TYPE WRONG: Used VT_BOOL instead of VT_UI4 (the MS-documented type).
+//
+// This probe RE-VALIDATES the Intel QSV verdict with the correct sequence:
+//   `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` BEFORE ProcessInput.
+//
+// If Intel QSV DOES honour ForceKeyFrame with the canonical sequence, Candidate B would
+// become VENDOR-UNIFORM (both NVENC and Intel QSV) — eliminating the need for vendor
+// dispatch and potentially replacing Mechanism G entirely. This is a high-value finding.
+//
+// Cadence (same as P2-NVENC for cross-probe comparability):
+//   1. Create encoder (vendor detection logs IntelQsv at INFO).
+//   2. Start, submit 5 priming frames → `enc.flush()` → drain (log every packet).
+//   3. Call `enc.request_keyframe_via_force_keyframe_icodecapi()` — arms the pending flag.
+//      pump_loop consumes it BEFORE ProcessInput on the next NeedInput credit.
+//   4. Submit 30 post-request frames → `enc.flush()` → drain (log every packet).
+//   5. Print SUMMARY block: totals, first post-request packet index / is_keyframe / raw_prefix.
+//
+// No assertions — observation-only. Results combined with P2-NVENC result for final decision.
+//
+// Run on Host A (Intel QSV):
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run --release --features hw-encoder -p sm-infra `
+//     --test windows_mft_encode phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput `
+//     --run-ignored only --no-capture
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 Slice 6 R2 P2-Intel — re-validates ForceKeyFrame via ICodecAPI BEFORE ProcessInput (VT_UI4) on Host A (Intel QSV); no assertions"]
+fn phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    // 5 priming frames: establishes a healthy encoder session with setup-sequence IDR at idx 0.
+    const PRIMING_FRAMES: u64 = 5;
+    // 30 post-request frames: matches the canonical probe cadence.
+    // If Intel QSV honours ForceKeyFrame BEFORE ProcessInput + VT_UI4, IDR should appear
+    // within the first 1-2 frames; 30 provides ample margin for any pipeline latency.
+    const POST_REQUEST_FRAMES: u64 = 30;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    // Inline packet logger — [INTEL-P2] prefix for cross-probe log disambiguation.
+    let log_pkt = |tag: &str, idx: u32, pkt: &EncodedPacket| {
+        let len = pkt.data.len();
+        let prefix_len = len.min(8);
+        let prefix = &pkt.data[..prefix_len];
+        let has_3byte_start = len >= 3
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x01;
+        let has_4byte_start = len >= 4
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x00
+            && pkt.data[3] == 0x01;
+        tracing::info!(
+            "[INTEL-P2] {} pkt {} — len={} is_keyframe={} \
+             raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+        println!(
+            "[INTEL-P2] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+    };
+
+    // ── Batch 1: priming drain ────────────────────────────────────────────────
+    tracing::info!("[INTEL-P2] submitting {} priming frames", PRIMING_FRAMES);
+    for i in 0..PRIMING_FRAMES {
+        send_frame(i);
+    }
+
+    tracing::info!("[INTEL-P2] flush() #1 — COMMAND_DRAIN to collect priming packets");
+    enc.flush();
+
+    let mut priming_count = 0u32;
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(pkt) => {
+                log_pkt("PRIMING", priming_count, &pkt);
+                priming_count += 1;
+                if priming_count >= (PRIMING_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[INTEL-P2] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                println!(
+                    "[INTEL-P2] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                let _ = enc.stop();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_count == 0 {
+                    tracing::warn!(
+                        "[INTEL-P2] OUTCOME=EMPTY_DRAIN — no priming packets before 10s timeout"
+                    );
+                    println!("[INTEL-P2] OUTCOME=EMPTY_DRAIN — no priming packets received");
+                } else {
+                    tracing::info!(
+                        "[INTEL-P2] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                    println!(
+                        "[INTEL-P2] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[INTEL-P2] PRIMING SUMMARY — total_priming={}",
+        priming_count
+    );
+    println!(
+        "[INTEL-P2] PRIMING SUMMARY total_priming={}",
+        priming_count
+    );
+
+    // ── Candidate B: arm ForceKeyFrame via request_keyframe_via_force_keyframe_icodecapi() ──
+    //
+    // RE-VALIDATION of Slice 4's "Intel QSV does not honor ForceKeyFrame" verdict.
+    // Slice 4 tested: SetValue AFTER ProcessInput + VT_BOOL (both wrong per research #808).
+    // This probe tests: SetValue BEFORE ProcessInput + VT_UI4 (canonical Chromium sequence).
+    //
+    // Sets `force_keyframe_icodecapi_pending=true` (atomic Release store).
+    // pump_loop consumes it on the next NeedInput credit before submit_frame / ProcessInput.
+    tracing::info!(
+        "[INTEL-P2] request_keyframe_via_force_keyframe_icodecapi() — re-validating \
+         Candidate B on Intel QSV with canonical BEFORE+VT_UI4 sequence \
+         (Slice 4 verdict used AFTER+VT_BOOL — research #808)"
+    );
+    enc.request_keyframe_via_force_keyframe_icodecapi();
+
+    // ── Batch 2: post-request drain ───────────────────────────────────────────
+    tracing::info!(
+        "[INTEL-P2] submitting {} post-request frames",
+        POST_REQUEST_FRAMES
+    );
+    for i in 0..POST_REQUEST_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
+
+    tracing::info!("[INTEL-P2] flush() #2 — COMMAND_DRAIN to collect post-request packets");
+    enc.flush();
+
+    let mut post_count = 0u32;
+    let mut first_post_is_keyframe: Option<bool> = None;
+    let mut first_post_raw_prefix: Option<Vec<u8>> = None;
+    let mut first_post_len: Option<usize> = None;
+
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(pkt) => {
+                if post_count == 0 {
+                    first_post_is_keyframe = Some(pkt.is_keyframe);
+                    first_post_len = Some(pkt.data.len());
+                    first_post_raw_prefix = Some(pkt.data[..pkt.data.len().min(8)].to_vec());
+                }
+                log_pkt("POST-REQUEST", post_count, &pkt);
+                post_count += 1;
+                if post_count >= (POST_REQUEST_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[INTEL-P2] OUTCOME=ENCODER_DIED — pump thread exited after \
+                     request_keyframe_via_force_keyframe_icodecapi + flush; \
+                     {} post-request packets received",
+                    post_count
+                );
+                println!(
+                    "[INTEL-P2] OUTCOME=ENCODER_DIED after {} post-request packets",
+                    post_count
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if post_count == 0 {
+                    tracing::warn!(
+                        "[INTEL-P2] OUTCOME=EMPTY_DRAIN — no post-request packets before 15s timeout; \
+                         pump may have failed to deliver frames after ForceKeyFrame SetValue"
+                    );
+                    println!("[INTEL-P2] OUTCOME=EMPTY_DRAIN — no post-request packets received");
+                } else {
+                    tracing::info!(
+                        "[INTEL-P2] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                    println!(
+                        "[INTEL-P2] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // ── SUMMARY block ─────────────────────────────────────────────────────────
+    //
+    // Cross-reference with P2-NVENC result to determine vendor coverage of Candidate B.
+    // Decision tree:
+    //   PASS (is_keyframe=true) + P2-NVENC PASS → Candidate B is VENDOR-UNIFORM.
+    //                                              Can replace Mechanism G for BOTH vendors.
+    //   PASS (is_keyframe=true) + P2-NVENC FAIL → Candidate B is Intel-only (unlikely).
+    //   FAIL (is_keyframe=false) + P2-NVENC PASS → Candidate B is NVENC-only (dispatch required).
+    //   FAIL (is_keyframe=false) + P2-NVENC FAIL → Escalate to Candidate C (GOP toggle) or P3.
+    let first_post_idx = if post_count > 0 { Some(0u32) } else { None };
+
+    tracing::info!(
+        "[INTEL-P2] SUMMARY — \
+         total_priming={} \
+         total_post_request={} \
+         first_post_request_idx={:?} \
+         first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} \
+         first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+    println!(
+        "[INTEL-P2] SUMMARY total_priming={} total_post_request={} \
+         first_post_request_idx={:?} first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+
+    // Observation-only probe: no assertions.
+    let _ = enc.stop();
+}
