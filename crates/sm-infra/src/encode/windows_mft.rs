@@ -2078,4 +2078,52 @@ mod tests {
             "expected InvalidConfig for set_bitrate(0), got {err:?}"
         );
     }
+
+    // ─── Slice 6 R2: ForceKeyFrame atomic flag semantics (spec R18, S19-S21) ──
+    //
+    // CI-runnable: new_for_validation_test() bypasses COM/MFT init.
+    // Tests verify the AtomicBool mechanics powering the vendor-uniform IDR mechanism.
+
+    // S19 — flag defaults to false on construction.
+    #[test]
+    fn force_keyframe_icodecapi_pending_defaults_to_false_on_construction() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        assert!(
+            !enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "force_keyframe_icodecapi_pending must be false immediately after construction"
+        );
+    }
+
+    // S20 — calling request_keyframe() sets the flag to true.
+    #[test]
+    fn request_keyframe_sets_force_keyframe_icodecapi_pending_to_true() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        enc.request_keyframe();
+        assert!(
+            enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "force_keyframe_icodecapi_pending must be true after request_keyframe()"
+        );
+    }
+
+    // S21 — swap(false, AcqRel) returns true (was set) and leaves false (consumed once).
+    #[test]
+    fn force_keyframe_icodecapi_pending_swap_consumes_to_false() {
+        let enc = WindowsMftH264Encoder::new_for_validation_test();
+        enc.request_keyframe(); // arm the flag
+        let previous = enc
+            .state
+            .force_keyframe_icodecapi_pending
+            .swap(false, Ordering::AcqRel); // simulate pump_loop NeedInput consume
+        assert!(previous, "swap must return true (flag was set by request_keyframe)");
+        assert!(
+            !enc.state
+                .force_keyframe_icodecapi_pending
+                .load(Ordering::Acquire),
+            "flag must be false after swap consume (one-shot semantics)"
+        );
+    }
 }
