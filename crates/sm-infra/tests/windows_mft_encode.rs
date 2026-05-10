@@ -18,6 +18,38 @@
 //!     cargo nextest run --workspace
 //!
 //! skips every test in this file (all are `#[ignore]`). This satisfies R11/T11.1.
+// Phase 0 probes — empirical regression evidence for Slice 6 R2 (and history):
+//
+//   * `phase0_nvenc_idr_packet_format_dump`
+//     Priming format diagnostic. Confirms NVENC emits 4-byte Annex-B start codes
+//     for the priming IDR (refutes a Slice 5/6 R1 hypothesis). Engram #800.
+//
+//   * `phase0_nvenc_post_recreate_idr_format_dump`
+//     Mechanism G falsification on NVENC. 29/29 P-frames post-recreate;
+//     setup-sequence guarantee fails. Engram #801.
+//
+//   * `phase0_nvenc_cleanpoint_idr_via_input_sample_attribute`
+//     CleanPoint INPUT-write falsification on NVENC. 30/30 P-frames despite
+//     the (now-deleted) DD10 inline comment claiming "NVENC honored CleanPoint."
+//     Engram #807.
+//
+//   * `phase0_nvenc_force_keyframe_via_codecapi_before_processinput`
+//     P2 success evidence on NVENC. ForceKeyFrame BEFORE+VT_UI4 emits IDR at
+//     idx 0 (len=49998). Engram #809.
+//
+//   * `phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput`
+//     P2 success evidence on Intel QSV — retroactive correction of Slice 4's
+//     "Intel QSV doesn't honor ForceKeyFrame" verdict. IDR at idx 1 (1-frame
+//     in-flight latency, within tolerance). Engram #809.
+//
+// All probes are #[ignore]-gated; run on demand on the appropriate host with:
+//   cargo nextest run --release --features hw-encoder -p sm-infra \
+//     --test windows_mft_encode <probe_name> --run-ignored only --no-capture
+//
+// Deleted probes (historical record in Slice 5 archive engram #791, rounds #779/#783):
+//   phase0_intel_qsv_idr_via_drain_resume_first_frame_is_idr    (round 1 — drain+resume falsification)
+//   phase0_intel_qsv_idr_via_drain_resume_latency_measure       (round 1 — drain+resume latency)
+//   phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr (round 3 — Mechanism G validation)
 #![cfg(all(target_os = "windows", feature = "hw-encoder"))]
 
 use std::sync::{Arc, mpsc};
