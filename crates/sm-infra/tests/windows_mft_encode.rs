@@ -2223,3 +2223,182 @@ fn phase0_intel_qsv_idr_via_imftransform_recreate_first_frame_is_idr() {
 
     let _ = enc.stop();
 }
+
+// ─── Phase 0 — Slice 6 NVENC `is_keyframe` flag: packet format probe ──────────
+//
+// Mechanism 1 hypothesis (explore #793, discovery #794): NVENC emits H.264 in
+// Annex-B format with 3-byte start codes (`0x00 0x00 0x01`), not the 4-byte form
+// (`0x00 0x00 0x00 0x01`) emitted by Intel QSV.  The pre-fix `is_annex_b_now`
+// expression in `collect_output` (windows_mft.rs:1814) requires all four bytes,
+// so 3-byte Annex-B packets are misclassified as AVCC and routed through
+// `avcc_to_annex_b`, corrupting the buffer and causing `is_keyframe = false` on
+// genuine NVENC IDR access units.
+//
+// This probe is Host B (NVIDIA NVENC) empirical evidence before the C1 RED / C2
+// GREEN fix commits.  It logs the raw bytes of the FIRST packet received so the
+// team can confirm whether the start code is 3-byte or 4-byte.  No assertion is
+// made — the trace log is the deliverable (DD5, Slice 6 design).
+//
+// Retained as a permanent #[ignore]-gated regression guard after Slice 6 merges,
+// following the Slice 5 DD7 / Slice 4 DD7 precedent.  Re-running on a future
+// driver update provides cheap evidence of format continuity vs. vendor changes.
+//
+// Run on Host B (NVIDIA NVENC):
+//
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run --release --features hw-encoder -p sm-infra `
+//     --test windows_mft_encode phase0_nvenc_idr_packet_format_dump `
+//     --run-ignored only --no-capture
+//
+// Expected result confirming Mechanism 1:
+//   raw_prefix on pkt 0: [00, 00, 01, ...] (3-byte Annex-B start code)
+
+/// Probe — dump the raw byte prefix of the first NVENC output packet.
+///
+/// Hypothesis: NVENC emits 3-byte Annex-B start codes (`0x00 0x00 0x01`), not the
+/// 4-byte form emitted by Intel QSV.  If confirmed, the `is_annex_b_now` expression
+/// at windows_mft.rs:1814 misclassifies NVENC packets as AVCC, corrupting IDR output.
+///
+/// This probe is observation-only (no assertions) — the trace is the deliverable.
+/// Retained post-Slice-6 as DD7-style regression evidence vs. future driver changes.
+///
+/// Cadence:
+///   1. Create encoder, start pump.
+///   2. Submit 5 synthetic frames → `enc.flush()` → drain output.
+///   3. Log: `raw_bytes[0..min(8, len)]` hex, `raw_bytes.len()`, `is_keyframe`.
+///   4. Also log 3-byte vs 4-byte Annex-B start code match (`0x00 0x00 0x01` vs
+///      `0x00 0x00 0x00 0x01`). `MFSampleExtension_CleanPoint` is internal to
+///      `collect_output`; `pkt.is_keyframe` = `clean_point || annex_b_contains_idr`.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 Slice 6 probe — NVENC packet format dump on Host B (NVIDIA); captures Mechanism 1 evidence"]
+fn phase0_nvenc_idr_packet_format_dump() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    // 5 frames is enough to trigger the SPS+PPS+IDR access unit on session open.
+    // A larger batch is not needed: the very first output packet is the one under
+    // investigation (start-code format is set by the encoder at session open).
+    const SUBMIT_FRAMES: u64 = 5;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    tracing::info!("[NVENC-P0] submitting {} synthetic frames", SUBMIT_FRAMES);
+    for i in 0..SUBMIT_FRAMES {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    }
+
+    tracing::info!("[NVENC-P0] flush() — COMMAND_DRAIN to force packet emission");
+    enc.flush();
+
+    let mut pkt_idx = 0u32;
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(pkt) => {
+                let len = pkt.data.len();
+                let prefix_len = len.min(8);
+                let prefix = &pkt.data[..prefix_len];
+
+                // Inline Annex-B start-code detection for observation purposes.
+                // These are the same byte patterns used by `is_annex_b_now` (pre-fix:
+                // 4-byte only) and the proposed fix (3-byte OR 4-byte, DD1).
+                let has_3byte_start = len >= 3
+                    && pkt.data[0] == 0x00
+                    && pkt.data[1] == 0x00
+                    && pkt.data[2] == 0x01;
+                let has_4byte_start = len >= 4
+                    && pkt.data[0] == 0x00
+                    && pkt.data[1] == 0x00
+                    && pkt.data[2] == 0x00
+                    && pkt.data[3] == 0x01;
+
+                tracing::info!(
+                    "[NVENC-P0] pkt {} — len={} is_keyframe={} \
+                     raw_prefix={:02x?} \
+                     has_3byte_annex_b={} has_4byte_annex_b={}",
+                    pkt_idx,
+                    len,
+                    pkt.is_keyframe,
+                    prefix,
+                    has_3byte_start,
+                    has_4byte_start,
+                );
+
+                // `is_keyframe` reflects `MFSampleExtension_CleanPoint || annex_b_contains_idr`.
+                // Both CleanPoint read and IDR scan are encapsulated inside collect_output;
+                // logging pkt.is_keyframe is the only observable from this test boundary.
+                println!(
+                    "[NVENC-P0] pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
+                     has_3byte_annex_b={} has_4byte_annex_b={}",
+                    pkt_idx,
+                    len,
+                    pkt.is_keyframe,
+                    prefix,
+                    has_3byte_start,
+                    has_4byte_start,
+                );
+
+                pkt_idx += 1;
+                // Collect up to SUBMIT_FRAMES + pipeline depth (max 10 packets).
+                if pkt_idx >= (SUBMIT_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P0] OUTCOME=ENCODER_DIED — pump thread exited unexpectedly after {} packets",
+                    pkt_idx
+                );
+                println!(
+                    "[NVENC-P0] OUTCOME=ENCODER_DIED after {} packets",
+                    pkt_idx
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if pkt_idx == 0 {
+                    tracing::warn!(
+                        "[NVENC-P0] OUTCOME=EMPTY_DRAIN — no packets before 10s timeout; \
+                         flush() may not have triggered output (harness misconfigured?)"
+                    );
+                    println!("[NVENC-P0] OUTCOME=EMPTY_DRAIN — no packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P0] drain complete — {} packets received",
+                        pkt_idx
+                    );
+                    println!("[NVENC-P0] drain complete — {} packets received", pkt_idx);
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[NVENC-P0] SUMMARY — total_packets={} \
+         (check raw_prefix on pkt 0: [00, 00, 01, ..] = 3-byte Annex-B → Mechanism 1 confirmed; \
+         [00, 00, 00, 01, ..] = 4-byte Annex-B → QSV-identical, no pre-fix bug on NVENC)",
+        pkt_idx
+    );
+    println!(
+        "[NVENC-P0] SUMMARY total_packets={} — see raw_prefix on pkt 0 for format verdict",
+        pkt_idx
+    );
+
+    // Observation-only probe: no assertions.
+    // The trace log is the deliverable for the Slice 6 design gate (DD5, S8).
+    let _ = enc.stop();
+}
