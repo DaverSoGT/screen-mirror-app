@@ -240,7 +240,10 @@ pub struct WindowsMftH264Encoder {
     /// (P2 evidence #809, design DD5). See `EncoderVendor`.
     // WHY: field is kept for future diagnostic use (vendor-specific quirk flags, metrics)
     // and is populated by new() from CLSID detection; not yet read back in Slice 6 R2.
-    #[expect(dead_code, reason = "populated for future diagnostic use; no behavioral consumer in Slice 6 R2")]
+    #[expect(
+        dead_code,
+        reason = "populated for future diagnostic use; no behavioral consumer in Slice 6 R2"
+    )]
     vendor: EncoderVendor,
     /// The winning `IMFActivate` selected during the destructive probe in `new()`.
     ///
@@ -1528,12 +1531,7 @@ fn pump_loop(
                         }
                     }
 
-                    match submit_frame(
-                        &mft,
-                        &nv12_scratch,
-                        frame.timestamp,
-                        frame_dur_100ns,
-                    ) {
+                    match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
@@ -2118,7 +2116,10 @@ mod tests {
             .state
             .force_keyframe_icodecapi_pending
             .swap(false, Ordering::AcqRel); // simulate pump_loop NeedInput consume
-        assert!(previous, "swap must return true (flag was set by request_keyframe)");
+        assert!(
+            previous,
+            "swap must return true (flag was set by request_keyframe)"
+        );
         assert!(
             !enc.state
                 .force_keyframe_icodecapi_pending

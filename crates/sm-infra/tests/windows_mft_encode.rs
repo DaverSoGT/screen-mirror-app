@@ -1,4 +1,4 @@
-﻿//! Hardware H.264 MFT encoder integration tests.
+//! Hardware H.264 MFT encoder integration tests.
 //!
 //! All tests are gated `#[cfg(all(target_os = "windows", feature = "hw-encoder"))]`
 //! and marked `#[ignore]` because they require a Windows host with a dedicated GPU
@@ -1692,10 +1692,8 @@ fn phase0_nvenc_idr_packet_format_dump() {
                 // Inline Annex-B start-code detection for observation purposes.
                 // These are the same byte patterns used by `is_annex_b_now` (pre-fix:
                 // 4-byte only) and the proposed fix (3-byte OR 4-byte, DD1).
-                let has_3byte_start = len >= 3
-                    && pkt.data[0] == 0x00
-                    && pkt.data[1] == 0x00
-                    && pkt.data[2] == 0x01;
+                let has_3byte_start =
+                    len >= 3 && pkt.data[0] == 0x00 && pkt.data[1] == 0x00 && pkt.data[2] == 0x01;
                 let has_4byte_start = len >= 4
                     && pkt.data[0] == 0x00
                     && pkt.data[1] == 0x00
@@ -1720,12 +1718,7 @@ fn phase0_nvenc_idr_packet_format_dump() {
                 println!(
                     "[NVENC-P0] pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
                      has_3byte_annex_b={} has_4byte_annex_b={}",
-                    pkt_idx,
-                    len,
-                    pkt.is_keyframe,
-                    prefix,
-                    has_3byte_start,
-                    has_4byte_start,
+                    pkt_idx, len, pkt.is_keyframe, prefix, has_3byte_start, has_4byte_start,
                 );
 
                 pkt_idx += 1;
@@ -1739,10 +1732,7 @@ fn phase0_nvenc_idr_packet_format_dump() {
                     "[NVENC-P0] OUTCOME=ENCODER_DIED — pump thread exited unexpectedly after {} packets",
                     pkt_idx
                 );
-                println!(
-                    "[NVENC-P0] OUTCOME=ENCODER_DIED after {} packets",
-                    pkt_idx
-                );
+                println!("[NVENC-P0] OUTCOME=ENCODER_DIED after {} packets", pkt_idx);
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1753,10 +1743,7 @@ fn phase0_nvenc_idr_packet_format_dump() {
                     );
                     println!("[NVENC-P0] OUTCOME=EMPTY_DRAIN — no packets received");
                 } else {
-                    tracing::info!(
-                        "[NVENC-P0] drain complete — {} packets received",
-                        pkt_idx
-                    );
+                    tracing::info!("[NVENC-P0] drain complete — {} packets received", pkt_idx);
                     println!("[NVENC-P0] drain complete — {} packets received", pkt_idx);
                 }
                 break;
@@ -1867,10 +1854,8 @@ fn phase0_nvenc_post_recreate_idr_format_dump() {
         let len = pkt.data.len();
         let prefix_len = len.min(8);
         let prefix = &pkt.data[..prefix_len];
-        let has_3byte_start = len >= 3
-            && pkt.data[0] == 0x00
-            && pkt.data[1] == 0x00
-            && pkt.data[2] == 0x01;
+        let has_3byte_start =
+            len >= 3 && pkt.data[0] == 0x00 && pkt.data[1] == 0x00 && pkt.data[2] == 0x01;
         let has_4byte_start = len >= 4
             && pkt.data[0] == 0x00
             && pkt.data[1] == 0x00
@@ -1891,13 +1876,7 @@ fn phase0_nvenc_post_recreate_idr_format_dump() {
         println!(
             "[NVENC-P0b] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
              has_3byte_annex_b={} has_4byte_annex_b={}",
-            tag,
-            idx,
-            len,
-            pkt.is_keyframe,
-            prefix,
-            has_3byte_start,
-            has_4byte_start,
+            tag, idx, len, pkt.is_keyframe, prefix, has_3byte_start, has_4byte_start,
         );
     };
 
@@ -1958,7 +1937,10 @@ fn phase0_nvenc_post_recreate_idr_format_dump() {
         "[NVENC-P0b] PRIMING SUMMARY — total_priming={}",
         priming_count
     );
-    println!("[NVENC-P0b] PRIMING SUMMARY total_priming={}", priming_count);
+    println!(
+        "[NVENC-P0b] PRIMING SUMMARY total_priming={}",
+        priming_count
+    );
 
     // ── Mechanism G (HISTORICAL — deleted in Slice 6 R2) ─────────────────────
     //
@@ -2154,10 +2136,8 @@ fn phase0_nvenc_cleanpoint_idr_via_input_sample_attribute() {
         let len = pkt.data.len();
         let prefix_len = len.min(8);
         let prefix = &pkt.data[..prefix_len];
-        let has_3byte_start = len >= 3
-            && pkt.data[0] == 0x00
-            && pkt.data[1] == 0x00
-            && pkt.data[2] == 0x01;
+        let has_3byte_start =
+            len >= 3 && pkt.data[0] == 0x00 && pkt.data[1] == 0x00 && pkt.data[2] == 0x01;
         let has_4byte_start = len >= 4
             && pkt.data[0] == 0x00
             && pkt.data[1] == 0x00
@@ -2178,13 +2158,7 @@ fn phase0_nvenc_cleanpoint_idr_via_input_sample_attribute() {
         println!(
             "[NVENC-P1] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
              has_3byte_annex_b={} has_4byte_annex_b={}",
-            tag,
-            idx,
-            len,
-            pkt.is_keyframe,
-            prefix,
-            has_3byte_start,
-            has_4byte_start,
+            tag, idx, len, pkt.is_keyframe, prefix, has_3byte_start, has_4byte_start,
         );
     };
 
@@ -2453,10 +2427,8 @@ fn phase0_nvenc_force_keyframe_via_codecapi_before_processinput() {
         let len = pkt.data.len();
         let prefix_len = len.min(8);
         let prefix = &pkt.data[..prefix_len];
-        let has_3byte_start = len >= 3
-            && pkt.data[0] == 0x00
-            && pkt.data[1] == 0x00
-            && pkt.data[2] == 0x01;
+        let has_3byte_start =
+            len >= 3 && pkt.data[0] == 0x00 && pkt.data[1] == 0x00 && pkt.data[2] == 0x01;
         let has_4byte_start = len >= 4
             && pkt.data[0] == 0x00
             && pkt.data[1] == 0x00
@@ -2477,13 +2449,7 @@ fn phase0_nvenc_force_keyframe_via_codecapi_before_processinput() {
         println!(
             "[NVENC-P2] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
              has_3byte_annex_b={} has_4byte_annex_b={}",
-            tag,
-            idx,
-            len,
-            pkt.is_keyframe,
-            prefix,
-            has_3byte_start,
-            has_4byte_start,
+            tag, idx, len, pkt.is_keyframe, prefix, has_3byte_start, has_4byte_start,
         );
     };
 
@@ -2736,10 +2702,8 @@ fn phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput() {
         let len = pkt.data.len();
         let prefix_len = len.min(8);
         let prefix = &pkt.data[..prefix_len];
-        let has_3byte_start = len >= 3
-            && pkt.data[0] == 0x00
-            && pkt.data[1] == 0x00
-            && pkt.data[2] == 0x01;
+        let has_3byte_start =
+            len >= 3 && pkt.data[0] == 0x00 && pkt.data[1] == 0x00 && pkt.data[2] == 0x01;
         let has_4byte_start = len >= 4
             && pkt.data[0] == 0x00
             && pkt.data[1] == 0x00
@@ -2760,13 +2724,7 @@ fn phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput() {
         println!(
             "[INTEL-P2] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
              has_3byte_annex_b={} has_4byte_annex_b={}",
-            tag,
-            idx,
-            len,
-            pkt.is_keyframe,
-            prefix,
-            has_3byte_start,
-            has_4byte_start,
+            tag, idx, len, pkt.is_keyframe, prefix, has_3byte_start, has_4byte_start,
         );
     };
 
@@ -2826,10 +2784,7 @@ fn phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput() {
         "[INTEL-P2] PRIMING SUMMARY — total_priming={}",
         priming_count
     );
-    println!(
-        "[INTEL-P2] PRIMING SUMMARY total_priming={}",
-        priming_count
-    );
+    println!("[INTEL-P2] PRIMING SUMMARY total_priming={}", priming_count);
 
     // ── Candidate B: arm ForceKeyFrame via request_keyframe_via_force_keyframe_icodecapi() ──
     //
