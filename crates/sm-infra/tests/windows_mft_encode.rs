@@ -372,8 +372,10 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
     // Mechanism G: drain of in-flight batch + ~9 ms tear-down + ~50–300 ms first-encode.
     // 5 s provides ample margin for the full G latency window (design DD11).
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-    // Eventually-style: expect IDR within first 5 post-request packets.
-    const IDR_TOLERANCE: usize = 5;
+    // Eventually-style: expect IDR within first 30 post-request packets. Larger
+    // tolerance accommodates the C2.2 race fix (recreate fires after DrainComplete,
+    // so several old-handle P-frames may precede the post-recreate IDR — see #787).
+    const IDR_TOLERANCE: usize = 30;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -446,12 +448,13 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
     // C2 GREEN (DD9): routes to request_keyframe_via_recreate() → Mechanism G.
     enc.request_keyframe();
 
-    // Push enough frames for Mechanism G to observe keyframe_recreate_pending,
-    // drain in-flight + recreate IMFTransform, then emit IDR. The pump_loop checks
-    // the flag on its lifecycle events (NeedInput / DrainComplete); 1 frame is not
-    // enough loop iteration. Round 3 probe uses 30; T7.2 uses 2; T7.1 needs ≥ 3
-    // to absorb G's pipeline depth and produce a stable post-recreate packet stream.
-    const POST_REQUEST_FRAMES: u64 = 3;
+    // Push enough frames so that AFTER Mechanism G's recreate fires (which only
+    // happens with !draining per C2.2 race fix #787), there are still frames in
+    // flight for the FRESH handle to encode — that first fresh-handle packet is
+    // the IDR. Match round 3 probe cadence (30 frames) for reliability: small N
+    // races against the priming-flush DrainComplete (encoder may consume all N
+    // before recreate fires, leaving fresh handle idle and no post-recreate IDR).
+    const POST_REQUEST_FRAMES: u64 = 30;
     for i in 0..POST_REQUEST_FRAMES {
         send_frame(PRIMING_FRAMES + i);
     }
@@ -523,8 +526,10 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
     const PRIMING_FRAMES: u64 = 12;
     // 5 s per packet gives G drain latency (DD11) ample margin.
     const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-    // Eventually-style: IDR expected within first 5 post-request packets.
-    const IDR_TOLERANCE: usize = 5;
+    // Eventually-style: IDR expected within first 30 post-request packets. Larger
+    // tolerance accommodates the C2.2 race fix (recreate fires after DrainComplete,
+    // so several old-handle P-frames may precede the post-recreate IDR — see #787).
+    const IDR_TOLERANCE: usize = 30;
 
     let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
         width: WIDTH,
@@ -597,10 +602,15 @@ fn mft_keyframe_flag_cleared_after_idr_emitted() {
     // C2 GREEN (DD9): routes to request_keyframe_via_recreate() → Mechanism G.
     enc.request_keyframe();
 
-    // Push IDR-target frame + one P-frame target, then flush.
-    // The P-frame is needed so we can assert exactly-once (flag cleared after IDR).
-    send_frame(PRIMING_FRAMES);
-    send_frame(PRIMING_FRAMES + 1);
+    // Push enough frames so that AFTER Mechanism G's recreate fires (which only
+    // happens with !draining per C2.2 race fix #787), there are still frames in
+    // flight for the FRESH handle to encode — that first fresh-handle packet is
+    // the IDR, and follow-on P-frames let us assert exactly-once semantics.
+    // Match round 3 probe cadence (30 frames) for reliability.
+    const POST_REQUEST_FRAMES: u64 = 30;
+    for i in 0..POST_REQUEST_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
     enc.flush();
 
     let mut post_pkts: Vec<EncodedPacket> = Vec::new();
