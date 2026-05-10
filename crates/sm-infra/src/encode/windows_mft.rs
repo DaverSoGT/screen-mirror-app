@@ -59,8 +59,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateSample,
     MFMediaType_Video,
     MFSTARTUP_FULL,
-    // MFSampleExtension_CleanPoint: kept for the READ path in collect_output (IDR detection).
-    // The WRITE path (forcing CleanPoint=1 on input samples) is deleted by DD10.
+    // MFSampleExtension_CleanPoint: used for BOTH the READ path in collect_output (IDR detection)
+    // AND the WRITE path in submit_frame (forcing CleanPoint=1 on NVENC input samples,
+    // Candidate A, Slice 6 R2 — re-introduced; was deleted by DD10 under vendor-uniform assumption).
     MFSampleExtension_CleanPoint,
     MFShutdown,
     MFStartup,
@@ -115,6 +116,47 @@ impl<T> ComSend<T> {
 // NOT transferred cross-thread; they live entirely on the encoder thread.
 unsafe impl<T> Send for ComSend<T> {}
 
+// ── Encoder vendor identity ───────────────────────────────────────────────────
+
+/// Identity of the winning hardware encoder MFT, detected at probe time.
+///
+/// Determined by matching the MFT CLSID obtained from `MFT_TRANSFORM_CLSID_Attribute`
+/// during `probe_and_select_mft`. Used for vendor-specific IDR mechanism dispatch:
+///
+/// - `NvidiaNvenc` → [`MftEncoderShared::cleanpoint_pending`] / Candidate A
+///   (re-introduced `MFSampleExtension_CleanPoint=1` write path, Slice 6 R2).
+/// - `IntelQsv` / `Unknown` → [`MftEncoderShared::keyframe_recreate_pending`] / Mechanism G
+///   (IMFTransform drop+recreate, Slice 5 — the only empirically validated path for Intel QSV).
+///
+/// See explore #803 vendor dispatch decision and discovery #804 for CleanPoint evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderVendor {
+    /// Intel Quick Sync Video H.264 MFT — CLSID `{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}`.
+    IntelQsv,
+    /// NVIDIA NVENC H.264 MFT — CLSID `{60F44560-5A20-4857-BFEF-D29773CB8040}`.
+    NvidiaNvenc,
+    /// Any other vendor (AMD, fallback). Treated as IntelQsv for mechanism routing.
+    Unknown,
+}
+
+impl EncoderVendor {
+    /// Detect vendor from the CLSID string formatted by `probe_and_select_mft`.
+    ///
+    /// The CLSID is formatted as `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (upper-case hex).
+    /// Matching on prefix is sufficient because the leading data1 component is unique per vendor.
+    fn from_clsid_str(clsid_str: &str) -> Self {
+        // NVENC: {60F44560-5A20-4857-BFEF-D29773CB8040} — confirmed in C0/C0.b probe logs (Slice 6).
+        if clsid_str.starts_with("{60F44560-") {
+            return Self::NvidiaNvenc;
+        }
+        // Intel QSV: {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471} — from Slice 4 archive explore.
+        if clsid_str.starts_with("{4BE8D3C0-") {
+            return Self::IntelQsv;
+        }
+        Self::Unknown
+    }
+}
+
 // ── Shared cross-thread state ─────────────────────────────────────────────────
 
 /// Shared atomics between the caller and the encoder OS thread.
@@ -134,11 +176,26 @@ struct MftEncoderShared {
     /// swap(false, AcqRel). Triggers full IMFTransform teardown + re-activation within
     /// pump_loop, producing a guaranteed IDR as the first frame of the fresh handle.
     ///
-    /// DD10: `keyframe_pending` (CleanPoint/ForceKeyFrame channel) is deleted. This field
-    /// (`keyframe_recreate_pending`) is the ONLY mid-stream IDR signal on this struct.
+    /// Mechanism G is the only empirically-validated mid-stream IDR path on Intel QSV
+    /// (Slice 5 Phase 0 rounds 1–3). NVENC does NOT honour the recreate-based IDR (Slice 6
+    /// C0.b: 29/29 P-frames post-recreate); NVENC uses `cleanpoint_pending` instead.
     // allow: keyframe_recreate_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     keyframe_recreate_pending: AtomicBool,
+    /// Set by `request_keyframe_via_cleanpoint()` (Candidate A, Slice 6 R2 — NVENC only).
+    ///
+    /// Consumed by pump_loop in the NeedInput service path: before calling ProcessInput,
+    /// swap(false, AcqRel) to consume the flag; if true, set `MFSampleExtension_CleanPoint=1`
+    /// on the IMFSample before handing it to ProcessInput.
+    ///
+    /// Ordering follows the Slice 5 GUARD-BEFORE-SWAP race fix (#787): the flag is consumed
+    /// (swap) only when it is safe to act — i.e., at the point where the sample is being
+    /// submitted. Because CleanPoint is on the INPUT path (no drain involved), the simple
+    /// form `if cleanpoint_pending.swap(false, AcqRel) { sample.SetUINT32(...) }` is correct
+    /// and does not require a `!draining` guard.
+    // allow: cleanpoint_pending only read by pump_loop under hw-encoder feature
+    #[allow(dead_code)]
+    cleanpoint_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -149,6 +206,7 @@ impl Default for MftEncoderShared {
             stop: AtomicBool::new(false),
             drain_pending: AtomicBool::new(false),
             keyframe_recreate_pending: AtomicBool::new(false),
+            cleanpoint_pending: AtomicBool::new(false),
         }
     }
 }
@@ -175,6 +233,14 @@ const FRAME_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 pub struct WindowsMftH264Encoder {
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
+    /// Vendor identity of the winning MFT, detected during `new()` via CLSID matching.
+    ///
+    /// Used by `request_keyframe()` to dispatch to the correct vendor-specific mechanism:
+    /// `NvidiaNvenc` → CleanPoint write (Candidate A, Slice 6 R2);
+    /// `IntelQsv` / `Unknown` → Mechanism G recreate (Slice 5, validated on Intel QSV).
+    ///
+    /// See `EncoderVendor` and explore #803.
+    vendor: EncoderVendor,
     /// The winning `IMFActivate` selected during the destructive probe in `new()`.
     ///
     /// `IMFActivate` is an MTA-registered COM factory pointer; it is safe to transfer
@@ -247,11 +313,13 @@ impl VideoEncoder for WindowsMftH264Encoder {
         // This eliminates cross-thread IMFTransform transfer, the root cause of AVs in
         // commit ccd2e43 (phase0v3 trace: H-AV3 confirmed — NVENC singleton corruption
         // when IMFTransform is used from a different thread than ActivateObject).
-        let activate = init_mft_sync(&config)?;
+        // Vendor identity is returned alongside the activate for mid-stream IDR dispatch.
+        let (activate, vendor) = init_mft_sync(&config)?;
 
         Ok(Self {
             config,
             state: Arc::new(MftEncoderShared::default()),
+            vendor,
             mft_activate_factory: Some(activate),
             handle: None,
             com_initialized: true,
@@ -297,9 +365,14 @@ impl VideoEncoder for WindowsMftH264Encoder {
     }
 
     fn request_keyframe(&self) {
-        // DD9: route through Mechanism G (IMFTransform recreate) — the only
-        // empirically-validated mid-stream IDR path on Intel QSV (Phase 0 rounds 1–3).
-        self.request_keyframe_via_recreate()
+        // Vendor dispatch (Slice 6 R2, explore #803):
+        // NVENC does NOT produce IDR after ActivateObject recreate (C0.b probe: 29/29 P-frames).
+        // CleanPoint=1 on the input IMFSample is the mechanism NVENC honours (discovery #804).
+        // Intel QSV / Unknown → Mechanism G (recreate), unchanged from Slice 5.
+        match self.vendor {
+            EncoderVendor::NvidiaNvenc => self.request_keyframe_via_cleanpoint(),
+            _ => self.request_keyframe_via_recreate(), // Intel QSV + Unknown
+        }
     }
 
     fn set_bitrate(&self, bps: u32) -> Result<(), EncoderError> {
@@ -355,7 +428,7 @@ impl Drop for WindowsMftH264Encoder {
 /// different thread than the one that called `ActivateObject` (phase0v3 trace: H-AV3
 /// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
 /// for `IMFTransform` and `ICodecAPI`.
-fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
+fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
     // Step 1: CoInitializeEx on caller thread (MTA).
     // SAFETY: Paired with CoUninitialize in Drop.
     // CoInitializeEx returns HRESULT directly (not Result).
@@ -393,7 +466,7 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<IMFActivate, EncoderError> {
     };
 
     match result {
-        Ok(activate) => Ok(activate),
+        Ok((activate, vendor)) => Ok((activate, vendor)),
         Err(err) => {
             unsafe {
                 let _ = MFShutdown();
@@ -481,7 +554,7 @@ fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
 fn probe_and_select_mft(
     activates: Vec<IMFActivate>,
     config: &EncoderConfig,
-) -> Result<IMFActivate, EncoderError> {
+) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
     // Use the session's real config dimensions for the probe so the
     // SetOutputType call validates the actual session parameters.
     let (probe_w, probe_h) = effective_dimensions(config);
@@ -616,10 +689,36 @@ fn probe_and_select_mft(
         drop(mft);
         let _ = unsafe { activate.ShutdownObject() };
 
+        // ── Vendor detection (Slice 6 R2) ────────────────────────────────────
+        // Match CLSID string to EncoderVendor for mid-stream IDR dispatch.
+        // NVENC → CleanPoint (Candidate A); Intel QSV / Unknown → Mechanism G.
+        // See explore #803 and discovery #804.
+        let vendor = EncoderVendor::from_clsid_str(&clsid_str);
+        match vendor {
+            EncoderVendor::NvidiaNvenc => {
+                tracing::info!(
+                    "probe_and_select_mft: detected vendor=NvidiaNvenc for [{i}] \"{friendly_name}\" {clsid_str} \
+                     — mid-stream IDR will use CleanPoint (Candidate A, Slice 6 R2)"
+                );
+            }
+            EncoderVendor::IntelQsv => {
+                tracing::info!(
+                    "probe_and_select_mft: detected vendor=IntelQsv for [{i}] \"{friendly_name}\" {clsid_str} \
+                     — mid-stream IDR will use Mechanism G (IMFTransform recreate, Slice 5)"
+                );
+            }
+            EncoderVendor::Unknown => {
+                tracing::warn!(
+                    "probe_and_select_mft: vendor Unknown for [{i}] \"{friendly_name}\" {clsid_str} \
+                     — CLSID not in known-vendor table; falling back to Mechanism G"
+                );
+            }
+        }
+
         tracing::info!(
             "probe_and_select_mft: selected candidate [{i}] \"{friendly_name}\" {clsid_str}"
         );
-        return Ok(activate.clone());
+        return Ok((activate.clone(), vendor));
     }
 
     Err(last_err)
@@ -1400,7 +1499,20 @@ fn pump_loop(
                     }
                     current_ts = frame.timestamp;
                     nv12_convert(&frame, &mut nv12_scratch);
-                    match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
+                    // Candidate A (Slice 6 R2): consume cleanpoint_pending immediately before
+                    // ProcessInput so the attribute is set on exactly the frame being submitted.
+                    // GUARD-BEFORE-SWAP lesson (Slice 5 C2.2 race fix #787): on this INPUT path
+                    // there is no drain window, so the simple swap form is correct — no `!draining`
+                    // guard needed (unlike Mechanism G's recreate gate).
+                    let force_cleanpoint =
+                        state.cleanpoint_pending.swap(false, Ordering::AcqRel);
+                    match submit_frame(
+                        &mft,
+                        &nv12_scratch,
+                        frame.timestamp,
+                        frame_dur_100ns,
+                        force_cleanpoint,
+                    ) {
                         Ok(()) => {
                             // Decrement AFTER successful ProcessInput (spec OQ-1, design DD2).
                             ni_count -= 1;
@@ -1716,19 +1828,47 @@ fn pump_loop(
 
 /// Submit one NV12 frame as an `IMFSample` to `ProcessInput`.
 ///
-/// DD10: `force_keyframe` parameter and `MFSampleExtension_CleanPoint` write path
-/// are removed. Intel QSV does not honor CleanPoint mid-stream; NVENC's CleanPoint
-/// path was valid but is superseded by Mechanism G (IMFTransform recreate) which
-/// produces a vendor-uniform IDR at the first frame of a fresh activation.
-/// `MFSampleExtension_CleanPoint` is still READ in `collect_output` for IDR detection
-/// — the read path is unchanged.
+/// When `force_cleanpoint` is `true`, sets `MFSampleExtension_CleanPoint=1` on the sample
+/// BEFORE calling `ProcessInput`. This signals NVENC to emit an IDR NAL unit in the
+/// corresponding output packet (Candidate A, Slice 6 R2 — re-introduced CleanPoint write
+/// path deleted by DD10).
+///
+/// Intel QSV does NOT honour CleanPoint mid-stream (Slice 5 DD10 evidence). On Intel QSV
+/// `force_cleanpoint` is always `false`; the CleanPoint flag is consumed in pump_loop only
+/// when the vendor is `NvidiaNvenc` (see `EncoderVendor` dispatch in `request_keyframe()`).
+///
+/// The `MFSampleExtension_CleanPoint` attribute is still READ in `collect_output` for IDR
+/// detection — the read path is unchanged.
+///
+/// Ordering note (Slice 5 GUARD-BEFORE-SWAP race fix #787): `force_cleanpoint` is derived
+/// from `cleanpoint_pending.swap(false, AcqRel)` in the caller (pump_loop NeedInput path).
+/// The swap happens at the moment the sample is being built — there is no drain window on
+/// this code path, so no `!draining` guard is needed (unlike Mechanism G's recreate path).
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
     timestamp: std::time::Duration,
     duration_100ns: i64,
+    force_cleanpoint: bool,
 ) -> Result<(), EncoderError> {
     let sample = build_imfsample(&nv12.buf, timestamp, duration_100ns)?;
+    if force_cleanpoint {
+        // SAFETY: SetUINT32 on a valid IMFSample is always safe; the sample was just created.
+        unsafe {
+            sample
+                .SetUINT32(&MFSampleExtension_CleanPoint, 1)
+                .map_err(|e| {
+                    EncoderError::EncodeFailed(format!(
+                        "SetUINT32(CleanPoint): 0x{:08X}",
+                        e.code().0
+                    ))
+                })?;
+        }
+        tracing::debug!(
+            target: "sm_infra::encode::windows_mft",
+            "submit_frame: MFSampleExtension_CleanPoint=1 set on input sample (NVENC Candidate A)"
+        );
+    }
     unsafe {
         mft.ProcessInput(0, &sample, 0)
             .map_err(|e| EncoderError::EncodeFailed(format!("ProcessInput: 0x{:08X}", e.code().0)))
@@ -1981,6 +2121,35 @@ impl WindowsMftH264Encoder {
             .keyframe_recreate_pending
             .store(true, Ordering::Release);
     }
+
+    /// Request a forced mid-stream IDR by setting `MFSampleExtension_CleanPoint=1` on
+    /// the next input `IMFSample` submitted to `ProcessInput`.
+    ///
+    /// **Candidate A — Slice 6 R2 (NVENC-specific)**. Re-introduces the CleanPoint write
+    /// path deleted by DD10 (Slice 5). NVENC honours `MFSampleExtension_CleanPoint=1` on
+    /// the input `IMFSample` and emits an IDR NAL unit in the corresponding output packet
+    /// (discovery #804: inline comment confirms pre-deletion behaviour).
+    ///
+    /// Intel QSV does NOT honour CleanPoint mid-stream (Slice 5 DD10 evidence); that vendor
+    /// uses `request_keyframe_via_recreate()` (Mechanism G). The trait `request_keyframe()`
+    /// impl dispatches automatically based on `self.vendor` — callers should prefer
+    /// `request_keyframe()` over this method unless direct mechanism control is needed
+    /// (e.g. Phase 0 probes).
+    ///
+    /// **Latency**: Zero extra drain cost. The attribute is attached to the next input sample
+    /// in the NeedInput service path; the IDR appears in the corresponding output packet.
+    ///
+    /// **Concurrency**: Backed by `AtomicBool::store(true, Release)`. Concurrent calls are
+    /// idempotent — multiple stores collapse to a single CleanPoint frame
+    /// (AcqRel swap in pump_loop consumes the flag exactly once per submitted frame).
+    ///
+    /// **Phase 0 probe**: `phase0_nvenc_cleanpoint_idr_via_input_sample_attribute`
+    /// in `crates/sm-infra/tests/windows_mft_encode.rs` (`#[ignore]`-gated, Host B).
+    pub fn request_keyframe_via_cleanpoint(&self) {
+        self.state
+            .cleanpoint_pending
+            .store(true, Ordering::Release);
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -2006,6 +2175,7 @@ impl WindowsMftH264Encoder {
         Self {
             config: EncoderConfig::default(),
             state: Arc::new(MftEncoderShared::default()),
+            vendor: EncoderVendor::Unknown,
             mft_activate_factory: None,
             handle: None,
             com_initialized: false,
