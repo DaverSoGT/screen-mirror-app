@@ -28,9 +28,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-// (No Win32::Foundation imports needed after DD10 deletion of VARIANT_TRUE/VARIANT_FALSE.)
+// Win32::Foundation imports — VARIANT_TRUE/VARIANT_FALSE removed by DD10; restored below as
+// CODECAPI_AVEncVideoForceKeyFrame re-introduced for Phase 0 Candidate B testing (Batch 2).
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncVideoForceKeyFrame,
     ICodecAPI,
     IMFActivate,
     IMFMediaEventGenerator,
@@ -196,6 +198,32 @@ struct MftEncoderShared {
     // allow: cleanpoint_pending only read by pump_loop under hw-encoder feature
     #[allow(dead_code)]
     cleanpoint_pending: AtomicBool,
+    /// Set by `request_keyframe_via_force_keyframe_icodecapi()` (Candidate B, Slice 6 R2 Batch 2).
+    ///
+    /// Consumed by pump_loop in the NeedInput service path: BEFORE calling `submit_frame()`,
+    /// swap(false, AcqRel) to consume the flag; if true, call
+    /// `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` on the encoder's
+    /// ICodecAPI interface.
+    ///
+    /// WHY BEFORE ProcessInput: Per Chromium `media_foundation_video_encode_accelerator_win.cc`
+    /// lines 2299-2307 and FFmpeg `libavcodec/mfenc.c::mf_send_frame()`, the canonical
+    /// production sequence calls SetValue(CODECAPI_AVEncVideoForceKeyFrame) BEFORE the
+    /// ProcessInput call for the target frame. The Slice 4 SWAP-FIRE pattern used AFTER
+    /// ProcessInput — that is the known-wrong timing this probe corrects.
+    ///
+    /// VT_UI4 (not VT_BOOL): per research #808, the correct VARIANT type is VT_UI4=1.
+    /// Slice 4 used VT_BOOL, which may also have contributed to falsification on Intel QSV.
+    ///
+    /// CODECAPI_AVEncVideoForceKeyFrame is a REQUIRED HCK Win8+ certification property for
+    /// hardware encoder MFTs (Microsoft docs). NVENC MUST implement it to be certified.
+    ///
+    /// The property auto-resets to 0 after the next ProcessInput per MS docs — no manual
+    /// cleanup needed after the call.
+    ///
+    /// SetValue rejection is non-fatal (warn + continue) per DD13 convention.
+    // allow: force_keyframe_icodecapi_pending only read by pump_loop under hw-encoder feature
+    #[allow(dead_code)]
+    force_keyframe_icodecapi_pending: AtomicBool,
 }
 
 impl Default for MftEncoderShared {
@@ -207,6 +235,7 @@ impl Default for MftEncoderShared {
             drain_pending: AtomicBool::new(false),
             keyframe_recreate_pending: AtomicBool::new(false),
             cleanpoint_pending: AtomicBool::new(false),
+            force_keyframe_icodecapi_pending: AtomicBool::new(false),
         }
     }
 }
@@ -1506,6 +1535,56 @@ fn pump_loop(
                     // guard needed (unlike Mechanism G's recreate gate).
                     let force_cleanpoint =
                         state.cleanpoint_pending.swap(false, Ordering::AcqRel);
+
+                    // Candidate B (Slice 6 R2 Batch 2): consume force_keyframe_icodecapi_pending
+                    // BEFORE submit_frame / ProcessInput — canonical Chromium + FFmpeg ordering.
+                    //
+                    // WHY BEFORE ProcessInput (not after): Chromium
+                    // `media_foundation_video_encode_accelerator_win.cc:2299-2307` and FFmpeg
+                    // `libavcodec/mfenc.c::mf_send_frame()` both call
+                    // `SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` BEFORE ProcessInput.
+                    // The Slice 4 SWAP-FIRE pattern called it AFTER — that is the known-wrong
+                    // timing (research #808). This placement corrects it.
+                    //
+                    // WHY VT_UI4 (not VT_BOOL): per research #808, the MS-documented type is
+                    // VT_UI4=1. Slice 4 used VT_BOOL, contributing to falsification on Intel QSV.
+                    //
+                    // CODECAPI_AVEncVideoForceKeyFrame is a REQUIRED HCK Win8+ certification
+                    // property for hardware encoder MFTs. The property auto-resets to 0 after
+                    // the next ProcessInput per MS docs — no manual cleanup needed.
+                    //
+                    // Used by phase0_*_force_keyframe_via_codecapi_before_processinput probes.
+                    // Vendor dispatch (request_keyframe()) does NOT route here — probes call
+                    // request_keyframe_via_force_keyframe_icodecapi() directly (test-only).
+                    if state
+                        .force_keyframe_icodecapi_pending
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        let v = make_variant_u32(1);
+                        // SAFETY: SetValue on a valid ICodecAPI is always safe;
+                        // the VARIANT is stack-allocated and correctly typed VT_UI4.
+                        unsafe {
+                            if let Err(e) =
+                                codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v)
+                            {
+                                // Non-fatal — driver rejection is acceptable (DD13 convention).
+                                // Probe will observe P-frame instead of IDR, which is valid evidence.
+                                tracing::warn!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    "submit_frame: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
+                                     rejected: 0x{:08X} (non-fatal, Candidate B probe continues)",
+                                    e.code().0
+                                );
+                            } else {
+                                tracing::debug!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    "submit_frame: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
+                                     VT_UI4=1) issued (Candidate B before ProcessInput)"
+                                );
+                            }
+                        }
+                    }
+
                     match submit_frame(
                         &mft,
                         &nv12_scratch,
@@ -2057,8 +2136,9 @@ fn make_variant_u32(value: u32) -> VARIANT {
     v
 }
 
-// DD10: make_variant_bool() deleted — was used exclusively for CODECAPI_AVEncVideoForceKeyFrame.
-// That SetValue call is removed; VT_BOOL is no longer needed.
+// DD10 note: make_variant_bool() remains deleted — VT_BOOL is not used anywhere.
+// Slice 6 R2 Batch 2 re-introduces CODECAPI_AVEncVideoForceKeyFrame via make_variant_u32(1)
+// (VT_UI4=1, the correct VARIANT type per MS docs and research #808). VT_BOOL is still unneeded.
 
 // ── Inherent methods ──────────────────────────────────────────────────────────
 
@@ -2148,6 +2228,39 @@ impl WindowsMftH264Encoder {
     pub fn request_keyframe_via_cleanpoint(&self) {
         self.state
             .cleanpoint_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Phase 0 Candidate B mechanism: force IDR via `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame,
+    /// VT_UI4=1)` called BEFORE the `ProcessInput` call for the target frame.
+    ///
+    /// **Candidate B — Slice 6 R2 Batch 2 (cross-vendor probe)**. Tests the canonical
+    /// production sequence from Chromium `media_foundation_video_encode_accelerator_win.cc`
+    /// (lines 2299-2307) and FFmpeg `libavcodec/mfenc.c::mf_send_frame()`.
+    ///
+    /// **WHY this is different from Slice 4's SWAP-FIRE**: Slice 4 (DD1) called
+    /// `SetValue(CODECAPI_AVEncVideoForceKeyFrame)` AFTER `ProcessInput` (the "FIRE" step).
+    /// Chromium calls it BEFORE `ProcessInput` on the same frame. This timing difference
+    /// may be the reason Slice 4 failed on Intel QSV and was not validated on NVENC.
+    ///
+    /// **WHY VT_UI4 (not VT_BOOL)**: Slice 4 used VT_BOOL; the MS-documented type for
+    /// `CODECAPI_AVEncVideoForceKeyFrame` is VT_UI4=1 (research #808).
+    ///
+    /// **HCK compliance note**: `CODECAPI_AVEncVideoForceKeyFrame` is a REQUIRED Win8+
+    /// hardware encoder MFT certification property. Both NVENC and Intel QSV MUST implement
+    /// it to be Microsoft-certified. If this call is rejected, it is either a driver bug
+    /// or the SetValue call is not reaching the encoder's codec API correctly.
+    ///
+    /// **DO NOT call from production code** — vendor dispatch in `request_keyframe()` does
+    /// NOT route here. This method is a Phase 0 probe escape hatch for direct mechanism
+    /// testing on both Host A (Intel QSV) and Host B (NVENC).
+    ///
+    /// **Phase 0 probes**: `phase0_nvenc_force_keyframe_via_codecapi_before_processinput`
+    /// and `phase0_intel_qsv_force_keyframe_via_codecapi_before_processinput`
+    /// in `crates/sm-infra/tests/windows_mft_encode.rs` (`#[ignore]`-gated).
+    pub fn request_keyframe_via_force_keyframe_icodecapi(&self) {
+        self.state
+            .force_keyframe_icodecapi_pending
             .store(true, Ordering::Release);
     }
 }
