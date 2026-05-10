@@ -2705,3 +2705,291 @@ fn phase0_nvenc_post_recreate_idr_format_dump() {
     // The trace log is the deliverable for post-falsification re-investigation (engram #800).
     let _ = enc.stop();
 }
+
+// ─── Phase 0 Probe P1: CleanPoint INPUT write on NVENC ───────────────────────
+//
+// WHY this probe exists:
+//
+// Slice 6 R2 re-introduces `MFSampleExtension_CleanPoint=1` on the INPUT IMFSample as the
+// mid-stream IDR mechanism for NVIDIA NVENC (Candidate A — explore #803, Slice 6 R2).
+//
+// Background:
+// - Mechanism G (IMFTransform drop+recreate, Slice 5) was confirmed to work on Intel QSV
+//   but was FALSIFIED on NVENC (C0.b probe `ae36499`: 29/29 P-frames post-recreate, zero IDR).
+// - Discovery #804 (inline comment at `windows_mft.rs:1108-1110`) confirms NVENC honoured
+//   CleanPoint before Slice 5 DD10 deleted the write path under the vendor-uniform assumption.
+// - This probe VALIDATES that re-introducing the CleanPoint write in the current architecture
+//   (post-Slice-4 SWAP-FIRE deletion, post-Slice-5 Mechanism G) still produces IDR on NVENC.
+//
+// Cadence:
+//   1. Create encoder (vendor detection logs NvidiaNvenc at INFO).
+//   2. Start, submit 5 priming frames → `enc.flush()` → drain (log every packet).
+//   3. Call `enc.request_keyframe_via_cleanpoint()` — arms `cleanpoint_pending` atomic.
+//   4. Submit 30 post-request frames → `enc.flush()` → drain (log every packet).
+//   5. Print SUMMARY block: totals, first post-request packet index / is_keyframe / raw_prefix.
+//
+// 30 post-request frames matches the Slice 5 / Slice 6 C0.b canonical probe cadence (#786):
+// eliminates any timing sensitivity; CleanPoint should produce IDR at index 0 or 1.
+//
+// No assertions — observation-only.  If first_post_request_is_keyframe=true, Candidate A
+// is confirmed and the project moves to sdd-propose.  If false, escalate to P2 / P3.
+//
+// Run on Host B (NVIDIA NVENC):
+//   cargo nextest run --release --features hw-encoder -p sm-infra \
+//     --test windows_mft_encode phase0_nvenc_cleanpoint_idr_via_input_sample_attribute \
+//     --run-ignored only --no-capture
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 Slice 6 R2 P1 — NVENC CleanPoint IDR via input sample attribute on Host B (NVIDIA); no assertions"]
+fn phase0_nvenc_cleanpoint_idr_via_input_sample_attribute() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    // 5 priming frames: enough to establish a healthy encoder session and drain the
+    // SPS+PPS+IDR access unit as baseline.
+    const PRIMING_FRAMES: u64 = 5;
+    // 30 post-request frames: matches the Slice 5 round-3 / Slice 6 C0.b canonical cadence
+    // (#786).  CleanPoint should produce IDR within the first 1–2 frames; 30 is overkill but
+    // eliminates any NVENC pipeline latency sensitivity.
+    const POST_REQUEST_FRAMES: u64 = 30;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    // Inline packet logger — same format as phase0_nvenc_post_recreate_idr_format_dump
+    // (C0.b probe `ae36499`) for cross-probe comparability.
+    let log_pkt = |tag: &str, idx: u32, pkt: &EncodedPacket| {
+        let len = pkt.data.len();
+        let prefix_len = len.min(8);
+        let prefix = &pkt.data[..prefix_len];
+        let has_3byte_start = len >= 3
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x01;
+        let has_4byte_start = len >= 4
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x00
+            && pkt.data[3] == 0x01;
+        tracing::info!(
+            "[NVENC-P1] {} pkt {} — len={} is_keyframe={} \
+             raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+        println!(
+            "[NVENC-P1] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+    };
+
+    // ── Batch 1: priming drain ────────────────────────────────────────────────
+    tracing::info!("[NVENC-P1] submitting {} priming frames", PRIMING_FRAMES);
+    for i in 0..PRIMING_FRAMES {
+        send_frame(i);
+    }
+
+    tracing::info!("[NVENC-P1] flush() #1 — COMMAND_DRAIN to collect priming packets");
+    enc.flush();
+
+    let mut priming_count = 0u32;
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(pkt) => {
+                log_pkt("PRIMING", priming_count, &pkt);
+                priming_count += 1;
+                // Drain up to PRIMING_FRAMES + pipeline depth.
+                if priming_count >= (PRIMING_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P1] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                println!(
+                    "[NVENC-P1] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                let _ = enc.stop();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P1] OUTCOME=EMPTY_DRAIN — no priming packets before 10s timeout"
+                    );
+                    println!("[NVENC-P1] OUTCOME=EMPTY_DRAIN — no priming packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P1] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                    println!(
+                        "[NVENC-P1] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[NVENC-P1] PRIMING SUMMARY — total_priming={}",
+        priming_count
+    );
+    println!("[NVENC-P1] PRIMING SUMMARY total_priming={}", priming_count);
+
+    // ── Candidate A: arm CleanPoint via request_keyframe_via_cleanpoint() ────
+    //
+    // Sets `cleanpoint_pending=true` (atomic Release store).
+    // pump_loop consumes it on the next NeedInput credit: swaps to false (AcqRel),
+    // calls `submit_frame(..., force_cleanpoint=true)`, which sets
+    // `MFSampleExtension_CleanPoint=1` on the IMFSample BEFORE ProcessInput.
+    // NVENC should emit IDR in the corresponding output packet (discovery #804).
+    tracing::info!(
+        "[NVENC-P1] request_keyframe_via_cleanpoint() — arming Candidate A (CleanPoint write)"
+    );
+    enc.request_keyframe_via_cleanpoint();
+
+    // ── Batch 2: post-request drain ───────────────────────────────────────────
+    tracing::info!(
+        "[NVENC-P1] submitting {} post-request frames",
+        POST_REQUEST_FRAMES
+    );
+    for i in 0..POST_REQUEST_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
+
+    tracing::info!("[NVENC-P1] flush() #2 — COMMAND_DRAIN to collect post-request packets");
+    enc.flush();
+
+    let mut post_count = 0u32;
+    // Track first post-request packet fields for SUMMARY block.
+    let mut first_post_is_keyframe: Option<bool> = None;
+    let mut first_post_raw_prefix: Option<Vec<u8>> = None;
+    let mut first_post_len: Option<usize> = None;
+
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(pkt) => {
+                if post_count == 0 {
+                    first_post_is_keyframe = Some(pkt.is_keyframe);
+                    first_post_len = Some(pkt.data.len());
+                    first_post_raw_prefix = Some(pkt.data[..pkt.data.len().min(8)].to_vec());
+                }
+                log_pkt("POST-REQUEST", post_count, &pkt);
+                post_count += 1;
+                // Drain up to POST_REQUEST_FRAMES + pipeline depth.
+                if post_count >= (POST_REQUEST_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P1] OUTCOME=ENCODER_DIED — pump thread exited after \
+                     request_keyframe_via_cleanpoint + flush; {} post-request packets received",
+                    post_count
+                );
+                println!(
+                    "[NVENC-P1] OUTCOME=ENCODER_DIED after {} post-request packets",
+                    post_count
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if post_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P1] OUTCOME=EMPTY_DRAIN — no post-request packets before 15s timeout; \
+                         pump may have failed to deliver frames after CleanPoint"
+                    );
+                    println!("[NVENC-P1] OUTCOME=EMPTY_DRAIN — no post-request packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P1] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                    println!(
+                        "[NVENC-P1] post-request drain complete — {} packets received",
+                        post_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // ── SUMMARY block ─────────────────────────────────────────────────────────
+    //
+    // The summary is the primary deliverable.  Compare:
+    //   - first_post_request_is_keyframe: should be TRUE if Candidate A works on NVENC
+    //   - first_post_request_raw_prefix: compare to priming pkt 0 prefix ([00,00,00,01,09,10])
+    //   - If is_keyframe=TRUE and raw_prefix shows I-frame AUD: Candidate A CONFIRMED
+    //   - If is_keyframe=FALSE: escalate to P2 (ForceKeyFrame) or P3 (Hybrid G+CleanPoint)
+    let first_post_idx = if post_count > 0 { Some(0u32) } else { None };
+
+    tracing::info!(
+        "[NVENC-P1] SUMMARY — \
+         total_priming={} \
+         total_post_request={} \
+         first_post_request_idx={:?} \
+         first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} \
+         first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+    println!(
+        "[NVENC-P1] SUMMARY total_priming={} total_post_request={} \
+         first_post_request_idx={:?} first_post_request_is_keyframe={:?} \
+         first_post_request_raw_prefix={:02x?} first_post_request_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+
+    // Observation-only probe: no assertions.
+    // Decision rule (explore #803):
+    //   P1 PASS (is_keyframe=true) → Candidate A confirmed; move to sdd-propose.
+    //   P1 FAIL (is_keyframe=false) → escalate to P2 (CODECAPI_AVEncVideoForceKeyFrame)
+    //                                  or P3 (Hybrid Mechanism G + CleanPoint on first post-recreate frame).
+    let _ = enc.stop();
+}
