@@ -1487,10 +1487,18 @@ fn pump_loop(
         // Round 3 (#783) validated G: 2nd ActivateObject succeeds, IDR at index 0, encoder
         // alive. codec_api and event_gen are re-cast from the fresh handle after recreate
         // (Step G5b) — no stale COM refs in the resumed pump_loop.
-        if state
-            .keyframe_recreate_pending
-            .swap(false, Ordering::AcqRel)
-            && !draining
+        //
+        // ORDERING: check `!draining` FIRST so the swap is short-circuited when we
+        // can't process the recreate this iteration. If we swapped unconditionally and
+        // then tested `!draining`, a swap during the drain window would consume the
+        // flag and silently drop the keyframe request (race observed empirically when
+        // a caller does `flush(); request_keyframe();` in quick succession — Slice 5
+        // C2 GREEN Host A trace #786). With this ordering the flag persists across
+        // drain iterations and is consumed only when we commit to the recreate.
+        if !draining
+            && state
+                .keyframe_recreate_pending
+                .swap(false, Ordering::AcqRel)
         {
             tracing::info!(
                 "pump_loop: request_keyframe_via_recreate() — tearing down IMFTransform for Mechanism G"
