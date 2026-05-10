@@ -183,7 +183,7 @@ pub struct WindowsMftH264Encoder {
     /// it to produce a fresh `IMFTransform` that lives ENTIRELY on that thread —
     /// no cross-thread COM for `IMFTransform` or `ICodecAPI` (root cause of AVs in
     /// commit ccd2e43, see sdd/.../phase0v3-final-root-cause).
-    winning_activate: Option<IMFActivate>,
+    mft_activate_factory: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
     /// Tracks whether `new()` performed `CoInitializeEx` + `MFStartup`.
@@ -201,7 +201,7 @@ impl std::fmt::Debug for WindowsMftH264Encoder {
 }
 
 // SAFETY: `WindowsMftH264Encoder` is used from a single owner thread.
-// `winning_activate` (`Option<IMFActivate>`) is transferred to the encoder thread
+// `mft_activate_factory` (`Option<IMFActivate>`) is transferred to the encoder thread
 // inside `start()` via `ComSend` and set to `None` on the caller side immediately
 // after. `IMFActivate` is an MTA-registered factory pointer; cross-thread transfer
 // is safe per Windows COM rules for MTA-registered objects (see `ComSend` docs).
@@ -252,7 +252,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
         Ok(Self {
             config,
             state: Arc::new(MftEncoderShared::default()),
-            winning_activate: Some(activate),
+            mft_activate_factory: Some(activate),
             handle: None,
             com_initialized: true,
         })
@@ -263,7 +263,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
         rx: Receiver<sm_domain::CaptureFrame>,
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
-        let activate = self.winning_activate.take().ok_or_else(|| {
+        let activate = self.mft_activate_factory.take().ok_or_else(|| {
             EncoderError::Internal("start() called after IMFActivate was already consumed".into())
         })?;
         let config = self.config.clone();
@@ -322,10 +322,10 @@ impl Drop for WindowsMftH264Encoder {
         // Join encoder thread first. If start() was never called this is a no-op.
         let _ = self.stop();
 
-        // winning_activate: if start() was never called, the IMFActivate is still here.
+        // mft_activate_factory: if start() was never called, the IMFActivate is still here.
         // Drop it before MFShutdown to release the COM ref while MF is still alive.
-        // If start() was called, winning_activate is already None (transferred to thread).
-        drop(self.winning_activate.take());
+        // If start() was called, mft_activate_factory is already None (transferred to thread).
+        drop(self.mft_activate_factory.take());
 
         if self.com_initialized {
             unsafe {
@@ -2000,13 +2000,13 @@ impl WindowsMftH264Encoder {
     /// # Safety
     /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
     /// which would be incorrect since COM was never initialised by this constructor.
-    /// `winning_activate` is `None`, so any call to `start()` will return
+    /// `mft_activate_factory` is `None`, so any call to `start()` will return
     /// `Err(Internal(_))` rather than accessing an invalid COM pointer.
     fn new_for_validation_test() -> Self {
         Self {
             config: EncoderConfig::default(),
             state: Arc::new(MftEncoderShared::default()),
-            winning_activate: None,
+            mft_activate_factory: None,
             handle: None,
             com_initialized: false,
         }
