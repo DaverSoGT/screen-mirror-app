@@ -446,8 +446,15 @@ fn mft_request_keyframe_marks_next_packet_as_keyframe() {
     // C2 GREEN (DD9): routes to request_keyframe_via_recreate() → Mechanism G.
     enc.request_keyframe();
 
-    // Push 1 IDR-target frame then flush — gives the encoder work after the request.
-    send_frame(PRIMING_FRAMES);
+    // Push enough frames for Mechanism G to observe keyframe_recreate_pending,
+    // drain in-flight + recreate IMFTransform, then emit IDR. The pump_loop checks
+    // the flag on its lifecycle events (NeedInput / DrainComplete); 1 frame is not
+    // enough loop iteration. Round 3 probe uses 30; T7.2 uses 2; T7.1 needs ≥ 3
+    // to absorb G's pipeline depth and produce a stable post-recreate packet stream.
+    const POST_REQUEST_FRAMES: u64 = 3;
+    for i in 0..POST_REQUEST_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
     enc.flush();
 
     let mut post_pkts: Vec<EncodedPacket> = Vec::new();
