@@ -19,4 +19,5 @@ coverage/
 
 # Smoke test ephemeral outputs — transcripts persist in engram
 *smoke*.log
+*-trace.log
 smoke-trace.ps1
