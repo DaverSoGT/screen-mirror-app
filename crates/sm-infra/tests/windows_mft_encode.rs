@@ -2402,3 +2402,306 @@ fn phase0_nvenc_idr_packet_format_dump() {
     // The trace log is the deliverable for the Slice 6 design gate (DD5, S8).
     let _ = enc.stop();
 }
+
+// ─── Phase 0 — Slice 6 NVENC post-recreate IDR format probe (Batch 2) ─────────
+//
+// WHY THIS PROBE EXISTS:
+// The original Slice 6 hypothesis (explore #793, discovery #794) claimed NVENC emits
+// 3-byte Annex-B start codes.  The first C0 probe (`phase0_nvenc_idr_packet_format_dump`,
+// commit `b048b36`) FALSIFIED that hypothesis on Host B: NVENC priming IDR emits 4-byte
+// Annex-B start codes identical to Intel QSV, and `is_keyframe=TRUE` on pkt 0 (engram
+// #800).  The priming path works correctly.
+//
+// The bug reported by T7.1/T7.2 on Host B (`is_keyframe=false` on post-recreate IDR)
+// must therefore live in the POST-RECREATE path (Mechanism G: `request_keyframe_via_recreate()`),
+// NOT in the priming path.  This probe exercises that path directly so we have empirical
+// byte-level evidence of what NVENC actually emits AFTER recreate, enabling a new
+// (grounded) hypothesis before any C1 RED fix is attempted.
+//
+// Run on Host B (NVIDIA NVENC):
+//
+//   $env:RUST_LOG="sm_infra::encode=trace,windows_mft_encode=trace"
+//   cargo nextest run --release --features hw-encoder -p sm-infra `
+//     --test windows_mft_encode phase0_nvenc_post_recreate_idr_format_dump `
+//     --run-ignored only --no-capture
+//
+// No assertions — the trace log is the deliverable.  Compare priming pkt 0 (from the
+// first C0 probe) with the first post-recreate packet here to spot any structural
+// difference in NAL layout, start-code type, or `is_keyframe` flag state.
+
+/// Probe — dump raw byte prefix of NVENC packets both before and after
+/// `request_keyframe_via_recreate()` (Mechanism G).
+///
+/// The first C0 probe (engram #800) established that the NVENC priming IDR is detected
+/// correctly (`is_keyframe=TRUE`, 4-byte Annex-B).  This probe targets the POST-RECREATE
+/// path that T7.1/T7.2 actually exercise; it logs every packet from both the priming and
+/// post-recreate drains so the two can be compared side-by-side.
+///
+/// Cadence:
+///   1. Create encoder, start pump.
+///   2. Submit 5 priming frames → `enc.flush()` → drain (log every packet).
+///   3. Call `enc.request_keyframe_via_recreate()` (Mechanism G: pump_loop tears down
+///      IMFTransform and re-activates fresh handle).
+///   4. Submit 30 post-recreate frames → `enc.flush()` → drain (log every packet).
+///   5. Print SUMMARY block: totals, first post-recreate packet index / is_keyframe / raw_prefix.
+///
+/// 30 post-recreate frames matches the Slice 5 canonical cadence (#786, #787): pump_loop
+/// needs ≥3 frames post-request to observe the flag, trigger recreate, and emit IDR.
+/// No assertions — observation-only.
+#[test]
+#[cfg(feature = "hw-encoder")]
+#[ignore = "Phase 0 Slice 6 Batch 2 probe — NVENC post-recreate IDR format dump on Host B (NVIDIA); no assertions"]
+fn phase0_nvenc_post_recreate_idr_format_dump() {
+    init_tracing();
+
+    const WIDTH: u32 = 640;
+    const HEIGHT: u32 = 480;
+    // 5 priming frames: enough to establish a healthy encoder session and drain the
+    // SPS+PPS+IDR access unit as baseline for the start-code comparison.
+    const PRIMING_FRAMES: u64 = 5;
+    // 30 post-recreate frames: matches the Slice 5 round-3 probe cadence (#786).
+    // pump_loop needs ≥3 frames to observe `keyframe_recreate_pending`, drain the
+    // old handle, re-activate, and emit IDR on the fresh handle.  30 is overkill
+    // but eliminates any timing sensitivity on NVENC.
+    const POST_RECREATE_FRAMES: u64 = 30;
+
+    let mut enc = WindowsMftH264Encoder::new(EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        bitrate_bps: 4_000_000,
+        ..EncoderConfig::default()
+    })
+    .expect("WindowsMftH264Encoder::new must succeed on a HW-capable machine");
+
+    let (frame_tx, frame_rx) = mpsc::sync_channel(16);
+    let (pkt_tx, pkt_rx) = mpsc::sync_channel(16);
+    enc.start(frame_rx, pkt_tx).expect("start must succeed");
+
+    let send_frame = |i: u64| {
+        frame_tx
+            .send(make_synthetic_frame(WIDTH, HEIGHT, i * 33))
+            .expect("frame_tx should be open");
+    };
+
+    // Inline Annex-B detection helper — same byte patterns as `is_annex_b_now` (4-byte)
+    // and the proposed fix (3-byte OR 4-byte, DD1).  Defined as a closure so both drain
+    // loops share identical logic without repeating the byte comparisons.
+    let log_pkt = |tag: &str, idx: u32, pkt: &EncodedPacket| {
+        let len = pkt.data.len();
+        let prefix_len = len.min(8);
+        let prefix = &pkt.data[..prefix_len];
+        let has_3byte_start = len >= 3
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x01;
+        let has_4byte_start = len >= 4
+            && pkt.data[0] == 0x00
+            && pkt.data[1] == 0x00
+            && pkt.data[2] == 0x00
+            && pkt.data[3] == 0x01;
+        tracing::info!(
+            "[NVENC-P0b] {} pkt {} — len={} is_keyframe={} \
+             raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+        println!(
+            "[NVENC-P0b] {} pkt={} len={} is_keyframe={} raw_prefix={:02x?} \
+             has_3byte_annex_b={} has_4byte_annex_b={}",
+            tag,
+            idx,
+            len,
+            pkt.is_keyframe,
+            prefix,
+            has_3byte_start,
+            has_4byte_start,
+        );
+    };
+
+    // ── Batch 1: priming drain ────────────────────────────────────────────────
+    tracing::info!("[NVENC-P0b] submitting {} priming frames", PRIMING_FRAMES);
+    for i in 0..PRIMING_FRAMES {
+        send_frame(i);
+    }
+
+    tracing::info!("[NVENC-P0b] flush() #1 — COMMAND_DRAIN to collect priming packets");
+    enc.flush();
+
+    let mut priming_count = 0u32;
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(pkt) => {
+                log_pkt("PRIMING", priming_count, &pkt);
+                priming_count += 1;
+                // Drain up to PRIMING_FRAMES + pipeline depth.
+                if priming_count >= (PRIMING_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P0b] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                println!(
+                    "[NVENC-P0b] OUTCOME=ENCODER_DIED during priming drain after {} packets",
+                    priming_count
+                );
+                let _ = enc.stop();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if priming_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P0b] OUTCOME=EMPTY_DRAIN — no priming packets before 10s timeout"
+                    );
+                    println!("[NVENC-P0b] OUTCOME=EMPTY_DRAIN — no priming packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P0b] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                    println!(
+                        "[NVENC-P0b] priming drain complete — {} packets received",
+                        priming_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        "[NVENC-P0b] PRIMING SUMMARY — total_priming={}",
+        priming_count
+    );
+    println!("[NVENC-P0b] PRIMING SUMMARY total_priming={}", priming_count);
+
+    // ── Mechanism G: request IMFTransform recreate ────────────────────────────
+    //
+    // request_keyframe_via_recreate() sets `keyframe_recreate_pending=true` (atomic).
+    // pump_loop observes it on the next lifecycle event and tears down the IMFTransform:
+    //   1. END_OF_STREAM + COMMAND_DRAIN → wait DrainComplete
+    //   2. END_STREAMING
+    //   3. Drop IMFTransform handle (COM Release)
+    //   4. Re-call ActivateObject on retained factory → fresh IMFTransform
+    //   5. Re-run setup_mft (SetInputType + SetOutputType + BEGIN_STREAMING + START)
+    // The first encoded frame from a fresh activation is always IDR.
+    tracing::info!(
+        "[NVENC-P0b] request_keyframe_via_recreate() — arming Mechanism G on NVENC"
+    );
+    enc.request_keyframe_via_recreate();
+
+    // ── Batch 2: post-recreate drain ──────────────────────────────────────────
+    tracing::info!(
+        "[NVENC-P0b] submitting {} post-recreate frames",
+        POST_RECREATE_FRAMES
+    );
+    for i in 0..POST_RECREATE_FRAMES {
+        send_frame(PRIMING_FRAMES + i);
+    }
+
+    tracing::info!("[NVENC-P0b] flush() #2 — COMMAND_DRAIN to collect post-recreate packets");
+    enc.flush();
+
+    let mut post_count = 0u32;
+    // Track first post-recreate packet fields for SUMMARY block.
+    let mut first_post_is_keyframe: Option<bool> = None;
+    let mut first_post_raw_prefix: Option<Vec<u8>> = None;
+    let mut first_post_len: Option<usize> = None;
+
+    loop {
+        match pkt_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(pkt) => {
+                if post_count == 0 {
+                    first_post_is_keyframe = Some(pkt.is_keyframe);
+                    first_post_len = Some(pkt.data.len());
+                    first_post_raw_prefix = Some(pkt.data[..pkt.data.len().min(8)].to_vec());
+                }
+                log_pkt("POST-RECREATE", post_count, &pkt);
+                post_count += 1;
+                // Drain up to POST_RECREATE_FRAMES + pipeline depth.
+                if post_count >= (POST_RECREATE_FRAMES as u32).saturating_add(5) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!(
+                    "[NVENC-P0b] OUTCOME=ENCODER_DIED — pump thread exited after \
+                     request_keyframe_via_recreate + flush; {} post-recreate packets received",
+                    post_count
+                );
+                println!(
+                    "[NVENC-P0b] OUTCOME=ENCODER_DIED after {} post-recreate packets",
+                    post_count
+                );
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if post_count == 0 {
+                    tracing::warn!(
+                        "[NVENC-P0b] OUTCOME=EMPTY_DRAIN — no post-recreate packets before 15s timeout; \
+                         Mechanism G may have failed on NVENC (ActivateObject rejected?)"
+                    );
+                    println!("[NVENC-P0b] OUTCOME=EMPTY_DRAIN — no post-recreate packets received");
+                } else {
+                    tracing::info!(
+                        "[NVENC-P0b] post-recreate drain complete — {} packets received",
+                        post_count
+                    );
+                    println!(
+                        "[NVENC-P0b] post-recreate drain complete — {} packets received",
+                        post_count
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // ── SUMMARY block ─────────────────────────────────────────────────────────
+    //
+    // The summary is the primary deliverable.  Compare:
+    //   - first_post_recreate_is_keyframe: should be TRUE if Mechanism G works on NVENC
+    //   - first_post_recreate_raw_prefix: compare to priming pkt 0 prefix for NAL structure delta
+    //   - If is_keyframe=FALSE: bug is confirmed in post-recreate path; use raw_prefix to
+    //     form a new hypothesis (3-byte vs 4-byte? no AUD? different NAL ordering?)
+    let first_post_idx = if post_count > 0 { Some(0u32) } else { None };
+
+    tracing::info!(
+        "[NVENC-P0b] SUMMARY — \
+         total_priming={} \
+         total_post_recreate={} \
+         first_post_recreate_idx={:?} \
+         first_post_recreate_is_keyframe={:?} \
+         first_post_recreate_raw_prefix={:02x?} \
+         first_post_recreate_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+    println!(
+        "[NVENC-P0b] SUMMARY total_priming={} total_post_recreate={} \
+         first_post_recreate_idx={:?} first_post_recreate_is_keyframe={:?} \
+         first_post_recreate_raw_prefix={:02x?} first_post_recreate_len={:?}",
+        priming_count,
+        post_count,
+        first_post_idx,
+        first_post_is_keyframe,
+        first_post_raw_prefix.as_deref(),
+        first_post_len,
+    );
+
+    // Observation-only probe: no assertions.
+    // The trace log is the deliverable for post-falsification re-investigation (engram #800).
+    let _ = enc.stop();
+}
