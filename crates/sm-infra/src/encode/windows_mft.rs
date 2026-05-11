@@ -1302,6 +1302,13 @@ fn pump_loop(
     // GUARD at top of `while ni_count > 0` loop — MUST precede SWAP (GUARD-BEFORE-SWAP).
     let mut draining = false;
 
+    // Permanent once-shot for disconnect-triggered DRAIN. After upstream channel closes,
+    // F2 wake-up post-DrainComplete (BEGIN_STREAMING + START_OF_STREAM) re-emits NeedInput;
+    // re-entering the disconnect branch would re-fire DRAIN indefinitely (~12× spam observed
+    // in v0.1.0 / v0.2.0). The first disconnect-DRAIN is the legitimate flush; subsequent
+    // re-fires add no signal — the channel stays closed until the encoder thread exits.
+    let mut disconnect_drained = false;
+
     // Change-detection sentinels for DD8 counter snapshot logging (spec R7/S7.2).
     let mut last_logged_ni: u32 = u32::MAX;
     let mut last_logged_ho: u32 = u32::MAX;
@@ -1575,17 +1582,23 @@ fn pump_loop(
                 Err(RecvTimeoutError::Disconnected) => {
                     // Upstream closed — drain MFT and continue looping (do NOT consume credit).
                     // Restore both codec atomics (DD3) — encoder shutting down, but be consistent.
-                    tracing::info!("pump_loop: frame channel disconnected, sending COMMAND_DRAIN");
                     restore_pending_codec(state, &swap);
-                    unsafe {
-                        let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                    if !disconnect_drained {
+                        tracing::info!(
+                            "pump_loop: frame channel disconnected, sending COMMAND_DRAIN"
+                        );
+                        unsafe {
+                            let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+                        }
+                        // DD14 SET site #2: mark drain window open BEFORE break.
+                        draining = true;
+                        // Permanent once-shot: do NOT re-fire even after DrainComplete + F2 wake-up.
+                        disconnect_drained = true;
+                        tracing::trace!(
+                            target: "sm_infra::encode::windows_mft",
+                            "draining = true (disconnect)"
+                        );
                     }
-                    // DD14 SET site #2: mark drain window open BEFORE break.
-                    draining = true;
-                    tracing::trace!(
-                        target: "sm_infra::encode::windows_mft",
-                        "draining = true (disconnect)"
-                    );
                     break;
                 }
             }
