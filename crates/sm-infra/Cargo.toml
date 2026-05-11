@@ -5,20 +5,21 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Default: hw-encoder is OFF. The Windows MFT adapter has known unresolved
-# Bucket A bugs (vendor-specific async event priming + GetEvent stop-signal
-# starvation; see discoveries #582, #591, #592) and currently deadlocks on
-# real GPU hosts. Until the MFT integration is reworked against Microsoft's
-# official async-MFT sample, ship the OpenH264 software path by default and
-# let downstream consumers opt in via `--features hw-encoder` for testing.
-default = []
+# Default: hw-encoder is ON. Bucket A bugs (async event priming, GetEvent
+# stop-signal starvation, pump_loop deadlocks) were closed in Slice 6 R2
+# (PR #22, archive #816). ForceKeyFrame via ICodecAPI VT_UI4 BEFORE
+# ProcessInput is now vendor-uniform on both Intel QSV and NVIDIA NVENC.
+# Automatic SW fallback: if WindowsMftH264Encoder::new returns InitFailed,
+# build_video_encoder silently promotes WindowsOpenH264Encoder. To force
+# software-only at runtime without rebuilding, set:
+#   SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER=1
+default = ["hw-encoder"]
 # Reserved for V2 Media Foundation MFT hardware decoder adapter.
 # Empty in V1 — no code is gated behind it yet.
 hw-decoder = []
 # Gates the WindowsMftH264Encoder MFT adapter and its windows crate dependency.
-# OPT-IN ONLY — the path does not currently work end-to-end on hardware. Fixing
-# this requires a redesign of pump_loop's event handling against vendor MFT
-# priming sequences.
+# Enabled by default since v0.2.0 (Slice 6 R2 closure). Automatic SW fallback
+# is active — no GPU required to run the binary or the unit-test suite.
 hw-encoder = []
 # Exposes test-support helpers (NicOverrideGuard, enumerate_local_ipv4_raw)
 # for use in integration tests outside this crate. Never enable in production.

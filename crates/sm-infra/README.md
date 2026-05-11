@@ -118,23 +118,32 @@ tests are annotated `#[ignore]` and live in the dedicated integration test file
 `crates/sm-infra/tests/windows_mft_encode.rs`. They run on a Windows host with
 a dedicated GPU.
 
-**Preconditions:**
+Since v0.2.0 the `hw-encoder` feature is **on by default**. Normal build and
+test commands do not require `--features hw-encoder`:
+
+```sh
+cargo build -p sm-infra
+cargo nextest run -p sm-infra
+```
+
+**Preconditions (for GPU-dependent integration tests):**
 - Windows 10 1709 (Fall Creators Update) or Windows 11
 - A GPU with a hardware H.264 encoder (Intel Quick Sync, NVIDIA NVENC, AMD AMF,
   or compatible)
 - Up-to-date GPU driver
 
-**Run hardware encoder tests manually:**
+**Run hardware encoder integration tests manually (requires a real GPU):**
 
 ```sh
-cargo nextest run -p sm-infra --features hw-encoder --run-ignored only --tests windows_mft_encode
+cargo nextest run -p sm-infra --run-ignored only --tests windows_mft_encode
 ```
 
-**Force software encoder (bypass HW enumeration):**
+**Runtime kill-switch — force software encoder without rebuilding:**
 
-Set the environment variable `SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER=1` to skip
-`MFTEnumEx` and always use the OpenH264 software encoder. Useful for debugging,
-CPU benchmarks, or machines without a compatible GPU:
+Set `SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER=1` before launching to skip
+`MFTEnumEx` and always use the OpenH264 software encoder. This is the
+documented Tier 1 rollback path (DD7) — useful for CPU benchmarks, debugging,
+or machines without a compatible GPU:
 
 ```sh
 $env:SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER = "1"
