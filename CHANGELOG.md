@@ -12,6 +12,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-10
+
+### Changed
+
+- **`WindowsMftH264Encoder` is now the default encoder on Windows.**
+  The `hw-encoder` Cargo feature is enabled by default in `sm-infra`
+  (`crates/sm-infra/Cargo.toml`). Bucket A bugs (async event priming,
+  `GetEvent` stop-signal starvation, `pump_loop` deadlocks) were resolved
+  in Slice 6 R2 (PR #22, archive engram #816). ForceKeyFrame via ICodecAPI
+  `VT_UI4` BEFORE `ProcessInput` is vendor-uniform on Intel Quick Sync and
+  NVIDIA NVENC.
+- **Version bump `0.1.0` → `0.2.0`** (`src-tauri/Cargo.toml`). Adding a
+  default feature qualifies as a minor bump per the project's changelog
+  policy (patch = bug-fix only).
+
+### Documentation
+
+- `crates/sm-infra/Cargo.toml`: stale Bucket A comment replaced with
+  current-state comment citing Slice 6 R2 closure and the env-var kill-switch.
+- `crates/sm-infra/README.md`: hardware encoder section updated to reflect
+  default-on status; `--features hw-encoder` removed from normal build and
+  test commands; kill-switch documented as the Tier 1 rollback path.
+
+### Compatibility
+
+- **Windows hosts with a compatible GPU** (Intel Quick Sync, NVIDIA NVENC,
+  AMD AMF): `WindowsMftH264Encoder` is selected automatically. No user action
+  required.
+- **Windows hosts without a compatible GPU**: `build_video_encoder` detects
+  `InitFailed` and promotes `WindowsOpenH264Encoder` automatically. No user
+  action required.
+- **macOS and Linux**: `hw-encoder` is gated by
+  `cfg(all(target_os = "windows", feature = "hw-encoder"))` — zero impact on
+  non-Windows platforms.
+- **Runtime rollback**: set `SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER=1` before
+  launching to force the software path without rebuilding (Tier 1 rollback,
+  DD7).
+
 ## [0.1.0] - 2026-05-02
 
 First public beta release. Windows-to-Windows screen-mirroring demo end-to-end:
@@ -90,5 +128,6 @@ AD98689078B263FA181859014D7CD1BFE622896C920295EEECF6E06476E95B2B  Screen Mirror_
 
 Both files are attached to the [v0.1.0 GitHub release](https://github.com/DaverSoGT/screen-mirror-app/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/DaverSoGT/screen-mirror-app/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/DaverSoGT/screen-mirror-app/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DaverSoGT/screen-mirror-app/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/DaverSoGT/screen-mirror-app/releases/tag/v0.1.0
