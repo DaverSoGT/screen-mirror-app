@@ -23,9 +23,44 @@
   // These elements may be absent from older HTML pages — guard with ?. calls.
   const retryBtn = document.getElementById("retry");
   const cancelBtn = document.getElementById("cancel");
+  // hw-encoder-backend-disclosure: backend label span (hidden by default).
+  const encoderBackendEl = document.getElementById("encoder-backend");
 
   // "idle" | "running" | "restart" | "reconnecting" | "dead"
   let senderMode = "idle";
+
+  // ── Backend label helpers (DD4) ──────────────────────────────────────────────
+
+  // Canonical vocabulary → human-readable display mapping (R10, DD4).
+  const BACKEND_LABELS = {
+    hw_nvenc: "HW (NVENC)",
+    hw_intel_qsv: "HW (Intel QSV)",
+    hw_unknown: "HW (unknown)",
+    sw_openh264: "SW (OpenH264)",
+    sw_fake: "SW (fake)",
+  };
+
+  function backendLabel(key) {
+    return BACKEND_LABELS[key] ?? "Encoder: " + (key || "?");
+  }
+
+  /** Show the encoder backend label with the given token. */
+  function renderBackend(key) {
+    if (!encoderBackendEl) return;
+    if (!key) {
+      clearBackend();
+      return;
+    }
+    encoderBackendEl.textContent = backendLabel(key);
+    encoderBackendEl.hidden = false;
+  }
+
+  /** Hide and clear the encoder backend label. */
+  function clearBackend() {
+    if (!encoderBackendEl) return;
+    encoderBackendEl.hidden = true;
+    encoderBackendEl.textContent = "";
+  }
 
   // ── Phase 9 helpers ──────────────────────────────────────────────────────────
 
@@ -57,6 +92,10 @@
         errorDiv.textContent = "";
         hideDeadButtons();
         senderMode = "running";
+        // One-shot backend disclosure (DD3, R11): invoke once per session start.
+        invoke("sender_diagnostics")
+          .then(function (s) { renderBackend(s.backend_name); })
+          .catch(function () {});
         break;
       case "reconnecting":
         // Transient reconnect status — show attempt N of max (AC-2).
@@ -74,12 +113,14 @@
         showDeadButtons();
         senderMode = "dead";
         window.__sm_streamActive = false;
+        clearBackend();
         break;
       case "peer_lost":
         // V1-incompatible-peer path only (transient ICE failure now goes
         // through the reconnect supervisor, not here). Kept for backwards compat.
         statusDiv.textContent = "Disconnected";
         hideDeadButtons();
+        clearBackend();
         break;
       case "stopped":
         statusDiv.textContent = "Not connected";
@@ -87,6 +128,7 @@
         senderMode = "idle";
         window.__sm_streamActive = false;
         hideDeadButtons();
+        clearBackend();
         break;
       case "button":
         startBtn.textContent = value.label;
@@ -120,6 +162,8 @@
     statusDiv.textContent = "Connecting...";
     startBtn.textContent = "Stop streaming";
     senderMode = "running";
+    // Clear any stale backend label from the previous session (DD6).
+    clearBackend();
 
     const channel = new Channel();
     channel.onmessage = function (payload) {
