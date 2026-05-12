@@ -1478,7 +1478,7 @@ fn build_production_sender_bundle(
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
-    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder};
+    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
@@ -1835,10 +1835,7 @@ mod tests {
     #[test]
     fn capture_backend_and_erase_returns_matching_name() {
         use super::capture_backend_and_erase;
-        use sm_domain::encode::{
-            EncodedPacket, EncoderConfig, EncoderError, VideoEncoder,
-        };
-        use std::sync::Arc;
+        use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
 
         // Minimal inline fake for this unit test (FakeVideoEncoder in sm-domain
         // is inside #[cfg(test)] and unreachable from here).
@@ -1873,7 +1870,10 @@ mod tests {
 
         let boxed: Box<dyn VideoEncoder + Send + Sync> = Box::new(TestEncoder);
         let (arc, name) = capture_backend_and_erase(boxed);
-        assert_eq!(name, "sw_fake", "captured name must match encoder's backend_name()");
+        assert_eq!(
+            name, "sw_fake",
+            "captured name must match encoder's backend_name()"
+        );
         // Arc must be valid — verify we can call through it.
         assert_eq!(arc.dropped_frames(), 0);
     }
