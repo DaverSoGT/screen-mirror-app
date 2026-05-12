@@ -69,6 +69,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_ENUM_FLAG,
     MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
     MFT_FRIENDLY_NAME_Attribute,
     MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_COMMAND_FLUSH,
@@ -134,24 +135,85 @@ enum EncoderVendor {
     IntelQsv,
     /// NVIDIA NVENC H.264 MFT — CLSID `{60F44560-5A20-4857-BFEF-D29773CB8040}`.
     NvidiaNvenc,
-    /// Any other vendor (AMD, fallback). Treated as IntelQsv for mechanism routing.
+    /// AMD H.264 MFT (`AMDh264Encoder`).
+    ///
+    /// Detected via the PCI vendor-ID attribute `VEN_1002` rather than a stable
+    /// CLSID prefix. AMD has historically rotated its MFT CLSID across driver
+    /// versions (no rigorous public source documents a stable AMD H.264 CLSID
+    /// as of 2026-05), so the canonical detection path is the PCI vendor-ID
+    /// rather than the CLSID. For AMF SDK context see
+    /// <https://gpuopen.com/advanced-media-framework/>.
+    Amd,
+    /// Any other vendor (fallback). Treated as IntelQsv for mechanism routing.
     Unknown,
 }
 
 impl EncoderVendor {
-    /// Detect vendor from the CLSID string formatted by `probe_and_select_mft`.
+    /// Classify the MFT vendor from the CLSID and optional PCI vendor-ID.
     ///
-    /// The CLSID is formatted as `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (upper-case hex).
-    /// Matching on prefix is sufficient because the leading data1 component is unique per vendor.
-    fn from_clsid_str(clsid_str: &str) -> Self {
+    /// Priority:
+    /// 1. **CLSID exact-prefix match** (NVENC `{60F44560-`, Intel QSV `{4BE8D3C0-`).
+    /// 2. **PCI vendor-ID prefix match** (`VEN_10DE` NVIDIA, `VEN_8086` Intel,
+    ///    `VEN_1002` AMD) — rotation-insurance fallback.
+    /// 3. `Unknown` when neither signal resolves.
+    ///
+    /// # CLSID wins on disagreement
+    ///
+    /// If the CLSID matches a known prefix but the vendor-ID disagrees, the CLSID
+    /// is authoritative. The CLSID is obtained via `GetGUID` (a structured 16-byte
+    /// value), is registered per-vendor in the Windows COM registry, and is what
+    /// `MFTEnumEx` keys on to activate the transform. Disagreement implies either
+    /// a Windows misregistration bug or a forked/repackaged MFT — in either case
+    /// the more specific signal (CLSID) is trusted. The vendor-ID is a fallback
+    /// for the case where the CLSID has rotated AWAY from any prefix we know
+    /// about, not a tie-breaker.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // CLSID exact match — NVENC.
+    /// assert_eq!(
+    ///     EncoderVendor::detect("{60F44560-5033-...}", None),
+    ///     EncoderVendor::NvidiaNvenc,
+    /// );
+    ///
+    /// // CLSID unknown, vendor-ID resolves AMD.
+    /// assert_eq!(
+    ///     EncoderVendor::detect("(no CLSID)", Some("VEN_1002")),
+    ///     EncoderVendor::Amd,
+    /// );
+    ///
+    /// // CLSID unknown, vendor-ID disagrees with no known prefix.
+    /// assert_eq!(
+    ///     EncoderVendor::detect("(no CLSID)", Some("VEN_FFFF")),
+    ///     EncoderVendor::Unknown,
+    /// );
+    /// ```
+    pub(crate) fn detect(clsid: &str, vendor_id: Option<&str>) -> Self {
+        // Stage 1: CLSID exact-prefix match (authoritative).
         // NVENC: {60F44560-5A20-4857-BFEF-D29773CB8040} — confirmed in C0/C0.b probe logs (Slice 6).
-        if clsid_str.starts_with("{60F44560-") {
+        if clsid.starts_with("{60F44560-") {
             return Self::NvidiaNvenc;
         }
         // Intel QSV: {4BE8D3C0-0515-4A37-AD55-E4BAE19AF471} — from Slice 4 archive explore.
-        if clsid_str.starts_with("{4BE8D3C0-") {
+        if clsid.starts_with("{4BE8D3C0-") {
             return Self::IntelQsv;
         }
+
+        // Stage 2: vendor-ID prefix fallback (rotation-insurance).
+        // starts_with used to tolerate trailing &DEV_xxxx suffixes (R1.4).
+        if let Some(vid) = vendor_id {
+            if vid.starts_with("VEN_10DE") {
+                return Self::NvidiaNvenc;
+            }
+            if vid.starts_with("VEN_8086") {
+                return Self::IntelQsv;
+            }
+            if vid.starts_with("VEN_1002") {
+                return Self::Amd;
+            }
+        }
+
         Self::Unknown
     }
 }
@@ -398,6 +460,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
         match self.vendor {
             EncoderVendor::NvidiaNvenc => "hw_nvenc",
             EncoderVendor::IntelQsv => "hw_intel_qsv",
+            EncoderVendor::Amd => "hw_amd",
             EncoderVendor::Unknown => "hw_unknown",
         }
     }
@@ -545,6 +608,34 @@ fn enumerate_activates() -> Result<Vec<IMFActivate>, EncoderError> {
     }
 
     Ok(activates)
+}
+
+// ── Vendor-ID attribute extraction helper ────────────────────────────────────
+/// Reads the optional `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute` from an
+/// `IMFActivate`, returning `None` if the attribute is absent, the string
+/// is null, or UTF-16 decode fails. Encapsulates the `unsafe` COM dance
+/// (GetAllocatedString + PWSTR::to_string + CoTaskMemFree) so the probe
+/// loop stays readable.
+fn read_vendor_id_attribute(activate: &IMFActivate) -> Option<String> {
+    // SAFETY: GetAllocatedString writes a CoTaskMemAlloc'd PWSTR on Ok(())
+    // which we MUST CoTaskMemFree exactly once. On Err the pointer is left
+    // null (per windows-rs docs) so no free is needed on the failure path.
+    unsafe {
+        let mut pwstr = PWSTR::null();
+        let mut cch: u32 = 0;
+        match activate.GetAllocatedString(
+            &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+            &mut pwstr,
+            &mut cch,
+        ) {
+            Ok(()) if !pwstr.is_null() => {
+                let s = pwstr.to_string().ok();
+                CoTaskMemFree(Some(pwstr.0 as *const _));
+                s
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Iterate IMFActivate candidates and return the FIRST one that passes the full
@@ -706,22 +797,46 @@ fn probe_and_select_mft(
         // Match CLSID string to EncoderVendor for diagnostic logging only.
         // Mid-stream IDR is vendor-uniform via CODECAPI_AVEncVideoForceKeyFrame (P2 #809).
         // See explore #803 and design DD5.
-        let vendor = EncoderVendor::from_clsid_str(&clsid_str);
+        let vendor_id_str = read_vendor_id_attribute(activate);
+        let vendor = EncoderVendor::detect(&clsid_str, vendor_id_str.as_deref());
+
+        // DD3 three-site logging: source="clsid" | "vendor_id_fallback" | debug on absent.
         match vendor {
-            EncoderVendor::NvidiaNvenc => {
-                tracing::info!(
-                    "probe_and_select_mft: detected vendor=NvidiaNvenc for [{i}] \"{friendly_name}\" {clsid_str}"
-                );
-            }
-            EncoderVendor::IntelQsv => {
-                tracing::info!(
-                    "probe_and_select_mft: detected vendor=IntelQsv for [{i}] \"{friendly_name}\" {clsid_str}"
-                );
+            EncoderVendor::NvidiaNvenc | EncoderVendor::IntelQsv | EncoderVendor::Amd => {
+                // Determine which stage resolved the vendor.
+                let clsid_matched =
+                    clsid_str.starts_with("{60F44560-") || clsid_str.starts_with("{4BE8D3C0-");
+                if clsid_matched {
+                    tracing::info!(
+                        target: "encoder.vendor",
+                        vendor = ?vendor,
+                        source = "clsid",
+                        clsid = %clsid_str,
+                        "vendor detected"
+                    );
+                } else if let Some(ref vid) = vendor_id_str {
+                    tracing::info!(
+                        target: "encoder.vendor",
+                        vendor = ?vendor,
+                        source = "vendor_id_fallback",
+                        clsid = %clsid_str,
+                        vendor_id = %vid,
+                        "vendor detected"
+                    );
+                }
             }
             EncoderVendor::Unknown => {
+                if vendor_id_str.is_none() {
+                    tracing::debug!(
+                        target: "encoder.vendor",
+                        clsid = %clsid_str,
+                        "vendor-id attribute absent — fallback unavailable"
+                    );
+                }
                 tracing::warn!(
-                    "probe_and_select_mft: vendor Unknown for [{i}] \"{friendly_name}\" {clsid_str} \
-                     — CLSID not in known-vendor table"
+                    target: "encoder.vendor",
+                    clsid = %clsid_str,
+                    "vendor Unknown — CLSID not in known-vendor table and vendor-ID did not resolve"
                 );
             }
         }
@@ -2143,12 +2258,110 @@ mod tests {
         );
     }
 
+    // ── T.A.1 (RED → GREEN): EncoderVendor::detect — 9 unit tests ──────────────
+    //
+    // Priority contract: CLSID exact-prefix (stage 1) → vendor-ID prefix (stage 2) →
+    // Unknown (catch-all). All tests are pure string comparisons; no COM, no GPU.
+
+    // SC-DETECT-1 / R1.2, R1.3: CLSID exact-prefix → NvidiaNvenc
+    #[test]
+    fn detect_clsid_match_nvenc() {
+        assert_eq!(
+            EncoderVendor::detect("{60F44560-5A20-4857-BFEF-D29773CB8040}", None),
+            EncoderVendor::NvidiaNvenc
+        );
+    }
+
+    // SC-DETECT-3 / R1.2, R1.3: CLSID exact-prefix → IntelQsv
+    #[test]
+    fn detect_clsid_match_intel() {
+        assert_eq!(
+            EncoderVendor::detect("{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}", None),
+            EncoderVendor::IntelQsv
+        );
+    }
+
+    // SC-DETECT-4 / R1.4, R1.6: vendor-ID fallback → Amd
+    #[test]
+    fn detect_vendor_id_only_amd() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_1002")),
+            EncoderVendor::Amd
+        );
+    }
+
+    // SC-DETECT-2 / R1.4: vendor-ID fallback → NvidiaNvenc (CLSID rotation)
+    #[test]
+    fn detect_vendor_id_only_nvenc_fallback() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_10DE")),
+            EncoderVendor::NvidiaNvenc
+        );
+    }
+
+    // R1.4: vendor-ID fallback → IntelQsv
+    #[test]
+    fn detect_vendor_id_only_intel_fallback() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_8086")),
+            EncoderVendor::IntelQsv
+        );
+    }
+
+    // SC-DETECT-7 / R1.4: no CLSID, no vendor-ID → Unknown
+    #[test]
+    fn detect_unknown_both_absent() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", None),
+            EncoderVendor::Unknown
+        );
+    }
+
+    // SC-DETECT-6 / R1.4: unrecognized vendor-ID + malformed sub-cases → all Unknown
+    #[test]
+    fn detect_unknown_vendor_id_not_recognized() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_FFFF")),
+            EncoderVendor::Unknown
+        );
+        // Malformed: prefix only (no digits after VEN_)
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_")),
+            EncoderVendor::Unknown
+        );
+        // Malformed: digits without prefix
+        assert_eq!(
+            EncoderVendor::detect("", Some("1002")),
+            EncoderVendor::Unknown
+        );
+    }
+
+    // SC-DETECT-8 / R1.5, DD4: CLSID wins when vendor-ID disagrees
+    #[test]
+    fn detect_clsid_wins_on_disagreement() {
+        // CLSID says NVENC, vendor-ID says AMD — CLSID must win.
+        assert_eq!(
+            EncoderVendor::detect("{60F44560-5A20-4857-BFEF-D29773CB8040}", Some("VEN_1002")),
+            EncoderVendor::NvidiaNvenc
+        );
+    }
+
+    // R1.4 prefix-match tolerance: VEN_1002 with trailing device suffix → Amd
+    #[test]
+    fn detect_vendor_id_suffix_tolerated() {
+        assert_eq!(
+            EncoderVendor::detect("(no CLSID)", Some("VEN_1002&DEV_xxxx")),
+            EncoderVendor::Amd
+        );
+    }
+
     // ─── T.B.3: mft_encoder_reports_hw_backend_name (HW-gated, #[ignore]) ────
     //
     // Requires a real MFT host (Windows machine with NVENC or Intel QSV).
     // Tagged `#[ignore]` to match the existing 46 HW-gated tests pattern.
     // On HW: constructs a real `WindowsMftH264Encoder` and asserts the returned
     // backend name starts with `"hw_"`, covering all three vendor branches.
+    // Note: "hw_amd" also passes the starts_with("hw_") assertion.
 
     #[test]
     #[ignore = "requires real MFT hardware (NVENC or Intel QSV) — run manually on HW host"]
