@@ -113,6 +113,10 @@ describe('sender — backend label (SC-BACKEND-*)', () => {
     await assertBackendLabel('sw_fake', 'SW (fake)');
   });
 
+  it('SC-BACKEND-2f: hw_amd → "HW (AMD)"', async () => {
+    await assertBackendLabel('hw_amd', 'HW (AMD)');
+  });
+
   // ── SC-BACKEND-3a..3c: stopped/dead/peer_lost hide and clear the label ───────
 
   async function assertClearingEvent(kind, payload) {
