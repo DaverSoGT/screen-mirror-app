@@ -195,6 +195,24 @@ pub trait VideoEncoder: Send + Sync {
     ///
     /// Thread-safe via `AtomicU64`. Monotonically non-decreasing.
     fn dropped_frames(&self) -> u64;
+
+    /// Return the stable backend identifier for this encoder.
+    ///
+    /// The return value MUST be one of the five canonical vocabulary strings:
+    ///
+    /// | Token            | Meaning                              |
+    /// |------------------|--------------------------------------|
+    /// | `"sw_openh264"`  | Software encoder (Cisco OpenH264)    |
+    /// | `"hw_nvenc"`     | NVIDIA NVENC via MFT                 |
+    /// | `"hw_intel_qsv"` | Intel Quick Sync via MFT             |
+    /// | `"hw_unknown"`   | MFT encoder, vendor CLSID unknown    |
+    /// | `"sw_fake"`      | Test fake encoder (tests only)       |
+    ///
+    /// # Allocation contract
+    ///
+    /// Returns `&'static str` — the value is a compile-time string literal owned
+    /// by the impl. The call site converts to `String` at most once per session.
+    fn backend_name(&self) -> &'static str;
 }
 
 #[cfg(test)]
@@ -305,6 +323,10 @@ mod tests {
 
         fn dropped_frames(&self) -> u64 {
             self.dropped.load(Ordering::Relaxed)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "sw_fake"
         }
     }
 
@@ -663,5 +685,20 @@ mod tests {
         // This requires the trait to declare: pub trait VideoEncoder: Send + Sync
         fn check_dyn_sync<T: ?Sized + Sync>() {}
         check_dyn_sync::<dyn VideoEncoder>();
+    }
+
+    // ─── T.A.1: fake_encoder_reports_backend_name (RED) ──────────────────────
+    //
+    // Confirms `backend_name()` exists on `VideoEncoder` and that `FakeVideoEncoder`
+    // returns `"sw_fake"`. RED until T.A.2 adds the trait method + impl.
+
+    #[test]
+    fn fake_encoder_reports_backend_name() {
+        let enc = FakeVideoEncoder::default();
+        assert_eq!(
+            enc.backend_name(),
+            "sw_fake",
+            "FakeVideoEncoder must return the canonical test-encoder token"
+        );
     }
 }

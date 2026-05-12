@@ -70,6 +70,7 @@ fn blocking_session(
             // Block until the test releases us.
             let _ = release_rx.recv_timeout(Duration::from_secs(5));
         })),
+        backend_name: "sw_fake".to_string(),
     };
     Arc::new(Mutex::new(Some(session)))
 }

@@ -235,15 +235,9 @@ pub struct WindowsMftH264Encoder {
     state: Arc<MftEncoderShared>,
     /// Vendor identity of the winning MFT, detected during `new()` via CLSID matching.
     ///
-    /// Retained for INFO/WARN diagnostic logging only. Does NOT drive IDR mechanism
-    /// dispatch — mid-stream IDR is vendor-uniform via `CODECAPI_AVEncVideoForceKeyFrame`
-    /// (P2 evidence #809, design DD5). See `EncoderVendor`.
-    // WHY: field is kept for future diagnostic use (vendor-specific quirk flags, metrics)
-    // and is populated by new() from CLSID detection; not yet read back in Slice 6 R2.
-    #[expect(
-        dead_code,
-        reason = "populated for future diagnostic use; no behavioral consumer in Slice 6 R2"
-    )]
+    /// Read by `backend_name()` to return the canonical backend token (`"hw_nvenc"`,
+    /// `"hw_intel_qsv"`, or `"hw_unknown"`). Also available for future diagnostic use
+    /// (vendor-specific quirk flags, metrics). See `EncoderVendor`.
     vendor: EncoderVendor,
     /// The winning `IMFActivate` selected during the destructive probe in `new()`.
     ///
@@ -398,6 +392,14 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
     fn dropped_frames(&self) -> u64 {
         self.state.dropped.load(Ordering::Relaxed)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self.vendor {
+            EncoderVendor::NvidiaNvenc => "hw_nvenc",
+            EncoderVendor::IntelQsv => "hw_intel_qsv",
+            EncoderVendor::Unknown => "hw_unknown",
+        }
     }
 }
 
@@ -2138,6 +2140,25 @@ mod tests {
                 .force_keyframe_icodecapi_pending
                 .load(Ordering::Acquire),
             "flag must be false after swap consume (one-shot semantics)"
+        );
+    }
+
+    // ─── T.B.3: mft_encoder_reports_hw_backend_name (HW-gated, #[ignore]) ────
+    //
+    // Requires a real MFT host (Windows machine with NVENC or Intel QSV).
+    // Tagged `#[ignore]` to match the existing 46 HW-gated tests pattern.
+    // On HW: constructs a real `WindowsMftH264Encoder` and asserts the returned
+    // backend name starts with `"hw_"`, covering all three vendor branches.
+
+    #[test]
+    #[ignore = "requires real MFT hardware (NVENC or Intel QSV) — run manually on HW host"]
+    fn mft_encoder_reports_hw_backend_name() {
+        let enc = WindowsMftH264Encoder::new(EncoderConfig::default())
+            .expect("MFT encoder construction must succeed on HW host");
+        let name = enc.backend_name();
+        assert!(
+            name.starts_with("hw_"),
+            "MFT encoder backend_name must start with 'hw_', got: {name:?}"
         );
     }
 }

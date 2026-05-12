@@ -128,6 +128,7 @@ fn make_supervised_bridge_with_policy(
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
         sup_tx,
@@ -726,6 +727,7 @@ fn make_supervised_bridge_with_rebuild_hook(
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
         session_arc,
@@ -905,6 +907,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
         session_arc,
@@ -1232,6 +1235,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                 Ok(SenderBundle {
                     drain_handles: vec![h],
                     shutdown: None,
+                    backend_name: "sw_fake".to_string(),
                 })
             });
 
@@ -1492,6 +1496,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
         session_arc,

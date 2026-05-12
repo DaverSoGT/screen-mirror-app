@@ -106,6 +106,10 @@ impl VideoEncoder for FakeLoopbackEncoder {
     fn dropped_frames(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    fn backend_name(&self) -> &'static str {
+        "sw_fake"
+    }
 }
 
 // ─── Helper: build a minimal synthetic IDR frame in Annex-B format ───────────

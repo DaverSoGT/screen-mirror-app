@@ -52,6 +52,10 @@ impl VideoEncoder for FakeEncoder {
     fn dropped_frames(&self) -> u64 {
         0
     }
+
+    fn backend_name(&self) -> &'static str {
+        "sw_fake"
+    }
 }
 
 fn make_packet(seq: u64) -> EncodedPacket {
