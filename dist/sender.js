@@ -35,6 +35,7 @@
   const BACKEND_LABELS = {
     hw_nvenc: "HW (NVENC)",
     hw_intel_qsv: "HW (Intel QSV)",
+    hw_amd: "HW (AMD)",
     hw_unknown: "HW (unknown)",
     sw_openh264: "SW (OpenH264)",
     sw_fake: "SW (fake)",
