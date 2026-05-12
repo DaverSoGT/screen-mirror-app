@@ -61,11 +61,13 @@ fn sender_stats_serializes_correctly() {
         dropped_frames_transport: 0,
         keyframe_requests_received: 0,
         running: false,
+        backend_name: String::new(),
     };
     let s = serde_json::to_string(&stats).unwrap();
     let back: serde_json::Value = serde_json::from_str(&s).unwrap();
     assert_eq!(back["running"], false);
     assert_eq!(back["dropped_frames_encoder"], 0);
+    assert_eq!(back["backend_name"], "");
 }
 
 // ─── B2 command registration assertions ──────────────────────────────────────
@@ -346,6 +348,7 @@ fn stop_sender_fake_session_drains_handles() {
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
     });
@@ -402,6 +405,28 @@ fn sender_diagnostics_with_fake_session_returns_stats() {
     let stats = sender_diagnostics_impl(&bridge).expect("should return stats");
     assert_eq!(stats.dropped_frames_encoder, 3);
     assert!(stats.running);
+    // T.D.4 RED→GREEN: backend_name must be "sw_fake" when session uses test stub
+    // (SenderBundle::test_stub() sets backend_name = "sw_fake").
+    assert_eq!(
+        stats.backend_name, "sw_fake",
+        "backend_name must equal the test-stub sentinel"
+    );
+}
+
+/// No session → Err("not running") — R7: backend_name not surfaced on Err path.
+///
+/// Covers R7: when no session is active, `sender_diagnostics` returns Err,
+/// meaning `backend_name` is not surfaced at all (the field lives only in Ok).
+#[test]
+fn sender_diagnostics_no_session_err_path_omits_backend_name() {
+    let bridge = SenderBridge::new();
+    let result = sender_diagnostics_impl(&bridge);
+    assert!(result.is_err(), "no session must return Err");
+    assert_eq!(
+        result.unwrap_err(),
+        "not running",
+        "error message must be 'not running'"
+    );
 }
 
 /// running field reflects session presence.
@@ -968,6 +993,7 @@ fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
                 shutdown: Some(Box::new(move || {
                     drop(tracker);
                 })),
+                backend_name: "sw_fake".to_string(),
             })
         },
     ));

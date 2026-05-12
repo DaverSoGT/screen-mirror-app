@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 sm-domain = { workspace = true }
 sm-infra = { workspace = true }
 rand = "0.8"
+tracing = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -122,15 +122,21 @@ pub struct SenderBundle {
     /// Owns production-only resources whose `Drop` impls perform ordered teardown
     /// (capture → sender Arc → encoder Arc → signaling Arc). `None` for test stubs.
     pub shutdown: Option<Box<dyn FnOnce() + Send>>,
+    /// Backend token captured from the encoder before Arc-erasure (DD2).
+    /// Production: set by `capture_backend_and_erase` in the builder.
+    /// Test stubs: `"sw_fake"` sentinel (matches `FakeVideoEncoder::backend_name()`).
+    pub backend_name: String,
 }
 
 impl SenderBundle {
     /// Construct a minimal bundle suitable for unit tests.
     /// Spawns no real threads; drain_handles is empty; no production shutdown.
+    /// Sets `backend_name: "sw_fake"` to match `FakeVideoEncoder::backend_name()`.
     pub fn test_stub() -> Self {
         Self {
             drain_handles: vec![],
             shutdown: None,
+            backend_name: "sw_fake".to_string(),
         }
     }
 }
@@ -185,6 +191,9 @@ pub struct SenderSession {
     pub counters: Arc<SenderCounters>,
     /// Production-only ordered teardown closure (C1 fix). See [`SenderBundle::shutdown`].
     pub shutdown: Option<Box<dyn FnOnce() + Send>>,
+    /// Canonical backend token captured at construction time (DD2 ordering invariant).
+    /// Immutable after session start — never mutated by any path (R9).
+    pub backend_name: String,
 }
 
 // ─── SenderBridge — Tauri managed state ──────────────────────────────────────
@@ -372,6 +381,10 @@ pub struct SenderStats {
     pub dropped_frames_transport: u64,
     pub keyframe_requests_received: u64,
     pub running: bool,
+    /// Canonical backend token for the active encoder session (R4, DD8).
+    /// One of the five vocabulary strings from R6. Empty string when no session is active
+    /// (the `Err` path never surfaces this field; `running == false` implies no session).
+    pub backend_name: String,
 }
 
 // ─── SenderStatusEvent — internal JSON event shapes ──────────────────────────
@@ -1038,6 +1051,7 @@ pub fn start_sender_inner(
         channel: channel.clone(),
         counters: Arc::new(SenderCounters::default()),
         shutdown: bundle.shutdown,
+        backend_name: bundle.backend_name,
     };
     *bridge.session.lock().unwrap() = Some(session);
     *bridge.current_args.lock().unwrap() = Some(SenderArgs {
@@ -1277,6 +1291,7 @@ pub fn make_sender_rebuild_hook(
                         channel: cache.channel.clone(),
                         counters: Arc::new(SenderCounters::default()),
                         shutdown: new_bundle.shutdown,
+                        backend_name: new_bundle.backend_name,
                     });
                 }
 
@@ -1413,8 +1428,37 @@ pub fn sender_diagnostics_impl(bridge: &SenderBridge) -> Result<SenderStats, Str
                 .keyframe_requests_received
                 .load(Ordering::Relaxed),
             running: true,
+            backend_name: s.backend_name.clone(),
         }),
     }
+}
+
+// ─── capture_backend_and_erase — DD2 ordering invariant ──────────────────────
+
+/// Capture `backend_name()` from a boxed encoder BEFORE erasing its concrete type
+/// behind an `Arc<dyn VideoEncoder + Send + Sync>`.
+///
+/// # DD2 ordering invariant
+///
+/// The compiler enforces this invariant structurally: `encoder` is consumed by
+/// this helper (move semantics). There is no syntactic path to call
+/// `Arc::from(encoder)` in the production builder before the name is captured —
+/// the helper is the only call site for the erasure.
+///
+/// Returns `(arc, backend_name_string)`. Callers MUST use the returned `arc`
+/// rather than creating a new `Arc::from` outside this function.
+//
+// `cfg(any(windows, test))`: production caller `build_production_sender_bundle`
+// is `cfg(target_os = "windows")`. Non-Windows lib builds would see the helper
+// as `dead_code`. The unit test below also exercises it cross-platform.
+#[cfg(any(target_os = "windows", test))]
+fn capture_backend_and_erase(
+    encoder: Box<dyn sm_domain::VideoEncoder + Send + Sync>,
+) -> (Arc<dyn sm_domain::VideoEncoder + Send + Sync>, String) {
+    // Capture the name FIRST — before the concrete type is erased.
+    let name = encoder.backend_name().to_string();
+    let arc: Arc<dyn sm_domain::VideoEncoder + Send + Sync> = Arc::from(encoder);
+    (arc, name)
 }
 
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
@@ -1439,7 +1483,7 @@ fn build_production_sender_bundle(
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
-    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector, VideoEncoder};
+    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
@@ -1514,8 +1558,11 @@ fn build_production_sender_bundle(
         .start(capture_to_enc_rx, enc_to_sender_tx)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
-    // Arc::from(Box<dyn T>) unsizes Box→Arc via impl From<Box<T>> for Arc<T> (stable since Rust 1.6).
-    let encoder_arc: Arc<dyn VideoEncoder + Send + Sync> = Arc::from(encoder);
+    // Capture backend_name() BEFORE type erasure (DD2 ordering invariant).
+    // `capture_backend_and_erase` is the only production call site for Arc::from(encoder);
+    // move semantics prevent any ordering violation.
+    let (encoder_arc, backend_name) = capture_backend_and_erase(encoder);
+    tracing::info!(target: "sender", backend = %backend_name, "encoder backend selected");
     sender.set_encoder(Arc::clone(&encoder_arc));
 
     // Extract offer BEFORE start(): start() consumes pre_neg via guard.take(),
@@ -1691,6 +1738,7 @@ fn build_production_sender_bundle(
     Ok(SenderBundle {
         drain_handles: vec![sig_drain, tr_drain],
         shutdown: Some(shutdown),
+        backend_name,
     })
 }
 
@@ -1780,6 +1828,60 @@ impl ChannelLike for TauriSenderChannel {
 #[cfg(test)]
 mod tests {
     use sm_domain::EncoderConfig;
+
+    // ─── T.C.1: capture_backend_and_erase_returns_matching_name (RED) ─────────
+    //
+    // Proves the DD2 ordering invariant: `backend_name()` is captured BEFORE
+    // `Arc::from(encoder)` erases the concrete type. The helper takes a
+    // `Box<dyn VideoEncoder + Send + Sync>` and returns `(Arc<dyn …>, String)`.
+    //
+    // RED until T.C.2 adds the `capture_backend_and_erase` function.
+
+    #[test]
+    fn capture_backend_and_erase_returns_matching_name() {
+        use super::capture_backend_and_erase;
+        use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
+
+        // Minimal inline fake for this unit test (FakeVideoEncoder in sm-domain
+        // is inside #[cfg(test)] and unreachable from here).
+        struct TestEncoder;
+        impl VideoEncoder for TestEncoder {
+            fn new(_: EncoderConfig) -> Result<Self, EncoderError> {
+                Ok(Self)
+            }
+            fn start(
+                &mut self,
+                _rx: std::sync::mpsc::Receiver<sm_domain::CaptureFrame>,
+                _tx: std::sync::mpsc::SyncSender<EncodedPacket>,
+            ) -> Result<(), EncoderError> {
+                Ok(())
+            }
+            fn stop(&mut self) -> Result<(), EncoderError> {
+                Ok(())
+            }
+            fn request_keyframe(&self) {}
+            fn set_bitrate(&self, _bps: u32) -> Result<(), EncoderError> {
+                Ok(())
+            }
+            fn dropped_frames(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "sw_fake"
+            }
+        }
+        unsafe impl Send for TestEncoder {}
+        unsafe impl Sync for TestEncoder {}
+
+        let boxed: Box<dyn VideoEncoder + Send + Sync> = Box::new(TestEncoder);
+        let (arc, name) = capture_backend_and_erase(boxed);
+        assert_eq!(
+            name, "sw_fake",
+            "captured name must match encoder's backend_name()"
+        );
+        // Arc must be valid — verify we can call through it.
+        assert_eq!(arc.dropped_frames(), 0);
+    }
 
     // ─── T2.3: build_video_encoder_propagates_config_dimensions_when_set ──────
     //

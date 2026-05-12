@@ -191,6 +191,7 @@ fn make_bridge_with_counting_hooks(
             Ok(SenderBundle {
                 drain_handles: vec![h],
                 shutdown: None,
+                backend_name: "sw_fake".to_string(),
             })
         }),
         sup_tx,

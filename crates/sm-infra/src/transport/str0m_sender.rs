@@ -819,6 +819,10 @@ mod tests {
         fn dropped_frames(&self) -> u64 {
             self.dropped.load(Ordering::Relaxed)
         }
+
+        fn backend_name(&self) -> &'static str {
+            "sw_fake"
+        }
     }
 
     // ─── S5.1 (batch 3 variant): new() returns Ok with default config ─────────

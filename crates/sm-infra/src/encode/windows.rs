@@ -319,6 +319,10 @@ impl VideoEncoder for WindowsOpenH264Encoder {
     fn dropped_frames(&self) -> u64 {
         self.state.dropped.load(Ordering::Relaxed)
     }
+
+    fn backend_name(&self) -> &'static str {
+        "sw_openh264"
+    }
 }
 
 impl Drop for WindowsOpenH264Encoder {
