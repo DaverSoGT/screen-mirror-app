@@ -1447,6 +1447,11 @@ pub fn sender_diagnostics_impl(bridge: &SenderBridge) -> Result<SenderStats, Str
 ///
 /// Returns `(arc, backend_name_string)`. Callers MUST use the returned `arc`
 /// rather than creating a new `Arc::from` outside this function.
+//
+// `cfg(any(windows, test))`: production caller `build_production_sender_bundle`
+// is `cfg(target_os = "windows")`. Non-Windows lib builds would see the helper
+// as `dead_code`. The unit test below also exercises it cross-platform.
+#[cfg(any(target_os = "windows", test))]
 fn capture_backend_and_erase(
     encoder: Box<dyn sm_domain::VideoEncoder + Send + Sync>,
 ) -> (Arc<dyn sm_domain::VideoEncoder + Send + Sync>, String) {
