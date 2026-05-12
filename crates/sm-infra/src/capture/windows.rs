@@ -57,6 +57,16 @@ fn djb2(bytes: &[u8]) -> u64 {
 /// `std::sync::mpsc::sync_channel(CAPTURE_CHANNEL_CAPACITY)`.
 pub const CAPTURE_CHANNEL_CAPACITY: usize = 4;
 
+/// Heartbeat interval for static-content frame injection (capture-static-freeze fix).
+///
+/// WGC `on_frame_arrived` is called only when desktop content changes. A static screen
+/// (no motion, no cursor blink, no animation) yields zero frames → zero RTP packets →
+/// viewer freezes on the last received frame. A sibling heartbeat thread injects a
+/// duplicate of the last real frame at this cadence (with an advanced timestamp) so the
+/// encoder keeps producing output. 100ms = 10fps minimum during static periods. Real
+/// frames arriving from WGC reset the heartbeat — no duplicates injected during motion.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 // ---------------------------------------------------------------------------
 // Phase 6 — Border detection (R9.1–R9.5)
 // ---------------------------------------------------------------------------
@@ -121,6 +131,11 @@ fn monitor_info_from(m: &Monitor, is_primary: bool) -> Result<MonitorInfo, Captu
 // Internal capture handler (lives on the WGC OS thread)
 // ---------------------------------------------------------------------------
 
+/// Shared snapshot of the most recent CaptureFrame + the instant it was observed.
+/// Owned by both `WgcHandler` (writer on the WGC thread) and the heartbeat thread (reader).
+/// `CaptureFrame::clone` is cheap (Arc refcount on the pixel buffer, no data copy).
+type LastFrameSlot = Arc<std::sync::Mutex<Option<(CaptureFrame, std::time::Instant)>>>;
+
 /// Internal state carried on the WGC capture thread.
 ///
 /// This type implements [`GraphicsCaptureApiHandler`] and forwards frames
@@ -128,15 +143,26 @@ fn monitor_info_from(m: &Monitor, is_primary: bool) -> Result<MonitorInfo, Captu
 struct WgcHandler {
     tx: std::sync::mpsc::SyncSender<CaptureFrame>,
     dropped: Arc<AtomicU64>,
+    /// Shared with the heartbeat thread; updated on every real frame delivery so the
+    /// heartbeat can detect "no real frame in HEARTBEAT_INTERVAL" and inject a duplicate.
+    last_frame: LastFrameSlot,
 }
 
 impl GraphicsCaptureApiHandler for WgcHandler {
-    type Flags = (Arc<AtomicU64>, std::sync::mpsc::SyncSender<CaptureFrame>);
+    type Flags = (
+        Arc<AtomicU64>,
+        std::sync::mpsc::SyncSender<CaptureFrame>,
+        LastFrameSlot,
+    );
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (dropped, tx) = ctx.flags;
-        Ok(Self { tx, dropped })
+        let (dropped, tx, last_frame) = ctx.flags;
+        Ok(Self {
+            tx,
+            dropped,
+            last_frame,
+        })
     }
 
     fn on_frame_arrived(
@@ -184,6 +210,13 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             timestamp,
         };
 
+        // Update shared snapshot BEFORE send so the heartbeat thread always has a
+        // representative frame to duplicate. Cloning `capture_frame` is cheap — the
+        // `data` field is `Arc<[u8]>`, so the clone is a refcount bump, not a memcpy.
+        if let Ok(mut guard) = self.last_frame.lock() {
+            *guard = Some((capture_frame.clone(), std::time::Instant::now()));
+        }
+
         match self.tx.try_send(capture_frame) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -202,6 +235,73 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         // Session closed externally (monitor unplugged, session ended). No action needed —
         // the WGC thread will exit naturally and the channel will be disconnected.
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat thread — static-content frame injection
+// ---------------------------------------------------------------------------
+
+/// Heartbeat loop body — runs on a sibling OS thread spawned by `WindowsCaptureSource::start`.
+///
+/// WGC delivers frames only on content change. When the desktop is static, the encoder
+/// receives nothing and the viewer freezes. This loop wakes every `HEARTBEAT_INTERVAL`,
+/// checks the shared `last_frame` snapshot, and if no real frame has arrived within that
+/// window, injects a duplicate (with an advanced monotonic timestamp) so the encoder keeps
+/// producing output.
+///
+/// Exits when `stop_flag` is set OR the consumer drops the channel (Disconnected). A
+/// `Full` send result is silently ignored — real-frame backpressure already handles this.
+fn heartbeat_loop(
+    tx: std::sync::mpsc::SyncSender<CaptureFrame>,
+    last_frame: LastFrameSlot,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        std::thread::sleep(HEARTBEAT_INTERVAL);
+
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Snapshot under lock, then drop the lock before sending.
+        let snapshot = match last_frame.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return, // mutex poisoned — capture thread panicked; exit gracefully
+        };
+
+        let Some((mut frame, last_update)) = snapshot else {
+            continue; // no real frame has arrived yet — nothing to duplicate
+        };
+
+        if last_update.elapsed() < HEARTBEAT_INTERVAL {
+            continue; // a real frame arrived within the window — skip this beat
+        }
+
+        // Advance timestamp monotonically so the encoder + downstream RTP timestamps
+        // see a regular cadence. `saturating_add` guards against u128 overflow at the
+        // far end of a session lifetime.
+        frame.timestamp = frame.timestamp.saturating_add(HEARTBEAT_INTERVAL);
+
+        // Reset the "last observed" instant so we don't immediately re-fire on the next
+        // tick. Real frames continue to overwrite this when they arrive. Nested `if let`
+        // (not let-chains) to stay compatible with MSRV 1.85.
+        if let Ok(mut guard) = last_frame.lock() {
+            if let Some((_, instant)) = guard.as_mut() {
+                *instant = std::time::Instant::now();
+            }
+        }
+
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // Channel saturated — encoder will catch up on real frames. Skip silently;
+                // bumping `dropped` here would conflate heartbeat throttling with WGC drops.
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return; // consumer dropped the receiver — session ending
+            }
+        }
     }
 }
 
@@ -235,6 +335,10 @@ pub struct WindowsCaptureSource {
     /// Handle to the running capture session, if any.
     /// `None` before `start()` or after `stop()`.
     control: Option<CaptureControl<WgcHandler, Box<dyn std::error::Error + Send + Sync>>>,
+
+    /// Stop signal for the heartbeat thread spawned by `start()`.
+    /// `None` before `start()` or after `stop()`; `Some` during an active session.
+    heartbeat_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 // SAFETY: Monitor wraps an HMONITOR handle. windows-capture declares Monitor as Send.
@@ -316,6 +420,7 @@ impl CaptureSource for WindowsCaptureSource {
             monitor,
             dropped: Arc::new(AtomicU64::new(0)),
             control: None,
+            heartbeat_stop: None,
         })
     }
 
@@ -350,6 +455,15 @@ impl CaptureSource for WindowsCaptureSource {
             BorderPolicy::AlwaysOn => DrawBorderSettings::WithBorder,
         };
 
+        // Heartbeat infrastructure (capture-static-freeze fix): shared snapshot of the
+        // most recent frame + a stop flag. Clone `tx` so the WGC handler and the heartbeat
+        // thread each own a send handle on the same bounded channel.
+        let last_frame: LastFrameSlot = Arc::new(std::sync::Mutex::new(None));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_tx = tx.clone();
+        let hb_last_frame = Arc::clone(&last_frame);
+        let hb_stop = Arc::clone(&stop_flag);
+
         let settings = Settings::new(
             self.monitor,
             cursor,
@@ -358,17 +472,28 @@ impl CaptureSource for WindowsCaptureSource {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            (Arc::clone(&self.dropped), tx),
+            (Arc::clone(&self.dropped), tx, last_frame),
         );
 
         let control = WgcHandler::start_free_threaded(settings)
             .map_err(|e| CaptureError::SessionCreateFailed(format!("{e}")))?;
 
+        // Sibling thread to the WGC OS thread; exits on stop_flag OR Disconnected.
+        std::thread::Builder::new()
+            .name("capture-heartbeat".into())
+            .spawn(move || heartbeat_loop(hb_tx, hb_last_frame, hb_stop))
+            .map_err(|e| CaptureError::Internal(format!("spawn heartbeat: {e}")))?;
+
         self.control = Some(control);
+        self.heartbeat_stop = Some(stop_flag);
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), CaptureError> {
+        // Signal the heartbeat thread to exit at its next wake (max HEARTBEAT_INTERVAL delay).
+        if let Some(flag) = self.heartbeat_stop.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
         if let Some(control) = self.control.take() {
             control
                 .stop()
