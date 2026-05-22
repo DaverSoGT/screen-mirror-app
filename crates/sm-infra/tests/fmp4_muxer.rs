@@ -465,13 +465,13 @@ fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
         .collect()
 }
 
-// T5.2 — Post-warm-up pipeline emits per-sample duration = inferred locked ticks.
+// T5.2 — Post-warm-up pipeline emits per-sample duration = REAL intra-GOP DTS delta.
 //
-// Feeds 10 packets at exact 100ms intervals (= 9000 ticks at 90 kHz = 10 fps,
-// inside the [5, 240] fps plausibility range and chosen because 0.100 * 90_000
-// = 9000 maps exactly via f64 multiply with zero rounding error). After the
-// 9th call (8 deltas) the tracker locks. The 10th packet triggers a flush;
-// all per-sample durations must equal the locked value. (Spec R2, R4.)
+// After the real-DTS-delta fix (T5), per-sample trun durations come from actual DTS
+// differences, NOT from FpsTracker. At 100ms uniform spacing, the real DTS delta
+// is (0.1 * 90000) as u64 = 8999 or 9000 ticks (f64 rounding). The test verifies
+// that all durations approximate the real 100ms gap and that the sum-of-durations
+// equals the real elapsed DTS span of the GOP.
 #[test]
 fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     use std::time::Duration;
@@ -523,31 +523,35 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     // Parse per-sample (duration, size) pairs from the flushed trun.
     let pairs = parse_segment_trun_pairs(&segment, true); // IDR segment
 
-    // All per-sample durations must be the locked tick value (9000 at 10 fps).
+    // With the real-DTS-delta fix, durations reflect actual inter-frame DTS differences.
+    // duration_to_90khz(100ms) via f64 yields 8999 or 9000 ticks — allow ±1 for rounding.
+    // Must NOT be 3000 (FpsTracker warm-up fallback — the old broken behavior).
     assert!(!pairs.is_empty(), "segment must have at least one sample");
-    let expected_ticks: u32 = 9_000; // 100ms at 90kHz = 9000 ticks
     for (i, &(dur, _)) in pairs.iter().enumerate() {
-        assert_eq!(
-            dur, expected_ticks,
-            "post-warm-up sample {i} duration must be {expected_ticks}; got {dur}"
+        assert!(
+            dur >= 8998 && dur <= 9001,
+            "sample {i} duration {dur} must approximate real 100ms DTS delta (8998–9001 ticks); \
+             must NOT be 3000 (FpsTracker fallback)"
         );
     }
 
-    // Verify that sum-of-durations equals tfdt delta to the next segment.
-    // (Next tfdt would be IDR2's DTS = 9 * 100ms = 810_000 ticks from origin = 810000... actually
-    //  tfdt[0] = DTS of GOP1 first sample = 0; tfdt[1] = DTS of GOP2 first sample = 9*9000 = 81000)
+    // Sum-of-durations must approximate the real elapsed DTS span of GOP1 (9 × ~9000 ticks).
+    // Allow ±9 ticks tolerance for 9 frames × ±1 tick rounding each.
     let total_dur: u64 = pairs.iter().map(|&(d, _)| d as u64).sum();
-    let tfdt0 = extract_tfdt_time(&segment);
-    assert_eq!(
-        total_dur as u64 + tfdt0,
-        9 * expected_ticks as u64,
-        "sum-of-durations + base tfdt must equal GOP2 base DTS"
+    let real_span: u64 = (0.9_f64 * 90_000.0) as u64; // 9 × 100ms
+    let tolerance: u64 = 9; // ±1 tick per frame
+    assert!(
+        total_dur.abs_diff(real_span) <= tolerance,
+        "sum-of-durations {total_dur} must approximate real GOP span {real_span} ticks (±{tolerance})"
     );
 }
 
-// T5.3 — 30fps stream carries explicit per-sample duration = 3000 post-T2.
+// T5.3 — trun per-sample durations reflect real DTS deltas regardless of FpsTracker state.
 //
-// Spec R10: semantics are preserved (sum = 4 * 3000 = 12000).
+// The 30fps fixture uses 33ms spacing (33 × 90 = 2970 ticks per frame).
+// After the real-DTS-delta fix, each sample gets duration ≈ 2970, NOT 3000 (the old
+// FpsTracker warm-up fallback). This verifies the fix works even during warm-up.
+// Sum = 4 × 2970 = 11880 ≈ real elapsed span, NOT 12000 (the old fixed-rate sum).
 #[test]
 fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
     let seg = build_30fps_4sample_gop_segment();
@@ -559,19 +563,30 @@ fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
         "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)"
     );
 
-    // During warm-up (only 4 deltas observed), each sample duration = 3000.
-    for (i, &(dur, _)) in pairs.iter().enumerate() {
+    // Real intra-GOP deltas: 33ms × 90 kHz = 2970 ticks each.
+    // After the real-DTS-delta fix, each per-sample trun duration must equal 2970 (not 3000).
+    let expected_delta: u32 = 33 * 90; // 2970 ticks
+    for (i, &(dur, _)) in pairs.iter().take(pairs.len().saturating_sub(1)).enumerate() {
         assert_eq!(
-            dur, 3000,
-            "warm-up 30fps sample {i} duration must be 3000; got {dur}"
+            dur, expected_delta,
+            "real-DTS sample {i} duration must be {expected_delta} ticks (33ms real delta); \
+             got {dur} — must NOT be 3000 (old FpsTracker warm-up fallback)"
         );
     }
+    // Last sample uses median of intra-GOP deltas (all 2970) = 2970.
+    let last_dur = pairs.last().expect("at least one sample").0;
+    assert_eq!(
+        last_dur, expected_delta,
+        "last sample duration must be median of intra-GOP deltas ({expected_delta}); got {last_dur}"
+    );
 
-    // Sum-of-durations = 4 * 3000 = 12000 (semantically identical to pre-T2 trex fallback).
+    // Sum-of-durations: 4 × 2970 = 11880 (real elapsed span), NOT 12000 (old fixed-rate).
     let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
     assert_eq!(
-        total, 12000,
-        "sum-of-durations for 4 samples at 3000 ticks must be 12000"
+        total,
+        4 * expected_delta,
+        "sum-of-durations for 4 samples at real 33ms deltas must be {}",
+        4 * expected_delta
     );
 }
 
@@ -667,13 +682,17 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
         seg.len()
     );
 
-    // All per-sample durations must be 3000 (warm-up fallback for 4-sample GOP).
+    // After the real-DTS-delta fix (T5), per-sample durations reflect actual 33ms intervals.
+    // 33ms × 90 kHz = 2970 ticks. The old FpsTracker warm-up fallback (3000) is no longer
+    // used for per-sample trun durations.
     let pairs = parse_segment_trun_pairs(&seg, true);
     assert_eq!(pairs.len(), 4, "must have 4 samples");
+    let expected_delta: u32 = 33 * 90; // 2970 ticks (real 33ms inter-frame gap)
     for (i, &(dur, _)) in pairs.iter().enumerate() {
         assert_eq!(
-            dur, 3000,
-            "post-T2 warm-up sample {i} must carry duration=3000"
+            dur, expected_delta,
+            "post-T5 real-DTS sample {i} must carry duration={expected_delta} (real 33ms delta); \
+             got {dur} — must NOT be 3000 (old FpsTracker fallback)"
         );
     }
 
