@@ -527,18 +527,15 @@ fn build_traf(base_dts: u64, samples: &[TrunSample], data_offset: i32, is_idr: b
 /// * `base_dts`        — DTS of the first sample in this fragment (90 kHz).
 /// * `samples`         — per-sample size data for `trun`.
 /// * `mdat_offset`     — signed byte offset from start of `moof` to first `mdat` payload byte.
+/// * `is_idr`          — if true, the first sample is an IDR (sync sample); propagated to
+///                       `build_traf` → `build_trun` to set the correct `first_sample_flags`.
 pub(crate) fn build_moof(
     sequence_number: u32,
     base_dts: u64,
     samples: &[TrunSample],
     mdat_offset: i32,
+    is_idr: bool,
 ) -> Vec<u8> {
-    // Determine is_idr from sample flags: if sequence_number > 0 and the fragment
-    // starts with an IDR, the caller sets it. We use a simple heuristic:
-    // the caller controls `mdat_offset`; for fragment assembly `is_idr` is always true
-    // (each fragment starts with an IDR per design §3.6).
-    let is_idr = true; // V1 strategy: every fragment starts with an IDR
-
     let mfhd = build_mfhd(sequence_number);
     let traf = build_traf(base_dts, samples, mdat_offset, is_idr);
 
@@ -576,16 +573,28 @@ pub(crate) struct TrunSample {
 /// ```text
 /// [size:4][b"trun":4][version:1 = 0][flags:3]
 /// [sample_count:4][data_offset:4]
-/// [first_sample_flags:4]  (if is_idr — indicates IDR frame)
+/// [first_sample_flags:4]  — ALWAYS present (Part B invariant)
 /// per-sample: [duration:4][size:4] × N
 /// ```
 ///
 /// # flags selection (24-bit field)
 ///
 /// - `0x000001` — `data-offset-present`
-/// - `0x000004` — `first-sample-flags-present` (set when `is_idr = true`)
+/// - `0x000004` — `first-sample-flags-present` (Part B: ALWAYS set — previously IDR-only)
 /// - `0x000100` — `sample-duration-present` (R1: always set — MSE reads per-sample duration)
 /// - `0x000200` — `sample-size-present`
+///
+/// # first_sample_flags encoding (ISO 14496-12 §8.8.3.1)
+///
+/// IDR (sync sample):
+///   `sample_depends_on=2`, `sample_is_non_sync_sample=0` → `0x0200_0000`
+///
+/// P-frame (non-sync sample):
+///   `sample_depends_on=1`, `sample_is_non_sync_sample=1` → `0x0101_0000`
+///
+/// The non-sync flag MUST be emitted for every P-frame-starting fragment.
+/// Without it, MSE's `trex.default_sample_flags` (=0) would label every
+/// fragment as sync → decoder corruption / SourceBuffer rejection.
 ///
 /// # R9 tfhd precedence note
 ///
@@ -598,24 +607,33 @@ pub(crate) struct TrunSample {
 ///
 /// * `samples`     — per-sample values (duration + size; optional flags override).
 /// * `data_offset` — signed byte offset from start of `moof` to start of `mdat` payload.
-/// * `is_idr`      — if true, inserts a `first_sample_flags` field marking the IDR sample.
+/// * `is_idr`      — if true, first_sample_flags = sync (0x0200_0000);
+///                   if false, first_sample_flags = non-sync (0x0101_0000).
 pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
     // R1: OR in 0x000100 (sample-duration-present) — MSE uses per-sample trun duration
     // rather than falling back to trex.default_sample_duration.
     // R9: bit 0x000008 (default-sample-duration-present) MUST stay clear in tfhd;
     // per-sample trun wins (ISO 14496-12 §8.8.7: sample > tfhd > trex).
-    let flags: u32 = 0x0000_0001 | 0x0000_0100 | 0x0000_0200 | if is_idr { 0x0000_0004 } else { 0 };
+    // Part B: bit 0x000004 (first-sample-flags-present) is ALWAYS set — previously
+    // was conditional on is_idr, which left P-frame fragments without first_sample_flags,
+    // causing MSE to fall back to trex.default_sample_flags=0 (sync label) for all fragments.
+    let flags: u32 = 0x0000_0001 | 0x0000_0004 | 0x0000_0100 | 0x0000_0200;
 
     let mut payload = Vec::new();
     write_full_box_header(&mut payload, 0, flags);
     write_u32_be(&mut payload, samples.len() as u32); // sample_count
     payload.extend_from_slice(&data_offset.to_be_bytes()); // data_offset (signed i32 BE)
 
-    if is_idr {
-        // first_sample_flags: sample_depends_on = 2 (IDR — does not depend on others)
-        // 0x02000000 encodes sample_is_non_sync_sample=0, sample_depends_on=2
-        write_u32_be(&mut payload, 0x0200_0000);
-    }
+    // Part B (Decision c): always emit first_sample_flags with the honest sync/non-sync value.
+    // ISO 14496-12 §8.8.3.1 bit layout:
+    //   bits 25-24: sample_depends_on  (2=IDR/sync, 1=P-frame/depends-on-others)
+    //   bit  16:    sample_is_non_sync_sample (0=sync/IDR, 1=non-sync/P-frame)
+    let first_sample_flags: u32 = if is_idr {
+        0x0200_0000 // IDR: sample_depends_on=2, sample_is_non_sync_sample=0
+    } else {
+        0x0101_0000 // P-frame: sample_depends_on=1, sample_is_non_sync_sample=1
+    };
+    write_u32_be(&mut payload, first_sample_flags);
 
     // R2: ISO 14496-12 §8.8.8 column ordering when both 0x000100 and 0x000200 are set:
     // sample_duration first, then sample_size.
@@ -717,12 +735,22 @@ pub fn annex_b_to_avcc(annex_b: &[u8]) -> Result<Vec<u8>, MuxerError> {
 
 // ─── Mp4Muxer public API ─────────────────────────────────────────────────────
 
+/// Number of samples to accumulate before flushing a media fragment.
+///
+/// Part B Decision (b): set to 1 so every frame is flushed immediately,
+/// eliminating the SourceBuffer starvation that caused periodic freezes.
+/// At 30 fps the per-fragment overhead is ~110–120 bytes < 0.8% of bandwidth.
+/// Increase to 2–3 for future VFR/low-bandwidth tuning without changing logic.
+const FRAGMENT_SAMPLE_THRESHOLD: usize = 1;
+
 /// Per-sample metadata accumulated during fragment assembly.
 struct PendingSample {
     /// AVCC-framed NAL bytes for this sample.
     avcc: Vec<u8>,
     /// DTS of this sample in 90 kHz units.
     dts_90khz: u64,
+    /// Whether this sample is an IDR (keyframe) — determines sync-sample flags.
+    is_keyframe: bool,
 }
 
 /// fMP4 muxer for screen-mirror live streaming.
@@ -871,17 +899,23 @@ impl Mp4Muxer {
 
     /// Append an encoded packet to the muxer's pending-fragment buffer.
     ///
-    /// # Fragmentation strategy (design §3.6)
+    /// # Fragmentation strategy — Part B (per-frame flush)
     ///
-    /// - **Non-IDR (P-frame)**: accumulate into pending buffer; return `None`.
-    /// - **IDR with empty pending**: first IDR of stream; begin accumulation; return `None`.
-    /// - **IDR with non-empty pending**: flush the accumulated previous GOP as a media
-    ///   segment (`moof` + `mdat`); accumulate the current IDR into fresh pending;
-    ///   return `Some(segment_bytes)`.
+    /// Every encoded sample is flushed immediately as its own `moof`+`mdat`
+    /// media fragment (threshold = `FRAGMENT_SAMPLE_THRESHOLD` = 1). This
+    /// eliminates the SourceBuffer starvation that previously caused periodic
+    /// freeze-then-jump artifacts (the old IDR-only flush starved the receiver
+    /// for the entire GOP duration, typically ~2 s).
+    ///
+    /// The sync-sample flag in each fragment's `trun` box correctly reflects
+    /// whether the sample is an IDR (`first_sample_flags = 0x0200_0000`) or a
+    /// P-frame (`first_sample_flags = 0x0101_0000`), satisfying ISO 14496-12
+    /// §8.8.3.1 and MSE byte-stream format requirements.
     ///
     /// # Returns
     ///
-    /// `None` while buffering. `Some(bytes)` when a complete fragment is ready.
+    /// `Some(bytes)` for every packet that produces a non-empty AVCC payload.
+    /// `None` only if AVCC conversion fails (malformed or empty input).
     /// The bytes are `[moof][mdat]` suitable for `SourceBuffer.appendBuffer(...)`.
     pub fn append_packet(&mut self, packet: &sm_domain::encode::EncodedPacket) -> Option<Vec<u8>> {
         // Convert Annex-B payload to AVCC-framed bytes.
@@ -899,23 +933,19 @@ impl Mp4Muxer {
         // tick duration after 8 deltas pass the IQR+plausibility guards.
         self.fps_tracker.observe_dts(dts);
 
-        if packet.is_keyframe && !self.pending.is_empty() {
-            // Flush the current accumulated GOP as a media segment.
-            let segment = self.flush_pending();
+        // Accumulate the sample into the pending buffer.
+        self.pending.push(PendingSample {
+            avcc,
+            dts_90khz: dts,
+            is_keyframe: packet.is_keyframe,
+        });
 
-            // Accumulate the triggering IDR into the fresh pending buffer.
-            self.pending.push(PendingSample {
-                avcc,
-                dts_90khz: dts,
-            });
-
-            Some(segment)
+        // Part B (Decision b): flush every FRAGMENT_SAMPLE_THRESHOLD samples.
+        // With threshold=1, every sample is flushed immediately — eliminates
+        // the IDR-cadence floor on SourceBuffer latency (~2 s → ~33 ms at 30 fps).
+        if self.pending.len() >= FRAGMENT_SAMPLE_THRESHOLD {
+            Some(self.flush_pending())
         } else {
-            // P-frame or first IDR: accumulate.
-            self.pending.push(PendingSample {
-                avcc,
-                dts_90khz: dts,
-            });
             None
         }
     }
@@ -923,12 +953,21 @@ impl Mp4Muxer {
     /// Flush the current pending samples as a `moof` + `mdat` media segment.
     ///
     /// Increments `fragment_seq`. Clears `pending`.
+    ///
+    /// Part B (Decision c): reads `is_keyframe` from the first pending sample to
+    /// thread the honest `is_idr` bool through `build_moof` → `build_traf` →
+    /// `build_trun`. This ensures `trun.first_sample_flags` always reflects the
+    /// actual sync/non-sync nature of the fragment's first sample.
     fn flush_pending(&mut self) -> Vec<u8> {
         self.fragment_seq += 1;
         let seq = self.fragment_seq;
 
         // Base DTS is the timestamp of the first sample in the fragment.
         let base_dts = self.pending.first().map(|s| s.dts_90khz).unwrap_or(0);
+
+        // Derive is_idr from the first sample — with per-frame flush (threshold=1)
+        // every fragment is exactly one sample, so this is always accurate.
+        let is_idr = self.pending.first().map(|s| s.is_keyframe).unwrap_or(false);
 
         // Build the concatenated AVCC mdat payload.
         let mdat_payload: Vec<u8> = self
@@ -954,18 +993,20 @@ impl Mp4Muxer {
 
         // Compute moof size to determine data_offset.
         // data_offset = size_of(moof) + 8  (8 bytes for the mdat size+tag header).
-        // We approximate by building moof with offset=0 first to get its size.
-        let moof_placeholder = build_moof(seq, base_dts, &trun_samples, 0);
+        // We build moof with offset=0 first to measure the exact size; since
+        // first_sample_flags is now always present, the size is consistent between
+        // the placeholder and the final moof, so no manual offset correction needed.
+        let moof_placeholder = build_moof(seq, base_dts, &trun_samples, 0, is_idr);
         let moof_size = moof_placeholder.len() as i32;
         // data_offset in trun = bytes from start of moof box to first byte of mdat payload.
         // mdat box header = 8 bytes (size + tag).
         let data_offset = moof_size + 8;
 
         // Rebuild moof with the correct data_offset.
-        let moof = build_moof(seq, base_dts, &trun_samples, data_offset);
+        let moof = build_moof(seq, base_dts, &trun_samples, data_offset, is_idr);
         let mdat = build_mdat(&mdat_payload);
 
-        // Clear pending for the next GOP.
+        // Clear pending for the next fragment.
         self.pending.clear();
 
         let mut segment = Vec::with_capacity(moof.len() + mdat.len());
@@ -1125,31 +1166,20 @@ mod tests {
             .build_init_segment(&sps_info, SPS_RT, PPS_RT)
             .expect("init segment");
 
-        // IDR1 → buffers (no emit)
+        // Part B: IDR1 → emits segment_1 immediately (per-frame flush)
         let idr1 = synthetic_keyframe();
-        assert!(muxer.append_packet(&idr1).is_none());
+        let seg1 = muxer.append_packet(&idr1).expect("IDR1 must emit segment 1");
 
-        // IDR2 → emits segment_1
+        // IDR2 → emits segment_2
         let idr2 = EncodedPacket {
             data: Arc::from(vec![0x00u8, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB].into_boxed_slice()),
             is_keyframe: true,
             timestamp: Duration::from_millis(100),
             sequence: 1,
         };
-        let seg1 = muxer
-            .append_packet(&idr2)
-            .expect("IDR2 must emit segment 1");
-
-        // IDR3 → emits segment_2
-        let idr3 = EncodedPacket {
-            data: Arc::from(vec![0x00u8, 0x00, 0x00, 0x01, 0x65, 0xCC, 0xDD].into_boxed_slice()),
-            is_keyframe: true,
-            timestamp: Duration::from_millis(200),
-            sequence: 2,
-        };
         let seg2 = muxer
-            .append_packet(&idr3)
-            .expect("IDR3 must emit segment 2");
+            .append_packet(&idr2)
+            .expect("IDR2 must emit segment 2");
 
         // Verify the full byte stream: init + seg1 + seg2
         let mut stream = Vec::new();
@@ -1220,60 +1250,242 @@ mod tests {
         }
     }
 
+    // ─── Part B: per-frame flush — rewritten behaviour contract ─────────────
+    //
+    // R2 (design §6): the OLD IDR-only contract encoded by the two tests below
+    // is INTENTIONALLY INVERTED by Part B (flush every frame). These tests are
+    // rewritten here as part of B's RED phase. This is a deliberate behaviour
+    // change, not a regression. The new contract: every append_packet call that
+    // produces a valid AVCC payload MUST return Some(segment).
+
     #[test]
-    fn append_packet_non_keyframe_returns_none() {
+    fn append_packet_non_keyframe_returns_some_per_frame_flush() {
+        // Part B: every P-frame is flushed immediately — returns Some.
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-        // Three P-frame packets; none should emit a segment.
-        for i in 0..3u64 {
+        // First packet (IDR at t=0) seeds pending and flushes immediately.
+        let idr = make_packet(true, 0, 100);
+        let seg = muxer.append_packet(&idr);
+        assert!(seg.is_some(), "IDR must emit a segment (per-frame flush)");
+
+        // Every P-frame must also flush.
+        for i in 1..4u64 {
             let pkt = make_packet(false, i * 33, 100);
             let result = muxer.append_packet(&pkt);
-            assert!(result.is_none(), "P-frame must not emit a segment");
+            assert!(result.is_some(), "P-frame must emit a segment (per-frame flush)");
         }
     }
 
     #[test]
-    fn append_packet_first_idr_returns_none() {
+    fn append_packet_first_idr_returns_some_per_frame_flush() {
+        // Part B: even the very first packet returns Some immediately.
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         let pkt = make_packet(true, 0, 200);
         let result = muxer.append_packet(&pkt);
-        // First IDR starts a new GOP; nothing to flush yet.
         assert!(
-            result.is_none(),
-            "first IDR must not emit (nothing buffered before it)"
+            result.is_some(),
+            "first IDR must emit a segment immediately (per-frame flush)"
+        );
+    }
+
+    // ─── Part B: sync-sample flag correctness (R1 — codec-correctness-critical) ─
+    //
+    // ISO 14496-12 §8.8.3.1 bit layout for sample_flags (32 bits, big-endian):
+    //   bits 31-26 : reserved
+    //   bits 25-24 : sample_depends_on        (2 = IDR/sync, 1 = depends on others)
+    //   bits 23-18 : reserved
+    //   bit  17    : sample_is_leading
+    //   bit  16    : sample_is_non_sync_sample (0 = sync/IDR, 1 = non-sync/P-frame)
+    //   bits 15-12 : sample_has_redundancy
+    //   bits 11-8  : sample_padding_value
+    //   bit   7    : sample_degradation_priority_present (reserved, always 0)
+    //   bits  6-0  : sample_degradation_priority
+    //
+    // IDR (sync) encoding : sample_depends_on=2, sample_is_non_sync_sample=0
+    //   → 0x0200_0000 (bits 25-24 = 10b; bit 16 = 0)
+    //
+    // P-frame (non-sync) encoding: sample_depends_on=1, sample_is_non_sync_sample=1
+    //   → 0x0101_0000 (bits 25-24 = 01b; bit 16 = 1)
+
+    /// Helper: find the trun box in a segment and return its byte slice (starting
+    /// at the size field of the trun box). Panics if trun is not found.
+    fn extract_trun_from_segment(segment: &[u8]) -> &[u8] {
+        let trun_tag_pos = segment
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("trun must be present in segment");
+        // trun box starts 4 bytes BEFORE the tag (the size field)
+        &segment[trun_tag_pos - 4..]
+    }
+
+    /// Parse first_sample_flags from a trun box (only when first_sample_flags_present
+    /// bit 0x000004 is set). Returns the 4-byte value or panics.
+    fn read_first_sample_flags(trun: &[u8]) -> u32 {
+        // [size:4][tag:4][v+f:4][count:4][data_offset:4][first_sample_flags:4]?
+        let flags_field = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(
+            flags_field & 0x000004,
+            0,
+            "first_sample_flags_present bit must be set in trun flags (0x000004); got 0x{flags_field:06X}"
+        );
+        // first_sample_flags is at offset 20 (after size+tag+v+f+count+data_offset)
+        u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]])
+    }
+
+    #[test]
+    fn append_packet_idr_fragment_trun_carries_sync_first_sample_flags() {
+        // R1 (HIGH — codec correctness): IDR-starting fragment MUST have
+        // first_sample_flags = 0x0200_0000 (sample_depends_on=2, non_sync_sample=0).
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let idr = make_packet(true, 0, 200);
+        let segment = muxer.append_packet(&idr).expect("IDR must emit segment immediately (per-frame flush)");
+
+        let trun = extract_trun_from_segment(&segment);
+        let fsf = read_first_sample_flags(trun);
+        assert_eq!(
+            fsf, 0x0200_0000,
+            "IDR trun.first_sample_flags must be 0x0200_0000 (sync); got 0x{fsf:08X}"
+        );
+        // Verify individual bits per ISO 14496-12 §8.8.3.1
+        assert_eq!(fsf >> 24 & 0x03, 2, "sample_depends_on must be 2 (IDR = does not depend on others)");
+        assert_eq!(fsf >> 16 & 0x01, 0, "sample_is_non_sync_sample must be 0 (IDR is a sync sample)");
+    }
+
+    #[test]
+    fn append_packet_p_frame_fragment_trun_carries_non_sync_first_sample_flags() {
+        // R1 (HIGH — codec correctness): P-frame-starting fragment MUST have
+        // first_sample_flags = 0x0101_0000 (sample_depends_on=1, non_sync_sample=1).
+        // This MUST always be emitted — a P-frame fragment with no first_sample_flags
+        // (or flags=0) tells MSE every fragment is a sync sample, which is FALSE
+        // and causes decoder errors or SourceBuffer rejection.
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // Skip the IDR's segment; flush a P-frame segment.
+        let _ = muxer.append_packet(&make_packet(true, 0, 100)); // IDR — consume
+        let p_frame = make_packet(false, 33, 150);
+        let segment = muxer.append_packet(&p_frame).expect("P-frame must emit segment (per-frame flush)");
+
+        let trun = extract_trun_from_segment(&segment);
+        let fsf = read_first_sample_flags(trun);
+        assert_eq!(
+            fsf, 0x0101_0000,
+            "P-frame trun.first_sample_flags must be 0x0101_0000 (non-sync); got 0x{fsf:08X}"
+        );
+        // Verify individual bits per ISO 14496-12 §8.8.3.1
+        assert_eq!(fsf >> 24 & 0x03, 1, "sample_depends_on must be 1 (P-frame depends on others)");
+        assert_eq!(fsf >> 16 & 0x01, 1, "sample_is_non_sync_sample must be 1 (P-frame is non-sync)");
+    }
+
+    #[test]
+    fn build_moof_non_idr_param_trun_emits_non_sync_first_sample_flags() {
+        // Direct unit test for build_moof with is_idr=false (new parameter).
+        // Verifies the non-sync first_sample_flags path at the lowest level.
+        let samples = vec![make_sample(100)];
+        let moof = build_moof(1, 0, &samples, 0, false); // NEW: is_idr=false
+        let trun_pos = moof.windows(4).position(|w| w == b"trun").expect("trun must be in moof");
+        let trun = &moof[trun_pos - 4..];
+        let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(
+            trun_flags & 0x000004,
+            0,
+            "first_sample_flags_present (0x000004) must ALWAYS be set regardless of IDR status"
+        );
+        let fsf = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
+        assert_eq!(
+            fsf, 0x0101_0000,
+            "non-IDR moof trun.first_sample_flags must be 0x0101_0000; got 0x{fsf:08X}"
         );
     }
 
     #[test]
-    fn append_packet_second_keyframe_flushes_first_gop() {
+    fn build_moof_idr_param_trun_emits_sync_first_sample_flags() {
+        // Direct unit test for build_moof with is_idr=true (new parameter, explicit call).
+        let samples = vec![make_sample(100)];
+        let moof = build_moof(1, 0, &samples, 0, true); // NEW: is_idr=true (explicit)
+        let trun_pos = moof.windows(4).position(|w| w == b"trun").expect("trun must be in moof");
+        let trun = &moof[trun_pos - 4..];
+        let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(trun_flags & 0x000004, 0, "first_sample_flags_present must be set for IDR");
+        let fsf = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
+        assert_eq!(
+            fsf, 0x0200_0000,
+            "IDR moof trun.first_sample_flags must be 0x0200_0000; got 0x{fsf:08X}"
+        );
+    }
+
+    #[test]
+    fn round_trip_idr_ppp_idr_emits_5_fragments_with_correct_sync_flags() {
+        // Round-trip test: IDR, P, P, P, IDR → 5 fragments.
+        // Fragment 1 (IDR)   → sync flags    (0x0200_0000)
+        // Fragments 2-4 (P)  → non-sync flags (0x0101_0000)
+        // Fragment 5 (IDR)   → sync flags    (0x0200_0000)
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-        // IDR1 (timestamp 0ms)
-        let idr1 = make_packet(true, 0, 200);
-        assert!(muxer.append_packet(&idr1).is_none(), "IDR1 must buffer");
+        let mut segments = Vec::new();
+
+        // IDR at t=0
+        segments.push(muxer.append_packet(&make_packet(true, 0, 200)).expect("IDR1 must emit"));
         // 3 P-frames
+        for i in 1..4u64 {
+            segments.push(muxer.append_packet(&make_packet(false, i * 33, 100)).expect("P-frame must emit"));
+        }
+        // IDR at t=132ms
+        segments.push(muxer.append_packet(&make_packet(true, 132, 200)).expect("IDR2 must emit"));
+
+        assert_eq!(segments.len(), 5, "must emit exactly 5 fragments");
+
+        let expected_fsf = [
+            0x0200_0000u32, // IDR
+            0x0101_0000u32, // P
+            0x0101_0000u32, // P
+            0x0101_0000u32, // P
+            0x0200_0000u32, // IDR
+        ];
+
+        for (i, (seg, &expected)) in segments.iter().zip(expected_fsf.iter()).enumerate() {
+            let trun = extract_trun_from_segment(seg);
+            let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+            assert_ne!(
+                trun_flags & 0x000004,
+                0,
+                "fragment {i}: first_sample_flags_present must ALWAYS be set"
+            );
+            let fsf = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
+            assert_eq!(
+                fsf, expected,
+                "fragment {i}: first_sample_flags must be 0x{expected:08X}; got 0x{fsf:08X}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_packet_second_keyframe_flushes_second_segment() {
+        // Part B: every packet emits immediately. IDR1 emits seg1, P-frames each
+        // emit a segment, IDR2 emits another segment. Verify IDR2 segment is Some.
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // IDR1 → emits seg1
+        let idr1 = make_packet(true, 0, 200);
+        assert!(muxer.append_packet(&idr1).is_some(), "IDR1 must emit segment (per-frame flush)");
+        // 3 P-frames → each emits a segment
         for i in 1..4u64 {
             assert!(
                 muxer
                     .append_packet(&make_packet(false, i * 33, 100))
-                    .is_none()
+                    .is_some(),
+                "P-frame must emit segment (per-frame flush)"
             );
         }
-        // IDR2 → must flush GOP containing IDR1 + P-frames
+        // IDR2 → also emits a segment
         let idr2 = make_packet(true, 4 * 33, 200);
         let segment = muxer.append_packet(&idr2);
-        assert!(segment.is_some(), "IDR2 must flush the previous GOP");
+        assert!(segment.is_some(), "IDR2 must emit segment (per-frame flush)");
     }
 
     #[test]
     fn media_segment_starts_with_moof_then_mdat() {
+        // Part B: the very first packet emits a segment immediately.
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         let idr1 = make_packet(true, 0, 200);
-        muxer.append_packet(&idr1);
-        // One P-frame to ensure pending is non-empty when IDR2 arrives
-        muxer.append_packet(&make_packet(false, 33, 100));
-        let idr2 = make_packet(true, 66, 200);
         let segment = muxer
-            .append_packet(&idr2)
-            .expect("should emit segment on IDR2");
+            .append_packet(&idr1)
+            .expect("IDR1 must emit segment immediately (per-frame flush)");
 
         // Check moof appears first
         let moof_pos = segment
@@ -1299,14 +1511,14 @@ mod tests {
             u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]])
         }
 
-        // Three IDRs → two emitted segments (IDR1 buffers, IDR2 emits, IDR3 emits)
-        muxer.append_packet(&make_packet(true, 0, 200));
+        // Part B: each packet emits immediately.
+        // IDR1 → seg1, IDR2 → seg2
         let seg1 = muxer
-            .append_packet(&make_packet(true, 33, 200))
-            .expect("seg1");
+            .append_packet(&make_packet(true, 0, 200))
+            .expect("seg1 from IDR1");
         let seg2 = muxer
-            .append_packet(&make_packet(true, 66, 200))
-            .expect("seg2");
+            .append_packet(&make_packet(true, 33, 200))
+            .expect("seg2 from IDR2");
 
         let seq1 = extract_seq(&seg1);
         let seq2 = extract_seq(&seg2);
@@ -1323,12 +1535,10 @@ mod tests {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         // IDR at t=1000ms (encoder-absolute). Per B11-S11 the muxer rebases
         // timestamps so the very first packet ever appended becomes the
-        // origin (rebased dts = 0). IDR1 is that first packet, so the
-        // tfdt of the segment that flushes IDR1's GOP must be 0.
+        // origin (rebased dts = 0). IDR1 is that first packet and emits
+        // immediately (per-frame flush), so its tfdt must be 0.
         let idr1 = make_packet(true, 1000, 200);
-        muxer.append_packet(&idr1);
-        let idr2 = make_packet(true, 2000, 200);
-        let segment = muxer.append_packet(&idr2).expect("should emit segment");
+        let segment = muxer.append_packet(&idr1).expect("IDR1 must emit segment (per-frame flush)");
 
         // Find tfdt in segment.
         // windows(4).position finds the offset where the 4-byte tag b"tfdt" appears.
@@ -1528,9 +1738,9 @@ mod tests {
 
     #[test]
     fn trun_golden_bytes_single_sample() {
-        // One sample, data_offset = 8 (arbitrary).
-        // flags = 0x000301 (data-offset-present | duration-present | sample-size-present)
-        // Layout: [size:4][b"trun":4][v=0:1][flags:3][sample_count:4][data_offset:4][duration:4][size:4]
+        // Part B: first_sample_flags is ALWAYS present. Even a non-IDR trun now has the field.
+        // flags = 0x000305 (data-offset | first-sample-flags | duration | size)
+        // Layout: [size:4][b"trun":4][v=0:1][flags:3][sample_count:4][data_offset:4][first_sample_flags:4][duration:4][size:4]
         let samples = vec![make_sample(100)];
         let trun = build_trun(&samples, 8, false);
         assert_eq!(&trun[4..8], b"trun", "box type must be trun");
@@ -1538,6 +1748,9 @@ mod tests {
         assert_eq!(size, trun.len(), "size field must match actual length");
         // version at byte 8
         assert_eq!(trun[8], 0, "version must be 0");
+        // flags at bytes 9..12 — must include 0x000004 (first_sample_flags_present)
+        let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+        assert_ne!(flags & 0x000004, 0, "first_sample_flags_present must be set");
         // sample_count at bytes 12..16
         let sample_count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]);
         assert_eq!(sample_count, 1);
@@ -1558,13 +1771,14 @@ mod tests {
     fn trun_per_sample_sizes_are_big_endian() {
         let samples = vec![make_sample(0x12345678), make_sample(0x9ABCDEF0)];
         let trun = build_trun(&samples, 0, false);
-        // Layout (non-IDR, with 0x000100 + 0x000200 flags):
-        // [size:4][tag:4][v+f:4][count:4][data_offset:4] = offset 20 for per-sample section
-        // Per-sample (0x000100 set): [duration:4][size:4] × N
-        // sample 0: duration at 20..24, size at 24..28
-        // sample 1: duration at 28..32, size at 32..36
-        let s0 = u32::from_be_bytes([trun[24], trun[25], trun[26], trun[27]]);
-        let s1 = u32::from_be_bytes([trun[32], trun[33], trun[34], trun[35]]);
+        // Part B: first_sample_flags is ALWAYS present (flag 0x000004 always set).
+        // Layout (non-IDR after Part B, flags 0x000305):
+        // [size:4][tag:4][v+f:4][count:4][data_offset:4][first_sample_flags:4] = offset 24 for per-sample section
+        // Per-sample (0x000100 + 0x000200 set): [duration:4][size:4] × N
+        // sample 0: duration at 24..28, size at 28..32
+        // sample 1: duration at 32..36, size at 36..40
+        let s0 = u32::from_be_bytes([trun[28], trun[29], trun[30], trun[31]]);
+        let s1 = u32::from_be_bytes([trun[36], trun[37], trun[38], trun[39]]);
         assert_eq!(s0, 0x12345678);
         assert_eq!(s1, 0x9ABCDEF0);
     }
@@ -1587,7 +1801,7 @@ mod tests {
     #[test]
     fn build_moof_contains_moof_mfhd_traf_tfhd_tfdt_trun_tags() {
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
         let required: &[&[u8; 4]] = &[b"moof", b"mfhd", b"traf", b"tfhd", b"tfdt", b"trun"];
         for tag in required {
             assert!(
@@ -1601,7 +1815,7 @@ mod tests {
     #[test]
     fn build_moof_mfhd_sequence_number_is_correct() {
         let samples = vec![make_sample(10)];
-        let moof = build_moof(7, 0, &samples, 0);
+        let moof = build_moof(7, 0, &samples, 0, true);
         let mfhd_pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
         // mfhd full-box: [size:4][tag:4][v+f:4][seq_num:4]
         // After tag: v+f at +4, seq at +8
@@ -1618,9 +1832,9 @@ mod tests {
     #[test]
     fn build_moof_sequence_numbers_increment_across_calls() {
         let samples = vec![make_sample(50)];
-        let moof1 = build_moof(1, 0, &samples, 0);
-        let moof2 = build_moof(2, 0, &samples, 0);
-        let moof3 = build_moof(3, 0, &samples, 0);
+        let moof1 = build_moof(1, 0, &samples, 0, true);
+        let moof2 = build_moof(2, 0, &samples, 0, true);
+        let moof3 = build_moof(3, 0, &samples, 0, true);
 
         fn extract_seq(moof: &[u8]) -> u32 {
             let pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
@@ -1635,7 +1849,7 @@ mod tests {
     #[test]
     fn build_moof_starts_with_moof_box() {
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
         assert_eq!(&moof[4..8], b"moof", "first box tag must be moof");
     }
 
@@ -1865,8 +2079,23 @@ mod tests {
             "expected absolute encoder DTS in 90 kHz, got {offset}"
         );
         // Second packet rebased: should be small (≈ 3000 ticks for 33 ms at 90 kHz).
-        let _ = muxer.append_packet(&pkt2);
-        let last_rebased = muxer.pending.last().expect("pkt2 stored").dts_90khz;
+        // Part B: pending is always empty after flush — read the rebased DTS from
+        // the segment's tfdt box instead.
+        let seg2 = muxer.append_packet(&pkt2).expect("pkt2 must emit segment (per-frame flush)");
+        let tfdt_pos = seg2
+            .windows(4)
+            .position(|w| w == b"tfdt")
+            .expect("tfdt must be in segment");
+        let last_rebased = u64::from_be_bytes([
+            seg2[tfdt_pos + 8],
+            seg2[tfdt_pos + 9],
+            seg2[tfdt_pos + 10],
+            seg2[tfdt_pos + 11],
+            seg2[tfdt_pos + 12],
+            seg2[tfdt_pos + 13],
+            seg2[tfdt_pos + 14],
+            seg2[tfdt_pos + 15],
+        ]);
         assert!(
             last_rebased < 10_000,
             "rebased dts must be near zero, got {last_rebased}"
@@ -2127,7 +2356,7 @@ mod tests {
     fn build_tfhd_does_not_set_default_sample_duration_present_bit() {
         // Call build_moof (the real production path) and verify tfhd flags via byte scan.
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
 
         let tfhd_pos = moof
             .windows(4)
@@ -2192,6 +2421,12 @@ mod tests {
             0,
             "trun flags must have sample-size-present (0x000200)"
         );
+        // Part B: first_sample_flags_present must ALWAYS be set (0x000004)
+        assert_ne!(
+            flags & 0x000004,
+            0,
+            "trun flags must ALWAYS have first_sample_flags_present (0x000004) — Part B invariant"
+        );
     }
 
     // T3.2 — build_trun IDR path includes first-sample-flags + duration-present. RED until T3.5.
@@ -2229,9 +2464,10 @@ mod tests {
             make_sample_with_duration(300, 3000),
         ];
         let trun = build_trun(&samples, 0, false);
-        // Layout (non-IDR): [size:4][tag:4][v+f:4][count:4][data_offset:4][per-sample...]
-        // With 0x000100 + 0x000200: per-sample = [duration:4][size:4]
-        let per_sample_offset = 8 + 4 + 4 + 4; // box header(8) + v+f(4) + count(4) + data_offset(4)
+        // Part B: first_sample_flags ALWAYS present. Layout:
+        // [size:4][tag:4][v+f:4][count:4][data_offset:4][first_sample_flags:4][per-sample...]
+        // per-sample = [duration:4][size:4]
+        let per_sample_offset = 8 + 4 + 4 + 4 + 4; // box-hdr(8) + v+f(4) + count(4) + data_offset(4) + fsf(4)
         for (i, &expected_size) in [100u32, 200, 300].iter().enumerate() {
             let off = per_sample_offset + i * 8;
             let dur = u32::from_be_bytes([trun[off], trun[off + 1], trun[off + 2], trun[off + 3]]);
@@ -2251,15 +2487,18 @@ mod tests {
             flags: None,
         }];
         let trun = build_trun(&samples, 0, false);
-        // With flags 0x000301 (duration+size+data-offset): per-sample = [duration:4][size:4] = 8 bytes
-        // Total box = 8 (box hdr) + 4 (v+f) + 4 (count) + 4 (data_offset) + 8 (1 sample) = 28 bytes
-        let expected_box_len: u32 = 8 + 4 + 4 + 4 + 8;
+        // Part B: first_sample_flags is ALWAYS emitted (flag 0x000004 always set).
+        // With flags 0x000305 (data-offset | first-sample-flags | duration | size):
+        //   [size:4][tag:4][v+f:4][count:4][data_offset:4][first_sample_flags:4][duration:4][size:4]
+        // Total box = 8 (box hdr) + 4 (v+f) + 4 (count) + 4 (data_offset) + 4 (fsf) + 8 (1 sample) = 32 bytes
+        let expected_box_len: u32 = 8 + 4 + 4 + 4 + 4 + 8;
         let actual_box_len = u32::from_be_bytes([trun[0], trun[1], trun[2], trun[3]]);
         assert_eq!(
             actual_box_len, expected_box_len,
-            "single-sample trun must be {expected_box_len} bytes"
+            "single-sample non-IDR trun must be {expected_box_len} bytes (first_sample_flags always present after Part B)"
         );
-        let per_sample_offset = 8 + 4 + 4 + 4;
+        // per-sample data starts after: box-hdr(8) + v+f(4) + count(4) + data_offset(4) + first_sample_flags(4) = 24
+        let per_sample_offset = 8 + 4 + 4 + 4 + 4;
         let dur = u32::from_be_bytes([
             trun[per_sample_offset],
             trun[per_sample_offset + 1],
@@ -2280,12 +2519,18 @@ mod tests {
 
     // Helper: parse per-sample duration values from a trun box.
     // Returns vec of (duration, size) pairs from the trun per-sample section.
+    //
+    // Part B change: first_sample_flags is now ALWAYS present (flag 0x000004 is always
+    // set regardless of IDR status). The is_idr parameter is kept for call-site
+    // documentation but ignored — first_sample_flags is always 4 bytes wide.
+    #[allow(unused_variables)]
     fn parse_trun_per_sample_durations(trun: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
         // Layout: [size:4][tag:4][v+f:4][count:4][data_offset:4]
-        //         [first_sample_flags:4] (only if is_idr)
+        //         [first_sample_flags:4] — ALWAYS present after Part B
         //         [duration:4][size:4] per sample
         let count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]) as usize;
-        let base = 8 + 4 + 4 + 4 + if is_idr { 4 } else { 0 };
+        // first_sample_flags is always emitted now (flag 0x000004 always set)
+        let base = 8 + 4 + 4 + 4 + 4; // always +4 for first_sample_flags
         (0..count)
             .map(|i| {
                 let off = base + i * 8;
