@@ -2476,9 +2476,9 @@ mod tests {
         for (i, &(dur, _)) in pairs.iter().enumerate() {
             // Real 100ms DTS delta via f64 conversion yields 8999 or 9000 ticks.
             assert!(
-                dur >= 8998 && dur <= 9001,
+                (8998..=9001).contains(&dur),
                 "post-warm-up sample {i} duration {dur} must approximate real 100ms delta \
-                 (8999–9001 ticks); must NOT be 3000 (FpsTracker warm-up fallback)"
+                 (8998–9001 ticks); must NOT be 3000 (FpsTracker warm-up fallback)"
             );
         }
         // Sanity: durations must NOT be the warm-up fallback.
@@ -2544,9 +2544,8 @@ mod tests {
 
         // Compute real DTS span of GOP0 (rebased: IDR1 at 0, IDR2 at ~71820).
         // duration_to_90khz: Duration::from_millis(ms) → (ms as f64 / 1000.0 * 90000.0) as u64
-        let real_span: u64 = crate::transport::annex_b::duration_to_90khz(
-            Duration::from_millis(6 * ms_per_frame),
-        );
+        let real_span: u64 =
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(6 * ms_per_frame));
 
         let actual_sum: u64 = pairs.iter().map(|&(dur, _)| dur as u64).sum();
 
@@ -2567,9 +2566,8 @@ mod tests {
         // After fix, each of the first N-1 samples should have duration ≈ 11970.
         // Current code: all durations == one fixed value (3000 or ~12000 locked).
         // The stricter check: per-sample durations must match real deltas individually.
-        let expected_delta: u64 = crate::transport::annex_b::duration_to_90khz(
-            Duration::from_millis(ms_per_frame),
-        );
+        let expected_delta: u64 =
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(ms_per_frame));
         // All of samples 0..N-2 must equal the real inter-frame delta (±1 for rounding).
         for (i, &(dur, _)) in pairs.iter().enumerate().take(pairs.len().saturating_sub(1)) {
             assert!(

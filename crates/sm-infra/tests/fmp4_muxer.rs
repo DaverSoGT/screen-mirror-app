@@ -529,7 +529,7 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     assert!(!pairs.is_empty(), "segment must have at least one sample");
     for (i, &(dur, _)) in pairs.iter().enumerate() {
         assert!(
-            dur >= 8998 && dur <= 9001,
+            (8998..=9001).contains(&dur),
             "sample {i} duration {dur} must approximate real 100ms DTS delta (8998–9001 ticks); \
              must NOT be 3000 (FpsTracker fallback)"
         );
