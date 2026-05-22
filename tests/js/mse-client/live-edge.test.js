@@ -181,6 +181,19 @@ describe('mse-client — live-edge snap (LE-S1..LE-S4)', () => {
   });
 
   // ─── LE-S4: snap target before buffered.start(last) → no snap ─────────────
+  //
+  // REQ-LE-3: if snapTarget = (lastEnd - LIVE_EDGE_TARGET_LEAD_SEC) < buffered.start(last),
+  // do NOT seek (snap would land in un-buffered space).
+  //
+  // Setup rationale:
+  //   - buffered range = [100.55 → 100.60] (a tiny tail segment, e.g. after GC)
+  //   - currentTime = 0.0  →  drift = 100.60 - 0.0 = 100.60 > 0.30
+  //     The drift guard (line ~397) passes — execution reaches the range guard.
+  //   - snapTarget  = 100.60 - 0.10 = 100.50
+  //     100.50 < 100.55 (bufStart) → range guard fires → return, no snap.
+  //
+  // Falsification: removing `if (snapTarget < buf.start(last)) return;` from
+  // checkLiveEdge would set currentTime = 100.50, causing this assertion to fail.
 
   it('LE-S4: no snap when snap target would be before buffered.start(last)', async () => {
     const { checkLiveEdge } = globalThis.__SCREEN_MIRROR_TEST_EXPORTS__;
@@ -190,15 +203,15 @@ describe('mse-client — live-edge snap (LE-S1..LE-S4)', () => {
 
     const VIDEO_EL = document.getElementById('player');
 
-    // LIVE_EDGE_TARGET_LEAD_SEC = 0.10 > buffered.end = 0.05
-    // snap_target = 0.05 - 0.10 = -0.05 → before buffered.start(0) = 0 → no snap
-    sb._setBuffered(0, 0.05);
-    VIDEO_EL.currentTime = 0.0; // drift = 0.05 (less than threshold anyway)
+    // buffered = [100.55 → 100.60]: tiny tail segment (e.g. after buffer eviction).
+    // snapTarget = 100.60 - 0.10 = 100.50, which is below bufStart 100.55.
+    sb._setBuffered(100.55, 100.60);
+    VIDEO_EL.currentTime = 0.0; // drift = 100.60s > 0.30 → drift guard passes
     Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
 
     checkLiveEdge(VIDEO_EL, sb);
 
-    // currentTime must NOT change (both drift guard and range guard would block)
+    // Range guard must block the snap — currentTime must NOT change.
     expect(VIDEO_EL.currentTime).toBeCloseTo(0.0, 2);
   });
 });

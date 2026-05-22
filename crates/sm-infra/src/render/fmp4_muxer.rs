@@ -528,7 +528,7 @@ fn build_traf(base_dts: u64, samples: &[TrunSample], data_offset: i32, is_idr: b
 /// * `samples`         — per-sample size data for `trun`.
 /// * `mdat_offset`     — signed byte offset from start of `moof` to first `mdat` payload byte.
 /// * `is_idr`          — if true, the first sample is an IDR (sync sample); propagated to
-///                       `build_traf` → `build_trun` to set the correct `first_sample_flags`.
+///   `build_traf` → `build_trun` to set the correct `first_sample_flags`.
 pub(crate) fn build_moof(
     sequence_number: u32,
     base_dts: u64,
@@ -608,7 +608,7 @@ pub(crate) struct TrunSample {
 /// * `samples`     — per-sample values (duration + size; optional flags override).
 /// * `data_offset` — signed byte offset from start of `moof` to start of `mdat` payload.
 /// * `is_idr`      — if true, first_sample_flags = sync (0x0200_0000);
-///                   if false, first_sample_flags = non-sync (0x0101_0000).
+///   if false, first_sample_flags = non-sync (0x0101_0000).
 pub(crate) fn build_trun(samples: &[TrunSample], data_offset: i32, is_idr: bool) -> Vec<u8> {
     // R1: OR in 0x000100 (sample-duration-present) — MSE uses per-sample trun duration
     // rather than falling back to trex.default_sample_duration.
