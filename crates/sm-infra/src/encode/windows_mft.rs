@@ -98,10 +98,12 @@ use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder
 
 /// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
 ///
-/// At 30 fps this is a 2-second keyframe interval. See design Decision (a).
+/// At 10–15 fps real encode rate this yields an IDR every ~1–1.5 s, keeping
+/// end-to-end stream delay below ~2 s. At 30 fps it yields ~0.5 s per IDR.
+/// Reduced from 60 → 15 (perf: shrink GOP to 15 frames for lower-latency IDRs).
 /// Value satisfies `GOP_SIZE_A1 <= 60` as required by REQ-A1-1.
 // verified present in windows 0.62.2 (imported from Win32_Media_MediaFoundation)
-const GOP_SIZE_FRAMES: u32 = 60;
+const GOP_SIZE_FRAMES: u32 = 15;
 
 // ── COM interface thread-transfer wrapper ─────────────────────────────────────
 
@@ -2449,9 +2451,11 @@ mod tests {
     // REQ-A1-5: guards against accidental constant deletion or value drift.
 
     #[test]
-    fn gop_size_constant_is_60_frames() {
+    fn gop_size_constant_is_15_frames() {
         // Structural guard: asserts the GOP constant exists and equals the design value.
+        // Changed from 60 → 15: perf(encode): shrink GOP for lower-latency IDRs.
+        // At 10–15 fps real encode rate, GOP=15 yields an IDR every ~1–1.5 s.
         // Real hardware IDR cadence is verified empirically (manual check — see task A1-5).
-        assert_eq!(GOP_SIZE_FRAMES, 60u32);
+        assert_eq!(GOP_SIZE_FRAMES, 15u32);
     }
 }
