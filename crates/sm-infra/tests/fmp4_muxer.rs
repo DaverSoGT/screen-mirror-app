@@ -88,8 +88,8 @@ fn extract_tfdt_time(seg: &[u8]) -> u64 {
 
 // ─── C1: init + 5 media segments round-trip via byte-level box scanner ───────
 //
-// Build init + feed IDR1..IDR6 (IDR1 accumulates; IDR2..IDR6 each emit a segment).
-// Concatenate all bytes. Verify box structure via byte scanning.
+// Updated to NEW per-frame-flush contract: every appended packet emits a segment
+// immediately. Feed 5 IDR packets → 5 emitted segments (one per IDR).
 
 #[test]
 fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
@@ -115,22 +115,18 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
         "init must contain mvex (fMP4 marker)"
     );
 
-    // Feed IDR packets — IDR1 buffers, IDR2..IDR6 each emit a segment.
+    // Under per-frame-flush, every packet emits a segment immediately.
+    // Feed 5 IDR packets → 5 emitted segments.
     let mut segments: Vec<Vec<u8>> = Vec::new();
-    let idr1 = make_idr_packet(0, 0);
-    assert!(
-        muxer.append_packet(&idr1).is_none(),
-        "IDR1 must not emit yet"
-    );
-
-    for i in 1..=5u64 {
+    for i in 0..5u64 {
         let idr = make_idr_packet(i * 33, i);
-        if let Some(seg) = muxer.append_packet(&idr) {
-            segments.push(seg);
-        }
+        let seg = muxer
+            .append_packet(&idr)
+            .expect("every IDR must emit a segment under per-frame-flush contract");
+        segments.push(seg);
     }
 
-    assert_eq!(segments.len(), 5, "expected 5 media segments from 6 IDRs");
+    assert_eq!(segments.len(), 5, "expected 5 media segments from 5 IDRs");
 
     // Verify each segment starts with moof.
     for (idx, seg) in segments.iter().enumerate() {
@@ -165,6 +161,7 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
 }
 
 // ─── C2: mfhd sequence numbers increment monotonically across segments ───────
+// Updated to NEW per-frame-flush contract: every IDR emits immediately.
 
 #[test]
 fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
@@ -174,16 +171,13 @@ fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
-    // IDR1 buffers.
-    let idr1 = make_idr_packet(0, 0);
-    assert!(muxer.append_packet(&idr1).is_none());
-
-    // IDR2..IDR6 each emit a segment.
-    for i in 1..=5u64 {
+    // 5 IDRs → 5 segments under per-frame-flush.
+    for i in 0..5u64 {
         let idr = make_idr_packet(i * 33, i);
-        if let Some(seg) = muxer.append_packet(&idr) {
-            segments.push(seg);
-        }
+        let seg = muxer
+            .append_packet(&idr)
+            .expect("IDR must emit segment immediately");
+        segments.push(seg);
     }
 
     assert_eq!(segments.len(), 5, "expected 5 segments");
@@ -213,6 +207,7 @@ fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
 }
 
 // ─── C3: tfdt.base_media_decode_time increases monotonically ─────────────────
+// Updated to NEW per-frame-flush contract: every IDR emits immediately.
 
 #[test]
 fn mp4_muxer_tfdt_decode_time_monotonic() {
@@ -222,17 +217,14 @@ fn mp4_muxer_tfdt_decode_time_monotonic() {
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
-    // IDR1 at t=0 buffers.
-    let idr1 = make_idr_packet(0, 0);
-    assert!(muxer.append_packet(&idr1).is_none());
-
-    // IDR2..IDR6 at increasing timestamps each emit a segment.
-    for i in 1..=5u64 {
+    // 5 IDRs at increasing timestamps, each emitting immediately.
+    for i in 0..5u64 {
         let ts_ms = i * 100; // 100ms spacing = 9000 ticks at 90kHz
         let idr = make_idr_packet(ts_ms, i);
-        if let Some(seg) = muxer.append_packet(&idr) {
-            segments.push(seg);
-        }
+        let seg = muxer
+            .append_packet(&idr)
+            .expect("IDR must emit segment immediately");
+        segments.push(seg);
     }
 
     assert_eq!(segments.len(), 5, "expected 5 segments");
@@ -250,10 +242,10 @@ fn mp4_muxer_tfdt_decode_time_monotonic() {
     }
 
     // Verify the timescale mapping: 100ms at 90kHz = 9000 ticks.
-    // Segment 1 has base_dts from IDR1 (t=0 ms), so times[0] should be 0.
-    assert_eq!(times[0], 0, "first segment tfdt must be 0 (IDR1 at t=0)");
+    // Segment 0 has base_dts = 0 (IDR at t=0ms, rebase origin).
+    assert_eq!(times[0], 0, "first segment tfdt must be 0 (IDR at t=0)");
 
-    // Segment 2 has base_dts from IDR2 (t=100ms → 9000 ticks).
+    // Segment 1 has base_dts from IDR at t=100ms → 9000 ticks.
     assert_eq!(
         times[1], 9_000,
         "second segment tfdt must be 9000 (100ms at 90kHz), got {}",
@@ -420,18 +412,20 @@ fn make_anchor_packet(is_kf: bool, ts_ms: u64) -> EncodedPacket {
     }
 }
 
-/// Build the deterministic 30fps 4-sample golden segment used by R10 tests.
+/// Build a deterministic single-sample P-frame segment at 30fps cadence.
 ///
-/// Built programmatically to avoid copy-paste errors in hex literals.
-fn build_30fps_4sample_gop_segment() -> Vec<u8> {
+/// Under per-frame flush, each packet emits a single-sample fragment.
+/// This helper feeds IDR at t=0 (sets prev_flushed_dts=0), then returns
+/// the P-frame segment at t=33ms (inter-delta = 33×90 = 2970 ticks).
+/// Used by R10 byte-level golden tests.
+fn build_30fps_single_sample_p_frame_segment() -> Vec<u8> {
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+    // IDR at t=0: sets prev_flushed_dts=0; discard its segment.
     muxer.append_packet(&make_anchor_packet(true, 0));
-    muxer.append_packet(&make_anchor_packet(false, 33));
-    muxer.append_packet(&make_anchor_packet(false, 66));
-    muxer.append_packet(&make_anchor_packet(false, 99));
+    // P-frame at t=33ms: inter-delta = 2970 ticks.
     muxer
-        .append_packet(&make_anchor_packet(true, 132))
-        .expect("IDR2 must flush the 4-sample GOP")
+        .append_packet(&make_anchor_packet(false, 33))
+        .expect("P-frame at t=33ms must emit segment")
 }
 
 // ─── Phase 5 + 6: integration tests + golden refresh ────────────────────────
@@ -465,19 +459,18 @@ fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
         .collect()
 }
 
-// T5.2 — Post-warm-up pipeline emits per-sample duration = REAL intra-GOP DTS delta.
+// T5.2 — Post-warm-up pipeline emits per-sample duration = REAL inter-frame DTS delta.
 //
-// After the real-DTS-delta fix (T5), per-sample trun durations come from actual DTS
-// differences, NOT from FpsTracker. At 100ms uniform spacing, the real DTS delta
-// is (0.1 * 90000) as u64 = 8999 or 9000 ticks (f64 rounding). The test verifies
-// that all durations approximate the real 100ms gap and that the sum-of-durations
-// equals the real elapsed DTS span of the GOP.
+// After the real-DTS-delta fix (T5) + per-frame-flush change: each single-sample
+// fragment's duration = prev_flushed_dts inter-fragment delta, NOT FpsTracker value.
+// At 100ms uniform spacing: duration ≈ 8999 or 9000 ticks (f64 rounding).
+// Updated to NEW per-frame-flush contract.
 #[test]
 fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     use std::time::Duration;
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
 
-    // Feed IDR at t=0 (no delta yet).
+    // Feed IDR at t=0 — emits immediately (first fragment uses WARMUP_FALLBACK for duration).
     let idr1 = EncodedPacket {
         data: {
             let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
@@ -488,9 +481,10 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
         timestamp: Duration::from_millis(0),
         sequence: 0,
     };
-    muxer.append_packet(&idr1);
+    muxer.append_packet(&idr1); // emits; discard
 
-    // Feed 8 P-frames at 100ms intervals to warm up the tracker.
+    // Feed 8 P-frames at 100ms intervals — each emits a single-sample segment.
+    // After the first P-frame, inter-fragment delta = 100ms ≈ 9000 ticks.
     for i in 1..=8u64 {
         let pkt = EncodedPacket {
             data: {
@@ -502,91 +496,49 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
             timestamp: Duration::from_millis(i * 100),
             sequence: i,
         };
-        muxer.append_packet(&pkt);
-    }
+        let seg = muxer
+            .append_packet(&pkt)
+            .expect("P-frame must emit segment under per-frame-flush");
 
-    // IDR2 triggers flush of GOP1 (9 samples: IDR1 + 8 P-frames).
-    let idr2 = EncodedPacket {
-        data: {
-            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
-            d.extend(vec![0xBBu8; 95]);
-            std::sync::Arc::from(d.into_boxed_slice())
-        },
-        is_keyframe: true,
-        timestamp: Duration::from_millis(9 * 100),
-        sequence: 9,
-    };
-    let segment = muxer
-        .append_packet(&idr2)
-        .expect("IDR2 must flush GOP1 (9 samples)");
-
-    // Parse per-sample (duration, size) pairs from the flushed trun.
-    let pairs = parse_segment_trun_pairs(&segment, true); // IDR segment
-
-    // With the real-DTS-delta fix, durations reflect actual inter-frame DTS differences.
-    // duration_to_90khz(100ms) via f64 yields 8999 or 9000 ticks — allow ±1 for rounding.
-    // Must NOT be 3000 (FpsTracker warm-up fallback — the old broken behavior).
-    assert!(!pairs.is_empty(), "segment must have at least one sample");
-    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        // Each single-sample P-frame trun has duration = inter-fragment delta ≈ 9000 ticks.
+        let pairs = parse_segment_trun_pairs(&seg, false); // P-frame segment
+        assert_eq!(
+            pairs.len(),
+            1,
+            "per-frame flush produces single-sample fragments"
+        );
+        let (dur, _) = pairs[0];
         assert!(
             (8998..=9001).contains(&dur),
-            "sample {i} duration {dur} must approximate real 100ms DTS delta (8998–9001 ticks); \
+            "P-frame {i} duration {dur} must approximate real 100ms DTS delta (8998–9001 ticks); \
              must NOT be 3000 (FpsTracker fallback)"
         );
     }
-
-    // Sum-of-durations must approximate the real elapsed DTS span of GOP1 (9 × ~9000 ticks).
-    // Allow ±9 ticks tolerance for 9 frames × ±1 tick rounding each.
-    let total_dur: u64 = pairs.iter().map(|&(d, _)| d as u64).sum();
-    let real_span: u64 = (0.9_f64 * 90_000.0) as u64; // 9 × 100ms
-    let tolerance: u64 = 9; // ±1 tick per frame
-    assert!(
-        total_dur.abs_diff(real_span) <= tolerance,
-        "sum-of-durations {total_dur} must approximate real GOP span {real_span} ticks (±{tolerance})"
-    );
 }
 
-// T5.3 — trun per-sample durations reflect real DTS deltas regardless of FpsTracker state.
+// T5.3 — trun per-sample duration reflects real DTS delta (per-frame flush, single-sample).
 //
-// The 30fps fixture uses 33ms spacing (33 × 90 = 2970 ticks per frame).
-// After the real-DTS-delta fix, each sample gets duration ≈ 2970, NOT 3000 (the old
-// FpsTracker warm-up fallback). This verifies the fix works even during warm-up.
-// Sum = 4 × 2970 = 11880 ≈ real elapsed span, NOT 12000 (the old fixed-rate sum).
+// Under per-frame flush, each fragment is a single sample. The P-frame at t=33ms
+// has inter-fragment delta = 33×90 = 2970 ticks. Must NOT be 3000 (FpsTracker fallback).
 #[test]
 fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
-    let seg = build_30fps_4sample_gop_segment();
+    let seg = build_30fps_single_sample_p_frame_segment();
 
-    let pairs = parse_segment_trun_pairs(&seg, true); // IDR segment
+    let pairs = parse_segment_trun_pairs(&seg, false); // P-frame segment (is_idr=false)
     assert_eq!(
         pairs.len(),
-        4,
-        "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)"
+        1,
+        "per-frame flush produces single-sample fragments"
     );
 
-    // Real intra-GOP deltas: 33ms × 90 kHz = 2970 ticks each.
-    // After the real-DTS-delta fix, each per-sample trun duration must equal 2970 (not 3000).
+    // Inter-fragment delta: 33ms × 90 kHz = 2970 ticks.
+    // Must NOT be 3000 (old FpsTracker warm-up fallback).
     let expected_delta: u32 = 33 * 90; // 2970 ticks
-    for (i, &(dur, _)) in pairs.iter().take(pairs.len().saturating_sub(1)).enumerate() {
-        assert_eq!(
-            dur, expected_delta,
-            "real-DTS sample {i} duration must be {expected_delta} ticks (33ms real delta); \
-             got {dur} — must NOT be 3000 (old FpsTracker warm-up fallback)"
-        );
-    }
-    // Last sample uses median of intra-GOP deltas (all 2970) = 2970.
-    let last_dur = pairs.last().expect("at least one sample").0;
+    let (dur, _) = pairs[0];
     assert_eq!(
-        last_dur, expected_delta,
-        "last sample duration must be median of intra-GOP deltas ({expected_delta}); got {last_dur}"
-    );
-
-    // Sum-of-durations: 4 × 2970 = 11880 (real elapsed span), NOT 12000 (old fixed-rate).
-    let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
-    assert_eq!(
-        total,
-        4 * expected_delta,
-        "sum-of-durations for 4 samples at real 33ms deltas must be {}",
-        4 * expected_delta
+        dur, expected_delta,
+        "real-DTS single-sample duration must be {expected_delta} ticks (33ms real delta); \
+         got {dur} — must NOT be 3000 (old FpsTracker warm-up fallback)"
     );
 }
 
@@ -636,17 +588,17 @@ fn init_segment_trex_default_sample_duration_is_3000_regardless_of_fps() {
 
 // ─── T6.1: Post-T2 byte-level golden (R10) ──────────────────────────────────
 //
-// Documents the post-T2 trun layout for a 30fps 4-sample GOP:
-//   - trun flags = 0x000305 (sample-duration-present + sample-size-present
-//     + first-sample-flags-present + data-offset-present)
-//   - per-sample entries: [duration:4][size:4]
-//   - moof grew by 4 bytes/sample = +16 bytes for 4 samples vs. the historical
-//     pre-T2 layout; total: 516 → 532 bytes.
+// Documents the post-T2 trun layout for a per-frame P-frame segment:
+//   - trun flags = 0x000301 (sample-duration-present + sample-size-present
+//     + data-offset-present; NO first-sample-flags-present for P-frame)
+//   - single per-sample entry: [duration:4][size:4]
+//   - moof size: 8(moof)+8(mfhd)+8(seq)+8(traf)+16(tfhd)+20(tfdt)+28(trun P-frame) = 96B
+//     mdat: 8 + 96 (AVCC-wrapped 100-byte packet) = 104B. Total ≈ 200B.
 #[test]
 fn mp4_muxer_30fps_segment_post_t2_golden() {
-    let seg = build_30fps_4sample_gop_segment();
+    let seg = build_30fps_single_sample_p_frame_segment();
 
-    // Structural validation: post-T2 trun MUST have 0x000100 flag.
+    // Structural validation: post-T2 trun MUST have 0x000100 flag (sample-duration-present).
     let trun_pos = seg
         .windows(4)
         .position(|w| w == b"trun")
@@ -667,37 +619,30 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
         0,
         "post-T2 trun must have data-offset-present (0x000001)"
     );
-    assert_ne!(
+    // P-frame: must NOT have first-sample-flags-present (that's IDR-only).
+    assert_eq!(
         flags & 0x000004,
         0,
-        "post-T2 trun must have first-sample-flags-present (0x000004, IDR)"
+        "post-T2 P-frame trun must NOT have first-sample-flags-present (0x000004); got 0x{flags:06X}"
     );
 
-    // Size check: moof(108→124) + mdat(408) = 532 bytes.
-    // moof grew by 4 bytes/sample × 4 samples = +16 bytes (from 108 to 124).
+    // Single-sample P-frame segment: exactly one (duration, size) pair.
+    let pairs = parse_segment_trun_pairs(&seg, false); // P-frame
     assert_eq!(
-        seg.len(),
-        532,
-        "post-T2 4-sample GOP must be 532 bytes (pre-T2 was 516, +16 from 4 duration fields); got {}",
-        seg.len()
+        pairs.len(),
+        1,
+        "per-frame flush produces single-sample fragments"
     );
-
-    // After the real-DTS-delta fix (T5), per-sample durations reflect actual 33ms intervals.
-    // 33ms × 90 kHz = 2970 ticks. The old FpsTracker warm-up fallback (3000) is no longer
-    // used for per-sample trun durations.
-    let pairs = parse_segment_trun_pairs(&seg, true);
-    assert_eq!(pairs.len(), 4, "must have 4 samples");
-    let expected_delta: u32 = 33 * 90; // 2970 ticks (real 33ms inter-frame gap)
-    for (i, &(dur, _)) in pairs.iter().enumerate() {
-        assert_eq!(
-            dur, expected_delta,
-            "post-T5 real-DTS sample {i} must carry duration={expected_delta} (real 33ms delta); \
-             got {dur} — must NOT be 3000 (old FpsTracker fallback)"
-        );
-    }
+    let expected_delta: u32 = 33 * 90; // 2970 ticks (real 33ms inter-frame gap at 90kHz)
+    let (dur, _) = pairs[0];
+    assert_eq!(
+        dur, expected_delta,
+        "post-T5 real-DTS single-sample must carry duration={expected_delta} (real 33ms delta); \
+         got {dur} — must NOT be 3000 (old FpsTracker fallback)"
+    );
 
     // Deterministic: two builds must produce identical bytes.
-    let seg2 = build_30fps_4sample_gop_segment();
+    let seg2 = build_30fps_single_sample_p_frame_segment();
     assert_eq!(seg, seg2, "post-T2 segment must be deterministic");
 }
 
