@@ -38,6 +38,13 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
+// ── Live-edge snap constants (LE-1) ──────────────────────────────────────────
+// If currentTime falls more than LIVE_EDGE_MAX_DRIFT_SEC behind the end of the
+// buffered range, snap forward to (end - LIVE_EDGE_TARGET_LEAD_SEC).
+// The heartbeat itself (2000 ms) acts as the debounce — at most one snap per 2 s.
+const LIVE_EDGE_MAX_DRIFT_SEC = 0.30;
+const LIVE_EDGE_TARGET_LEAD_SEC = 0.10;
+
 // ── Module-level MSE state ───────────────────────────────────────────────────
 // Lifted from main() so tearDownMse / setUpMse (called by handleStatus) can
 // mutate it without threading closure references through every caller.
@@ -370,6 +377,40 @@ function onInitFrame(data, frameBytes) {
   enqueue(frameBytes);
 }
 
+// ── Live-edge snap (LE-2) ────────────────────────────────────────────────────
+// Called inside the 2000ms heartbeat when a SourceBuffer is active.
+// Snaps currentTime to the live edge when the player has drifted too far.
+//
+// Design Decision (d): sb.mode = 'sequence' stays; drift is computed on
+// buffered.end - currentTime, NOT on tfdt.
+//
+// Guards (REQ-LE-5):
+//   1. Video must be playing (not paused) — never move the head on a paused player.
+//   2. Video must not be in ended state — no snap after playback has ended.
+//   3. Video must have enough data to advance (readyState >= HAVE_FUTURE_DATA = 3) —
+//      the "waiting" event fires when readyState drops below 3; snapping while
+//      the element is waiting for data cannot help and may confuse the decoder.
+//   4. snapTarget must be >= buffered.start(last) — don't seek into un-buffered space.
+const HAVE_FUTURE_DATA = 3; // HTMLMediaElement.HAVE_FUTURE_DATA
+function checkLiveEdge(videoEl, sb) {
+  if (videoEl.paused) return;
+  if (videoEl.ended) return;
+  if (videoEl.readyState < HAVE_FUTURE_DATA) return;
+  const buf = sb.buffered;
+  if (!buf || buf.length === 0) return;
+  const last = buf.length - 1;
+  const lastEnd = buf.end(last);
+  const drift = lastEnd - videoEl.currentTime;
+  if (drift <= LIVE_EDGE_MAX_DRIFT_SEC) return;
+  const snapTarget = lastEnd - LIVE_EDGE_TARGET_LEAD_SEC;
+  if (snapTarget < buf.start(last)) return;
+  console.log(
+    "[video.tick] live-edge snap: drift=" + drift.toFixed(3) +
+    "s → seeking to " + snapTarget.toFixed(3) + "s"
+  );
+  videoEl.currentTime = snapTarget;
+}
+
 async function main() {
   // ── R11.2: probe MSE+H.264 support generically ───────────────────────────
   if (!("MediaSource" in window) || !MediaSource.isTypeSupported(PROBE_CODEC)) {
@@ -433,6 +474,8 @@ async function main() {
       "buffered=" + (ranges.join(",") || "<none>"),
       curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
+    // LE-3: snap to live edge if currentTime has drifted too far behind
+    checkLiveEdge(VIDEO_EL, sb);
   }, 2000);
 
   try {
@@ -548,5 +591,5 @@ main().catch((e) => setStatus("startup failed: " + e));
 // undefined → the `if` short-circuits and this block is a byte-equivalent
 // no-op (zero parser/runtime cost; no observable behavior change).
 if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
-  Object.assign(globalThis.__SCREEN_MIRROR_TEST_EXPORTS__, { deriveCodecFromInitSegment });
+  Object.assign(globalThis.__SCREEN_MIRROR_TEST_EXPORTS__, { deriveCodecFromInitSegment, checkLiveEdge });
 }
