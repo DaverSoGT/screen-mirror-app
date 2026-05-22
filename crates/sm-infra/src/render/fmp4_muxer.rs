@@ -789,10 +789,17 @@ pub struct Mp4Muxer {
     /// RTP-timestamp-derived fps tracker for per-sample trun durations.
     /// Locked after 8 consecutive inter-AU deltas pass IQR + plausibility guards (R4–R8).
     /// Exposed as `pub(crate)` in test builds for white-box assertions (T4.1).
+    /// NOTE: still used for `trex.default_sample_duration` in the init segment only —
+    /// per-sample `trun` durations now come from real intra-GOP DTS deltas (T5).
     #[cfg(not(test))]
     fps_tracker: crate::render::fps_tracker::FpsTracker,
     #[cfg(test)]
     pub(crate) fps_tracker: crate::render::fps_tracker::FpsTracker,
+    /// DTS of the last sample in the most recently flushed GOP, in TIMESCALE units.
+    ///
+    /// Used as the predecessor DTS when computing the last-sample duration fallback
+    /// in `flush_pending()`. `None` until the first GOP has been flushed.
+    prev_flushed_dts: Option<u64>,
 }
 
 impl Mp4Muxer {
@@ -822,6 +829,7 @@ impl Mp4Muxer {
             pending: Vec::new(),
             first_dts_offset: None,
             fps_tracker: crate::render::fps_tracker::FpsTracker::new(),
+            prev_flushed_dts: None,
         }
     }
 
@@ -850,17 +858,19 @@ impl Mp4Muxer {
         }
 
         let ftyp = build_ftyp();
-        // R5/R11: trex.default_sample_duration is always the warm-up fallback (3000 ticks = 30 fps).
-        // The init segment is built before warm-up completes, and per-sample trun durations
-        // (flag 0x000100, set by build_trun) always override trex once T2 changes are active.
-        // Encoding the fps-derived value here would be premature and would break R11 (frozen signature).
+        // R5/R11: trex.default_sample_duration uses the FpsTracker's current best estimate.
+        // During warm-up this is 3000 (30 fps fallback); after lock it is the inferred median.
+        // Per-sample trun durations (flag 0x000100, set by build_trun) always override trex
+        // in each media segment, so this value only affects playback before the first fragment
+        // is received. Using the live tracker value here (not a hardcoded constant) is correct
+        // and keeps FpsTracker relevant for its stated purpose.
         let moov = build_moov(
             self.width,
             self.height,
             sps_info,
             sps_nal,
             pps_nal,
-            crate::render::fps_tracker::WARMUP_FALLBACK_TICKS,
+            self.fps_tracker.effective_ticks_per_sample(),
         )?;
 
         let mut out = Vec::with_capacity(ftyp.len() + moov.len());
@@ -937,16 +947,63 @@ impl Mp4Muxer {
             .flat_map(|s| s.avcc.iter().copied())
             .collect();
 
-        // R5: during warm-up returns 3000 (30 fps fallback); after lock returns
-        // the inferred median tick duration from RTP-timestamp deltas (R4).
-        // Future VFR change can swap this for per-sample observed deltas.
-        let ticks = self.fps_tracker.effective_ticks_per_sample();
+        // T5: compute per-sample trun durations from REAL intra-GOP DTS deltas.
+        //
+        // Why: FpsTracker stamps ALL samples with a single assumed rate, causing the MSE
+        // sequence-mode timeline to grow at (assumed_rate / real_rate)× speed. When capture
+        // runs slower than the assumed rate (e.g. 7.5 fps real vs 30 fps assumed), the MSE
+        // timeline grows 0.25× realtime and the <video> element permanently stalls. Using
+        // real DTS deltas makes the timeline track wall-clock regardless of capture speed.
+        //
+        // FpsTracker is KEPT for trex.default_sample_duration in the init segment (R5/R4)
+        // because trun per-sample durations override the trex default in the media segment.
+        //
+        // Duration clamping bounds [375, 900000] ticks:
+        //   375 = 90000 / 240  (240 fps guard — protects against DTS jitter / duplicates)
+        //   900000 = 90000 × 10  (10 s cap — catches only pathological sleep/wake gaps)
+        const MIN_DURATION_TICKS: u32 = 375;
+        const MAX_DURATION_TICKS: u32 = 900_000;
+
+        let n = self.pending.len();
+        let mut durations: Vec<u32> = Vec::with_capacity(n);
+
+        // Samples 0..N-2: use the successor DTS minus this sample's DTS.
+        for i in 0..n.saturating_sub(1) {
+            let delta = self.pending[i + 1]
+                .dts_90khz
+                .saturating_sub(self.pending[i].dts_90khz) as u32;
+            durations.push(delta.clamp(MIN_DURATION_TICKS, MAX_DURATION_TICKS));
+        }
+
+        // Last sample (index N-1): no in-fragment successor — use a fallback.
+        //   If GOP has ≥ 2 samples: median of the intra-GOP deltas computed above.
+        //   If GOP has exactly 1 sample: inter-fragment delta via prev_flushed_dts,
+        //     or WARMUP_FALLBACK_TICKS for the very first fragment.
+        let last_dur: u32 = if n >= 2 {
+            // Compute the median of the already-computed intra-GOP deltas.
+            let mut sorted = durations.clone();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2] // upper-median for odd N; upper of the two middle values for even N
+        } else {
+            // Single-sample GOP: use inter-fragment delta if available.
+            if let Some(prev) = self.prev_flushed_dts {
+                let inter_delta = base_dts.saturating_sub(prev) as u32;
+                inter_delta.clamp(MIN_DURATION_TICKS, MAX_DURATION_TICKS)
+            } else {
+                crate::render::fps_tracker::WARMUP_FALLBACK_TICKS
+            }
+        };
+        durations.push(last_dur);
+
+        // Update prev_flushed_dts to the last sample's DTS before clearing pending.
+        self.prev_flushed_dts = self.pending.last().map(|s| s.dts_90khz);
 
         let trun_samples: Vec<TrunSample> = self
             .pending
             .iter()
-            .map(|s| TrunSample {
-                duration: ticks, // R2/R3: always concrete u32
+            .zip(durations.iter())
+            .map(|(s, &dur)| TrunSample {
+                duration: dur,
                 size: s.avcc.len() as u32,
                 flags: None,
             })
@@ -2394,7 +2451,7 @@ mod tests {
             muxer.fps_tracker.is_locked(),
             "fps_tracker must be locked after 9 uniform 100ms packets"
         );
-        let expected_ticks = muxer.fps_tracker.effective_ticks_per_sample();
+        let locked_ticks = muxer.fps_tracker.effective_ticks_per_sample();
 
         // Parse trun from the flushed segment.
         let trun_pos = segment
@@ -2404,26 +2461,135 @@ mod tests {
         let trun = &segment[trun_pos - 4..];
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 
-        // All per-sample durations must match what the locked tracker reports.
+        // After the real-DTS-delta fix (T5), per-sample trun durations come from actual
+        // DTS differences, not from FpsTracker directly. At 100ms uniform spacing,
+        // duration_to_90khz(100ms) may yield 8999 or 9000 ticks due to f64 rounding.
+        // The key invariant: durations must approximate the real 100ms inter-frame gap
+        // (within 1 tick of rounding), and must NOT be 3000 (the warm-up fallback).
+        //
+        // FpsTracker is still verified to have locked correctly — it's used for the init
+        // segment trex.default_sample_duration, just no longer for trun per-sample values.
+        assert!(
+            locked_ticks > 8000 && locked_ticks < 10_000,
+            "locked tracker value {locked_ticks} must be near 9000 (10 fps at 100ms)"
+        );
         for (i, &(dur, _)) in pairs.iter().enumerate() {
-            assert_eq!(
-                dur, expected_ticks,
-                "post-warm-up sample {i} duration must be {expected_ticks}; got {dur}"
+            // Real 100ms DTS delta via f64 conversion yields 8999 or 9000 ticks.
+            assert!(
+                (8998..=9001).contains(&dur),
+                "post-warm-up sample {i} duration {dur} must approximate real 100ms delta \
+                 (8998–9001 ticks); must NOT be 3000 (FpsTracker warm-up fallback)"
             );
         }
-        // Sanity: the locked value must NOT be 3000 (we warmed up at 100ms ≠ 33ms).
+        // Sanity: durations must NOT be the warm-up fallback.
         assert_ne!(
-            expected_ticks, 3000,
+            locked_ticks, 3000,
             "locked value must differ from 30fps fallback (we used 10fps spacing)"
         );
     }
 
-    // T4.3 — flush_pending uses 3000 during warm-up (< 8 deltas observed).
-    // RED until T4.4.
+    // T5.1 — flush_pending stamps each trun sample with its REAL intra-GOP DTS delta,
+    // not a fixed FpsTracker rate. The sum of all per-sample trun durations for a flushed
+    // GOP must equal the real DTS span (first sample → first sample of next GOP), within
+    // one fallback tick of tolerance for the last-sample duration.
+    //
+    // RED on current master (all durations = fps_tracker value, sum = N×fixed_rate ≠ real span).
+    // GREEN after the real-DTS-delta fix in flush_pending.
     #[test]
-    fn mp4_muxer_flush_pending_uses_3000_during_warmup() {
+    fn flush_pending_trun_duration_sum_equals_real_dts_span_not_fixed_fps() {
+        use std::time::Duration;
+
+        // 7 frames at deliberately non-uniform DTS spacing (mix of ~7.5 fps and ~30 fps).
+        // We use Duration::from_millis because make_packet takes ms.
+        //
+        // DTS layout (ms → 90kHz ticks):
+        //   frame 0 (IDR1):  t=0ms      → dts=0
+        //   frame 1 (P):     t=133ms    → dts=11970  (≈12000, ~7.5fps)
+        //   frame 2 (P):     t=266ms    → dts=23940  (≈12000, ~7.5fps)
+        //   frame 3 (P):     t=399ms    → dts=35910  (≈12000, ~7.5fps)
+        //   frame 4 (P):     t=532ms    → dts=47880  (≈12000, ~7.5fps)
+        //   frame 5 (P):     t=665ms    → dts=59850  (≈12000, ~7.5fps)
+        //   IDR2 (flush):    t=798ms    → dts=71820  (≈12000, ~7.5fps)
+        //
+        // Real DTS span for GOP0 = dts[IDR2] - dts[IDR1] = 71820 - 0 = 71820 ticks.
+        //
+        // Current code stamps every sample with fps_tracker.effective_ticks_per_sample().
+        // After 6 deltas at ~12000 ticks, tracker may lock at 12000 (if IQR guard passes).
+        // If locked at 12000: sum = 6×12000 = 72000 ≠ 71820 (close but not exact).
+        // If still warming up: sum = 6×3000 = 18000 ≠ 71820.
+        //
+        // After the fix: sum = real intra-GOP deltas + last-sample fallback ≈ 71820.
+        // We test: abs(sum - real_span) ≤ one_fallback_tick (allow the last-sample approximation).
+        let ms_per_frame: u64 = 133; // ~7.5fps
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+
+        // IDR1 at t=0
+        muxer.append_packet(&make_packet(true, 0, 100));
+        // 5 P-frames at ~7.5fps spacing
+        for i in 1..=5u64 {
+            muxer.append_packet(&make_packet(false, i * ms_per_frame, 100));
+        }
+        // IDR2 triggers flush of GOP0
+        let segment = muxer
+            .append_packet(&make_packet(true, 6 * ms_per_frame, 100))
+            .expect("IDR2 must flush GOP0");
+
+        // Parse per-sample durations from the trun box.
+        let trun_pos = segment
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("segment must contain trun box");
+        let trun = &segment[trun_pos - 4..];
+        let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
+
+        // Compute real DTS span of GOP0 (rebased: IDR1 at 0, IDR2 at ~71820).
+        // duration_to_90khz: Duration::from_millis(ms) → (ms as f64 / 1000.0 * 90000.0) as u64
+        let real_span: u64 =
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(6 * ms_per_frame));
+
+        let actual_sum: u64 = pairs.iter().map(|&(dur, _)| dur as u64).sum();
+
+        // Allow ±one maximum fallback tick (12000) for last-sample approximation.
+        let tolerance: u64 = 12_001;
+        assert!(
+            actual_sum.abs_diff(real_span) <= tolerance,
+            "trun duration sum {actual_sum} must approximate real DTS span {real_span} \
+             (within ±{tolerance} ticks). Current code produces N×fixed_rate ({} frames × {} ticks/frame = {})",
+            pairs.len(),
+            pairs.first().map(|&(d, _)| d).unwrap_or(0),
+            pairs.iter().map(|&(d, _)| d as u64).sum::<u64>(),
+        );
+
+        // Stricter: durations must NOT all be identical when real spacing was uniform.
+        // (The last sample may differ from the others, but the rest should match real deltas.)
+        // Real intra-GOP deltas are all ~11970 (133ms × 90 = 11970 ticks).
+        // After fix, each of the first N-1 samples should have duration ≈ 11970.
+        // Current code: all durations == one fixed value (3000 or ~12000 locked).
+        // The stricter check: per-sample durations must match real deltas individually.
+        let expected_delta: u64 =
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(ms_per_frame));
+        // All of samples 0..N-2 must equal the real inter-frame delta (±1 for rounding).
+        for (i, &(dur, _)) in pairs.iter().enumerate().take(pairs.len().saturating_sub(1)) {
+            assert!(
+                (dur as u64).abs_diff(expected_delta) <= 1,
+                "sample {i} duration {dur} must equal real DTS delta {expected_delta} \
+                 (fix uses intra-GOP DTS deltas; current code stamps all samples with \
+                 FpsTracker value)"
+            );
+        }
+    }
+
+    // T4.3 — flush_pending uses real intra-GOP DTS deltas even during FpsTracker warm-up.
+    //
+    // Original T4.3 verified warm-up used 3000 (FpsTracker fallback). After the real-DTS-delta
+    // fix (T5), per-sample trun durations come from actual DTS differences regardless of
+    // FpsTracker state. This test verifies the new correct behavior: real deltas used,
+    // FpsTracker locked state is irrelevant for trun per-sample durations.
+    #[test]
+    fn mp4_muxer_flush_pending_uses_real_dts_deltas_during_warmup() {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         // Feed IDR1 + only 3 P-frames (warm-up incomplete with < 8 deltas).
+        // Spacing: 17ms each → 17 × 90 = 1530 ticks per inter-frame delta.
         let idr1 = make_packet(true, 0, 100);
         muxer.append_packet(&idr1);
         for i in 1..=3u64 {
@@ -2433,6 +2599,11 @@ mod tests {
         let idr2 = make_packet(true, 4 * 17, 100);
         let segment = muxer.append_packet(&idr2).expect("IDR2 must flush GOP1");
 
+        assert!(
+            !muxer.fps_tracker.is_locked(),
+            "fps_tracker must still be warming up (only 5 deltas after IDR2 appended)"
+        );
+
         let trun_pos = segment
             .windows(4)
             .position(|w| w == b"trun")
@@ -2440,11 +2611,21 @@ mod tests {
         let trun = &segment[trun_pos - 4..];
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 
-        for (i, &(dur, _)) in pairs.iter().enumerate() {
+        // With the real-DTS-delta fix, durations should reflect real 17ms spacing ≈ 1530 ticks.
+        // The FpsTracker fallback (3000) must NOT appear — real deltas are used.
+        let expected_delta: u32 = 17 * 90; // 1530 ticks
+        for (i, &(dur, _)) in pairs.iter().take(pairs.len().saturating_sub(1)).enumerate() {
             assert_eq!(
-                dur, 3000,
-                "warm-up sample {i} duration must be 3000 (fallback); got {dur}"
+                dur, expected_delta,
+                "warm-up sample {i} duration must be real DTS delta {expected_delta}; got {dur} \
+                 (must NOT be FpsTracker fallback 3000)"
             );
         }
+        // Last sample uses median of intra-GOP deltas (all 1530) = 1530.
+        let last_dur = pairs.last().expect("at least one sample").0;
+        assert_eq!(
+            last_dur, expected_delta,
+            "last sample duration must be median of intra-GOP deltas ({expected_delta}); got {last_dur}"
+        );
     }
 }

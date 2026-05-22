@@ -3951,6 +3951,7 @@ dependencies = [
  "mp4",
  "openh264",
  "openh264-sys2",
+ "rayon",
  "serde",
  "serde_json",
  "sm-domain",

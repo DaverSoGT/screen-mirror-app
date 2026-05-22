@@ -1473,6 +1473,14 @@ fn pump_loop(
     let mut last_logged_ho: u32 = u32::MAX;
     let mut iter_count: u64 = 0;
 
+    // Encode-rate diagnostic: count packets forwarded downstream and log fps once
+    // per ~1 s of wall-clock. This reveals whether the capture+encode pipeline is
+    // genuinely slow (corroborating the muxer real-DTS-delta fix) or whether the
+    // bottleneck is elsewhere. Log only — no encoder behavior is changed.
+    let mut fps_frame_count: u32 = 0;
+    let mut fps_window_start = std::time::Instant::now();
+    const FPS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
     loop {
         // Top-of-loop stop check — sole exit via stop flag (design DD1, spec R4/S4.1).
         // With POLLING_SLEEP=1ms this is reached within ≤2ms from any idle state.
@@ -1583,7 +1591,24 @@ fn pump_loop(
                     // Decrement AFTER successful COM call (spec OQ-1, design DD2).
                     ho_count -= 1;
                     match tx.try_send(pkt) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            // Encode-rate diagnostic: count successfully forwarded frames and
+                            // log fps once per FPS_LOG_INTERVAL. Reveals true encode throughput
+                            // to complement the muxer real-DTS-delta fix diagnosis.
+                            fps_frame_count += 1;
+                            let elapsed = fps_window_start.elapsed();
+                            if elapsed >= FPS_LOG_INTERVAL {
+                                let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
+                                tracing::info!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    encode_fps = %format!("{fps:.1}"),
+                                    frames = fps_frame_count,
+                                    "encode throughput"
+                                );
+                                fps_frame_count = 0;
+                                fps_window_start = std::time::Instant::now();
+                            }
+                        }
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
                             state.dropped.fetch_add(1, Ordering::Relaxed);
                         }
