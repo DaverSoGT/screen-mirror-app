@@ -35,6 +35,12 @@
 // higher level (e.g. 4.0 for 1080p), closing the MediaSource and removing
 // the SourceBuffer mid-stream.
 const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
+
+// Live-edge playback snap constants.
+// Snap once currentTime falls more than this many seconds behind the live edge.
+const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
+// After a snap, sit this far behind the edge (small playable cushion).
+const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
@@ -286,6 +292,47 @@ function trimSourceBuffer() {
   }
 }
 
+// ── seekToLiveEdge ───────────────────────────────────────────────────────────
+// Snaps playback to the live edge when currentTime falls too far behind the
+// newest buffered content. Called on every updateend (once the burst is fully
+// appended) and on the 2 s heartbeat as a safety net.
+//
+// Guard order:
+//   1. No SourceBuffer, or it is still updating (burst in progress) → wait.
+//   2. Pending queue not empty (more chunks about to be appended) → wait.
+//      This ensures ONE seek per burst, not one per chunk.
+//   3. A seek is already in flight → skip to avoid re-entrant seeks.
+//   4. buffered is empty → nothing to snap to.
+//   5. Drift ≤ LIVE_EDGE_MAX_DRIFT_SEC → already close enough, do nothing.
+//   6. target ≤ currentTime → never seek backward.
+function seekToLiveEdge() {
+  const sb = mseState.sb;
+  if (!sb || sb.updating || mseState.pending.length > 0) return;
+  if (VIDEO_EL.seeking) return;
+  let bufEnd;
+  try {
+    const buf = sb.buffered;
+    if (buf.length === 0) return;
+    bufEnd = buf.end(buf.length - 1);
+  } catch (e) {
+    return;
+  }
+  const drift = bufEnd - VIDEO_EL.currentTime;
+  if (drift <= LIVE_EDGE_MAX_DRIFT_SEC) return;
+  const target = bufEnd - LIVE_EDGE_TARGET_LEAD_SEC;
+  if (target <= VIDEO_EL.currentTime) return;
+  console.log(
+    "[mse] live-edge seek: " + VIDEO_EL.currentTime.toFixed(3) +
+    " → " + target.toFixed(3) +
+    " (drift was " + drift.toFixed(3) + "s)"
+  );
+  try {
+    VIDEO_EL.currentTime = target;
+  } catch (e) {
+    console.warn("[mse] live-edge seek failed", e);
+  }
+}
+
 // ── onInitFrame — lazy SourceBuffer creation on first FRAME_INIT ─────────────
 // Extracted from main() so setUpMse() reconnects can also receive a fresh init.
 // Reads mseState.ms (current MediaSource) and writes mseState.sb.
@@ -345,6 +392,7 @@ function onInitFrame(data, frameBytes) {
     // the IDR cadence).
     sb.mode = "sequence";
     sb.addEventListener("updateend", flushQueue);
+    sb.addEventListener("updateend", seekToLiveEdge);
     mseState.sb = sb; // write into module-level state (heartbeat + tearDownMse)
   } catch (e) {
     setStatus("addSourceBuffer failed: " + e);
@@ -433,6 +481,7 @@ async function main() {
       "buffered=" + (ranges.join(",") || "<none>"),
       curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
+    seekToLiveEdge();
   }, 2000);
 
   try {
@@ -548,5 +597,10 @@ main().catch((e) => setStatus("startup failed: " + e));
 // undefined → the `if` short-circuits and this block is a byte-equivalent
 // no-op (zero parser/runtime cost; no observable behavior change).
 if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
-  Object.assign(globalThis.__SCREEN_MIRROR_TEST_EXPORTS__, { deriveCodecFromInitSegment });
+  Object.assign(globalThis.__SCREEN_MIRROR_TEST_EXPORTS__, {
+    deriveCodecFromInitSegment,
+    seekToLiveEdge,
+    LIVE_EDGE_MAX_DRIFT_SEC,
+    LIVE_EDGE_TARGET_LEAD_SEC,
+  });
 }
