@@ -115,20 +115,22 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
         "init must contain mvex (fMP4 marker)"
     );
 
-    // Part B: every IDR emits a segment immediately. IDR1..IDR5 = 5 segments.
+    // Feed IDR packets — IDR1 buffers, IDR2..IDR6 each emit a segment.
     let mut segments: Vec<Vec<u8>> = Vec::new();
-    for i in 0..=4u64 {
+    let idr1 = make_idr_packet(0, 0);
+    assert!(
+        muxer.append_packet(&idr1).is_none(),
+        "IDR1 must not emit yet"
+    );
+
+    for i in 1..=5u64 {
         let idr = make_idr_packet(i * 33, i);
         if let Some(seg) = muxer.append_packet(&idr) {
             segments.push(seg);
         }
     }
 
-    assert_eq!(
-        segments.len(),
-        5,
-        "expected 5 media segments from 5 IDRs (per-frame flush)"
-    );
+    assert_eq!(segments.len(), 5, "expected 5 media segments from 6 IDRs");
 
     // Verify each segment starts with moof.
     for (idx, seg) in segments.iter().enumerate() {
@@ -172,15 +174,19 @@ fn mp4_muxer_mfhd_sequence_numbers_increment_across_segments() {
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
-    // Part B: each IDR emits immediately. IDR1..IDR5 = 5 segments.
-    for i in 0..=4u64 {
+    // IDR1 buffers.
+    let idr1 = make_idr_packet(0, 0);
+    assert!(muxer.append_packet(&idr1).is_none());
+
+    // IDR2..IDR6 each emit a segment.
+    for i in 1..=5u64 {
         let idr = make_idr_packet(i * 33, i);
         if let Some(seg) = muxer.append_packet(&idr) {
             segments.push(seg);
         }
     }
 
-    assert_eq!(segments.len(), 5, "expected 5 segments (per-frame flush)");
+    assert_eq!(segments.len(), 5, "expected 5 segments");
 
     let seq_numbers: Vec<u32> = segments.iter().map(|s| extract_mfhd_seq(s)).collect();
 
@@ -216,8 +222,12 @@ fn mp4_muxer_tfdt_decode_time_monotonic() {
 
     let mut segments: Vec<Vec<u8>> = Vec::new();
 
-    // Part B: each IDR emits immediately. IDR1 at t=0 → seg1, IDR2..IDR5 → seg2..seg5.
-    for i in 0..=4u64 {
+    // IDR1 at t=0 buffers.
+    let idr1 = make_idr_packet(0, 0);
+    assert!(muxer.append_packet(&idr1).is_none());
+
+    // IDR2..IDR6 at increasing timestamps each emit a segment.
+    for i in 1..=5u64 {
         let ts_ms = i * 100; // 100ms spacing = 9000 ticks at 90kHz
         let idr = make_idr_packet(ts_ms, i);
         if let Some(seg) = muxer.append_packet(&idr) {
@@ -225,7 +235,7 @@ fn mp4_muxer_tfdt_decode_time_monotonic() {
         }
     }
 
-    assert_eq!(segments.len(), 5, "expected 5 segments (per-frame flush)");
+    assert_eq!(segments.len(), 5, "expected 5 segments");
 
     let times: Vec<u64> = segments.iter().map(|s| extract_tfdt_time(s)).collect();
 
@@ -387,11 +397,15 @@ fn mp4_muxer_extract_sps_pps_from_idr_round_trips() {
     assert_eq!(pps_out, PPS, "extracted PPS must match input PPS");
 }
 
-// ─── 30fps single-sample golden segment fixture ─────────────────────────────
+// ─── 30fps 4-sample golden segment fixture ──────────────────────────────────
 //
-// Part B (per-frame flush): each packet is its own segment. The old 4-sample
-// GOP fixture is replaced by a single-sample IDR segment and a P-frame segment.
-// These are the new representative fixtures for the duration and flag tests.
+// Builds a deterministic 4-sample GOP at 30fps cadence (IDR + 3 P-frames,
+// each 100 bytes, 33ms apart). Used by R10 byte-level golden tests and the
+// post-warm-up duration assertions.
+//
+// Post-T2 layout (current code): trun flags = 0x000305 (includes
+// sample-duration-present 0x000100), each per-sample entry is
+// [duration:4][size:4]. Total segment: moof(124) + mdat(408) = 532 bytes.
 
 /// Build a fixed 100-byte synthetic packet for the golden fixture.
 fn make_anchor_packet(is_kf: bool, ts_ms: u64) -> EncodedPacket {
@@ -406,33 +420,32 @@ fn make_anchor_packet(is_kf: bool, ts_ms: u64) -> EncodedPacket {
     }
 }
 
-/// Build the deterministic single-sample IDR segment used by R10 tests.
-/// Part B: each append flushes immediately, so IDR at t=0 → one-sample segment.
+/// Build the deterministic 30fps 4-sample golden segment used by R10 tests.
+///
+/// Built programmatically to avoid copy-paste errors in hex literals.
 fn build_30fps_4sample_gop_segment() -> Vec<u8> {
-    // Renamed to avoid touching call sites; returns the IDR-starting segment
-    // (single sample, since Part B flushes every frame).
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+    muxer.append_packet(&make_anchor_packet(true, 0));
+    muxer.append_packet(&make_anchor_packet(false, 33));
+    muxer.append_packet(&make_anchor_packet(false, 66));
+    muxer.append_packet(&make_anchor_packet(false, 99));
     muxer
-        .append_packet(&make_anchor_packet(true, 0))
-        .expect("IDR must flush immediately (per-frame flush)")
+        .append_packet(&make_anchor_packet(true, 132))
+        .expect("IDR2 must flush the 4-sample GOP")
 }
 
 // ─── Phase 5 + 6: integration tests + golden refresh ────────────────────────
 
 // Helper: parse trun per-sample (duration, size) pairs from a media segment.
-//
-// Part B: first_sample_flags is ALWAYS present (flag 0x000004 always set).
-// The is_idr parameter is kept for documentation at call sites but ignored.
-#[allow(unused_variables)]
 fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
     let trun_tag_pos = seg
         .windows(4)
         .position(|w| w == b"trun")
         .expect("trun not found in segment");
-    // trun box layout after Part B:
-    // [size:4][tag:4][version:1][flags:3][count:4][data_offset:4][first_sample_flags:4]
-    // [duration:4][size:4] × count
-    // first_sample_flags is ALWAYS present — +4 unconditionally
+    // trun box starts 4 bytes before the tag (size field), tag is at trun_tag_pos.
+    // full box: [size:4][tag:4][version:1][flags:3][count:4][data_offset:4]
+    //           [first_sample_flags:4] (if is_idr)
+    //           [duration:4][size:4] × count
     let count = u32::from_be_bytes([
         seg[trun_tag_pos + 4 + 4],
         seg[trun_tag_pos + 4 + 5],
@@ -440,8 +453,8 @@ fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
         seg[trun_tag_pos + 4 + 7],
     ]) as usize;
     // Per-sample base offset from start of tag:
-    // +4 (v+f) + 4 (count) + 4 (data_offset) + 4 (first_sample_flags — always)
-    let base = trun_tag_pos + 4 + 4 + 4 + 4 + 4;
+    // +4 (v+f) + 4 (count) + 4 (data_offset) + 4 (first_sample_flags if idr)
+    let base = trun_tag_pos + 4 + 4 + 4 + 4 + if is_idr { 4 } else { 0 };
     (0..count)
         .map(|i| {
             let off = base + i * 8;
@@ -464,11 +477,7 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     use std::time::Duration;
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
 
-    // Part B: each packet flushes immediately. Feed IDR1 + 8 P-frames + IDR2 (10 packets).
-    // After 9 packets (8 deltas at 100ms spacing) the tracker locks at 9000 ticks.
-    // The 10th packet (IDR2 at t=900ms) flushes its own 1-sample segment with locked duration.
-
-    // Feed IDR at t=0 (no delta yet — warm-up, duration = 3000 fallback).
+    // Feed IDR at t=0 (no delta yet).
     let idr1 = EncodedPacket {
         data: {
             let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
@@ -479,9 +488,9 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
         timestamp: Duration::from_millis(0),
         sequence: 0,
     };
-    let _ = muxer.append_packet(&idr1); // emits immediately but in warm-up
+    muxer.append_packet(&idr1);
 
-    // Feed 8 P-frames at 100ms intervals to warm up the tracker (8 deltas = locked).
+    // Feed 8 P-frames at 100ms intervals to warm up the tracker.
     for i in 1..=8u64 {
         let pkt = EncodedPacket {
             data: {
@@ -493,10 +502,10 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
             timestamp: Duration::from_millis(i * 100),
             sequence: i,
         };
-        let _ = muxer.append_packet(&pkt); // each emits immediately
+        muxer.append_packet(&pkt);
     }
 
-    // IDR2 at t=900ms — tracker now locked at 9000 ticks. This segment uses locked duration.
+    // IDR2 triggers flush of GOP1 (9 samples: IDR1 + 8 P-frames).
     let idr2 = EncodedPacket {
         data: {
             let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
@@ -509,50 +518,60 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     };
     let segment = muxer
         .append_packet(&idr2)
-        .expect("IDR2 must flush immediately (per-frame flush)");
+        .expect("IDR2 must flush GOP1 (9 samples)");
 
-    // Parse per-sample (duration, size) pairs from the flushed trun (1 sample per segment).
+    // Parse per-sample (duration, size) pairs from the flushed trun.
     let pairs = parse_segment_trun_pairs(&segment, true); // IDR segment
 
-    // The single sample must use the locked tick value (9000 at 10 fps).
-    assert_eq!(pairs.len(), 1, "Part B: each segment has exactly 1 sample");
+    // All per-sample durations must be the locked tick value (9000 at 10 fps).
+    assert!(!pairs.is_empty(), "segment must have at least one sample");
     let expected_ticks: u32 = 9_000; // 100ms at 90kHz = 9000 ticks
-    let (dur, _) = pairs[0];
-    assert_eq!(
-        dur, expected_ticks,
-        "post-warm-up IDR2 sample duration must be {expected_ticks}; got {dur}"
-    );
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, expected_ticks,
+            "post-warm-up sample {i} duration must be {expected_ticks}; got {dur}"
+        );
+    }
 
-    // Verify that tfdt of this segment equals 9 * 9000 = 81000 ticks (900ms at 90kHz).
-    let tfdt = extract_tfdt_time(&segment);
+    // Verify that sum-of-durations equals tfdt delta to the next segment.
+    // (Next tfdt would be IDR2's DTS = 9 * 100ms = 810_000 ticks from origin = 810000... actually
+    //  tfdt[0] = DTS of GOP1 first sample = 0; tfdt[1] = DTS of GOP2 first sample = 9*9000 = 81000)
+    let total_dur: u64 = pairs.iter().map(|&(d, _)| d as u64).sum();
+    let tfdt0 = extract_tfdt_time(&segment);
     assert_eq!(
-        tfdt,
+        total_dur as u64 + tfdt0,
         9 * expected_ticks as u64,
-        "IDR2 tfdt must be 9 * 9000 = 81000 ticks; got {tfdt}"
+        "sum-of-durations + base tfdt must equal GOP2 base DTS"
     );
 }
 
-// T5.3 — 30fps stream carries explicit per-sample duration = 3000 (warm-up).
+// T5.3 — 30fps stream carries explicit per-sample duration = 3000 post-T2.
 //
-// Part B (per-frame flush): each segment has exactly 1 sample.
-// The duration for the first-ever IDR segment is 3000 (warm-up fallback).
+// Spec R10: semantics are preserved (sum = 4 * 3000 = 12000).
 #[test]
 fn mp4_muxer_30fps_segment_carries_per_sample_duration_3000() {
-    let seg = build_30fps_4sample_gop_segment(); // now returns 1-sample IDR segment
+    let seg = build_30fps_4sample_gop_segment();
 
     let pairs = parse_segment_trun_pairs(&seg, true); // IDR segment
     assert_eq!(
         pairs.len(),
-        1,
-        "Part B: each flush contains exactly 1 sample; got {} samples",
-        pairs.len()
+        4,
+        "GOP must have 4 samples (IDR1 + P2 + P3 + P4 before IDR2)"
     );
 
-    // During warm-up (0 deltas for first packet), sample duration = 3000 (fallback).
-    let (dur, _) = pairs[0];
+    // During warm-up (only 4 deltas observed), each sample duration = 3000.
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, 3000,
+            "warm-up 30fps sample {i} duration must be 3000; got {dur}"
+        );
+    }
+
+    // Sum-of-durations = 4 * 3000 = 12000 (semantically identical to pre-T2 trex fallback).
+    let total: u32 = pairs.iter().map(|&(d, _)| d).sum();
     assert_eq!(
-        dur, 3000,
-        "warm-up 30fps first IDR sample duration must be 3000; got {dur}"
+        total, 12000,
+        "sum-of-durations for 4 samples at 3000 ticks must be 12000"
     );
 }
 
@@ -602,21 +621,17 @@ fn init_segment_trex_default_sample_duration_is_3000_regardless_of_fps() {
 
 // ─── T6.1: Post-T2 byte-level golden (R10) ──────────────────────────────────
 //
-// Part B update: per-frame flush — each segment is exactly 1 sample.
-// Documents the post-Part-B trun layout for a single-sample IDR segment:
-//   - trun flags = 0x000305 (data-offset | first-sample-flags | duration | size)
-//   - first_sample_flags = 0x0200_0000 (IDR sync sample)
-//   - per-sample entry: [duration:4][size:4]
-//   - moof: header(8) + mfhd(16) + traf(8+tfhd(16)+tfdt(20)+trun(32)) = 8+16+76 = 100 bytes
-//     where trun = 8(hdr)+4(v+f)+4(count)+4(data_offset)+4(first_sample_flags)+8(1 sample) = 32
-//   - mdat: 8(hdr) + AVCC-framed payload for 100-byte input packet
-//     AVCC: 4(length_prefix) + 95(payload after NAL header) + NAL header absorbed into AVCC = varies
-//   Part B segment total measured: 208 bytes
+// Documents the post-T2 trun layout for a 30fps 4-sample GOP:
+//   - trun flags = 0x000305 (sample-duration-present + sample-size-present
+//     + first-sample-flags-present + data-offset-present)
+//   - per-sample entries: [duration:4][size:4]
+//   - moof grew by 4 bytes/sample = +16 bytes for 4 samples vs. the historical
+//     pre-T2 layout; total: 516 → 532 bytes.
 #[test]
 fn mp4_muxer_30fps_segment_post_t2_golden() {
     let seg = build_30fps_4sample_gop_segment();
 
-    // Structural validation: trun MUST have all required flags.
+    // Structural validation: post-T2 trun MUST have 0x000100 flag.
     let trun_pos = seg
         .windows(4)
         .position(|w| w == b"trun")
@@ -625,46 +640,46 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
     assert_ne!(
         flags & 0x000100,
         0,
-        "trun MUST have sample-duration-present flag (0x000100); got flags=0x{flags:06X}"
+        "post-T2 trun MUST have sample-duration-present flag (0x000100); got flags=0x{flags:06X}"
     );
     assert_ne!(
         flags & 0x000200,
         0,
-        "trun must have sample-size-present (0x000200)"
+        "post-T2 trun must have sample-size-present (0x000200)"
     );
     assert_ne!(
         flags & 0x000001,
         0,
-        "trun must have data-offset-present (0x000001)"
+        "post-T2 trun must have data-offset-present (0x000001)"
     );
     assert_ne!(
         flags & 0x000004,
         0,
-        "trun must have first-sample-flags-present (0x000004) — always set after Part B"
+        "post-T2 trun must have first-sample-flags-present (0x000004, IDR)"
     );
 
-    // Part B: single-sample IDR segment.
-    let pairs = parse_segment_trun_pairs(&seg, true);
-    assert_eq!(pairs.len(), 1, "Part B: each segment has exactly 1 sample");
-    let (dur, _) = pairs[0];
-    assert_eq!(dur, 3000, "warm-up IDR sample must carry duration=3000");
-
-    // Verify first_sample_flags = 0x0200_0000 (IDR sync sample).
-    // first_sample_flags is at offset 20 within the trun box (after size+tag+v+f+count+data_offset).
-    let fsf = u32::from_be_bytes([
-        seg[trun_pos + 16],
-        seg[trun_pos + 17],
-        seg[trun_pos + 18],
-        seg[trun_pos + 19],
-    ]);
+    // Size check: moof(108→124) + mdat(408) = 532 bytes.
+    // moof grew by 4 bytes/sample × 4 samples = +16 bytes (from 108 to 124).
     assert_eq!(
-        fsf, 0x0200_0000,
-        "IDR first_sample_flags must be 0x0200_0000; got 0x{fsf:08X}"
+        seg.len(),
+        532,
+        "post-T2 4-sample GOP must be 532 bytes (pre-T2 was 516, +16 from 4 duration fields); got {}",
+        seg.len()
     );
+
+    // All per-sample durations must be 3000 (warm-up fallback for 4-sample GOP).
+    let pairs = parse_segment_trun_pairs(&seg, true);
+    assert_eq!(pairs.len(), 4, "must have 4 samples");
+    for (i, &(dur, _)) in pairs.iter().enumerate() {
+        assert_eq!(
+            dur, 3000,
+            "post-T2 warm-up sample {i} must carry duration=3000"
+        );
+    }
 
     // Deterministic: two builds must produce identical bytes.
     let seg2 = build_30fps_4sample_gop_segment();
-    assert_eq!(seg, seg2, "Part B segment must be deterministic");
+    assert_eq!(seg, seg2, "post-T2 segment must be deterministic");
 }
 
 // ─── C7: annex_b_to_avcc rejects no bytes, handles correctly ────────────────
