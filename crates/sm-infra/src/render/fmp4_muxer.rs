@@ -1168,7 +1168,9 @@ mod tests {
 
         // Part B: IDR1 → emits segment_1 immediately (per-frame flush)
         let idr1 = synthetic_keyframe();
-        let seg1 = muxer.append_packet(&idr1).expect("IDR1 must emit segment 1");
+        let seg1 = muxer
+            .append_packet(&idr1)
+            .expect("IDR1 must emit segment 1");
 
         // IDR2 → emits segment_2
         let idr2 = EncodedPacket {
@@ -1271,7 +1273,10 @@ mod tests {
         for i in 1..4u64 {
             let pkt = make_packet(false, i * 33, 100);
             let result = muxer.append_packet(&pkt);
-            assert!(result.is_some(), "P-frame must emit a segment (per-frame flush)");
+            assert!(
+                result.is_some(),
+                "P-frame must emit a segment (per-frame flush)"
+            );
         }
     }
 
@@ -1337,7 +1342,9 @@ mod tests {
         // first_sample_flags = 0x0200_0000 (sample_depends_on=2, non_sync_sample=0).
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         let idr = make_packet(true, 0, 200);
-        let segment = muxer.append_packet(&idr).expect("IDR must emit segment immediately (per-frame flush)");
+        let segment = muxer
+            .append_packet(&idr)
+            .expect("IDR must emit segment immediately (per-frame flush)");
 
         let trun = extract_trun_from_segment(&segment);
         let fsf = read_first_sample_flags(trun);
@@ -1346,8 +1353,16 @@ mod tests {
             "IDR trun.first_sample_flags must be 0x0200_0000 (sync); got 0x{fsf:08X}"
         );
         // Verify individual bits per ISO 14496-12 §8.8.3.1
-        assert_eq!(fsf >> 24 & 0x03, 2, "sample_depends_on must be 2 (IDR = does not depend on others)");
-        assert_eq!(fsf >> 16 & 0x01, 0, "sample_is_non_sync_sample must be 0 (IDR is a sync sample)");
+        assert_eq!(
+            fsf >> 24 & 0x03,
+            2,
+            "sample_depends_on must be 2 (IDR = does not depend on others)"
+        );
+        assert_eq!(
+            fsf >> 16 & 0x01,
+            0,
+            "sample_is_non_sync_sample must be 0 (IDR is a sync sample)"
+        );
     }
 
     #[test]
@@ -1361,7 +1376,9 @@ mod tests {
         // Skip the IDR's segment; flush a P-frame segment.
         let _ = muxer.append_packet(&make_packet(true, 0, 100)); // IDR — consume
         let p_frame = make_packet(false, 33, 150);
-        let segment = muxer.append_packet(&p_frame).expect("P-frame must emit segment (per-frame flush)");
+        let segment = muxer
+            .append_packet(&p_frame)
+            .expect("P-frame must emit segment (per-frame flush)");
 
         let trun = extract_trun_from_segment(&segment);
         let fsf = read_first_sample_flags(trun);
@@ -1370,8 +1387,16 @@ mod tests {
             "P-frame trun.first_sample_flags must be 0x0101_0000 (non-sync); got 0x{fsf:08X}"
         );
         // Verify individual bits per ISO 14496-12 §8.8.3.1
-        assert_eq!(fsf >> 24 & 0x03, 1, "sample_depends_on must be 1 (P-frame depends on others)");
-        assert_eq!(fsf >> 16 & 0x01, 1, "sample_is_non_sync_sample must be 1 (P-frame is non-sync)");
+        assert_eq!(
+            fsf >> 24 & 0x03,
+            1,
+            "sample_depends_on must be 1 (P-frame depends on others)"
+        );
+        assert_eq!(
+            fsf >> 16 & 0x01,
+            1,
+            "sample_is_non_sync_sample must be 1 (P-frame is non-sync)"
+        );
     }
 
     #[test]
@@ -1380,7 +1405,10 @@ mod tests {
         // Verifies the non-sync first_sample_flags path at the lowest level.
         let samples = vec![make_sample(100)];
         let moof = build_moof(1, 0, &samples, 0, false); // NEW: is_idr=false
-        let trun_pos = moof.windows(4).position(|w| w == b"trun").expect("trun must be in moof");
+        let trun_pos = moof
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("trun must be in moof");
         let trun = &moof[trun_pos - 4..];
         let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
         assert_ne!(
@@ -1400,10 +1428,17 @@ mod tests {
         // Direct unit test for build_moof with is_idr=true (new parameter, explicit call).
         let samples = vec![make_sample(100)];
         let moof = build_moof(1, 0, &samples, 0, true); // NEW: is_idr=true (explicit)
-        let trun_pos = moof.windows(4).position(|w| w == b"trun").expect("trun must be in moof");
+        let trun_pos = moof
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("trun must be in moof");
         let trun = &moof[trun_pos - 4..];
         let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
-        assert_ne!(trun_flags & 0x000004, 0, "first_sample_flags_present must be set for IDR");
+        assert_ne!(
+            trun_flags & 0x000004,
+            0,
+            "first_sample_flags_present must be set for IDR"
+        );
         let fsf = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
         assert_eq!(
             fsf, 0x0200_0000,
@@ -1421,13 +1456,25 @@ mod tests {
         let mut segments = Vec::new();
 
         // IDR at t=0
-        segments.push(muxer.append_packet(&make_packet(true, 0, 200)).expect("IDR1 must emit"));
+        segments.push(
+            muxer
+                .append_packet(&make_packet(true, 0, 200))
+                .expect("IDR1 must emit"),
+        );
         // 3 P-frames
         for i in 1..4u64 {
-            segments.push(muxer.append_packet(&make_packet(false, i * 33, 100)).expect("P-frame must emit"));
+            segments.push(
+                muxer
+                    .append_packet(&make_packet(false, i * 33, 100))
+                    .expect("P-frame must emit"),
+            );
         }
         // IDR at t=132ms
-        segments.push(muxer.append_packet(&make_packet(true, 132, 200)).expect("IDR2 must emit"));
+        segments.push(
+            muxer
+                .append_packet(&make_packet(true, 132, 200))
+                .expect("IDR2 must emit"),
+        );
 
         assert_eq!(segments.len(), 5, "must emit exactly 5 fragments");
 
@@ -1462,7 +1509,10 @@ mod tests {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         // IDR1 → emits seg1
         let idr1 = make_packet(true, 0, 200);
-        assert!(muxer.append_packet(&idr1).is_some(), "IDR1 must emit segment (per-frame flush)");
+        assert!(
+            muxer.append_packet(&idr1).is_some(),
+            "IDR1 must emit segment (per-frame flush)"
+        );
         // 3 P-frames → each emits a segment
         for i in 1..4u64 {
             assert!(
@@ -1475,7 +1525,10 @@ mod tests {
         // IDR2 → also emits a segment
         let idr2 = make_packet(true, 4 * 33, 200);
         let segment = muxer.append_packet(&idr2);
-        assert!(segment.is_some(), "IDR2 must emit segment (per-frame flush)");
+        assert!(
+            segment.is_some(),
+            "IDR2 must emit segment (per-frame flush)"
+        );
     }
 
     #[test]
@@ -1538,7 +1591,9 @@ mod tests {
         // origin (rebased dts = 0). IDR1 is that first packet and emits
         // immediately (per-frame flush), so its tfdt must be 0.
         let idr1 = make_packet(true, 1000, 200);
-        let segment = muxer.append_packet(&idr1).expect("IDR1 must emit segment (per-frame flush)");
+        let segment = muxer
+            .append_packet(&idr1)
+            .expect("IDR1 must emit segment (per-frame flush)");
 
         // Find tfdt in segment.
         // windows(4).position finds the offset where the 4-byte tag b"tfdt" appears.
@@ -1750,7 +1805,11 @@ mod tests {
         assert_eq!(trun[8], 0, "version must be 0");
         // flags at bytes 9..12 — must include 0x000004 (first_sample_flags_present)
         let flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
-        assert_ne!(flags & 0x000004, 0, "first_sample_flags_present must be set");
+        assert_ne!(
+            flags & 0x000004,
+            0,
+            "first_sample_flags_present must be set"
+        );
         // sample_count at bytes 12..16
         let sample_count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]);
         assert_eq!(sample_count, 1);
@@ -2081,7 +2140,9 @@ mod tests {
         // Second packet rebased: should be small (≈ 3000 ticks for 33 ms at 90 kHz).
         // Part B: pending is always empty after flush — read the rebased DTS from
         // the segment's tfdt box instead.
-        let seg2 = muxer.append_packet(&pkt2).expect("pkt2 must emit segment (per-frame flush)");
+        let seg2 = muxer
+            .append_packet(&pkt2)
+            .expect("pkt2 must emit segment (per-frame flush)");
         let tfdt_pos = seg2
             .windows(4)
             .position(|w| w == b"tfdt")

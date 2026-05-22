@@ -124,7 +124,11 @@ fn mp4_muxer_init_plus_5_segments_round_trip_via_byte_scanner() {
         }
     }
 
-    assert_eq!(segments.len(), 5, "expected 5 media segments from 5 IDRs (per-frame flush)");
+    assert_eq!(
+        segments.len(),
+        5,
+        "expected 5 media segments from 5 IDRs (per-frame flush)"
+    );
 
     // Verify each segment starts with moof.
     for (idx, seg) in segments.iter().enumerate() {
@@ -647,8 +651,16 @@ fn mp4_muxer_30fps_segment_post_t2_golden() {
 
     // Verify first_sample_flags = 0x0200_0000 (IDR sync sample).
     // first_sample_flags is at offset 20 within the trun box (after size+tag+v+f+count+data_offset).
-    let fsf = u32::from_be_bytes([seg[trun_pos + 16], seg[trun_pos + 17], seg[trun_pos + 18], seg[trun_pos + 19]]);
-    assert_eq!(fsf, 0x0200_0000, "IDR first_sample_flags must be 0x0200_0000; got 0x{fsf:08X}");
+    let fsf = u32::from_be_bytes([
+        seg[trun_pos + 16],
+        seg[trun_pos + 17],
+        seg[trun_pos + 18],
+        seg[trun_pos + 19],
+    ]);
+    assert_eq!(
+        fsf, 0x0200_0000,
+        "IDR first_sample_flags must be 0x0200_0000; got 0x{fsf:08X}"
+    );
 
     // Deterministic: two builds must produce identical bytes.
     let seg2 = build_30fps_4sample_gop_segment();
