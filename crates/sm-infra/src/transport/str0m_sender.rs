@@ -1475,4 +1475,48 @@ mod tests {
             "stop() must return Ok even after full event channel"
         );
     }
+
+    // ─── RTX regression guard ─────────────────────────────────────────────────
+    //
+    // RTX regression guard — REQ-RTX-3: goes RED if clear_codecs(), set_rtp_mode(),
+    // or an str0m upgrade drops H.264 RTX default.
+    // REQ-RTX-4: passes under `cargo nextest run --workspace` without production changes.
+
+    #[test]
+    fn sender_sdp_offer_contains_h264_rtx() {
+        use std::time::Instant;
+        use str0m::media::{Direction, MediaKind};
+
+        // Build the sender Rtc EXACTLY as production does: no clear_codecs(), no set_rtp_mode().
+        // Any future change that calls those will break this test — that is intentional.
+        let crypto = str0m::crypto::from_feature_flags();
+        let mut rtc = str0m::Rtc::builder()
+            .set_crypto_provider(Arc::new(crypto))
+            .build(Instant::now());
+
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, _pending) = change.apply().expect("apply must succeed");
+        let sdp = offer.to_string();
+
+        // REQ-RTX-1(a): RTX codec present in SDP offer.
+        assert!(
+            sdp.contains("rtx/90000"),
+            "SDP offer must contain RTX payload type (a=rtpmap rtx/90000): {sdp}"
+        );
+
+        // REQ-RTX-1(b): fmtp apt= line present (RTX paired with H.264).
+        assert!(
+            sdp.lines()
+                .any(|l| l.starts_with("a=fmtp:") && l.contains("apt=")),
+            "SDP offer must contain a=fmtp apt= line (RTX→H.264 pairing): {sdp}"
+        );
+
+        // REQ-RTX-1(c): nack feedback present for H.264.
+        assert!(
+            sdp.lines()
+                .any(|l| l.starts_with("a=rtcp-fb:") && l.contains("nack")),
+            "SDP offer must contain a=rtcp-fb nack line: {sdp}"
+        );
+    }
 }
