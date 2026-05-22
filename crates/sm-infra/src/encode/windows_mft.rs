@@ -638,6 +638,35 @@ fn read_vendor_id_attribute(activate: &IMFActivate) -> Option<String> {
     }
 }
 
+/// Reads the optional `MFT_FRIENDLY_NAME_Attribute` from an `IMFActivate`.
+///
+/// Returns `Some` whenever the attribute is present and the string pointer is
+/// non-null — decoding to either the UTF-16 name or the sentinel
+/// `"(utf16 error)"` on a UTF-16 decode failure.  Returns `None` only when
+/// the attribute is absent, `GetAllocatedString` returns `Err`, or the
+/// returned pointer is null.
+///
+/// Memory: `CoTaskMemFree` is called exactly once, on the success (`Ok(())` +
+/// non-null) path.  No allocation is made on `Err`/null paths so no free is
+/// needed there (per windows-rs docs).
+fn read_friendly_name_attribute(activate: &IMFActivate) -> Option<String> {
+    // SAFETY: GetAllocatedString writes a CoTaskMemAlloc'd PWSTR on Ok(())
+    // which we MUST CoTaskMemFree exactly once. On Err the pointer is left
+    // null (per windows-rs docs) so no free is needed on the failure path.
+    unsafe {
+        let mut pwstr = PWSTR::null();
+        let mut cch: u32 = 0;
+        match activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut pwstr, &mut cch) {
+            Ok(()) if !pwstr.is_null() => {
+                let name = pwstr.to_string().unwrap_or_else(|_| "(utf16 error)".into());
+                CoTaskMemFree(Some(pwstr.0 as *const _));
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Iterate IMFActivate candidates and return the FIRST one that passes the full
 /// output-type negotiation probe (DD-A, DD-D, DD-E). This is a DESTRUCTIVE probe:
 /// the winner's `IMFTransform` is `ShutdownObject`'d after the probe, just like
@@ -671,20 +700,9 @@ fn probe_and_select_mft(
     for (i, activate) in activates.iter().enumerate() {
         // ── Log candidate identity for diagnostics ────────────────────────────
 
-        // Friendly name via GetAllocatedString (IMFActivate inherits IMFAttributes).
-        // SAFETY: GetAllocatedString allocates with CoTaskMemAlloc; freed with CoTaskMemFree.
-        let friendly_name: String = unsafe {
-            let mut pwstr = PWSTR::null();
-            let mut cch: u32 = 0;
-            match activate.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut pwstr, &mut cch) {
-                Ok(()) if !pwstr.is_null() => {
-                    let name = pwstr.to_string().unwrap_or_else(|_| "(utf16 error)".into());
-                    CoTaskMemFree(Some(pwstr.0 as *const _));
-                    name
-                }
-                _ => "(unknown)".into(),
-            }
-        };
+        // Friendly name via the encapsulated helper (mirrors read_vendor_id_attribute).
+        let friendly_name: String =
+            read_friendly_name_attribute(activate).unwrap_or_else(|| "(unknown)".into());
 
         // CLSID via GetGUID.
         // SAFETY: GetGUID reads from the internal attribute store; no allocation.
