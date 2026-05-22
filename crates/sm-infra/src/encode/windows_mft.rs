@@ -30,6 +30,7 @@ use std::thread::JoinHandle;
 
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate,
+    CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame,
     ICodecAPI,
     IMFActivate,
@@ -92,6 +93,15 @@ use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
+
+// ── A1: GOP size cap ──────────────────────────────────────────────────────────
+
+/// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
+///
+/// At 30 fps this is a 2-second keyframe interval. See design Decision (a).
+/// Value satisfies `GOP_SIZE_A1 <= 60` as required by REQ-A1-1.
+// verified present in windows 0.62.2 (imported from Win32_Media_MediaFoundation)
+const GOP_SIZE_FRAMES: u32 = 60;
 
 // ── COM interface thread-transfer wrapper ─────────────────────────────────────
 
@@ -1075,6 +1085,20 @@ fn run_encoder_thread(
             return;
         }
     };
+
+    // A1: cap GOP size to GOP_SIZE_FRAMES. Non-fatal if the driver rejects it (REQ-A1-2).
+    // Set before pump_loop starts so the GOP schedule takes effect from the first IDR.
+    // Consistent with the existing CODECAPI_AVEncCommonMeanBitRate rejection handling.
+    let v = make_variant_u32(GOP_SIZE_FRAMES);
+    // SAFETY: SetValue on a valid ICodecAPI is always safe; VARIANT is stack-allocated VT_UI4.
+    if let Err(e) = unsafe { codec_api.SetValue(&CODECAPI_AVEncMPVGOPSize, &v) } {
+        tracing::warn!(
+            target: "sm_infra::encode::windows_mft",
+            "ICodecAPI::SetValue(CODECAPI_AVEncMPVGOPSize, {GOP_SIZE_FRAMES}) rejected \
+             (non-fatal, encoding continues): 0x{:08X}",
+            e.code().0
+        );
+    }
 
     let event_gen: IMFMediaEventGenerator = match mft.cast() {
         Ok(g) => g,
@@ -2391,5 +2415,18 @@ mod tests {
             name.starts_with("hw_"),
             "MFT encoder backend_name must start with 'hw_', got: {name:?}"
         );
+    }
+
+    // ─── A1: GOP size cap structural constant guard ───────────────────────────
+    //
+    // CI-runnable: asserts the named constant exists and equals the design value.
+    // Real hardware IDR cadence is verified empirically (manual check — see task A1-5).
+    // REQ-A1-5: guards against accidental constant deletion or value drift.
+
+    #[test]
+    fn gop_size_constant_is_60_frames() {
+        // Structural guard: asserts the GOP constant exists and equals the design value.
+        // Real hardware IDR cadence is verified empirically (manual check — see task A1-5).
+        assert_eq!(GOP_SIZE_FRAMES, 60u32);
     }
 }
