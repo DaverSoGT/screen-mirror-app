@@ -61,17 +61,17 @@ fn blocking_session(
     channel: Arc<dyn ChannelLike>,
     release_rx: std::sync::mpsc::Receiver<()>,
 ) -> Arc<Mutex<Option<SenderSession>>> {
-    let session = SenderSession {
-        stop_flag: old_stop_flag,
-        drain_handles: vec![],
+    let session = SenderSession::new(
+        old_stop_flag,
+        vec![],
         channel,
-        counters: Arc::new(SenderCounters::default()),
-        shutdown: Some(Box::new(move || {
+        Arc::new(SenderCounters::default()),
+        Some(Box::new(move || {
             // Block until the test releases us.
             let _ = release_rx.recv_timeout(Duration::from_secs(5));
         })),
-        backend_name: "sw_fake".to_string(),
-    };
+        "sw_fake".to_string(),
+    );
     Arc::new(Mutex::new(Some(session)))
 }
 

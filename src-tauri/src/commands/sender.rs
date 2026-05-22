@@ -193,7 +193,40 @@ pub struct SenderSession {
     pub shutdown: Option<Box<dyn FnOnce() + Send>>,
     /// Canonical backend token captured at construction time (DD2 ordering invariant).
     /// Immutable after session start — never mutated by any path (R9).
-    pub backend_name: String,
+    backend_name: String,
+}
+
+impl SenderSession {
+    /// Construct a `SenderSession` from its component parts.
+    ///
+    /// All fields are taken by value. `backend_name` is private (immutable after
+    /// construction — R9); callers must go through this constructor or
+    /// `start_sender_inner` (which builds the session from a `SenderBundle`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stop_flag: Arc<AtomicBool>,
+        drain_handles: Vec<JoinHandle<()>>,
+        channel: Arc<dyn ChannelLike>,
+        counters: Arc<SenderCounters>,
+        shutdown: Option<Box<dyn FnOnce() + Send>>,
+        backend_name: String,
+    ) -> Self {
+        Self {
+            stop_flag,
+            drain_handles,
+            channel,
+            counters,
+            shutdown,
+            backend_name,
+        }
+    }
+
+    /// Return the canonical backend token for this session.
+    ///
+    /// Immutable after construction — never mutated by any path (R9).
+    pub fn backend_name(&self) -> &str {
+        &self.backend_name
+    }
 }
 
 // ─── SenderBridge — Tauri managed state ──────────────────────────────────────
@@ -1045,14 +1078,14 @@ pub fn start_sender_inner(
     })?;
 
     // Step 8 — store session and current_args.
-    let session = SenderSession {
+    let session = SenderSession::new(
         stop_flag,
-        drain_handles: bundle.drain_handles,
-        channel: channel.clone(),
-        counters: Arc::new(SenderCounters::default()),
-        shutdown: bundle.shutdown,
-        backend_name: bundle.backend_name,
-    };
+        bundle.drain_handles,
+        channel.clone(),
+        Arc::new(SenderCounters::default()),
+        bundle.shutdown,
+        bundle.backend_name,
+    );
     *bridge.session.lock().unwrap() = Some(session);
     *bridge.current_args.lock().unwrap() = Some(SenderArgs {
         udp_port: resolved_port,
@@ -1285,14 +1318,14 @@ pub fn make_sender_rebuild_hook(
                 // Step 11: acquire bridge.session and swap to the new session.
                 {
                     let mut g = bridge_session.lock().unwrap();
-                    *g = Some(SenderSession {
-                        stop_flag: fresh_stop_flag,
-                        drain_handles: new_bundle.drain_handles,
-                        channel: cache.channel.clone(),
-                        counters: Arc::new(SenderCounters::default()),
-                        shutdown: new_bundle.shutdown,
-                        backend_name: new_bundle.backend_name,
-                    });
+                    *g = Some(SenderSession::new(
+                        fresh_stop_flag,
+                        new_bundle.drain_handles,
+                        cache.channel.clone(),
+                        Arc::new(SenderCounters::default()),
+                        new_bundle.shutdown,
+                        new_bundle.backend_name,
+                    ));
                 }
 
                 // Gate D: abort after swap — stop arrived between Gate C and swap
@@ -1428,7 +1461,7 @@ pub fn sender_diagnostics_impl(bridge: &SenderBridge) -> Result<SenderStats, Str
                 .keyframe_requests_received
                 .load(Ordering::Relaxed),
             running: true,
-            backend_name: s.backend_name.clone(),
+            backend_name: s.backend_name().to_owned(),
         }),
     }
 }
