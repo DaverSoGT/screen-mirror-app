@@ -129,8 +129,10 @@ describe('mse-client — live-edge snap (LE-S1..LE-S4)', () => {
     // Set up: buffered.end = 5.0s, currentTime = 2.0s → drift = 3.0s > 0.30 threshold
     sb._setBuffered(0, 5.0);
     VIDEO_EL.currentTime = 2.0;
-    // Video is playing (not paused)
+    // Video is playing normally: not paused, not ended, readyState = HAVE_ENOUGH_DATA (4).
     Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'ended', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'readyState', { configurable: true, get: () => 4 });
 
     checkLiveEdge(VIDEO_EL, sb);
 
@@ -151,7 +153,10 @@ describe('mse-client — live-edge snap (LE-S1..LE-S4)', () => {
     // drift = 0.1s < 0.30 threshold → no snap
     sb._setBuffered(0, 1.5);
     VIDEO_EL.currentTime = 1.4;
+    // Video is playing normally: not paused, not ended, readyState = HAVE_ENOUGH_DATA (4).
     Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'ended', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'readyState', { configurable: true, get: () => 4 });
 
     checkLiveEdge(VIDEO_EL, sb);
 
@@ -207,11 +212,82 @@ describe('mse-client — live-edge snap (LE-S1..LE-S4)', () => {
     // snapTarget = 100.60 - 0.10 = 100.50, which is below bufStart 100.55.
     sb._setBuffered(100.55, 100.60);
     VIDEO_EL.currentTime = 0.0; // drift = 100.60s > 0.30 → drift guard passes
+    // Video is playing normally so all other guards pass — only the range guard fires.
     Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'ended', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'readyState', { configurable: true, get: () => 4 });
 
     checkLiveEdge(VIDEO_EL, sb);
 
     // Range guard must block the snap — currentTime must NOT change.
     expect(VIDEO_EL.currentTime).toBeCloseTo(0.0, 2);
+  });
+
+  // ─── LE-S5: ended → no snap (REQ-LE-5) ────────────────────────────────────
+  //
+  // REQ-LE-5: the live-edge snap SHALL only execute when the video element is
+  // not paused and is not in a "waiting" or "ended" state.
+  //
+  // Setup: drift = 3.0s > 0.30 threshold (would snap under the old paused-only
+  // guard), but video.ended = true. The new guard MUST suppress the snap.
+  //
+  // Falsification: removing the `if (videoEl.ended) return;` line from
+  // checkLiveEdge would allow the snap to fire and set currentTime = 4.90,
+  // failing the assertion that currentTime remains 2.0.
+
+  it('LE-S5: no snap when video.ended is true even with large drift (REQ-LE-5)', async () => {
+    const { checkLiveEdge } = globalThis.__SCREEN_MIRROR_TEST_EXPORTS__;
+    if (!checkLiveEdge) {
+      throw new Error('checkLiveEdge not found in __SCREEN_MIRROR_TEST_EXPORTS__ — RED (seam not wired)');
+    }
+
+    const VIDEO_EL = document.getElementById('player');
+
+    // drift = 3.0s > threshold — would snap without the ended guard.
+    sb._setBuffered(0, 5.0);
+    VIDEO_EL.currentTime = 2.0;
+    Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'ended', { configurable: true, get: () => true });
+
+    checkLiveEdge(VIDEO_EL, sb);
+
+    // ended guard must suppress the snap.
+    expect(VIDEO_EL.currentTime).toBeCloseTo(2.0, 2);
+  });
+
+  // ─── LE-S6: low readyState (waiting/buffering) → no snap (REQ-LE-5) ───────
+  //
+  // REQ-LE-5: the live-edge snap SHALL NOT execute while the video element is
+  // in a "waiting" state. The HTMLMediaElement "waiting" event fires when
+  // readyState drops below HAVE_FUTURE_DATA (3). Accordingly, the guard
+  // MUST suppress the snap when readyState < 3.
+  //
+  // Setup: drift = 3.0s > 0.30 (would snap), video not paused, not ended, but
+  // readyState = 2 (HAVE_CURRENT_DATA — element has current frame but no future
+  // data; this is the state that fires the "waiting" event). New guard blocks it.
+  //
+  // Falsification: removing `if (videoEl.readyState < HAVE_FUTURE_DATA) return;`
+  // from checkLiveEdge would let currentTime be set to 4.90 and fail this test.
+
+  it('LE-S6: no snap when readyState < HAVE_FUTURE_DATA (waiting state, REQ-LE-5)', async () => {
+    const { checkLiveEdge } = globalThis.__SCREEN_MIRROR_TEST_EXPORTS__;
+    if (!checkLiveEdge) {
+      throw new Error('checkLiveEdge not found in __SCREEN_MIRROR_TEST_EXPORTS__ — RED (seam not wired)');
+    }
+
+    const VIDEO_EL = document.getElementById('player');
+
+    // drift = 3.0s > threshold — would snap without the readyState guard.
+    sb._setBuffered(0, 5.0);
+    VIDEO_EL.currentTime = 2.0;
+    Object.defineProperty(VIDEO_EL, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(VIDEO_EL, 'ended', { configurable: true, get: () => false });
+    // readyState = 2 (HAVE_CURRENT_DATA): the "waiting" state per HTMLMediaElement spec.
+    Object.defineProperty(VIDEO_EL, 'readyState', { configurable: true, get: () => 2 });
+
+    checkLiveEdge(VIDEO_EL, sb);
+
+    // readyState guard must suppress the snap.
+    expect(VIDEO_EL.currentTime).toBeCloseTo(2.0, 2);
   });
 });

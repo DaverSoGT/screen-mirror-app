@@ -384,11 +384,18 @@ function onInitFrame(data, frameBytes) {
 // Design Decision (d): sb.mode = 'sequence' stays; drift is computed on
 // buffered.end - currentTime, NOT on tfdt.
 //
-// Guards:
+// Guards (REQ-LE-5):
 //   1. Video must be playing (not paused) — never move the head on a paused player.
-//   2. snapTarget must be >= buffered.start(last) — don't seek into un-buffered space.
+//   2. Video must not be in ended state — no snap after playback has ended.
+//   3. Video must have enough data to advance (readyState >= HAVE_FUTURE_DATA = 3) —
+//      the "waiting" event fires when readyState drops below 3; snapping while
+//      the element is waiting for data cannot help and may confuse the decoder.
+//   4. snapTarget must be >= buffered.start(last) — don't seek into un-buffered space.
+const HAVE_FUTURE_DATA = 3; // HTMLMediaElement.HAVE_FUTURE_DATA
 function checkLiveEdge(videoEl, sb) {
   if (videoEl.paused) return;
+  if (videoEl.ended) return;
+  if (videoEl.readyState < HAVE_FUTURE_DATA) return;
   const buf = sb.buffered;
   if (!buf || buf.length === 0) return;
   const last = buf.length - 1;
