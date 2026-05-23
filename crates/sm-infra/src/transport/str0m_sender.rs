@@ -25,6 +25,7 @@
 //! - `SenderControl::AddCandidate` parses a Candidate from JSON and calls
 //!   `rtc.add_remote_candidate(candidate)`.
 
+use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -229,9 +230,12 @@ impl VideoSender for Str0mVideoSender {
         self.state.stop.store(false, Ordering::Release);
 
         // Bind the UDP socket.
-        let bind_addr = format!("0.0.0.0:{}", self.config.udp_port);
-        let udp = UdpSocket::bind(&bind_addr)
-            .map_err(|e| TransportError::Io(format!("UDP bind failed on {bind_addr}: {e}")))?;
+        let bind_addr_str = format!("0.0.0.0:{}", self.config.udp_port);
+        let bind_addr: SocketAddr = bind_addr_str
+            .parse()
+            .expect("static 0.0.0.0:{port} format is always a valid SocketAddr");
+        let udp = bind_udp_socket_reusable(bind_addr)
+            .map_err(|e| TransportError::Io(format!("UDP bind failed on {bind_addr_str}: {e}")))?;
         let local_addr = udp
             .local_addr()
             .map_err(|e| TransportError::Io(e.to_string()))?;
@@ -747,6 +751,23 @@ fn handle_sender_event(
     }
 }
 
+// ─── Socket helpers ───────────────────────────────────────────────────────────
+
+fn bind_udp_socket_reusable(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    // Defense in depth — see bind_tcp_listener_reusable in mdns.rs for semantics.
+    // Current udp_port default is 0 (ephemeral) so this never collides today,
+    // but a fixed UDP port (future config) would re-introduce the bind race that
+    // we fix on TCP (Arc-lifetime race, engram #1417).
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -759,6 +780,7 @@ mod tests {
     use sm_domain::transport::{TransportConfig, TransportError, TransportEvent, VideoSender};
     use str0m::{Event, IceConnectionState};
 
+    use super::bind_udp_socket_reusable;
     use crate::transport::str0m_sender::{Str0mVideoSender, is_ice_ready_event};
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
@@ -1517,6 +1539,53 @@ mod tests {
             sdp.lines()
                 .any(|l| l.starts_with("a=rtcp-fb:") && l.contains("nack")),
             "SDP offer must contain a=rtcp-fb nack line: {sdp}"
+        );
+    }
+
+    // ─── SC-2: bind_udp_socket_reusable — bind→drop→rebind (cross-platform) ──
+
+    /// SC-2 — After dropping a UdpSocket, the same port can be rebound immediately.
+    /// Confirms SO_REUSEADDR is set correctly on all platforms.
+    #[test]
+    fn bind_udp_socket_reusable_rebind_after_drop_succeeds() {
+        use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let sock1 = StdUdpSocket::bind(zero).expect("ephemeral bind for port discovery");
+        let port = sock1.local_addr().unwrap().port();
+        drop(sock1);
+
+        let fixed: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let result = bind_udp_socket_reusable(fixed);
+        assert!(
+            result.is_ok(),
+            "rebind after drop must succeed (got: {:?})",
+            result.err()
+        );
+        let port2 = result.unwrap().local_addr().unwrap().port();
+        assert_eq!(port2, port, "rebound socket must have the same port");
+    }
+
+    // ─── SC-4: bind_udp_socket_reusable — live rebind (Windows-only) ──────────
+
+    /// SC-4 — On Windows, SO_REUSEADDR allows a second UDP bind while the first
+    /// socket is still alive. Defence-in-depth for the fixed-UDP-port scenario
+    /// (current udp_port default is 0/ephemeral, but a future fixed port would
+    /// re-introduce the bind race fixed on TCP).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bind_udp_socket_reusable_live_rebind_windows_succeeds() {
+        use std::net::SocketAddr;
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let sock1 = bind_udp_socket_reusable(zero).expect("first bind");
+        let port = sock1.local_addr().unwrap().port();
+        let _hold = sock1; // intentionally NOT dropped
+
+        let fixed: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let result = bind_udp_socket_reusable(fixed);
+        assert!(
+            result.is_ok(),
+            "live UDP rebind on Windows must succeed, got: {:?}",
+            result.err()
         );
     }
 }

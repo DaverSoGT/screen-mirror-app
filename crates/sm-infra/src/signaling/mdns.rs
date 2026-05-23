@@ -32,7 +32,7 @@
 //! ```
 
 use std::io::{self, BufReader, BufWriter, Read};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -373,6 +373,25 @@ fn run_signaling_thread(
     }
 }
 
+// ─── Socket helpers ───────────────────────────────────────────────────────────
+
+fn bind_tcp_listener_reusable(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        None,
+    )?;
+    // SO_REUSEADDR on Windows allows binding while a previous socket on the
+    // same address is still LIVE (LISTEN state) — exactly what we need for
+    // the supervisor rebuild race where the old MdnsSignaling thread still
+    // holds 0.0.0.0:7889 via Arc clones in coordinator_hooks (engram #1417).
+    // On Unix this only covers TIME_WAIT rebinds — also useful, never harmful.
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 // ─── Sender thread ────────────────────────────────────────────────────────────
 
 fn run_sender_thread(
@@ -386,7 +405,10 @@ fn run_sender_thread(
 
     // Bind TCP listener BEFORE mDNS registration so the receiver can connect
     // immediately after discovery.
-    let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
+    let bind_addr: SocketAddr = format!("0.0.0.0:{port}")
+        .parse()
+        .expect("static 0.0.0.0:{port} format is always a valid SocketAddr");
+    let listener = match bind_tcp_listener_reusable(bind_addr) {
         Ok(l) => l,
         Err(e) => {
             emit_error(&event_tx, SignalingError::Io(e.to_string()));
@@ -939,6 +961,7 @@ mod tests {
         SdpOffer, Signaling, SignalingConfig, SignalingError, SignalingEvent, SignalingRole,
     };
 
+    use super::bind_tcp_listener_reusable;
     use crate::signaling::mdns::MdnsSignaling;
 
     // ─── Compile-time check: implements Signaling ─────────────────────────────
@@ -1410,5 +1433,51 @@ mod tests {
         let err =
             read_frame_or_pending(&mut reader, &stop).expect_err("must error on truncated frame");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    // ─── SC-1: bind_tcp_listener_reusable — bind→drop→rebind (cross-platform) ─
+
+    /// SC-1 — After dropping a TcpListener, the same port can be rebound immediately.
+    /// Exercises TIME_WAIT rebind on Unix and confirms SO_REUSEADDR is set correctly
+    /// on all platforms.
+    #[test]
+    fn bind_tcp_listener_reusable_rebind_after_drop_succeeds() {
+        use std::net::SocketAddr;
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let listener1 = bind_tcp_listener_reusable(zero).expect("first bind");
+        let port = listener1.local_addr().unwrap().port();
+        drop(listener1);
+
+        let fixed: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let listener2 = bind_tcp_listener_reusable(fixed);
+        assert!(
+            listener2.is_ok(),
+            "rebind after drop must succeed (got: {:?})",
+            listener2.err()
+        );
+    }
+
+    // ─── SC-3: bind_tcp_listener_reusable — live rebind (Windows-only) ────────
+
+    /// SC-3 — On Windows, SO_REUSEADDR allows a second bind while the first socket
+    /// is still alive (LISTEN state). This reproduces the Arc-lifetime race where the
+    /// old MdnsSignaling thread still holds 0.0.0.0:7889 when a rebuild worker
+    /// attempts to bind a new one (engram #1417).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bind_tcp_listener_reusable_live_rebind_windows_succeeds() {
+        use std::net::SocketAddr;
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let listener1 = bind_tcp_listener_reusable(zero).expect("first bind");
+        let port = listener1.local_addr().unwrap().port();
+        let _hold = listener1; // intentionally NOT dropped — reproduces Arc race
+
+        let fixed: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let listener2 = bind_tcp_listener_reusable(fixed);
+        assert!(
+            listener2.is_ok(),
+            "live rebind on Windows must succeed (Arc race repro), got: {:?}",
+            listener2.err()
+        );
     }
 }
