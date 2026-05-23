@@ -13,15 +13,17 @@
 //!
 //! # Thread model
 //!
-//! - `new()`: validates config, runs a DESTRUCTIVE probe on the caller thread
-//!   (`CoInitializeEx` + `MFStartup` + `MFTEnumEx` + per-candidate
-//!   `ActivateObject` + `try_setup_output_type` + `ShutdownObject`). The winning
-//!   `IMFActivate` is retained; its `IMFTransform` is discarded after the probe.
+//! - `new()`: validates config, spawns a short-lived `"sm-mft-probe"` OS thread that
+//!   calls `CoInitializeEx(MTA)` + `MFStartup` + `MFTEnumEx` + per-candidate
+//!   `ActivateObject` + `try_setup_output_type` + `ShutdownObject`, then
+//!   `MFShutdown` + `CoUninitialize` before the thread exits. The winning
+//!   `IMFActivate` is sent back to the caller via a channel. The calling thread
+//!   never touches COM or MF during construction.
 //! - `start(rx, tx)`: transfers the `IMFActivate` to a spawned OS thread. The
 //!   encoder thread calls `ActivateObject` itself and owns the `IMFTransform`
 //!   entirely — no cross-thread COM transfer of `IMFTransform` or `ICodecAPI`.
 //! - `stop()`: idempotent. Sets stop flag and joins the handle.
-//! - `Drop`: calls `stop()` + `MFShutdown` + `CoUninitialize` on the caller thread.
+//! - `Drop`: calls `stop()` and releases `IMFActivate`. MF/COM teardown happens on the probe thread during `new()`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -110,10 +112,11 @@ const GOP_SIZE_FRAMES: u32 = 60;
 ///
 /// # Safety
 /// COM interfaces are apartment-threaded by default, but hardware MFTs are
-/// registered as free-threaded (MTA). Both the constructor (`new`) and the
-/// encoder thread call `CoInitializeEx(COINIT_MULTITHREADED)` to join the MTA,
-/// so cross-thread use of these MTA-registered interfaces is safe per Windows
-/// COM rules. Never use this wrapper for STA-registered objects.
+/// registered as free-threaded (MTA). The probe thread (spawned by `new()`) and
+/// the encoder thread each call `CoInitializeEx(COINIT_MULTITHREADED)` to join
+/// the MTA independently. The calling thread (`new()` itself) never calls
+/// `CoInitializeEx`, so cross-thread transfer of MTA-registered factory pointers
+/// is safe per Windows COM rules. Never use this wrapper for STA-registered objects.
 struct ComSend<T>(T);
 
 impl<T> ComSend<T> {
@@ -322,9 +325,6 @@ pub struct WindowsMftH264Encoder {
     mft_activate_factory: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
-    /// Tracks whether `new()` performed `CoInitializeEx` + `MFStartup`.
-    /// When `true`, `Drop` must call `MFShutdown` + `CoUninitialize` on this thread.
-    com_initialized: bool,
 }
 
 impl std::fmt::Debug for WindowsMftH264Encoder {
@@ -353,15 +353,17 @@ unsafe impl Sync for WindowsMftH264Encoder {}
 impl VideoEncoder for WindowsMftH264Encoder {
     /// Construct and validate an encoder configuration.
     ///
-    /// Performs a synchronous DESTRUCTIVE probe on the caller's thread:
-    /// `CoInitializeEx` → `MFStartup` → `MFTEnumEx` → per-candidate probe
-    /// (`ActivateObject`, `MF_TRANSFORM_ASYNC_UNLOCK`, `GetOutputAvailableType(0,0)`,
-    /// `SetOutputType` with Strategy E, then `ShutdownObject`). The winning
-    /// candidate's `IMFTransform` is discarded after the probe; only the `IMFActivate` is retained.
+    /// Spawns a short-lived `"sm-mft-probe"` OS thread that runs the MFT probe
+    /// (`CoInitializeEx(MTA)` → `MFStartup` → `MFTEnumEx` → per-candidate
+    /// `ActivateObject` / `try_setup_output_type` / `ShutdownObject` → `MFShutdown`
+    /// → `CoUninitialize`). The calling thread never touches COM or MF, which avoids
+    /// `RPC_E_CHANGED_MODE` when the caller is already STA-initialized (e.g. the Tauri
+    /// main thread after WebView2 init).
     ///
     /// Returns:
     /// - `Err(InvalidConfig(_))` for `bitrate_bps == 0` or `framerate == 0`.
-    /// - `Err(InitFailed(_))` if no hardware H.264 MFT candidate passes the probe.
+    /// - `Err(InitFailed(_))` if no hardware H.264 MFT candidate passes the probe,
+    ///   if the probe thread times out (5 s), or if it panics.
     fn new(config: EncoderConfig) -> Result<Self, EncoderError>
     where
         Self: Sized,
@@ -376,15 +378,10 @@ impl VideoEncoder for WindowsMftH264Encoder {
             return Err(EncoderError::InvalidConfig("framerate must be > 0".into()));
         }
 
-        // Synchronous MFT probe (design §5 steps 1–5).
-        // Returns only the winning IMFActivate — the IMFTransform from the probe is
-        // ShutdownObject'd immediately. The encoder thread re-activates from the
-        // IMFActivate to produce a fresh IMFTransform that lives entirely on that thread.
-        // This eliminates cross-thread IMFTransform transfer, the root cause of AVs in
-        // commit ccd2e43 (phase0v3 trace: H-AV3 confirmed — NVENC singleton corruption
-        // when IMFTransform is used from a different thread than ActivateObject).
-        // Vendor identity is returned alongside the activate for diagnostic logging.
-        let (activate, vendor) = init_mft_sync(&config)?;
+        // Off-main-thread probe: the Tauri main thread is STA-initialized by tao/wry
+        // for WebView2; calling CoInitializeEx(MTA) on it returns RPC_E_CHANGED_MODE
+        // (0x80010106). Running the probe on a fresh thread avoids this entirely.
+        let (activate, vendor) = run_probe_on_isolated_thread(config.clone())?;
 
         Ok(Self {
             config,
@@ -392,7 +389,6 @@ impl VideoEncoder for WindowsMftH264Encoder {
             vendor,
             mft_activate_factory: Some(activate),
             handle: None,
-            com_initialized: true,
         })
     }
 
@@ -482,28 +478,17 @@ impl Drop for WindowsMftH264Encoder {
         let _ = self.stop();
 
         // mft_activate_factory: if start() was never called, the IMFActivate is still here.
-        // Drop it before MFShutdown to release the COM ref while MF is still alive.
-        // If start() was called, mft_activate_factory is already None (transferred to thread).
+        // Release the COM ref. MF/COM teardown was already done by the probe thread
+        // inside new(); IMFActivate::Release does not require an active MFStartup on
+        // the calling thread (it only decrements a COM refcount).
+        // If start() was called, mft_activate_factory is already None.
         drop(self.mft_activate_factory.take());
-
-        if self.com_initialized {
-            unsafe {
-                // SAFETY: MFShutdown is the documented teardown for MFStartup.
-                // Process-global refcount per A4; safe to call here AFTER all MF
-                // interface refs above have been Release()d.
-                let _ = MFShutdown();
-                // SAFETY: CoUninitialize matches the CoInitializeEx in init_mft_sync()
-                // on this same thread. Safe AFTER all COM refs above are released.
-                CoUninitialize();
-            }
-            self.com_initialized = false;
-        }
     }
 }
 
 // ── Synchronous MFT initialisation (design §5 steps 1–6) ─────────────────────
 
-/// Caller-thread MFT probe. Returns the winning `IMFActivate` (not an `IMFTransform`).
+/// Probe-thread MFT enumeration. Returns the winning `IMFActivate` (not an `IMFTransform`).
 ///
 /// Each candidate is activated, probed with `try_setup_output_type`, then immediately
 /// `ShutdownObject`'d — including the winner. The returned `IMFActivate` is transferred
@@ -515,8 +500,8 @@ impl Drop for WindowsMftH264Encoder {
 /// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
 /// for `IMFTransform` and `ICodecAPI`.
 fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
-    // Step 1: CoInitializeEx on caller thread (MTA).
-    // SAFETY: Paired with CoUninitialize in Drop.
+    // Step 1: CoInitializeEx on the probe thread (MTA).
+    // SAFETY: Paired with `CoUninitialize` in the probe closure's teardown.
     // CoInitializeEx returns HRESULT directly (not Result).
     // S_OK (0) and S_FALSE (1, already initialised on this apartment) are both acceptable.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -560,6 +545,80 @@ fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFActivate, EncoderVendor),
             }
             Err(err)
         }
+    }
+}
+
+// ── Probe-thread isolation (REQ-MFT-1..REQ-MFT-8) ───────────────────────────
+
+/// Wall-clock cap for the probe thread. ~25x the worst observed real-probe latency.
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `init_mft_sync` on a fresh OS thread so `CoInitializeEx(MTA)` succeeds even
+/// when the caller's apartment is STA (Tauri main thread + WebView2).
+///
+/// Returns `(IMFActivate, EncoderVendor)` on success; maps any failure (probe error,
+/// timeout, thread panic) into `EncoderError::InitFailed`.
+fn run_probe_on_isolated_thread(
+    config: EncoderConfig,
+) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
+    run_probe_on_isolated_thread_with(PROBE_TIMEOUT, move || init_mft_sync(&config))
+}
+
+/// Testability seam — same machinery as `run_probe_on_isolated_thread`, but the
+/// probe body and timeout are injected. Tests use this to simulate panic, error,
+/// and timeout without touching real Media Foundation.
+///
+/// `F` must produce `ComSend`-compatible values; `IMFActivate` is MTA-safe.
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_probe_on_isolated_thread_with<F>(
+    timeout: std::time::Duration,
+    probe: F,
+) -> Result<(IMFActivate, EncoderVendor), EncoderError>
+where
+    F: FnOnce() -> Result<(IMFActivate, EncoderVendor), EncoderError> + Send + 'static,
+{
+    use std::sync::mpsc;
+    type ProbeOut = Result<(ComSend<IMFActivate>, EncoderVendor), EncoderError>;
+    let (tx, rx) = mpsc::channel::<ProbeOut>();
+
+    // Variant a: the probe closure owns the full Co/MF lifecycle on the spawned thread.
+    // init_mft_sync already handles CoUninitialize on its error arms; calling
+    // CoUninitialize again after a failed probe is a documented no-op per DD10
+    // (apartment refcount was 0 on those paths). Zero correctness cost, avoids
+    // refactoring every error arm of init_mft_sync.
+    let _handle = std::thread::Builder::new()
+        .name("sm-mft-probe".into())
+        .spawn(move || {
+            let co_hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            if co_hr.is_err() {
+                let _ = tx.send(Err(EncoderError::InitFailed(format!(
+                    "probe thread CoInitializeEx: 0x{:08X}",
+                    co_hr.0
+                ))));
+                // Nothing to tear down — refcount stayed at 0.
+                return;
+            }
+            // From here we must always run MFShutdown+CoUninitialize before exit.
+            let result = probe().map(|(act, v)| (ComSend(act), v));
+            let _ = tx.send(result);
+            unsafe {
+                let _ = MFShutdown();
+                CoUninitialize();
+            }
+        })
+        .map_err(|e| EncoderError::InitFailed(format!("probe thread spawn: {e}")))?;
+    // detached not joined — see REQ-MFT-15
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok((activate_send, vendor))) => Ok((activate_send.into_inner(), vendor)),
+        Ok(Err(e)) => Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(EncoderError::InitFailed(format!(
+            "probe thread timeout after {}s",
+            timeout.as_secs()
+        ))),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(EncoderError::InitFailed(
+            "probe thread panicked before sending result".into(),
+        )),
     }
 }
 
@@ -988,6 +1047,25 @@ fn renegotiate_output_type(
 
 // ── Encoder thread ────────────────────────────────────────────────────────────
 
+/// RAII guard that calls `MFShutdown` on drop (paired with encoder thread's MFStartup).
+///
+/// Must be constructed AFTER `CoUninitGuard` so it drops BEFORE it —
+/// i.e. `MFShutdown` runs before `CoUninitialize`, matching the teardown order in
+/// `init_mft_sync` and the Microsoft Media Foundation documentation.
+struct MfShutdownGuard;
+
+impl Drop for MfShutdownGuard {
+    fn drop(&mut self) {
+        // SAFETY: Paired with MFStartup in run_encoder_thread. MFStartup/MFShutdown
+        // use a process-global reference count; this call decrements it exactly once
+        // for the encoder thread's MFStartup. Per MS docs, MFShutdown is safe to call
+        // from any thread and is a no-op when the refcount would go negative.
+        unsafe {
+            let _ = MFShutdown();
+        };
+    }
+}
+
 /// RAII guard that calls `CoUninitialize` on drop (paired with encoder thread's CoInitializeEx).
 struct CoUninitGuard;
 
@@ -1024,8 +1102,23 @@ fn run_encoder_thread(
         tracing::error!("encoder thread CoInitializeEx failed: 0x{:08X}", co_hr.0);
         return;
     }
+
+    // Step 1b: MFStartup on the encoder thread — this thread owns its own MF lifecycle.
+    // The probe thread started and shut down MF during new(); MF is not alive here.
+    // SAFETY: MFStartup initialises Media Foundation for this thread's MF calls. Paired
+    // with MFShutdown via MfShutdownGuard. MfShutdownGuard is constructed AFTER
+    // CoUninitGuard so it drops FIRST, preserving the teardown order: MFShutdown then
+    // CoUninitialize (matching init_mft_sync's precedent and Microsoft docs).
+    let _mf_guard = match unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
+        Ok(_) => MfShutdownGuard,
+        Err(e) => {
+            tracing::error!("encoder thread MFStartup failed: 0x{:08X}", e.code().0);
+            return;
+        }
+    };
+
     tracing::debug!(
-        "encoder thread CoInitializeEx OK; config: {}x{} @ {}fps {}bps",
+        "encoder thread CoInitializeEx+MFStartup OK; config: {}x{} @ {}fps {}bps",
         config.width,
         config.height,
         config.framerate,
@@ -1070,8 +1163,8 @@ fn run_encoder_thread(
     // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
-        // MFShutdown for the thread's MF context is not needed here because
-        // the caller thread's new() owns MFStartup/MFShutdown (step 2 and Drop).
+        // MFShutdown is handled by MfShutdownGuard; CoUninitialize by CoUninitGuard.
+        // Both guards drop automatically when this function returns.
         return;
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
@@ -1137,8 +1230,8 @@ fn run_encoder_thread(
     // mft is dropped here (COM Release via Drop).
     // codec_api and event_gen were moved into pump_loop and dropped inside it.
     // activate is dropped here (COM Release via Drop).
-    // MFShutdown for the thread is NOT called here — the caller thread's Drop handles it.
-    // CoUninitGuard calls CoUninitialize when this function returns.
+    // MfShutdownGuard calls MFShutdown and CoUninitGuard calls CoUninitialize when
+    // this function returns — encoder thread owns its own MF lifecycle end-to-end.
 }
 
 /// Resolve effective (width, height) from config, applying 1920×1080 fallback for sentinel zeros.
@@ -2105,10 +2198,10 @@ impl WindowsMftH264Encoder {
     /// apartment. The resulting encoder MUST NOT be started — it has no MFT handle.
     ///
     /// # Safety
-    /// `com_initialized = false` prevents Drop from calling MFShutdown/CoUninitialize,
-    /// which would be incorrect since COM was never initialised by this constructor.
     /// `mft_activate_factory: None` means `start()` returns `Err(Internal(_))` rather
-    /// than accessing an invalid COM pointer. The test encoder MUST NOT be started.
+    /// than accessing an invalid COM pointer. Drop only calls `stop()` (a no-op when
+    /// `handle` is None) and drops the None factory — no COM or MF calls are made.
+    /// The test encoder MUST NOT be started.
     fn new_for_validation_test() -> Self {
         Self {
             config: EncoderConfig::default(),
@@ -2116,7 +2209,6 @@ impl WindowsMftH264Encoder {
             vendor: EncoderVendor::Unknown,
             mft_activate_factory: None,
             handle: None,
-            com_initialized: false,
         }
     }
 }
@@ -2453,5 +2545,91 @@ mod tests {
         // Structural guard: asserts the GOP constant exists and equals the design value.
         // Real hardware IDR cadence is verified empirically (manual check — see task A1-5).
         assert_eq!(GOP_SIZE_FRAMES, 60u32);
+    }
+
+    // ─── sender-mft-hw-init: probe-thread seam tests (SC-2, SC-3, SC-4, SC-5) ─
+
+    // SC-2: Err returned from the probe closure is propagated unchanged (REQ-MFT-7).
+    #[test]
+    fn probe_thread_failure_propagates_err_unchanged() {
+        use std::time::Duration;
+        let r = run_probe_on_isolated_thread_with(Duration::from_secs(5), || {
+            Err(EncoderError::InitFailed("simulated".into()))
+        });
+        assert!(
+            matches!(&r, Err(EncoderError::InitFailed(s)) if s == "simulated"),
+            "expected InitFailed(\"simulated\"), got {r:?}"
+        );
+    }
+
+    // SC-3: timeout path returns InitFailed with "probe thread timeout" in message (REQ-MFT-6).
+    #[test]
+    fn probe_thread_timeout_returns_init_failed() {
+        use std::time::Duration;
+        let r = run_probe_on_isolated_thread_with(Duration::from_secs(1), || {
+            std::thread::sleep(Duration::from_secs(3));
+            Err(EncoderError::InitFailed("late".into()))
+        });
+        assert!(
+            matches!(&r, Err(EncoderError::InitFailed(s)) if s.contains("probe thread timeout")),
+            "expected InitFailed containing \"probe thread timeout\", got {r:?}"
+        );
+    }
+
+    // SC-4: probe closure panic is caught via channel Disconnected; caller gets InitFailed (REQ-MFT-6).
+    #[test]
+    fn probe_thread_panic_returns_init_failed() {
+        use std::time::Duration;
+        let r = run_probe_on_isolated_thread_with(Duration::from_secs(5), || {
+            panic!("simulated probe panic")
+        });
+        assert!(
+            matches!(&r, Err(EncoderError::InitFailed(s)) if s.contains("panicked before sending result")),
+            "expected InitFailed containing \"panicked before sending result\", got {r:?}"
+        );
+    }
+
+    // SC-5: new() must not corrupt the caller's COM apartment (REQ-MFT-8).
+    // The calling thread enters STA (mimicking Tauri main thread + WebView2).
+    // After new() returns (Ok or Err), re-calling CoInitializeEx(STA) must return
+    // S_FALSE (0x1) — apartment still STA and untouched, not RPC_E_CHANGED_MODE.
+    // CI-runnable: purely checks COM apartment semantics, no real GPU needed.
+    #[test]
+    fn new_does_not_corrupt_caller_sta_apartment() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+
+        // Enter STA — mimics Tauri main thread after tao/wry WebView2 init.
+        let sta_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        assert!(
+            sta_hr.is_ok() || sta_hr.0 == 0x1,
+            "must be able to enter STA on a fresh test thread, got 0x{:08X}",
+            sta_hr.0
+        );
+
+        let config = EncoderConfig {
+            bitrate_bps: 4_000_000,
+            framerate: 30,
+            ..EncoderConfig::default()
+        };
+        // new() may return Ok or Err depending on hardware availability.
+        // What matters is the caller apartment state after the call.
+        let _result = WindowsMftH264Encoder::new(config);
+
+        // Verify: re-entering STA returns S_FALSE (0x1) meaning the apartment is
+        // still STA and has NOT been changed to MTA by new().
+        let recheck_hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        assert_ne!(
+            recheck_hr.0, 0x80010106_u32 as i32,
+            "caller apartment must not have been changed to MTA (RPC_E_CHANGED_MODE)"
+        );
+        assert_eq!(
+            recheck_hr.0, 0x1,
+            "caller apartment must still be STA (S_FALSE = already initialized)"
+        );
+
+        unsafe { CoUninitialize() }; // for the recheck CoInitializeEx
+        unsafe { CoUninitialize() }; // for the initial STA init
     }
 }
