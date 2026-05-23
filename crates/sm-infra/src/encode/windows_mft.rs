@@ -488,7 +488,7 @@ impl Drop for WindowsMftH264Encoder {
 
 // ── Synchronous MFT initialisation (design §5 steps 1–6) ─────────────────────
 
-/// Caller-thread MFT probe. Returns the winning `IMFActivate` (not an `IMFTransform`).
+/// Probe-thread MFT enumeration. Returns the winning `IMFActivate` (not an `IMFTransform`).
 ///
 /// Each candidate is activated, probed with `try_setup_output_type`, then immediately
 /// `ShutdownObject`'d — including the winner. The returned `IMFActivate` is transferred
@@ -500,8 +500,8 @@ impl Drop for WindowsMftH264Encoder {
 /// confirmed). This destructive-probe approach eliminates all cross-thread COM transfer
 /// for `IMFTransform` and `ICodecAPI`.
 fn init_mft_sync(config: &EncoderConfig) -> Result<(IMFActivate, EncoderVendor), EncoderError> {
-    // Step 1: CoInitializeEx on caller thread (MTA).
-    // SAFETY: Paired with CoUninitialize in Drop.
+    // Step 1: CoInitializeEx on the probe thread (MTA).
+    // SAFETY: Paired with `CoUninitialize` in the probe closure's teardown.
     // CoInitializeEx returns HRESULT directly (not Result).
     // S_OK (0) and S_FALSE (1, already initialised on this apartment) are both acceptable.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -1047,6 +1047,25 @@ fn renegotiate_output_type(
 
 // ── Encoder thread ────────────────────────────────────────────────────────────
 
+/// RAII guard that calls `MFShutdown` on drop (paired with encoder thread's MFStartup).
+///
+/// Must be constructed AFTER `CoUninitGuard` so it drops BEFORE it —
+/// i.e. `MFShutdown` runs before `CoUninitialize`, matching the teardown order in
+/// `init_mft_sync` and the Microsoft Media Foundation documentation.
+struct MfShutdownGuard;
+
+impl Drop for MfShutdownGuard {
+    fn drop(&mut self) {
+        // SAFETY: Paired with MFStartup in run_encoder_thread. MFStartup/MFShutdown
+        // use a process-global reference count; this call decrements it exactly once
+        // for the encoder thread's MFStartup. Per MS docs, MFShutdown is safe to call
+        // from any thread and is a no-op when the refcount would go negative.
+        unsafe {
+            let _ = MFShutdown();
+        };
+    }
+}
+
 /// RAII guard that calls `CoUninitialize` on drop (paired with encoder thread's CoInitializeEx).
 struct CoUninitGuard;
 
@@ -1083,8 +1102,23 @@ fn run_encoder_thread(
         tracing::error!("encoder thread CoInitializeEx failed: 0x{:08X}", co_hr.0);
         return;
     }
+
+    // Step 1b: MFStartup on the encoder thread — this thread owns its own MF lifecycle.
+    // The probe thread started and shut down MF during new(); MF is not alive here.
+    // SAFETY: MFStartup initialises Media Foundation for this thread's MF calls. Paired
+    // with MFShutdown via MfShutdownGuard. MfShutdownGuard is constructed AFTER
+    // CoUninitGuard so it drops FIRST, preserving the teardown order: MFShutdown then
+    // CoUninitialize (matching init_mft_sync's precedent and Microsoft docs).
+    let _mf_guard = match unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
+        Ok(_) => MfShutdownGuard,
+        Err(e) => {
+            tracing::error!("encoder thread MFStartup failed: 0x{:08X}", e.code().0);
+            return;
+        }
+    };
+
     tracing::debug!(
-        "encoder thread CoInitializeEx OK; config: {}x{} @ {}fps {}bps",
+        "encoder thread CoInitializeEx+MFStartup OK; config: {}x{} @ {}fps {}bps",
         config.width,
         config.height,
         config.framerate,
@@ -1129,8 +1163,8 @@ fn run_encoder_thread(
     // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
-        // MFShutdown for the thread's MF context is not needed here because
-        // the caller thread's new() owns MFStartup/MFShutdown (step 2 and Drop).
+        // MFShutdown is handled by MfShutdownGuard; CoUninitialize by CoUninitGuard.
+        // Both guards drop automatically when this function returns.
         return;
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
@@ -1196,8 +1230,8 @@ fn run_encoder_thread(
     // mft is dropped here (COM Release via Drop).
     // codec_api and event_gen were moved into pump_loop and dropped inside it.
     // activate is dropped here (COM Release via Drop).
-    // MFShutdown for the thread is NOT called here — the caller thread's Drop handles it.
-    // CoUninitGuard calls CoUninitialize when this function returns.
+    // MfShutdownGuard calls MFShutdown and CoUninitGuard calls CoUninitialize when
+    // this function returns — encoder thread owns its own MF lifecycle end-to-end.
 }
 
 /// Resolve effective (width, height) from config, applying 1920×1080 fallback for sentinel zeros.
