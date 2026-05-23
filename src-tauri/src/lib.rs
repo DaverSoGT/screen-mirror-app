@@ -2,6 +2,14 @@ pub mod commands;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install a tracing subscriber so `tracing::{info,warn,debug}!` calls in
+    // the workspace (encoder, capture, muxer, WebRTC plumbing) actually reach
+    // stdout. `try_init` is used so a second initialization (e.g. tests
+    // re-entering this fn) is a no-op rather than a panic.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     tauri::Builder::default()
         .manage(commands::stream::StreamBridge::new())
         .manage(commands::sender::SenderBridge::new())
