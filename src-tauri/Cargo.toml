@@ -24,6 +24,9 @@ tracing-subscriber = { workspace = true }
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
 [features]
 # custom-protocol is activated by tauri-build when bundling; do not remove.
 custom-protocol = ["tauri/custom-protocol"]
