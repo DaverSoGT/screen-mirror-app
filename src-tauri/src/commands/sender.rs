@@ -266,8 +266,11 @@ impl SenderBridge {
     pub fn new() -> Self {
         let session_arc: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(None));
         let restart_cache_arc: Arc<Mutex<Option<RestartCache>>> = Arc::new(Mutex::new(None));
+        let sup_tx_arc: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
         let session_for_builder = session_arc.clone();
         let cache_for_builder = restart_cache_arc.clone();
+        let sup_tx_for_builder = sup_tx_arc.clone();
         Self {
             session: session_arc,
             builder: Arc::new(move |udp_port, service_name, stop_flag, channel| {
@@ -278,11 +281,12 @@ impl SenderBridge {
                     channel,
                     session_for_builder.clone(),
                     cache_for_builder.clone(),
+                    sup_tx_for_builder.clone(),
                 )
             }),
             current_args: Mutex::new(None),
             restart_cache: restart_cache_arc,
-            supervisor_signal_tx: Arc::new(Mutex::new(None)),
+            supervisor_signal_tx: sup_tx_arc,
         }
     }
 
@@ -1002,7 +1006,7 @@ fn handle_supervisor_outcome(
             (hooks.initiate_mdns_reset)();
         }
         SupervisorOutcome::Stopped => {
-            eprintln!("[sm-sender-sup-coord] supervisor stopped");
+            tracing::info!(target: "sender-supervisor", "supervisor stopped cleanly");
         }
         SupervisorOutcome::StateChanged(_) => {
             // Connecting or other transient states — no frontend event needed.
@@ -1236,6 +1240,12 @@ pub fn make_sender_rebuild_hook(
 
                 // Gate A: abort if stop already arrived before we started any work.
                 if old_stop_flag.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sender-rebuild",
+                        attempt,
+                        gate = "A",
+                        "rebuild aborted: stop flag set before work began",
+                    );
                     let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
                     return;
                 }
@@ -1282,6 +1292,12 @@ pub fn make_sender_rebuild_hook(
                 // Gate B: abort after teardown, before builder invocation.
                 // Stop arrived during the ~150ms shutdown closure execution window.
                 if old_stop_flag.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sender-rebuild",
+                        attempt,
+                        gate = "B",
+                        "rebuild aborted: stop flag set after teardown",
+                    );
                     let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
                     return;
                 }
@@ -1295,7 +1311,13 @@ pub fn make_sender_rebuild_hook(
                     cache.channel.clone(),
                 ) {
                     Ok(b) => b,
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::error!(
+                            target: "sender-rebuild",
+                            attempt,
+                            error = %e,
+                            "bundle builder failed during rebuild",
+                        );
                         let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
                         return;
                     }
@@ -1305,6 +1327,12 @@ pub fn make_sender_rebuild_hook(
                 // ~300ms builder execution window. The freshly-built bundle must be
                 // torn down so no orphan threads are left running.
                 if old_stop_flag.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sender-rebuild",
+                        attempt,
+                        gate = "C",
+                        "rebuild aborted: stop flag set after build",
+                    );
                     // Set the fresh bundle's stop_flag so its drain threads exit.
                     fresh_stop_flag.store(true, Ordering::Relaxed);
                     // Dropping the bundle here detaches any JoinHandles; the drain
@@ -1333,6 +1361,12 @@ pub fn make_sender_rebuild_hook(
                 // bridge_session arc (equivalent to stop_sender_session_internal but
                 // without the bridge reference; the worker IS its own thread — safe).
                 if old_stop_flag.load(Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "sender-rebuild",
+                        attempt,
+                        gate = "D",
+                        "rebuild aborted: stop flag set after swap",
+                    );
                     // Take and tear down the new session we just swapped in.
                     let new_session_opt = bridge_session.lock().unwrap().take();
                     if let Some(mut new_session) = new_session_opt {
@@ -1512,6 +1546,7 @@ fn build_production_sender_bundle(
     _channel: Arc<dyn ChannelLike>,
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
+    _bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) -> Result<SenderBundle, BundleError> {
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
@@ -1536,6 +1571,11 @@ fn build_production_sender_bundle(
     };
     let mut signaling =
         MdnsSignaling::new(sig_config).map_err(|e| BundleError::Other(e.to_string()))?;
+    // Sub-fix 2: wire the bridge-owned supervisor signal Arc into MdnsSignaling so the
+    // signaling thread's frame_to_event reader and the drain's enter_supervisor_mode
+    // writer share ONE Option<SyncSender<SupervisorSignal>>. Must run BEFORE wrapping
+    // in Arc<Mutex<>> and BEFORE start() — see register_supervisor_signal_arc doc.
+    signaling.register_supervisor_signal_arc(_bridge_supervisor_signal_tx.clone());
 
     // PQ-ST-5 hardcoded defaults: Primary monitor, 30 fps, border explicitly off.
     // Spec said "BorderPolicy::Hidden" — domain enum is named AlwaysOff (same intent:
@@ -1649,27 +1689,64 @@ fn build_production_sender_bundle(
     let _counters = Arc::new(SenderCounters::default());
 
     // ── 5. Build production coordinator hooks ─────────────────────────────────
-    // These closures close over `signaling_for_hooks` (Arc<Mutex<MdnsSignaling>>).
-    // CRITICAL-2: the TODO stubs are now wired to real signaling calls.
-    let sig_for_req = signaling_for_hooks.clone();
-    let sig_for_ack = signaling_for_hooks.clone();
-    let sig_for_reset = signaling_for_hooks.clone();
+    // Sub-fix 1 (engram proposal sdd/sender-supervisor-rebuild-lifetime): Weak refs
+    // prevent Arc-lifetime leak. Strong clones here held MdnsSignaling alive past
+    // shutdown(), causing a zombie sm-signaling-mdns thread + competing TCP listener
+    // during rebuild window. After this change, only signaling_arc (in shutdown
+    // closure below) holds a strong reference after build_production_sender_bundle
+    // returns. Ref-count = 1 post-return; drops to 0 when sd() runs → Drop::stop()
+    // joins thread synchronously before the new builder is invoked.
+    let sig_for_req = Arc::downgrade(&signaling_for_hooks);
+    let sig_for_ack = Arc::downgrade(&signaling_for_hooks);
+    let sig_for_reset = Arc::downgrade(&signaling_for_hooks);
 
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
-            let sig = sig_for_req.lock().unwrap();
+            // Sub-fix 1: Weak upgrade — None means session was torn down before this
+            // hook fired (e.g., late supervisor outcome after sd()). Safe no-op.
+            let Some(arc) = sig_for_req.upgrade() else {
+                tracing::debug!(
+                    target: "sender-hooks",
+                    hook = "publish_reconnect_request",
+                    "signaling Arc dropped (session torn down); hook is no-op",
+                );
+                return;
+            };
+            // Strong arc keeps MdnsSignaling alive until end of closure scope; safe.
+            let sig = arc.lock().unwrap();
             if let Err(e) = sig.publish_reconnect_request(
                 attempt,
                 sm_domain::signaling::SignalingRole::Sender,
                 session_nonce,
             ) {
-                eprintln!("[sm-sender-coord] publish_reconnect_request failed: {e}");
+                tracing::error!(
+                    target: "sender-hooks",
+                    hook = "publish_reconnect_request",
+                    error = %e,
+                    "publish_reconnect_request failed",
+                );
             }
         }),
         publish_reconnect_ack: Arc::new(move |attempt, session_nonce| {
-            let sig = sig_for_ack.lock().unwrap();
+            // Sub-fix 1: Weak upgrade — None means session was torn down before this
+            // hook fired. Safe no-op.
+            let Some(arc) = sig_for_ack.upgrade() else {
+                tracing::debug!(
+                    target: "sender-hooks",
+                    hook = "publish_reconnect_ack",
+                    "signaling Arc dropped (session torn down); hook is no-op",
+                );
+                return;
+            };
+            // Strong arc keeps MdnsSignaling alive until end of closure scope; safe.
+            let sig = arc.lock().unwrap();
             if let Err(e) = sig.publish_reconnect_ack(attempt, session_nonce) {
-                eprintln!("[sm-sender-coord] publish_reconnect_ack failed: {e}");
+                tracing::error!(
+                    target: "sender-hooks",
+                    hook = "publish_reconnect_ack",
+                    error = %e,
+                    "publish_reconnect_ack failed",
+                );
             }
         }),
         // V2: spawn a worker thread that rebuilds the bundle without blocking the drain.
@@ -1689,6 +1766,7 @@ fn build_production_sender_bundle(
             {
                 let session_for_inner = _bridge_session.clone();
                 let cache_for_inner = _bridge_cache.clone();
+                let sup_tx_for_inner = _bridge_supervisor_signal_tx.clone();
                 Arc::new(move |udp_port, service_name, stop_flag, channel| {
                     build_production_sender_bundle(
                         udp_port,
@@ -1697,6 +1775,7 @@ fn build_production_sender_bundle(
                         channel,
                         session_for_inner.clone(),
                         cache_for_inner.clone(),
+                        sup_tx_for_inner.clone(),
                     )
                 })
             },
@@ -1706,23 +1785,39 @@ fn build_production_sender_bundle(
             1, // attempt — supervisor attempt counter; 1 as the default for production hook
         ),
         initiate_mdns_reset: Arc::new(move || {
-            // MdnsSignaling::reset() consumes self. Since we hold an Arc<Mutex<>>,
-            // we call stop() in-place (which is what reset() does under the hood)
-            // then call start() again with the same config to re-engage discovery.
-            // This is safe: the coordinator is the only writer during reconnect.
-            eprintln!(
-                "[sm-sender-coord] InitiateMdnsReset — calling MdnsSignaling::stop() + re-engaging discovery"
+            // Sub-fix 1: Weak upgrade — None means session was torn down before this
+            // hook fired. Safe no-op.
+            let Some(arc) = sig_for_reset.upgrade() else {
+                tracing::debug!(
+                    target: "sender-hooks",
+                    hook = "initiate_mdns_reset",
+                    "signaling Arc dropped (session torn down); hook is no-op",
+                );
+                return;
+            };
+            tracing::info!(
+                target: "sender-hooks",
+                "InitiateMdnsReset — calling MdnsSignaling::stop() + re-engaging discovery",
             );
-            let mut sig = sig_for_reset.lock().unwrap();
+            // Strong arc keeps MdnsSignaling alive until end of closure scope; safe.
+            let mut sig = arc.lock().unwrap();
             if let Err(e) = sig.stop() {
-                eprintln!("[sm-sender-coord] MdnsSignaling::stop() failed: {e}");
+                tracing::error!(
+                    target: "sender-hooks",
+                    error = %e,
+                    "MdnsSignaling::stop() failed during reset",
+                );
             }
-            // Re-start with a fresh event channel. The supervisor will route incoming
-            // frames via the existing supervisor_signal_tx (already set on the signaling
-            // instance via set_supervisor_signal_tx before start() was first called).
+            // Re-start with a fresh event channel. The supervisor_signal_tx Arc is
+            // shared via register_supervisor_signal_arc — the running thread automatically
+            // uses the bridge-level Arc after restart.
             let (sig_ev_tx, _sig_ev_rx) = std::sync::mpsc::sync_channel(4);
             if let Err(e) = sig.start(sig_ev_tx) {
-                eprintln!("[sm-sender-coord] MdnsSignaling::start() after reset failed: {e}");
+                tracing::error!(
+                    target: "sender-hooks",
+                    error = %e,
+                    "MdnsSignaling::start() failed after reset",
+                );
             }
         }),
     };
@@ -1742,7 +1837,10 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
     // Production transport drain with real coordinator hooks (CRITICAL-2).
-    let sup_tx = Arc::new(Mutex::new(None::<SyncSender<SupervisorSignal>>));
+    // Sub-fix 2: use the bridge-owned Arc (wired into MdnsSignaling via
+    // register_supervisor_signal_arc above) so frame_to_event and
+    // enter_supervisor_mode share the SAME Option<SyncSender<SupervisorSignal>>.
+    let sup_tx = _bridge_supervisor_signal_tx.clone();
     let tr_drain = std::thread::Builder::new()
         .name("sm-sender-transport-drain".into())
         .spawn(move || {
@@ -1783,6 +1881,7 @@ fn build_production_sender_bundle(
     _channel: Arc<dyn ChannelLike>,
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
+    _bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) -> Result<SenderBundle, BundleError> {
     Err(BundleError::Other(
         "sender pipeline requires Windows".to_string(),
