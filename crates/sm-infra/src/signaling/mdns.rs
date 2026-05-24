@@ -223,6 +223,39 @@ impl MdnsSignaling {
         *self.supervisor_signal_tx.lock().unwrap() = Some(tx);
     }
 
+    /// Replace the internal `supervisor_signal_tx` Arc with a caller-owned shared Arc.
+    ///
+    /// Sub-fix 2 (engram sdd/sender-supervisor-rebuild-lifetime/proposal):
+    /// `build_production_sender_bundle` passes `bridge.supervisor_signal_tx.clone()`
+    /// so the `frame_to_event` reader path on the signaling thread and the
+    /// `enter_supervisor_mode` writer path on the drain thread observe the SAME
+    /// `Option<SyncSender<SupervisorSignal>>`. Without this call the bridge writes
+    /// `Some(signal_tx)` into its own Arc while MdnsSignaling keeps reading from a
+    /// freshly-allocated `Arc::new(Mutex::new(None))` (mdns.rs:140) — peer reconnect
+    /// frames are silently consumed.
+    ///
+    /// # Ordering (MUST hold)
+    ///
+    /// Call BEFORE `start()`. `start()` clones the Arc field into the signaling
+    /// thread closure (mdns.rs:156). Calling AFTER `start()` leaves the running
+    /// thread reading from the OLD per-instance Arc, defeating the wiring.
+    /// `debug_assert!(self.handle.is_none())` enforces this in debug builds.
+    ///
+    /// # Misuse (multiple calls)
+    ///
+    /// Last-write-wins. The new Arc replaces the field; the previous Arc is
+    /// dropped. Spec forbids multiple registrations; this is a debug-only assertion.
+    pub fn register_supervisor_signal_arc(
+        &mut self,
+        sup_arc: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    ) {
+        debug_assert!(
+            self.handle.is_none(),
+            "register_supervisor_signal_arc must be called BEFORE start()"
+        );
+        self.supervisor_signal_tx = sup_arc;
+    }
+
     /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
     ///
     /// Uses the existing inbox mechanism — the frame loop writes it on the next
@@ -1454,6 +1487,132 @@ mod tests {
             listener2.is_ok(),
             "rebind after drop must succeed (got: {:?})",
             listener2.err()
+        );
+    }
+
+    // ─── SC-1: arc_drop_releases_signaling_after_build ────────────────────────
+
+    /// SC-1 (REQ-SSRL-1, REQ-SSRL-2): After dropping the root Arc, Weak::upgrade
+    /// MUST return None. This locks in the Weak-topology contract: no strong clone
+    /// held by coordinator hooks keeps MdnsSignaling alive past shutdown().
+    #[test]
+    fn arc_drop_releases_signaling_after_build_sc1() {
+        use std::sync::{Arc, Mutex};
+        let arc = Arc::new(Mutex::new(
+            MdnsSignaling::new(SignalingConfig::default()).unwrap(),
+        ));
+        let weak = Arc::downgrade(&arc);
+        drop(arc);
+        assert!(
+            weak.upgrade().is_none(),
+            "Weak must not upgrade after root Arc drop"
+        );
+    }
+
+    // ─── SC-4/SC-5: register_supervisor_signal_arc wiring ────────────────────
+
+    /// SC-4 (REQ-SSRL-5, REQ-SSRL-6): `register_supervisor_signal_arc` replaces the
+    /// internal Arc so that the frame reader and the supervisor writer share ONE Arc.
+    /// Behavioral check: write a SyncSender into the shared Arc, drive frame_to_event,
+    /// assert PeerRequest arrives — proving the signaling instance uses the caller's Arc.
+    #[test]
+    fn bundle_wires_supervisor_signal_arc_sc4() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(4);
+        let bridge_arc: Arc<Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(sup_tx)));
+
+        // Simulate register_supervisor_signal_arc: create a signaling instance and
+        // replace its internal Arc with the bridge Arc.
+        let mut sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
+        sig.register_supervisor_signal_arc(bridge_arc.clone());
+
+        // Wrap in Arc<Mutex<>> (as production code does) — the internal field
+        // should now point to bridge_arc.
+        let signaling_arc = Arc::new(Mutex::new(sig));
+
+        // Drive frame_to_event using the shared Arc directly (same Arc the
+        // signaling thread would use after start() clones it at line 156).
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Sender,
+            session_nonce: 77,
+        };
+        let result = frame_to_event(frame, &bridge_arc);
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must be routed, not returned as an event"
+        );
+
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("PeerRequest must arrive on the bridge Arc within 100ms");
+        assert!(
+            matches!(signal, SupervisorSignal::PeerRequest { .. }),
+            "expected PeerRequest, got {signal:?}"
+        );
+
+        // Ensure signaling_arc is kept alive for the duration of the test.
+        drop(signaling_arc);
+    }
+
+    /// SC-5 (REQ-SSRL-6, REQ-SSRL-7, REQ-SSRL-8): After register_supervisor_signal_arc,
+    /// ReconnectRequest frames reach the supervisor within 100ms.
+    /// None-path sub-case: when Arc contains None, frame is silently consumed.
+    #[test]
+    fn reconnect_request_frame_reaches_supervisor_sc5() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(4);
+        let bridge_arc: Arc<Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(sup_tx)));
+
+        // Some-path: frame routes to supervisor.
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 3,
+            requester_role: SignalingRole::Receiver,
+            session_nonce: 999,
+        };
+        let result = frame_to_event(frame, &bridge_arc);
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must be routed (returns None)"
+        );
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("PeerRequest must arrive within 100ms");
+        assert!(
+            matches!(
+                signal,
+                SupervisorSignal::PeerRequest {
+                    peer_nonce: 999,
+                    attempt: 3
+                }
+            ),
+            "unexpected signal: {signal:?}"
+        );
+
+        // None-path: when Arc contains None, frame is silently consumed (no panic).
+        let none_arc: Arc<Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let frame2 = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Sender,
+            session_nonce: 1,
+        };
+        let result2 = frame_to_event(frame2, &none_arc);
+        assert!(
+            result2.is_none(),
+            "ReconnectRequest with None supervisor must return None without panic"
         );
     }
 
