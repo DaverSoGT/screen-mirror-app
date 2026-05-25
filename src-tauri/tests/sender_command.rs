@@ -600,7 +600,15 @@ fn signaling_drain_peer_found_logs_and_emits_connecting() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender,
+            stop_clone,
+            ch_clone,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     ev_tx
@@ -631,7 +639,15 @@ fn signaling_drain_answer_received_calls_apply_remote_answer() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     ev_tx
@@ -661,7 +677,15 @@ fn signaling_drain_candidate_received_calls_add_remote_candidate() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     ev_tx
@@ -690,7 +714,15 @@ fn signaling_drain_offer_received_is_silently_ignored() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     ev_tx
@@ -720,7 +752,15 @@ fn signaling_drain_closed_emits_peer_lost_and_exits() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender,
+            stop_clone,
+            ch_clone,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     ev_tx.send(SignalingEvent::Closed).unwrap();
@@ -741,7 +781,15 @@ fn signaling_drain_disconnected_rx_exits_cleanly() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender,
+            stop_clone,
+            ch,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     drop(ev_tx); // disconnect
@@ -764,7 +812,15 @@ fn signaling_drain_stop_flag_exits_loop() {
     let stop_clone = stop_flag.clone();
 
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+        // OQ-13: wrap ev_rx in cell; pass None supervisor_signal_tx.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(ev_rx)));
+        run_sender_signaling_drain(
+            cell,
+            fake_sender,
+            stop_clone,
+            ch,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
     });
 
     stop_flag.store(true, Ordering::Relaxed);
