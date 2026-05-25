@@ -1489,6 +1489,29 @@ mod tests {
         );
     }
 
+    // ─── SC-C-001: DISCOVER_TIMEOUT must be 30s ───────────────────────────────────
+
+    /// SC-C-001 — `DISCOVER_TIMEOUT` constant must be `Duration::from_secs(30)`.
+    ///
+    /// RED: current value is `Duration::from_secs(10)` (too short for sender republish
+    ///      after S-1 supervisor wakes — see design D-7). A 10s window guarantees a
+    ///      miss in the legacy path and gives zero margin in the S-1 path.
+    ///
+    /// GREEN (T07): change constant to 30s → test passes.
+    #[test]
+    fn discover_timeout_is_30s() {
+        use std::time::Duration;
+        assert_eq!(
+            super::DISCOVER_TIMEOUT,
+            Duration::from_secs(30),
+            "SC-C-001 FAIL: DISCOVER_TIMEOUT must be Duration::from_secs(30). \
+             Current value is {:?}. \
+             Fix (D-7): change `const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10)` \
+             to `Duration::from_secs(30)` in mdns.rs.",
+            super::DISCOVER_TIMEOUT
+        );
+    }
+
     // ─── SC-D-001 / SC-D-002: mdns.shutdown() MUST be called AFTER run_frame_loop ──
 
     /// SC-D-001 — Sender thread: `mdns.shutdown()` must be called AFTER `run_frame_loop`
