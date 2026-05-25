@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use screen_mirror_lib::commands::sender::{
     BundleError, ChannelLike, SenderBridge, SenderBuilderFn, SenderBundle, SenderCoordinatorHooks,
-    SenderCounters, make_sender_rebuild_hook, retry_session_inner,
+    SenderCounters, SenderSession, make_sender_rebuild_hook, retry_session_inner,
     run_sender_transport_event_drain_with_supervisor_custom,
     run_sender_transport_event_drain_with_supervisor_custom_and_hooks, start_sender_inner,
     stop_sender_session,
@@ -528,6 +528,9 @@ fn raw_logs_contain(val: &str) -> bool {
 
 /// SC-6 Gate A (REQ-SSRL-9): When stop flag is set BEFORE rebuild starts,
 /// a warn-level event with target "sender-rebuild", gate="A", and attempt field MUST fire.
+///
+/// Fixture: stop_flag pre-set true before hook invocation → Gate A check fires immediately.
+/// Verified by WARNING-2 fix (batch 2): asserts structured gate="A" field, not just message.
 #[traced_test]
 #[test]
 fn rebuild_gate_a_abort_emits_warn_sc6() {
@@ -536,17 +539,14 @@ fn rebuild_gate_a_abort_emits_warn_sc6() {
     let ch = FakeJsonChannel::new();
     let stop_flag = Arc::new(AtomicBool::new(true)); // pre-set → Gate A fires
     let bridge_cache = Arc::new(Mutex::new(Some(make_test_restart_cache(ch.clone()))));
-    let bridge_session: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
-        Arc::new(Mutex::new(None));
+    let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(None));
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
-    let builder: SenderBuilderFn =
-        Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub()));
+    let builder: SenderBuilderFn = Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub()));
 
     let hook = make_sender_rebuild_hook(builder, bridge_cache, bridge_session, stop_flag, 1);
     (hook)(sig_tx);
 
-    // Wait for RebuildFailed signal to confirm hook completed.
     sig_rx
         .recv_timeout(Duration::from_millis(500))
         .expect("RebuildFailed must arrive");
@@ -559,61 +559,88 @@ fn rebuild_gate_a_abort_emits_warn_sc6() {
         raw_logs_contain("rebuild aborted: stop flag set before work began"),
         "expected Gate A abort message"
     );
+    // WARNING-2 fix: assert the structured gate field so each gate test is distinct.
+    assert!(
+        raw_logs_contain("gate=\"A\""),
+        "expected structured gate=\"A\" field in warn event"
+    );
 }
 
 /// SC-6 Gate B (REQ-SSRL-9): stop flag set AFTER teardown (Gate B).
+///
+/// Fixture (WARNING-1 fix, batch 2): inject a SenderSession whose shutdown closure
+/// atomically sets old_stop_flag, so:
+///   Gate A check: flag false → passes
+///   Teardown runs shutdown closure → sets flag true
+///   Gate B check: flag true → fires
+///
+/// This replaces the previous fixture that pre-set the flag before the hook ran
+/// (which caused Gate A to fire instead of Gate B).
 #[traced_test]
 #[test]
 fn rebuild_gate_b_abort_emits_warn_sc6() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let ch = FakeJsonChannel::new();
-    // Stop flag NOT set initially; set it from a separate thread after a short delay
-    // so Gate A passes but Gate B fires (stop arrives during teardown window).
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_setter = stop_flag.clone();
-
+    let stop_flag = Arc::new(AtomicBool::new(false)); // starts false → Gate A passes
     let bridge_cache = Arc::new(Mutex::new(Some(make_test_restart_cache(ch.clone()))));
-    // No session to tear down — teardown is near-instant; set stop before Gate B.
-    let bridge_session: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
-        Arc::new(Mutex::new(None));
 
-    // Set stop flag immediately from test thread before hook runs Gate B.
-    // The hook runs Gate A (passes, flag is false at that moment via Relaxed),
-    // then tears down session (instant, no session), then checks Gate B.
-    // We race the flag set — to guarantee Gate B fires, set flag AFTER Gate A check.
-    // Simplest approach: use a builder that sets the flag before returning.
-    let stop_flag_in_builder = stop_flag.clone();
-    let builder: SenderBuilderFn =
-        Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
-            // This should not be called for Gate B — stop flag set before builder.
-            stop_flag_in_builder.store(true, Ordering::Relaxed);
-            Ok(SenderBundle::test_stub())
-        });
+    // Inject a session whose shutdown closure sets the stop flag.
+    // Teardown runs s.shutdown.take()() → sets flag → Gate B sees it true.
+    let stop_flag_for_shutdown = stop_flag.clone();
+    let session = SenderSession::new(
+        stop_flag.clone(),
+        vec![],
+        ch.clone() as Arc<dyn ChannelLike>,
+        Arc::new(SenderCounters::default()),
+        Some(Box::new(move || {
+            stop_flag_for_shutdown.store(true, Ordering::SeqCst);
+        })),
+        "sw_fake".to_string(),
+    );
+    let bridge_session: Arc<Mutex<Option<SenderSession>>> =
+        Arc::new(Mutex::new(Some(session)));
 
-    // Set stop flag BEFORE invoking hook so Gate B fires reliably.
-    stop_flag_setter.store(true, Ordering::SeqCst);
+    // Builder must NOT be called (Gate B fires before builder).
+    let builder: SenderBuilderFn = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+        panic!("Gate B: builder must not be called");
+    });
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
+    // Spawn hook on separate thread and join — ensures worker thread finishes
+    // before we read raw_logs_contain (which reads global tracing buffer).
     let hook = make_sender_rebuild_hook(builder, bridge_cache, bridge_session, stop_flag, 2);
-    (hook)(sig_tx);
+    let hook_handle = std::thread::Builder::new()
+        .name("test-hook-gate-b".into())
+        .spawn(move || hook(sig_tx))
+        .expect("failed to spawn hook thread");
 
     sig_rx
         .recv_timeout(Duration::from_millis(500))
         .expect("RebuildFailed must arrive");
 
+    hook_handle.join().expect("hook thread must not panic");
+
     assert!(
         raw_logs_contain("sender-rebuild"),
-        "expected target=sender-rebuild"
+        "expected target=sender-rebuild in warn event"
     );
-    // Gate A or B fires — both emit warn with target sender-rebuild.
     assert!(
-        raw_logs_contain("rebuild aborted"),
-        "expected rebuild aborted message"
+        raw_logs_contain("rebuild aborted: stop flag set after teardown"),
+        "expected Gate B abort message"
+    );
+    // WARNING-1+2 fix: assert the structured gate field to prove Gate B (not A) fired.
+    assert!(
+        raw_logs_contain("gate=\"B\""),
+        "expected structured gate=\"B\" field — verifies fixture actually triggers Gate B"
     );
 }
 
 /// SC-6 Gate C (REQ-SSRL-9): stop flag set AFTER build succeeds (Gate C).
+///
+/// Fixture: builder sets stop_flag during build → Gate C check (after builder returns)
+/// sees it true. This fixture was always correct; batch 2 adds the gate="C" assertion
+/// (WARNING-2 fix).
 #[traced_test]
 #[test]
 fn rebuild_gate_c_abort_emits_warn_sc6() {
@@ -623,15 +650,14 @@ fn rebuild_gate_c_abort_emits_warn_sc6() {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_in_builder = stop_flag.clone();
     let bridge_cache = Arc::new(Mutex::new(Some(make_test_restart_cache(ch.clone()))));
-    let bridge_session: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
-        Arc::new(Mutex::new(None));
+    let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(None));
 
-    // Builder sets stop flag to simulate stop arriving AFTER build completes (Gate C).
-    let builder: SenderBuilderFn =
-        Arc::new(move |_, _, _, _| {
-            stop_flag_in_builder.store(true, Ordering::SeqCst);
-            Ok(SenderBundle::test_stub())
-        });
+    // Builder sets stop flag while running → Gate C (after-build check) fires.
+    // Gate A and Gate B pass (flag false at those checkpoints).
+    let builder: SenderBuilderFn = Arc::new(move |_, _, _, _| {
+        stop_flag_in_builder.store(true, Ordering::SeqCst);
+        Ok(SenderBundle::test_stub())
+    });
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
     let hook = make_sender_rebuild_hook(builder, bridge_cache, bridge_session, stop_flag, 3);
@@ -643,55 +669,106 @@ fn rebuild_gate_c_abort_emits_warn_sc6() {
 
     assert!(
         raw_logs_contain("sender-rebuild"),
-        "expected target=sender-rebuild"
+        "expected target=sender-rebuild in warn event"
     );
     assert!(
-        raw_logs_contain("rebuild aborted"),
-        "expected rebuild aborted message"
+        raw_logs_contain("rebuild aborted: stop flag set after build"),
+        "expected Gate C abort message"
+    );
+    // WARNING-2 fix: assert the structured gate field.
+    assert!(
+        raw_logs_contain("gate=\"C\""),
+        "expected structured gate=\"C\" field in warn event"
     );
 }
 
-/// SC-6 Gate D (REQ-SSRL-9): stop flag set AFTER swap (Gate D).
+/// SC-6 Gate D (REQ-SSRL-9): stop flag set AFTER session swap (Gate D).
+///
+/// Fixture (WARNING-1 fix, batch 2): controlled-timing via blocking builder +
+/// bridge_session lock held by test thread. Sequence:
+///   1. Builder signals "started" then blocks on release_rx.
+///   2. Test waits for builder_started, then holds bridge_session.lock().
+///   3. Test releases builder (flag still false → Gate C passes).
+///   4. Test sets stop_flag=true while still holding bridge_session lock.
+///   5. Test drops lock → worker proceeds to swap (step 11) → Gate D fires.
+///
+/// This is deterministic: the swap at step 11 blocks until the test drops the lock,
+/// by which time stop_flag is true → Gate D always fires, Gate C never does.
+///
+/// This replaces the previous fixture that set the flag inside the builder, which
+/// caused Gate C (not Gate D) to fire.
 #[traced_test]
 #[test]
 fn rebuild_gate_d_abort_emits_warn_sc6() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let ch = FakeJsonChannel::new();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_in_builder = stop_flag.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false)); // starts false
     let bridge_cache = Arc::new(Mutex::new(Some(make_test_restart_cache(ch.clone()))));
-    let bridge_session: Arc<Mutex<Option<screen_mirror_lib::commands::sender::SenderSession>>> =
-        Arc::new(Mutex::new(None));
+    let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(None));
 
-    // Builder sets stop flag — but just AFTER the check in Gate C (after the swap check).
-    // Since test stub builds instantly and Gate C checks the flag after build,
-    // we need to set the flag during the builder AND make Gate C pass by unsetting it,
-    // then set it again for Gate D. Simplest: set stop flag only ONCE; Gate C or D fires.
-    let builder: SenderBuilderFn =
-        Arc::new(move |_, _, _, _| {
-            // The stop_flag check for Gate C happens BEFORE swap, AFTER build.
-            // By setting stop_flag here, the earliest gate to fire may be C or D.
-            // This test is satisfied if ANY gate fires after a successful build.
-            stop_flag_in_builder.store(true, Ordering::SeqCst);
-            Ok(SenderBundle::test_stub())
-        });
+    // Two-channel builder: signals "started", then blocks until test releases.
+    let (builder_started_tx, builder_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+
+    let builder: SenderBuilderFn = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+        let _ = builder_started_tx.send(());
+        let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        Ok(SenderBundle::test_stub())
+    });
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
-    let hook = make_sender_rebuild_hook(builder, bridge_cache, bridge_session, stop_flag, 4);
-    (hook)(sig_tx);
+    let hook = make_sender_rebuild_hook(
+        builder,
+        bridge_cache,
+        bridge_session.clone(),
+        stop_flag.clone(),
+        4,
+    );
+    let hook_handle = std::thread::Builder::new()
+        .name("test-hook-gate-d".into())
+        .spawn(move || hook(sig_tx))
+        .expect("failed to spawn hook thread");
+
+    // Wait for builder to start (Gates A, B passed; step 6 teardown is done).
+    builder_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("builder must start within 5s");
+
+    // Hold bridge_session lock so the swap at step 11 blocks after builder returns.
+    let guard = bridge_session.lock().unwrap();
+
+    // Release builder — stop_flag still false → Gate C check passes.
+    let _ = release_tx.send(());
+
+    // Give worker ~5ms to: receive release, pass Gate C, block on bridge_session.lock().
+    std::thread::sleep(Duration::from_millis(5));
+
+    // Set stop_flag=true while worker is blocked waiting for bridge_session lock.
+    stop_flag.store(true, Ordering::SeqCst);
+
+    // Release lock → worker swaps (step 11), hits Gate D (flag true) → RebuildFailed.
+    drop(guard);
 
     sig_rx
         .recv_timeout(Duration::from_millis(500))
         .expect("RebuildFailed must arrive");
 
+    hook_handle.join().expect("hook thread must not panic");
+
     assert!(
         raw_logs_contain("sender-rebuild"),
-        "expected target=sender-rebuild"
+        "expected target=sender-rebuild in warn event"
     );
     assert!(
-        raw_logs_contain("rebuild aborted"),
-        "expected rebuild aborted message"
+        raw_logs_contain("rebuild aborted: stop flag set after swap"),
+        "expected Gate D abort message"
+    );
+    // WARNING-1+2 fix: assert the structured gate field to prove Gate D (not C) fired.
+    assert!(
+        raw_logs_contain("gate=\"D\""),
+        "expected structured gate=\"D\" field — verifies fixture actually triggers Gate D"
     );
 }
 
