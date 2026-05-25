@@ -492,8 +492,12 @@ fn run_sender_thread(
         }
     };
 
-    let _ = mdns.shutdown();
+    // D-8: mdns.shutdown() is called AFTER run_frame_loop returns so the mDNS service
+    // stays published throughout the entire TCP session. A reconnecting receiver can
+    // still discover the sender while streaming. When run_frame_loop exits (Bye, error,
+    // or stop_flag), shutdown() sends the goodbye packet to clean up the mDNS entry.
     run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    let _ = mdns.shutdown();
 }
 
 // ─── Receiver thread ──────────────────────────────────────────────────────────
@@ -571,17 +575,21 @@ fn run_receiver_thread(
             port: peer_port,
         },
     );
-    let _ = mdns.shutdown();
-
     let stream = match TcpStream::connect((peer_ip, peer_port)) {
         Ok(s) => s,
         Err(e) => {
             emit_error(&event_tx, SignalingError::Io(e.to_string()));
+            let _ = mdns.shutdown();
             return;
         }
     };
 
+    // D-8: mdns.shutdown() is called AFTER run_frame_loop returns so the mDNS service
+    // stays published throughout the entire TCP session. The mDNS entry remains active
+    // until the TCP session ends, ensuring a reconnecting sender can still be discovered
+    // by other receivers. Shutdown sends the goodbye packet to clean up the mDNS entry.
     run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    let _ = mdns.shutdown();
 }
 
 // ─── Shared TCP frame loop ────────────────────────────────────────────────────
@@ -1530,8 +1538,6 @@ mod tests {
             .find("fn run_sender_thread(")
             .expect("run_sender_thread must exist in mdns.rs");
         let sender_fn_end = {
-            // Find the next top-level function after run_sender_thread.
-            // run_receiver_thread starts the next section.
             source[sender_fn_start..]
                 .find("\nfn run_receiver_thread(")
                 .map(|rel| sender_fn_start + rel)
@@ -1539,22 +1545,27 @@ mod tests {
         };
         let sender_body = &source[sender_fn_start..sender_fn_end];
 
-        // Find the byte offsets of the key calls within the sender body.
+        // Use rfind for the LAST occurrence of mdns.shutdown() in the sender body.
+        // The early-exit shutdown calls (inside error branches) are NOT the main-path
+        // shutdown. The main-path shutdown is the one directly adjacent to run_frame_loop.
+        // rfind finds the LAST occurrence which should be the main-path one.
         let shutdown_pos = sender_body
-            .find("mdns.shutdown()")
+            .rfind("mdns.shutdown()")
             .expect("mdns.shutdown() must appear in run_sender_thread");
         let frame_loop_pos = sender_body
-            .find("run_frame_loop(")
+            .rfind("run_frame_loop(")
             .expect("run_frame_loop( must appear in run_sender_thread");
 
-        // SC-D-001 assertion: mdns.shutdown() must appear AFTER run_frame_loop.
-        // RED: current code has shutdown at L495 BEFORE run_frame_loop at L496
-        //      → shutdown_pos < frame_loop_pos → test FAILS.
-        // GREEN (T05): shutdown moved to AFTER run_frame_loop → shutdown_pos > frame_loop_pos.
+        // SC-D-001 assertion: the main-path mdns.shutdown() MUST appear AFTER run_frame_loop.
+        // RED: current code has shutdown at L495 BEFORE run_frame_loop at L496.
+        //      With the early-exit shutdowns present, rfind still finds the main-path
+        //      shutdown. In BROKEN state, the main-path shutdown is BEFORE run_frame_loop.
+        // GREEN (T05): main-path shutdown moved to AFTER run_frame_loop.
         assert!(
             shutdown_pos > frame_loop_pos,
-            "SC-D-001 FAIL: in run_sender_thread, mdns.shutdown() (byte offset {shutdown_pos}) \
-             appears BEFORE run_frame_loop (byte offset {frame_loop_pos}). \
+            "SC-D-001 FAIL: in run_sender_thread, the main-path mdns.shutdown() \
+             (last occurrence, byte offset {shutdown_pos}) appears BEFORE run_frame_loop \
+             (last occurrence, byte offset {frame_loop_pos}). \
              Fix (D-8): move `let _ = mdns.shutdown();` to AFTER `run_frame_loop(...)` \
              so the mDNS service stays published during the entire TCP session."
         );
@@ -1581,7 +1592,6 @@ mod tests {
             .find("fn run_receiver_thread(")
             .expect("run_receiver_thread must exist in mdns.rs");
         let receiver_fn_end = {
-            // Shared frame loop section starts next.
             source[receiver_fn_start..]
                 .find("\n// ─── Shared TCP frame loop")
                 .map(|rel| receiver_fn_start + rel)
@@ -1589,21 +1599,22 @@ mod tests {
         };
         let receiver_body = &source[receiver_fn_start..receiver_fn_end];
 
+        // Use rfind: the main-path shutdown is the LAST occurrence (after run_frame_loop).
         let shutdown_pos = receiver_body
-            .find("mdns.shutdown()")
+            .rfind("mdns.shutdown()")
             .expect("mdns.shutdown() must appear in run_receiver_thread");
         let frame_loop_pos = receiver_body
-            .find("run_frame_loop(")
+            .rfind("run_frame_loop(")
             .expect("run_frame_loop( must appear in run_receiver_thread");
 
-        // SC-D-002 assertion: mdns.shutdown() must appear AFTER run_frame_loop.
-        // RED: current code has shutdown at L574 BEFORE run_frame_loop at L584
-        //      → shutdown_pos < frame_loop_pos → test FAILS.
+        // SC-D-002 assertion: main-path mdns.shutdown() MUST appear AFTER run_frame_loop.
+        // RED: current code has shutdown at L574 BEFORE run_frame_loop at L584.
         // GREEN (T05): shutdown moved to AFTER run_frame_loop.
         assert!(
             shutdown_pos > frame_loop_pos,
-            "SC-D-002 FAIL: in run_receiver_thread, mdns.shutdown() (byte offset {shutdown_pos}) \
-             appears BEFORE run_frame_loop (byte offset {frame_loop_pos}). \
+            "SC-D-002 FAIL: in run_receiver_thread, the main-path mdns.shutdown() \
+             (last occurrence, byte offset {shutdown_pos}) appears BEFORE run_frame_loop \
+             (last occurrence, byte offset {frame_loop_pos}). \
              Fix (D-8): move `let _ = mdns.shutdown();` to AFTER `run_frame_loop(...)` \
              so the mDNS service stays published during the entire TCP session."
         );
