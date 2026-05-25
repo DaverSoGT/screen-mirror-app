@@ -6540,4 +6540,160 @@ mod tests {
         // If send_result.is_err(): drain already exited (stop_flag=true, outer check
         // fired first). Channel was already closed. Spec-compliant — no assertion.
     }
+
+    // ─── SC-RBL-4: receiver bundle bridge Arc smoke (PQ-E lock) ──────────────────
+    //
+    // REQ-RBL-4: build_production_bundle (receiver) already passes the bridge-level
+    // supervisor_signal_tx Arc to both the transport drain and the signaling drain.
+    // This was confirmed by explore §8 Q4; no code change needed.
+    //
+    // The receiver's architecture: StreamBridge::new() creates the supervisor_signal_tx
+    // Arc and CAPTURES it in the production builder closure (NOT passed as a BuilderFn
+    // parameter — the closure captures it directly). This is the correct design:
+    //
+    //   let sup_tx = Arc::new(Mutex::new(None));                    ← bridge's Arc
+    //   let sup_tx_for_builder = sup_tx.clone();                    ← same Arc
+    //   builder = Arc::new(move |...| {
+    //       build_production_bundle(..., sup_tx_for_builder.clone()) ← bridge Arc passed to drain
+    //   });
+    //   Self::new_with_builder_and_arcs(builder, ..., sup_tx)       ← bridge stores the SAME Arc
+    //
+    // SC-RBL-4 tests this invariant: a fake builder that captures the bridge's
+    // supervisor_signal_tx Arc will confirm they are the same pointer (ptr_eq).
+    //
+    // If this FAILS, it means the bridge's supervisor_signal_tx diverged from what the
+    // drain received — same Bug #1 pattern as the sender — and receiver fix ESCALATES.
+
+    /// SC-RBL-4 — Receiver bridge Arc smoke: `stop_stream_session_internal` reaches
+    ///             the supervisor via `bridge.supervisor_signal_tx` (PQ-E, REQ-RBL-4).
+    ///
+    /// GIVEN: A StreamBridge where the builder CAPTURES the bridge's supervisor_signal_tx
+    ///        and writes the supervisor's signal_tx into it (correct pattern).
+    /// WHEN:  stop_stream_session is called.
+    /// THEN:  The supervisor drain receives Stop and the session joins cleanly.
+    ///        Arc::ptr_eq(bridge.supervisor_signal_tx, captured_arc) is true.
+    #[test]
+    fn sc_rbl_4_receiver_bridge_supervisor_signal_tx_arc_identity_smoke() {
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{SyncSender, sync_channel};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Create the shared bridge Arc BEFORE the bridge, so the fake builder can
+        // capture it — same pattern as StreamBridge::new() in production.
+        let shared_sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let sup_tx_for_builder = shared_sup_tx.clone();
+
+        // Supervisor signal channel.
+        let (fake_sup_tx, fake_sup_rx) = sync_channel::<SupervisorSignal>(4);
+        // Wrap both tx and rx in Mutex<Option<_>> so the builder closure is Sync.
+        let fake_sup_tx_cell: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(fake_sup_tx)));
+        let fake_sup_rx_cell: Arc<Mutex<Option<std::sync::mpsc::Receiver<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(fake_sup_rx)));
+
+        let stop_received = Arc::new(AtomicBool::new(false));
+        let stop_recv_clone = stop_received.clone();
+
+        // Wrap pkt_rx in a cell for one-shot take inside the builder.
+        let (pkt_tx, pkt_rx) = sync_channel::<sm_domain::encode::EncodedPacket>(1);
+        let pkt_rx_cell: Arc<
+            Mutex<Option<std::sync::mpsc::Receiver<sm_domain::encode::EncodedPacket>>>,
+        > = Arc::new(Mutex::new(Some(pkt_rx)));
+
+        let builder: super::BuilderFn = Arc::new(move |_bind_ctx, _port, _svc, _sf, _ch| {
+            // Write the fake supervisor's tx into the SHARED bridge Arc.
+            // (In production, enter_supervisor_mode does this.)
+            let fake_tx = fake_sup_tx_cell
+                .lock()
+                .unwrap()
+                .take()
+                .expect("SC-RBL-4: builder called more than once");
+            *sup_tx_for_builder.lock().unwrap() = Some(fake_tx.clone());
+
+            // Take the rx out of the cell (builder called once).
+            let fake_rx = fake_sup_rx_cell
+                .lock()
+                .unwrap()
+                .take()
+                .expect("SC-RBL-4: sup_rx already taken");
+
+            // Spawn a fake "drain" that receives Stop and sets stop_received.
+            // NOTE: recv BEFORE checking stop_flag — stop_stream_session_internal
+            // sends Stop first (step 0), then sets stop_flag (step 2), then joins.
+            // If we checked stop_flag first, we'd exit the loop before receiving Stop.
+            let stop_clone = stop_recv_clone.clone();
+            let drain = std::thread::Builder::new()
+                .name("sc-rbl-4-drain".into())
+                .spawn(move || {
+                    loop {
+                        match fake_rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(SupervisorSignal::Stop) => {
+                                stop_clone.store(true, Ordering::Release);
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(_) => break, // channel closed or timeout — exit
+                        }
+                    }
+                })
+                .unwrap();
+
+            let pkt_rx_taken = pkt_rx_cell
+                .lock()
+                .unwrap()
+                .take()
+                .expect("SC-RBL-4: pkt_rx already taken");
+
+            Ok(super::ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx: pkt_rx_taken,
+                signaling: None,
+                drain_handles: vec![drain],
+                _drain_senders: vec![],
+            })
+        });
+
+        // Build bridge with the SAME shared_sup_tx.
+        let bridge =
+            super::StreamBridge::new_with_builder_and_sup_tx(builder, shared_sup_tx.clone());
+
+        // SC-RBL-4 key assertion: bridge.supervisor_signal_tx IS shared_sup_tx (ptr_eq).
+        assert!(
+            Arc::ptr_eq(&bridge.supervisor_signal_tx, &shared_sup_tx),
+            "SC-RBL-4: bridge.supervisor_signal_tx MUST be the same Arc as shared_sup_tx — \
+             PQ-E receiver bridge Arc identity violated"
+        );
+
+        struct FakeCh4;
+        impl super::ChannelLike for FakeCh4 {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let ch: Arc<dyn super::ChannelLike> = Arc::new(FakeCh4);
+
+        let port = pick_free_udp_port();
+        super::start_stream_inner(
+            &bridge,
+            ch,
+            Some(port),
+            Some("_sc-rbl-4._tcp.local.".to_string()),
+        )
+        .expect("SC-RBL-4: start_stream_inner must succeed");
+
+        // WHEN: stop_stream_session — sends Stop via bridge.supervisor_signal_tx.
+        super::stop_stream_session(&bridge);
+
+        // THEN: supervisor drain received Stop.
+        assert!(
+            stop_received.load(Ordering::Acquire),
+            "SC-RBL-4: supervisor MUST receive Stop via bridge Arc — \
+             receiver's stop_stream_session_internal did not reach the supervisor"
+        );
+
+        drop(pkt_tx);
+    }
 }

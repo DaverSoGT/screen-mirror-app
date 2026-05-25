@@ -15,8 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 use screen_mirror_lib::commands::sender::{
-    ChannelLike, SenderBridge, SenderBundle, SenderCoordinatorHooks, SenderCounters,
-    make_sender_rebuild_hook, retry_session_inner,
+    ChannelLike, NoopSignalingRefresh, SenderBridge, SenderBundle, SenderCoordinatorHooks,
+    SenderCounters, SignalingSupervisorRefresh, make_sender_rebuild_hook, retry_session_inner,
     run_sender_transport_event_drain_with_supervisor_custom,
     run_sender_transport_event_drain_with_supervisor_custom_and_hooks, start_sender_inner,
     stop_sender_session,
@@ -720,7 +720,15 @@ fn make_supervised_bridge_with_rebuild_hook(
                 .name("supervised-drain-v2".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, ack_t, rebuild_t, hooks,
+                        ev_rx,
+                        stop_flag,
+                        channel,
+                        st,
+                        p,
+                        ack_t,
+                        rebuild_t,
+                        hooks,
+                        Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                     );
                 })
                 .expect("spawn drain");
@@ -900,7 +908,15 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 .name("failing-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        ev_rx,
+                        stop_flag,
+                        channel,
+                        st,
+                        p,
+                        t,
+                        t,
+                        hooks,
+                        Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                     );
                 })
                 .expect("spawn");
@@ -1228,6 +1244,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                             t,
                             t,
                             hooks,
+                            Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                         );
                     })
                     .expect("spawn drain");
@@ -1489,7 +1506,15 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                 .name("t6-1-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        ev_rx,
+                        stop_flag,
+                        channel,
+                        st,
+                        p,
+                        t,
+                        t,
+                        hooks,
+                        Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                     );
                 })
                 .expect("spawn drain");

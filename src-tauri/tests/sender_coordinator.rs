@@ -23,9 +23,9 @@ use std::thread;
 use std::time::Duration;
 
 use screen_mirror_lib::commands::sender::{
-    ChannelLike, SenderBridge, SenderBundle, SenderCoordinatorHooks,
-    run_sender_transport_event_drain_with_supervisor_custom_and_hooks, start_sender_inner,
-    stop_sender_session,
+    ChannelLike, NoopSignalingRefresh, SenderBridge, SenderBundle, SenderCoordinatorHooks,
+    SignalingSupervisorRefresh, run_sender_transport_event_drain_with_supervisor_custom_and_hooks,
+    start_sender_inner, stop_sender_session,
 };
 use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
 use sm_domain::supervisor::SupervisorSignal;
@@ -184,7 +184,15 @@ fn make_bridge_with_counting_hooks(
                 .name("coord-test-drain".into())
                 .spawn(move || {
                     run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        ev_rx,
+                        stop_flag,
+                        channel,
+                        st,
+                        p,
+                        t,
+                        t,
+                        hooks,
+                        Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                     );
                 })
                 .expect("spawn drain");
