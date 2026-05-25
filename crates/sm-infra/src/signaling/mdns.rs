@@ -1554,10 +1554,9 @@ mod tests {
     fn sender_mdns_shutdown_happens_after_frame_loop() {
         // Read the source file (relative to the manifest directory at test time).
         // `CARGO_MANIFEST_DIR` is set by Cargo for all crate-level tests.
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR must be set by Cargo");
-        let source_path = std::path::PathBuf::from(&manifest_dir)
-            .join("src/signaling/mdns.rs");
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/signaling/mdns.rs");
         let source =
             std::fs::read_to_string(&source_path).expect("mdns.rs must be readable in tests");
 
@@ -1608,10 +1607,9 @@ mod tests {
     /// GREEN (T05): shutdown moved to after `run_frame_loop`.
     #[test]
     fn receiver_mdns_shutdown_happens_after_frame_loop() {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR must be set by Cargo");
-        let source_path = std::path::PathBuf::from(&manifest_dir)
-            .join("src/signaling/mdns.rs");
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/signaling/mdns.rs");
         let source =
             std::fs::read_to_string(&source_path).expect("mdns.rs must be readable in tests");
 

@@ -5198,7 +5198,7 @@ mod tests {
     #[test]
     fn sc_f_001_initiate_mdns_reset_spawns_consumer_for_new_sig_ev_rx() {
         use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
-        use std::sync::mpsc::{sync_channel, TrySendError};
+        use std::sync::mpsc::{TrySendError, sync_channel};
 
         // ── SpySignaling: captures the sig_ev_tx passed to start() ──
         // Shared via Arc<Mutex<Option<SyncSender<_>>>> so the test can retrieve it.
@@ -5209,7 +5209,9 @@ mod tests {
             fn new_arc(
                 capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
             ) -> Arc<Mutex<Self>> {
-                Arc::new(Mutex::new(Self { captured_tx: capture }))
+                Arc::new(Mutex::new(Self {
+                    captured_tx: capture,
+                }))
             }
         }
         // We need to call stop/start on it, but via Arc<Mutex<>> — use a simple trait.
@@ -5218,7 +5220,9 @@ mod tests {
             fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String>;
         }
         impl SpySignalingOps for SpySignaling {
-            fn stop_spy(&mut self) -> Result<(), String> { Ok(()) }
+            fn stop_spy(&mut self) -> Result<(), String> {
+                Ok(())
+            }
             fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String> {
                 *self.captured_tx.lock().unwrap() = Some(tx);
                 Ok(())
@@ -5231,7 +5235,9 @@ mod tests {
         }
         impl SpyReceiver {
             fn new_arc(counter: Arc<Mutex<u32>>) -> Arc<Self> {
-                Arc::new(Self { offer_count: counter })
+                Arc::new(Self {
+                    offer_count: counter,
+                })
             }
         }
         impl SignalingReceiverOps for SpyReceiver {
