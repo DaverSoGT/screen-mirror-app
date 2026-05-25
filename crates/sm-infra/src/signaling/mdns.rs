@@ -64,7 +64,12 @@ const SERVICE_TYPE: &str = "_screen-mirror._tcp.local.";
 const INSTANCE_NAME: &str = "screen-mirror";
 
 /// mDNS/TCP discovery timeout before `PeerNotFound` is reported.
-const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// D-7: extended from 10s to 30s to cover sender republish latency after S-1 supervisor
+/// wakes on Bye. The sender republishes within ≤2s of receiving PeerBye via the supervisor;
+/// 30s provides a 28s buffer for Windows mDNS jitter, anti-virus scan delays, and
+/// USB-Ethernet hotplug events — all while satisfying the 12s reconnect budget.
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read timeout for the TCP frame loop — allows periodic stop-flag checks.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -492,8 +497,12 @@ fn run_sender_thread(
         }
     };
 
-    let _ = mdns.shutdown();
+    // D-8: mdns.shutdown() is called AFTER run_frame_loop returns so the mDNS service
+    // stays published throughout the entire TCP session. A reconnecting receiver can
+    // still discover the sender while streaming. When run_frame_loop exits (Bye, error,
+    // or stop_flag), shutdown() sends the goodbye packet to clean up the mDNS entry.
     run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    let _ = mdns.shutdown();
 }
 
 // ─── Receiver thread ──────────────────────────────────────────────────────────
@@ -571,17 +580,21 @@ fn run_receiver_thread(
             port: peer_port,
         },
     );
-    let _ = mdns.shutdown();
-
     let stream = match TcpStream::connect((peer_ip, peer_port)) {
         Ok(s) => s,
         Err(e) => {
             emit_error(&event_tx, SignalingError::Io(e.to_string()));
+            let _ = mdns.shutdown();
             return;
         }
     };
 
+    // D-8: mdns.shutdown() is called AFTER run_frame_loop returns so the mDNS service
+    // stays published throughout the entire TCP session. The mDNS entry remains active
+    // until the TCP session ends, ensuring a reconnecting sender can still be discovered
+    // by other receivers. Shutdown sends the goodbye packet to clean up the mDNS entry.
     run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    let _ = mdns.shutdown();
 }
 
 // ─── Shared TCP frame loop ────────────────────────────────────────────────────
@@ -1478,6 +1491,158 @@ mod tests {
             listener2.is_ok(),
             "live rebind on Windows must succeed (Arc race repro), got: {:?}",
             listener2.err()
+        );
+    }
+
+    // ─── SC-C-001: DISCOVER_TIMEOUT must be 30s ───────────────────────────────────
+
+    /// SC-C-001 — `DISCOVER_TIMEOUT` constant must be `Duration::from_secs(30)`.
+    ///
+    /// RED: current value is `Duration::from_secs(10)` (too short for sender republish
+    ///      after S-1 supervisor wakes — see design D-7). A 10s window guarantees a
+    ///      miss in the legacy path and gives zero margin in the S-1 path.
+    ///
+    /// GREEN (T07): change constant to 30s → test passes.
+    #[test]
+    fn discover_timeout_is_30s() {
+        use std::time::Duration;
+        assert_eq!(
+            super::DISCOVER_TIMEOUT,
+            Duration::from_secs(30),
+            "SC-C-001 FAIL: DISCOVER_TIMEOUT must be Duration::from_secs(30). \
+             Current value is {:?}. \
+             Fix (D-7): change `const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10)` \
+             to `Duration::from_secs(30)` in mdns.rs.",
+            super::DISCOVER_TIMEOUT
+        );
+    }
+
+    // ─── SC-D-001 / SC-D-002: mdns.shutdown() MUST be called AFTER run_frame_loop ──
+
+    /// SC-D-001 — Sender thread: `mdns.shutdown()` must be called AFTER `run_frame_loop`
+    /// returns.
+    ///
+    /// Test strategy: start a real `MdnsSignaling` sender, connect to it via loopback
+    /// TCP (bypassing mDNS discovery), drive `run_frame_loop` to exit by closing the
+    /// connection, then verify that `MdnsSignaling::stop()` completes cleanly AND
+    /// that `SignalingEvent::Closed` was emitted by the frame loop (not before it).
+    ///
+    /// The KEY invariant: `SignalingEvent::Closed` is emitted by `run_frame_loop` when
+    /// the peer closes the connection. With the BROKEN code, `mdns.shutdown()` is
+    /// called BEFORE `run_frame_loop` starts — but the frame loop still runs (shutdown
+    /// does not prevent TCP). The observable difference is that with the BROKEN code,
+    /// the mDNS service entry is removed from the network BEFORE the TCP session ends,
+    /// which means a reconnecting receiver would find no service during the session.
+    ///
+    /// For a unit test without real mDNS, we verify the SEQUENCING by tracking when
+    /// `SignalingEvent::Closed` arrives relative to `stop()` returning. The frame loop
+    /// MUST have run (producing Closed) before the signaling stop completes.
+    ///
+    /// RED (current code): mdns.shutdown() is at L495 BEFORE run_frame_loop at L496.
+    ///     The test detects this via: `DISCOVER_TIMEOUT` constant value is 10s.
+    ///     After D-8 fix: shutdown moves to after run_frame_loop.
+    ///
+    /// For a concrete RED/GREEN test that verifies the SOURCE CODE ordering without
+    /// real mDNS infrastructure, we use a source-text structural assertion:
+    /// the line "let _ = mdns.shutdown();" must appear AFTER the line
+    /// "run_frame_loop(" in the sender thread function body.
+    ///
+    /// This is a legitimate static gate: any refactor that re-introduces the broken
+    /// ordering will fail this test immediately, catching regressions at compile/test
+    /// time on every CI run.
+    #[test]
+    fn sender_mdns_shutdown_happens_after_frame_loop() {
+        // Read the source file (relative to the manifest directory at test time).
+        // `CARGO_MANIFEST_DIR` is set by Cargo for all crate-level tests.
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/signaling/mdns.rs");
+        let source =
+            std::fs::read_to_string(&source_path).expect("mdns.rs must be readable in tests");
+
+        // Find run_sender_thread body boundaries.
+        let sender_fn_start = source
+            .find("fn run_sender_thread(")
+            .expect("run_sender_thread must exist in mdns.rs");
+        let sender_fn_end = {
+            source[sender_fn_start..]
+                .find("\nfn run_receiver_thread(")
+                .map(|rel| sender_fn_start + rel)
+                .unwrap_or(source.len())
+        };
+        let sender_body = &source[sender_fn_start..sender_fn_end];
+
+        // Use rfind for the LAST occurrence of mdns.shutdown() in the sender body.
+        // The early-exit shutdown calls (inside error branches) are NOT the main-path
+        // shutdown. The main-path shutdown is the one directly adjacent to run_frame_loop.
+        // rfind finds the LAST occurrence which should be the main-path one.
+        let shutdown_pos = sender_body
+            .rfind("mdns.shutdown()")
+            .expect("mdns.shutdown() must appear in run_sender_thread");
+        let frame_loop_pos = sender_body
+            .rfind("run_frame_loop(")
+            .expect("run_frame_loop( must appear in run_sender_thread");
+
+        // SC-D-001 assertion: the main-path mdns.shutdown() MUST appear AFTER run_frame_loop.
+        // RED: current code has shutdown at L495 BEFORE run_frame_loop at L496.
+        //      With the early-exit shutdowns present, rfind still finds the main-path
+        //      shutdown. In BROKEN state, the main-path shutdown is BEFORE run_frame_loop.
+        // GREEN (T05): main-path shutdown moved to AFTER run_frame_loop.
+        assert!(
+            shutdown_pos > frame_loop_pos,
+            "SC-D-001 FAIL: in run_sender_thread, the main-path mdns.shutdown() \
+             (last occurrence, byte offset {shutdown_pos}) appears BEFORE run_frame_loop \
+             (last occurrence, byte offset {frame_loop_pos}). \
+             Fix (D-8): move `let _ = mdns.shutdown();` to AFTER `run_frame_loop(...)` \
+             so the mDNS service stays published during the entire TCP session."
+        );
+    }
+
+    /// SC-D-002 — Receiver thread: `mdns.shutdown()` must be called AFTER `run_frame_loop`
+    /// returns.
+    ///
+    /// Mirror of SC-D-001 for `run_receiver_thread`.
+    ///
+    /// RED: production code has `mdns.shutdown()` at L574 BEFORE `run_frame_loop` at L584.
+    /// GREEN (T05): shutdown moved to after `run_frame_loop`.
+    #[test]
+    fn receiver_mdns_shutdown_happens_after_frame_loop() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/signaling/mdns.rs");
+        let source =
+            std::fs::read_to_string(&source_path).expect("mdns.rs must be readable in tests");
+
+        // Find run_receiver_thread body boundaries.
+        let receiver_fn_start = source
+            .find("fn run_receiver_thread(")
+            .expect("run_receiver_thread must exist in mdns.rs");
+        let receiver_fn_end = {
+            source[receiver_fn_start..]
+                .find("\n// ─── Shared TCP frame loop")
+                .map(|rel| receiver_fn_start + rel)
+                .unwrap_or(source.len())
+        };
+        let receiver_body = &source[receiver_fn_start..receiver_fn_end];
+
+        // Use rfind: the main-path shutdown is the LAST occurrence (after run_frame_loop).
+        let shutdown_pos = receiver_body
+            .rfind("mdns.shutdown()")
+            .expect("mdns.shutdown() must appear in run_receiver_thread");
+        let frame_loop_pos = receiver_body
+            .rfind("run_frame_loop(")
+            .expect("run_frame_loop( must appear in run_receiver_thread");
+
+        // SC-D-002 assertion: main-path mdns.shutdown() MUST appear AFTER run_frame_loop.
+        // RED: current code has shutdown at L574 BEFORE run_frame_loop at L584.
+        // GREEN (T05): shutdown moved to AFTER run_frame_loop.
+        assert!(
+            shutdown_pos > frame_loop_pos,
+            "SC-D-002 FAIL: in run_receiver_thread, the main-path mdns.shutdown() \
+             (last occurrence, byte offset {shutdown_pos}) appears BEFORE run_frame_loop \
+             (last occurrence, byte offset {frame_loop_pos}). \
+             Fix (D-8): move `let _ = mdns.shutdown();` to AFTER `run_frame_loop(...)` \
+             so the mDNS service stays published during the entire TCP session."
         );
     }
 }

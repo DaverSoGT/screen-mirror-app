@@ -131,6 +131,11 @@ pub enum ReconnectTrigger {
         /// The peer's session nonce (used for race resolution).
         peer_nonce: u64,
     },
+    /// Remote peer sent a `SignalingFrame::Bye` (clean disconnect).
+    ///
+    /// Detected by `run_signaling_drain` receiving `SignalingEvent::Closed`
+    /// after the mDNS signaling thread observes the peer closing the TCP channel.
+    PeerBye,
 }
 
 // ─── ReconnectAttempt ─────────────────────────────────────────────────────────

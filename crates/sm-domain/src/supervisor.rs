@@ -490,6 +490,8 @@ fn dead_reason_for_trigger(trigger: &ReconnectTrigger) -> DeadReason {
         ReconnectTrigger::IceFailed => DeadReason::IceFailedRepeatedly,
         ReconnectTrigger::ConnectionLost { .. } => DeadReason::ConnectionLostRepeatedly,
         ReconnectTrigger::PeerRequested { .. } => DeadReason::IceFailedRepeatedly,
+        // PeerBye: peer disconnected cleanly; treat exhausted retries as signaling dead.
+        ReconnectTrigger::PeerBye => DeadReason::SignalingChannelDead,
     }
 }
 
