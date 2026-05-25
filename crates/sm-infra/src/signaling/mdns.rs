@@ -64,7 +64,12 @@ const SERVICE_TYPE: &str = "_screen-mirror._tcp.local.";
 const INSTANCE_NAME: &str = "screen-mirror";
 
 /// mDNS/TCP discovery timeout before `PeerNotFound` is reported.
-const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// D-7: extended from 10s to 30s to cover sender republish latency after S-1 supervisor
+/// wakes on Bye. The sender republishes within ≤2s of receiving PeerBye via the supervisor;
+/// 30s provides a 28s buffer for Windows mDNS jitter, anti-virus scan delays, and
+/// USB-Ethernet hotplug events — all while satisfying the 12s reconnect budget.
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read timeout for the TCP frame loop — allows periodic stop-flag checks.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
