@@ -870,14 +870,23 @@ pub struct ReceiverBundle {
 /// - `OfferReceived(offer)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
 /// - `CandidateReceived(c)` → `receiver.add_remote_candidate(c)`
 /// - `PeerFound` → log
-/// - `Closed` / `Error` → log + exit
+/// - `Closed` → forward `LocalFailure{PeerBye}` to supervisor (D-3, REQ-A) then exit
+/// - `Error` → log
 ///
 /// Exits when `stop_flag` is set or the event channel is disconnected.
+///
+/// # Parameters (D-3)
+/// The `supervisor_signal_tx` parameter (5th) receives `LocalFailure { trigger: PeerBye }`
+/// when `Closed` is observed. Best-effort `try_send` — the supervisor channel may be
+/// `None` (receiver lazy-init: set later) or full (capacity 16), but a Closed event
+/// means the peer has gone away so the forward is fire-and-forget. The drain exits
+/// immediately after forwarding regardless of whether the send succeeded.
 fn run_signaling_drain(
     ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
     receiver: Arc<dyn SignalingReceiverOps>,
     signaling: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -904,7 +913,16 @@ fn run_signaling_drain(
                     }
                 }
                 SignalingEvent::Closed => {
-                    eprintln!("[sm-signaling-drain] signaling closed");
+                    // D-3 (REQ-A): forward Closed → supervisor as LocalFailure{PeerBye}.
+                    // Best-effort: if the supervisor channel is None or full, we still exit.
+                    eprintln!(
+                        "[sm-signaling-drain] Closed → forwarding LocalFailure{{PeerBye}} to supervisor"
+                    );
+                    if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
+                        let _ = tx.try_send(SupervisorSignal::LocalFailure {
+                            trigger: ReconnectTrigger::PeerBye,
+                        });
+                    }
                     break;
                 }
                 SignalingEvent::Error(e) => {
@@ -1377,11 +1395,15 @@ pub(crate) fn build_signaling_config_for_receiver(
 /// - `recv_ops`: Arc to the `SignalingReceiverOps` for the new drain thread.
 /// - `sig_publish`: Arc to the `SignalingPublishOps` for the new drain thread.
 /// - `stop_flag`: Shared stop flag threaded through to the new drain thread.
+/// - `supervisor_signal_tx`: Arc shared with the new drain thread so a post-reset
+///   `Closed` event still wakes the supervisor (D-3, REQ-A — defense-in-depth for
+///   repeated resets within the same session).
 fn build_initiate_mdns_reset_hook<T>(
     sig_for_reset: Arc<Mutex<T>>,
     recv_ops: Arc<dyn SignalingReceiverOps>,
     sig_publish: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
 ) -> Arc<dyn Fn() + Send + Sync>
 where
     T: sm_domain::signaling::Signaling + 'static,
@@ -1412,6 +1434,7 @@ where
         let recv_clone = recv_ops.clone();
         let pub_clone = sig_publish.clone();
         let stop_clone = stop_flag.clone();
+        let sup_tx_clone = supervisor_signal_tx.clone(); // D-3: forward to new drain
 
         // Spawn the new drain thread consuming the fresh sig_ev_rx.
         // The handle is intentionally not joined — same lifecycle pattern as the
@@ -1419,7 +1442,7 @@ where
         if let Err(e) = std::thread::Builder::new()
             .name("sm-signaling-event-drain-reset".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone);
+                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone);
             })
         {
             eprintln!("[sm-stream-coord] failed to spawn reset drain thread: {e}");
@@ -1589,17 +1612,23 @@ fn build_production_bundle(
         ),
         // D-4 (GAP-F fix): delegate to the extracted helper so SC-F-002 can call
         // the SAME function with spy implementations (no real mDNS/UDP stack needed).
+        // D-3 (REQ-A): pass supervisor_signal_tx so each post-reset drain thread
+        // can also forward Closed → LocalFailure{PeerBye} to the supervisor.
         initiate_mdns_reset: build_initiate_mdns_reset_hook(
             sig_for_reset,
             recv_ops_for_reset_drain,
             sig_publish_for_reset_drain,
             stop_flag_for_reset,
+            supervisor_signal_tx.clone(), // D-3 REQ-A: wired to reset drain
         ),
     };
 
     // ── 4b. Spawn transport-event drain thread with reconnect supervisor ──
     // CRITICAL-2: uses _and_hooks variant with real production coordinator hooks
     // so reconnect request/ack/mDNS-reset are wired to MdnsSignaling (decision #477).
+    // Clone supervisor_signal_tx BEFORE moving it into transport drain so the sig
+    // drain (step 5) and the reset hook (already cloned above) can share the same Arc.
+    let sup_tx_for_sig_drain = supervisor_signal_tx.clone(); // D-3: pre-clone for sig drain
     let stop_flag_t = stop_flag.clone();
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
@@ -1608,7 +1637,7 @@ fn build_production_bundle(
                 transport_event_rx,
                 stop_flag_t,
                 channel,
-                supervisor_signal_tx,
+                supervisor_signal_tx, // moved here — sig drain uses pre-cloned sup_tx_for_sig_drain
                 ReconnectPolicy::v1_default(),
                 Duration::from_secs(2),
                 Duration::from_secs(15),
@@ -1617,7 +1646,10 @@ fn build_production_bundle(
         })?;
 
     // ── 5. Spawn signaling-event drain thread (W2-fix-B) ──────────────────
+    // D-3 (REQ-A): pass supervisor_signal_tx so Closed → LocalFailure{PeerBye}
+    // is forwarded to the receiver supervisor (enables reconnect on Bye).
     let stop_flag_s = stop_flag.clone();
+    let sup_tx_for_drain = sup_tx_for_sig_drain; // pre-cloned above (D-3)
     let sig_drain = thread::Builder::new()
         .name("sm-signaling-event-drain".into())
         .spawn(move || {
@@ -1626,6 +1658,7 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
+                sup_tx_for_drain, // D-3 REQ-A
             );
         })?;
 
@@ -3270,12 +3303,19 @@ mod tests {
         let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(8);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // Spawn the drain.
+        // Spawn the drain. Pass Arc::new(Mutex::new(None)) as supervisor_signal_tx
+        // (5th param, D-3) — this test only checks offer→answer routing, not supervisor.
         let recv_clone = recv.clone();
         let sig_clone = sig.clone();
         let stop_clone = stop_flag.clone();
         let drain = thread::spawn(move || {
-            run_signaling_drain(ev_rx, recv_clone, sig_clone, stop_clone);
+            run_signaling_drain(
+                ev_rx,
+                recv_clone,
+                sig_clone,
+                stop_clone,
+                Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
+            );
         });
 
         // Send an OfferReceived event.
@@ -3365,6 +3405,7 @@ mod tests {
                 recv_clone,
                 Arc::new(NoopSignalingPublish),
                 stop_clone,
+                Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
             );
         });
 
@@ -5339,10 +5380,17 @@ mod tests {
             let stop_clone = stop_for_reset.clone();
 
             // Spawn drain — this is exactly what the production D-4 fix does.
+            // SC-F-001 tests the drain spawn pattern only (no supervisor wiring needed).
             if let Err(e) = std::thread::Builder::new()
                 .name("sm-signaling-event-drain-reset-test".into())
                 .spawn(move || {
-                    run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone);
+                    run_signaling_drain(
+                        sig_ev_rx,
+                        recv_clone,
+                        pub_clone,
+                        stop_clone,
+                        Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
+                    );
                 })
             {
                 eprintln!("[test] spawn failed: {e}");
@@ -5525,8 +5573,18 @@ mod tests {
         // ── Call the REAL production function (not a reconstruction) ──
         // This is the exact function `build_production_bundle` calls. If anyone breaks
         // the production hook composition, this test fails while SC-F-001 might not.
-        let reset_hook =
-            build_initiate_mdns_reset_hook(spy_sig, spy_recv, noop_pub, stop_flag.clone());
+        // Pass a spy supervisor_signal_tx (5th param, D-3) so a Closed event after
+        // reset would still reach the supervisor — SC-F-002 verifies the offer path,
+        // so the supervisor channel is a no-op spy here.
+        let spy_supervisor_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let reset_hook = build_initiate_mdns_reset_hook(
+            spy_sig,
+            spy_recv,
+            noop_pub,
+            stop_flag.clone(),
+            spy_supervisor_tx,
+        );
 
         // ── Invoke the hook (mimics supervisor calling InitiateMdnsReset) ──
         (reset_hook)();
@@ -5565,5 +5623,118 @@ mod tests {
 
         // Cleanup: signal the drain thread to exit.
         stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    // ─── SC-A-001: run_signaling_drain Closed → supervisor LocalFailure{PeerBye} ──
+    //
+    // REQ-A: When run_signaling_drain receives SignalingEvent::Closed it MUST send
+    // SupervisorSignal::LocalFailure { trigger: ReconnectTrigger::PeerBye } via
+    // supervisor_signal_tx before exiting.
+    //
+    // RED: run_signaling_drain currently has 4 params (no supervisor_signal_tx).
+    // This test will NOT COMPILE until T09 adds the 5th param.
+
+    /// SC-A-001 — `run_signaling_drain` forwards `Closed` to supervisor as `LocalFailure{PeerBye}`.
+    ///
+    /// GIVEN: A mock `supervisor_signal_tx` backed by `mpsc::sync_channel(8)`;
+    ///        a `sig_ev_rx` / `sig_ev_tx` channel pair;
+    ///        `run_signaling_drain` started on a real thread with both wired.
+    /// WHEN:  `SignalingEvent::Closed` is sent on `sig_ev_tx`.
+    /// THEN:  `supervisor_signal_rx` receives exactly one
+    ///        `SupervisorSignal::LocalFailure { trigger: ReconnectTrigger::PeerBye }`
+    ///        within 500ms. The drain thread exits cleanly (join within 1s).
+    #[test]
+    fn sc_a_001_run_signaling_drain_closed_forwards_local_failure_peer_bye() {
+        use sm_domain::session::ReconnectTrigger;
+        use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingError};
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::mpsc::sync_channel;
+
+        // ── Spy supervisor channel ──────────────────────────────────────────
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(sup_tx)));
+
+        // ── Signaling event channel ────────────────────────────────────────
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+
+        // ── Minimal no-op spy impls ────────────────────────────────────────
+        struct NoOpReceiverOps;
+        impl SignalingReceiverOps for NoOpReceiverOps {
+            fn apply_remote_offer(
+                &self,
+                _offer: SdpOffer,
+            ) -> Result<SdpAnswer, TransportError> {
+                Err(TransportError::NotRunning)
+            }
+            fn add_remote_candidate(
+                &self,
+                _cand: IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct NoOpPublishOps;
+        impl SignalingPublishOps for NoOpPublishOps {
+            fn publish_local_answer(
+                &self,
+                _answer: SdpAnswer,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: IceCandidate,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+        }
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(NoOpReceiverOps);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishOps);
+
+        // ── Spawn the drain (5th param: supervisor_signal_tx) ──────────────
+        // RED: run_signaling_drain only has 4 params currently — this will not
+        // compile until T09 adds the 5th param.
+        let stop_clone = stop_flag.clone();
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-a-001-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    supervisor_signal_tx, // 5th param — added in T09
+                );
+            })
+            .expect("spawn drain thread");
+
+        // ── WHEN: inject Closed ────────────────────────────────────────────
+        sig_ev_tx
+            .send(SignalingEvent::Closed)
+            .expect("send Closed event");
+
+        // ── THEN: supervisor receives LocalFailure{PeerBye} within 500ms ──
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("SC-A-001: supervisor_signal_rx must receive a signal within 500ms when Closed is sent");
+
+        assert!(
+            matches!(
+                signal,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-A-001: expected LocalFailure{{PeerBye}} but got {signal:?}"
+        );
+
+        // ── Drain thread must exit cleanly ─────────────────────────────────
+        drain_handle
+            .join()
+            .expect("SC-A-001: drain thread must not panic and must exit within 1s");
     }
 }
