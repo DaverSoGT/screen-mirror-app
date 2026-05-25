@@ -525,8 +525,25 @@ fn run_sender_thread(
         }
     };
 
-    let _ = mdns.shutdown();
+    // Sub-fix A: mDNS service stays published for the full session lifetime.
+    // Old behavior called mdns.shutdown() here (right after first accept, before the
+    // frame loop), which unregistered the mDNS service record from the network.
+    // This prevented a restarted receiver from rediscovering the sender via mDNS:
+    // the service was gone, so browse() returned PeerNotFound on every reconnect.
+    //
+    // Fix: move the shutdown to the thread-exit path below (after run_frame_loop returns).
+    // The Drop chain (Bundle → Arc<Mutex<MdnsSignaling>> → stop() → join) ensures this
+    // runs synchronously before the next MdnsSignaling instance started by
+    // `initiate_mdns_reset` registers its own service.
     run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+
+    // Thread-exit unpublish: runs after run_frame_loop returns (any cause — stop flag,
+    // Bye frame, TCP EOF, or error). This is the ONLY shutdown call for the happy path.
+    tracing::debug!(
+        target: "mdns-signaling",
+        "mDNS service goodbye sent on thread exit",
+    );
+    let _ = mdns.shutdown();
 }
 
 // ─── Receiver thread ──────────────────────────────────────────────────────────
@@ -1613,6 +1630,93 @@ mod tests {
         assert!(
             result2.is_none(),
             "ReconnectRequest with None supervisor must return None without panic"
+        );
+    }
+
+    // ─── Sub-fix A: SC-11 mDNS service stays published after first TCP accept ──
+
+    /// SC-11 (REQ-SSRL-18, REQ-SSRL-20): After the first receiver connects (TCP accept),
+    /// the mDNS service MUST remain published so a restarted receiver can rediscover
+    /// the sender without a full bundle rebuild.
+    ///
+    /// This test is `#[ignore]` because it requires a working mDNS multicast interface.
+    /// Run manually: `cargo nextest run -p sm-infra --ignored -- t_a1_mdns_service_stays_published_after_first_tcp_accept`
+    ///
+    /// RED: On current HEAD (before sub-fix A), `let _ = mdns.shutdown()` at line 528
+    /// runs right after accept and before the frame loop, unregistering the service.
+    /// A second browse launched after the first accept cannot resolve the service →
+    /// the test fails (recv_timeout on browse_rx expires → no ServiceResolved).
+    #[test]
+    #[ignore]
+    fn t_a1_mdns_service_stays_published_after_first_tcp_accept() {
+        use super::{INSTANCE_NAME, SERVICE_TYPE};
+        use mdns_sd::{ServiceDaemon, ServiceEvent};
+        use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+        use std::net::{SocketAddr, TcpStream};
+        use std::time::Duration;
+
+        let control_port: u16 = 18911;
+
+        // Start an MdnsSignaling instance in Sender role.
+        let sender_config = SignalingConfig {
+            role: SignalingRole::Sender,
+            control_port,
+            ..Default::default()
+        };
+        let mut sig = MdnsSignaling::new(sender_config).unwrap();
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(8);
+        sig.start(ev_tx).unwrap();
+
+        // Give mDNS time to register.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Simulate a first TCP accept by connecting to the sender.
+        let addr: SocketAddr = format!("127.0.0.1:{control_port}").parse().unwrap();
+        let _peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+            .expect("first TCP connect must succeed");
+
+        // Give the sender thread time to accept and run the post-accept code.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Sub-fix A assertion: the mDNS service MUST still be published.
+        // Browse with a fresh ServiceDaemon and assert ServiceResolved arrives within 3s.
+        let browse_daemon = ServiceDaemon::new().expect("browse daemon must start");
+        let browse_rx = browse_daemon
+            .browse(SERVICE_TYPE)
+            .expect("browse must succeed");
+
+        let resolved = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut found = false;
+            while std::time::Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match browse_rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                    Ok(ServiceEvent::ServiceResolved(info)) => {
+                        if info.get_fullname().contains(INSTANCE_NAME) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                }
+            }
+            found
+        };
+
+        // Cleanup.
+        let _ = browse_daemon.shutdown();
+        drop(_peer);
+        sig.stop().unwrap();
+
+        // Drain remaining events.
+        while ev_rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+
+        assert!(
+            resolved,
+            "mDNS service MUST remain published after first TCP accept (sub-fix A). \
+             Got ServiceResolved: false. On current HEAD without fix, mdns.shutdown() \
+             fires at line 528 right after accept, unregistering the service."
         );
     }
 
