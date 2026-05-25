@@ -915,9 +915,7 @@ fn run_signaling_drain(
                     match receiver.apply_remote_offer(offer) {
                         Ok(answer) => {
                             if let Err(e) = signaling.publish_local_answer(answer) {
-                                eprintln!(
-                                    "[sm-signaling-drain] publish_local_answer failed: {e}"
-                                );
+                                eprintln!("[sm-signaling-drain] publish_local_answer failed: {e}");
                             }
                         }
                         Err(e) => {
@@ -6286,16 +6284,17 @@ mod tests {
     /// becomes true AFTER the outer check but BEFORE apply_remote_offer executes.
     ///
     /// Test approach (deterministic via blocking receiver):
-    ///   1. stop_flag=false; drain spawned with a BLOCKING CountingReceiverOps.
-    ///   2. Offer pre-loaded in channel → drain grabs it on first recv_timeout.
-    ///   3. apply_remote_offer is entered; the impl blocks waiting on `release_rx`.
-    ///      At this point: WITHOUT inner guard → apply_remote_offer WAS entered (RED).
-    ///                     WITH inner guard (WU-2) → apply_remote_offer is NEVER entered.
-    ///   4. Test thread waits 100ms for `entered_rx` notification.
-    ///      In RED state: `entered_rx` fires → drain is inside apply_remote_offer.
-    ///      In GREEN state: `entered_rx` times out → drain exited via inner guard.
-    ///   5. Regardless, release_tx unblocks apply_remote_offer (cleanup).
-    ///   6. Assert: `entered` == false (GREEN) / fails if entered == true (RED).
+    ///
+    /// 1. stop_flag=false; drain spawned with a BLOCKING CountingReceiverOps.
+    /// 2. Offer pre-loaded in channel → drain grabs it on first recv_timeout.
+    /// 3. apply_remote_offer is entered; the impl blocks waiting on `release_rx`.
+    ///    WITHOUT inner guard → apply_remote_offer WAS entered (RED).
+    ///    WITH inner guard (WU-2) → apply_remote_offer is NEVER entered.
+    /// 4. Test thread waits 200ms for `entered_rx` notification.
+    ///    In RED state: `entered_rx` fires → drain is inside apply_remote_offer.
+    ///    In GREEN state: `entered_rx` times out → drain exited via inner guard.
+    /// 5. Regardless, release_tx unblocks apply_remote_offer (cleanup).
+    /// 6. Assert: `entered` == false (GREEN) / fails if entered == true (RED).
     ///
     /// RED until WU-2 adds the inner stop_flag guard in the OfferReceived arm.
     #[test]
@@ -6375,9 +6374,7 @@ mod tests {
         stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Wait up to 200ms for the drain to enter apply_remote_offer (RED signal).
-        let entered = entered_rx
-            .recv_timeout(Duration::from_millis(200))
-            .is_ok();
+        let entered = entered_rx.recv_timeout(Duration::from_millis(200)).is_ok();
 
         // Unblock apply_remote_offer (cleanup — no-op if drain didn't enter it).
         let _ = release_tx.try_send(());
