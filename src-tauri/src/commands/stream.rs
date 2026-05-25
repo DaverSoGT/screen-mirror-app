@@ -897,16 +897,34 @@ fn run_signaling_drain(
                 SignalingEvent::PeerFound { host, port } => {
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
-                SignalingEvent::OfferReceived(offer) => match receiver.apply_remote_offer(offer) {
-                    Ok(answer) => {
-                        if let Err(e) = signaling.publish_local_answer(answer) {
-                            eprintln!("[sm-signaling-drain] publish_local_answer failed: {e}");
+                SignalingEvent::OfferReceived(offer) => {
+                    // D-RBF-2: race-window guard. The outer stop_flag check (line 892) fires
+                    // ONCE per recv_timeout iteration; an offer pulled before the OLD session
+                    // teardown started can still race into this arm. The OLD receiver's str0m
+                    // Rtc has m-line state that conflicts with a fresh sender Rtc, so we drop
+                    // the offer when stop_flag has flipped to true (REQ-MLO-1).
+                    //
+                    // `break` (not `continue`) — stop_flag=true means this drain must exit.
+                    // Matches the existing Closed arm's pattern at line ~926.
+                    if stop_flag.load(Ordering::Relaxed) {
+                        eprintln!(
+                            "[sm-signaling-drain] OfferReceived after stop_flag set; dropping (D-RBF-2)"
+                        );
+                        break;
+                    }
+                    match receiver.apply_remote_offer(offer) {
+                        Ok(answer) => {
+                            if let Err(e) = signaling.publish_local_answer(answer) {
+                                eprintln!(
+                                    "[sm-signaling-drain] publish_local_answer failed: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[sm-signaling-drain] apply_remote_offer failed: {e}");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[sm-signaling-drain] apply_remote_offer failed: {e}");
-                    }
-                },
+                }
                 SignalingEvent::CandidateReceived(cand) => {
                     if let Err(e) = receiver.add_remote_candidate(cand) {
                         eprintln!("[sm-signaling-drain] add_remote_candidate failed: {e}");
