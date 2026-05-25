@@ -45,6 +45,36 @@ use tauri::ipc::InvokeResponseBody;
 
 pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 
+// ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
+
+/// Seam used by `enter_supervisor_mode` to refresh the signaling layer's stored
+/// `supervisor_signal_tx` whenever a NEW supervisor starts.
+///
+/// After `enter_supervisor_mode` writes the NEW supervisor's `signal_tx` into the
+/// bridge-level Arc, it MUST also propagate that `signal_tx` into the signaling
+/// layer's own stored clone (`MdnsSignaling.supervisor_signal_tx`) so that future
+/// `frame_to_event(Bye/PeerRequest/PeerAck)` calls reach the LIVE supervisor
+/// rather than the DEAD eager baseline sender (D-RBF-1).
+///
+/// Public so that integration tests (external crates) can pass `NoopSignalingRefresh`
+/// when calling `run_sender_transport_event_drain_with_supervisor_custom_and_hooks`
+/// directly. Production callers never need to implement this trait — only the
+/// Windows-only `MdnsSupervisorRefresh` impl is used at runtime.
+pub trait SignalingSupervisorRefresh: Send + Sync {
+    fn set_supervisor_signal_tx(&self, tx: SyncSender<SupervisorSignal>);
+}
+
+/// No-op implementation used by the non-production-hooks drain path
+/// (`run_sender_transport_event_drain_with_supervisor`). That path spawns the
+/// supervisor without a real signaling layer, so no refresh is needed.
+/// Also used by integration tests that exercise the drain in isolation.
+pub struct NoopSignalingRefresh;
+impl SignalingSupervisorRefresh for NoopSignalingRefresh {
+    fn set_supervisor_signal_tx(&self, _tx: SyncSender<SupervisorSignal>) {
+        // no-op — non-production drain has no signaling layer to refresh
+    }
+}
+
 // ─── SenderCoordinatorHooks — production wiring seam ─────────────────────────
 
 /// Callbacks invoked by the sender supervisor coordinator when the supervisor
@@ -266,8 +296,11 @@ impl SenderBridge {
     pub fn new() -> Self {
         let session_arc: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(None));
         let restart_cache_arc: Arc<Mutex<Option<RestartCache>>> = Arc::new(Mutex::new(None));
+        let supervisor_signal_tx_arc: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
         let session_for_builder = session_arc.clone();
         let cache_for_builder = restart_cache_arc.clone();
+        let sup_tx_for_builder = supervisor_signal_tx_arc.clone(); // D-RBF-1 (REQ-RBL-1)
         Self {
             session: session_arc,
             builder: Arc::new(move |udp_port, service_name, stop_flag, channel| {
@@ -278,11 +311,12 @@ impl SenderBridge {
                     channel,
                     session_for_builder.clone(),
                     cache_for_builder.clone(),
+                    sup_tx_for_builder.clone(), // D-RBF-1 (REQ-RBL-1)
                 )
             }),
             current_args: Mutex::new(None),
             restart_cache: restart_cache_arc,
-            supervisor_signal_tx: Arc::new(Mutex::new(None)),
+            supervisor_signal_tx: supervisor_signal_tx_arc,
         }
     }
 
@@ -689,6 +723,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                         ack_timeout,
                         rebuild_timeout,
                         SenderCoordinatorHooks::noop(),
+                        &(Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>),
                     );
                     break 'drain;
                 }
@@ -707,6 +742,7 @@ pub fn run_sender_transport_event_drain_with_supervisor(
                         ack_timeout,
                         rebuild_timeout,
                         SenderCoordinatorHooks::noop(),
+                        &(Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>),
                     );
                     break 'drain;
                 }
@@ -753,6 +789,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
         ack_timeout,
         rebuild_timeout,
         SenderCoordinatorHooks::noop(),
+        Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>, // D-RBF-1
     );
     // Note: `counters` not used in the hooks variant — kept in signature for backward compat.
     let _ = counters;
@@ -773,6 +810,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     ack_timeout: Duration,
     rebuild_timeout: Duration,
     hooks: SenderCoordinatorHooks,
+    signaling_refresh: Arc<dyn SignalingSupervisorRefresh>, // D-RBF-1 (REQ-RBL-2)
 ) {
     let session_nonce: u64 = rand::random();
 
@@ -804,6 +842,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                         ack_timeout,
                         rebuild_timeout,
                         hooks,
+                        &signaling_refresh,
                     );
                     break 'drain;
                 }
@@ -819,6 +858,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                         ack_timeout,
                         rebuild_timeout,
                         hooks,
+                        &signaling_refresh,
                     );
                     break 'drain;
                 }
@@ -853,14 +893,24 @@ fn enter_supervisor_mode(
     ack_timeout: Duration,
     rebuild_timeout: Duration,
     hooks: SenderCoordinatorHooks,
+    signaling_refresh: &Arc<dyn SignalingSupervisorRefresh>, // D-RBF-1 (REQ-RBL-2)
 ) {
     use std::sync::mpsc::sync_channel;
 
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
     let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
 
-    // Register signal_tx so stop_sender_session can interrupt backoff sleep.
+    // LOCK ORDER (D-RBF-1, R-2 mitigation, REQ-RBL-2):
+    //   Step 1. Write bridge supervisor_signal_tx — guard MUST die at the `;`.
+    //   Step 2. Refresh signaling supervisor_signal_tx — independent Arc, no overlap.
+    //
+    // Keep these as TWO SEPARATE STATEMENTS so the bridge MutexGuard is dropped
+    // before set_supervisor_signal_tx acquires the mdns Arc lock. Combining them
+    // into a single let-binding (e.g. `let g = ...; *g = ...; refresh.set_...`)
+    // would hold the bridge guard across the refresh call and deadlock under
+    // concurrent frame_to_event traffic.
     *supervisor_signal_tx.lock().unwrap() = Some(signal_tx.clone());
+    signaling_refresh.set_supervisor_signal_tx(signal_tx.clone());
 
     // Send initial trigger to kick off the supervisor.
     let _ = signal_tx.try_send(SupervisorSignal::LocalFailure {
@@ -1512,6 +1562,7 @@ fn build_production_sender_bundle(
     _channel: Arc<dyn ChannelLike>,
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
+    bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1 (REQ-RBL-1)
 ) -> Result<SenderBundle, BundleError> {
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
@@ -1581,7 +1632,14 @@ fn build_production_sender_bundle(
     // ── 3. Start pipeline (S-1 / D-5): create eager supervisor BEFORE start() ──
     // Create (sup_tx, sup_rx) BEFORE signaling.start() so the Bye-arm in
     // frame_to_event always finds Some(sup_tx) — no None-window for PeerBye.
-    let (sup_tx_eager, _sup_rx_eager) = std::sync::mpsc::sync_channel::<SupervisorSignal>(16);
+    //
+    // REQ-RBL-S1 / D-RBF-3: _relic_rx_eager is the predecessor PR-1 eager Receiver.
+    // After the D-RBF-1 fix, bridge_supervisor_signal_tx is seeded with sup_tx_eager
+    // (below) and becomes the authoritative slot. _relic_rx_eager is intentionally
+    // held but never polled — its only role is to keep the channel alive so the
+    // pre-start() sup_tx_eager send-path doesn't immediately see Disconnected.
+    // A future cleanup can drain or drop it once the supervisor lifecycle is stable.
+    let (sup_tx_eager, _relic_rx_eager) = std::sync::mpsc::sync_channel::<SupervisorSignal>(16);
     // Register sup_tx on the signaling instance BEFORE start() (D-1).
     signaling.set_supervisor_signal_tx(sup_tx_eager.clone());
 
@@ -1637,6 +1695,23 @@ fn build_production_sender_bundle(
     let signaling_arc = Arc::new(Mutex::new(signaling));
     // Clone for the production coordinator hooks BEFORE moving into shutdown.
     let signaling_for_hooks = signaling_arc.clone();
+
+    // D-RBF-1 (REQ-RBL-1): Seed the shared bridge Arc with sup_tx_eager so
+    // stop_sender_session_internal finds Some(tx) even before the first IceFailed.
+    // This also means the bridge Arc IS the authoritative slot — enter_supervisor_mode
+    // will overwrite it with the live signal_tx on every reconnect cycle.
+    *bridge_supervisor_signal_tx.lock().unwrap() = Some(sup_tx_eager);
+
+    // D-RBF-1 (REQ-RBL-2): Wrap signaling_arc in the refresh adapter so
+    // enter_supervisor_mode can push the live signal_tx into MdnsSignaling.
+    struct MdnsSupervisorRefresh(Arc<Mutex<MdnsSignaling>>);
+    impl SignalingSupervisorRefresh for MdnsSupervisorRefresh {
+        fn set_supervisor_signal_tx(&self, tx: SyncSender<SupervisorSignal>) {
+            self.0.lock().unwrap().set_supervisor_signal_tx(tx);
+        }
+    }
+    let signaling_refresh: Arc<dyn SignalingSupervisorRefresh> =
+        Arc::new(MdnsSupervisorRefresh(signaling_arc.clone()));
 
     struct Str0mSenderOpsImpl(Arc<Mutex<Str0mVideoSender>>);
     impl SignalingSenderOps for Str0mSenderOpsImpl {
@@ -1695,6 +1770,7 @@ fn build_production_sender_bundle(
             {
                 let session_for_inner = _bridge_session.clone();
                 let cache_for_inner = _bridge_cache.clone();
+                let sup_tx_for_inner = bridge_supervisor_signal_tx.clone(); // D-RBF-1
                 Arc::new(move |udp_port, service_name, stop_flag, channel| {
                     build_production_sender_bundle(
                         udp_port,
@@ -1703,6 +1779,7 @@ fn build_production_sender_bundle(
                         channel,
                         session_for_inner.clone(),
                         cache_for_inner.clone(),
+                        sup_tx_for_inner.clone(), // D-RBF-1 (REQ-RBL-1)
                     )
                 })
             },
@@ -1748,9 +1825,11 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
     // Production transport drain with real coordinator hooks (CRITICAL-2).
-    // S-1 (D-5): use Some(sup_tx_eager) so IceFailed/ConnectionLost events also
-    // reach the pre-wired supervisor — no None-window for any failure trigger.
-    let sup_tx = Arc::new(Mutex::new(Some(sup_tx_eager)));
+    // D-RBF-1 (REQ-RBL-1): use bridge_supervisor_signal_tx (already seeded with
+    // sup_tx_eager above) so IceFailed/ConnectionLost events reach the pre-wired
+    // supervisor — no None-window — AND enter_supervisor_mode writes back into
+    // the SAME Arc that stop_sender_session_internal reads.
+    let sup_tx_for_drain = bridge_supervisor_signal_tx.clone();
     let tr_drain = std::thread::Builder::new()
         .name("sm-sender-transport-drain".into())
         .spawn(move || {
@@ -1758,11 +1837,12 @@ fn build_production_sender_bundle(
                 tr_ev_rx,
                 tr_stop,
                 tr_channel,
-                sup_tx,
+                sup_tx_for_drain,
                 ReconnectPolicy::v1_default(),
                 Duration::from_secs(2),
                 Duration::from_secs(15),
                 coordinator_hooks,
+                signaling_refresh, // D-RBF-1 (REQ-RBL-2)
             );
         })
         .map_err(|e| BundleError::Other(format!("spawn transport drain: {e}")))?;
@@ -1791,6 +1871,7 @@ fn build_production_sender_bundle(
     _channel: Arc<dyn ChannelLike>,
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
+    _bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1
 ) -> Result<SenderBundle, BundleError> {
     Err(BundleError::Other(
         "sender pipeline requires Windows".to_string(),
@@ -2305,6 +2386,8 @@ mod tests {
                     Duration::from_millis(50),
                     Duration::from_millis(200),
                     hooks,
+                    std::sync::Arc::new(super::NoopSignalingRefresh)
+                        as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
                 );
             })
             .unwrap();
