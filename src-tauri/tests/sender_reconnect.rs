@@ -528,6 +528,17 @@ fn raw_logs_contain(val: &str) -> bool {
     s.contains(val)
 }
 
+/// Return the byte offset of the first occurrence of `val` in the raw global
+/// tracing buffer. Returns `None` if the string is not present.
+/// Used for ordering assertions between sequentially-fired tracing events.
+fn raw_logs_find(val: &str) -> Option<usize> {
+    let buf = tracing_test::internal::global_buf().lock().unwrap();
+    // Cow<str> from from_utf8_lossy is valid for .find() directly; we shadow `s`
+    // as owned String to avoid the temporary borrow lifetime issue with Cow.
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    s.find(val)
+}
+
 /// SC-6 Gate A (REQ-SSRL-9): When stop flag is set BEFORE rebuild starts,
 /// a warn-level event with target "sender-rebuild", gate="A", and attempt field MUST fire.
 ///
@@ -2611,13 +2622,22 @@ fn t_c2_c3_signaling_drain_swap_and_exit_race() {
 
 // ─── T34: SC-17 — tracing events fire in expected order for sub-fixes A+B+C ──
 
-/// SC-17 (REQ-SSRL-19 mDNS goodbye, REQ-SSRL-24 PeerBye warn):
+/// SC-17 sub-test A (REQ-SSRL-24 PeerBye warn) + ordering (REQ-SSRL-24 ordering):
 ///
 /// Sub-test A: drain emits warn at target "sender-signaling-drain" with trigger="PeerBye"
 ///             when supervisor channel is registered and Closed arrives.
-/// Sub-test B: mDNS thread-exit debug event fires when thread exits (sub-fix A tracing).
 ///
-/// Uses raw_logs_contain() (spawned-thread events not captured by scope-filtered logs_contain).
+/// Ordering assertion (W2 fix, batch 4): asserts that within the drain thread,
+/// the PeerBye warn fires BEFORE the "Closed received and cell empty; drain exits"
+/// debug event. Both events fire on the same thread (drain) sequentially — this
+/// ordering is deterministic and not subject to cross-thread races.
+///
+/// Note: Cross-thread ordering of event 3 (mDNS goodbye at target "mdns-signaling")
+/// requires a network fixture (TCP accept) and is covered by the #[ignore] test
+/// `t_abc2b_mdns_goodbye_event_on_thread_exit_hw` below.
+///
+/// Uses raw_logs_contain() / raw_logs_find() (spawned-thread events not captured
+/// by scope-filtered logs_contain).
 #[traced_test]
 #[test]
 fn t_abc2_tracing_events_fire_in_order_for_abc_sites() {
@@ -2667,6 +2687,101 @@ fn t_abc2_tracing_events_fire_in_order_for_abc_sites() {
     assert!(
         raw_logs_contain("peer Bye received, notifying supervisor"),
         "expected PeerBye warn message in tracing output"
+    );
+
+    // === Ordering assertion (W2 fix): same-thread deterministic ordering ===
+    // Both events fire on the drain thread sequentially, so their relative
+    // position in the log buffer is guaranteed.
+    //
+    // Event 1: PeerBye warn — fires when Closed arrives and supervisor channel is active.
+    // Event 2: "Closed received and cell empty; drain exits" — fires after cell is checked
+    //           empty and drain is about to break (same recv_timeout iteration, after warn).
+    //
+    // Cross-thread event 3 (mDNS goodbye, target "mdns-signaling") cannot be asserted
+    // in this fixture because it requires a real TCP connection to advance the mDNS
+    // thread past its accept loop. See t_abc2b_mdns_goodbye_event_on_thread_exit_hw.
+    let pos_peer_bye = raw_logs_find("peer Bye received, notifying supervisor")
+        .expect("PeerBye warn must be present to assert ordering");
+    let pos_drain_exit = raw_logs_find("Closed received and cell empty; drain exits")
+        .expect("drain-exit debug must be present to assert ordering");
+
+    assert!(
+        pos_peer_bye < pos_drain_exit,
+        "PeerBye warn (pos={pos_peer_bye}) MUST appear before drain-exit debug \
+         (pos={pos_drain_exit}) in tracing log buffer (same-thread ordering)"
+    );
+}
+
+// ─── T35: SC-17 sub-test B — mDNS goodbye tracing event on thread exit ────────
+
+/// SC-17 sub-test B (REQ-SSRL-19): the mDNS thread-exit debug event
+/// `"mDNS service goodbye sent on thread exit"` at target `"mdns-signaling"` MUST
+/// fire when the `sm-signaling-mdns` thread exits after a real TCP session ends.
+///
+/// This test is `#[ignore]` because it requires the mDNS thread to advance past the
+/// TCP accept phase, which in turn requires a live TCP connect on the loopback
+/// interface. The accept loop polls the stop flag and calls `mdns.shutdown()` from
+/// the pre-accept path (not the goodbye path) if stopped before any connection —
+/// so `.stop()` alone without a prior TCP connect does NOT trigger the goodbye event.
+///
+/// Run manually:
+/// ```text
+/// cargo nextest run -p screen-mirror-app --test sender_reconnect --run-ignored \
+///     ignored-only -E "test(t_abc2b_)"
+/// ```
+///
+/// RED gate: the production goodbye tracing event was already present at
+/// mdns.rs:542-545 when this test was written. The test passes on first run because
+/// the production code is correct. It adds REGRESSION COVERAGE — if the tracing
+/// call is removed, this test will fail.
+#[traced_test]
+#[test]
+#[ignore = "requires live TCP loopback connect to advance past mDNS accept phase"]
+fn t_abc2b_mdns_goodbye_event_on_thread_exit_hw() {
+    use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+    use sm_infra::signaling::mdns::MdnsSignaling;
+    use std::net::{SocketAddr, TcpStream};
+
+    // Ephemeral port — chosen to avoid collision with other tests.
+    let control_port: u16 = 18913;
+
+    let config = SignalingConfig {
+        role: SignalingRole::Sender,
+        control_port,
+        ..Default::default()
+    };
+    let mut sig = MdnsSignaling::new(config).unwrap();
+    let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<SignalingEvent>(8);
+    sig.start(ev_tx).unwrap();
+
+    // Give the mDNS thread time to bind and register.
+    thread::sleep(Duration::from_millis(200));
+
+    // TCP connect so the thread advances past the accept loop into run_frame_loop.
+    // Without this, stop() hits the pre-accept exit path (mdns.rs:501-504) which
+    // does NOT emit the goodbye tracing event.
+    let addr: SocketAddr = format!("127.0.0.1:{control_port}").parse().unwrap();
+    let _peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .expect("loopback TCP connect must succeed");
+
+    // Give the thread time to accept and enter run_frame_loop.
+    thread::sleep(Duration::from_millis(100));
+
+    // Stop the signaling thread — sets stop flag, run_frame_loop exits on next
+    // READ_TIMEOUT poll (≤200ms), then the goodbye tracing event fires before
+    // mdns.shutdown() at mdns.rs:542-546.
+    sig.stop().unwrap();
+
+    // Drain any remaining events so the channel is clean.
+    while ev_rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+
+    // Assert the thread-exit goodbye tracing event fired (REQ-SSRL-19).
+    assert!(
+        raw_logs_contain("mDNS service goodbye sent on thread exit"),
+        "expected tracing::debug! event at target 'mdns-signaling' with message \
+         'mDNS service goodbye sent on thread exit' (mdns.rs:542-545). \
+         If this fails: check that the tracing call was not removed and that \
+         the TCP connect successfully advanced the thread past the accept loop."
     );
 }
 
