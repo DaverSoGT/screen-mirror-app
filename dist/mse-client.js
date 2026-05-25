@@ -150,19 +150,23 @@ const deadReasonEl = document.getElementById("dead-reason");
 const receiverRetryBtn = document.getElementById("receiver-retry");
 const receiverCancelBtn = document.getElementById("receiver-cancel");
 
-// Retry: stop current session (if any) then restart via start_stream with
-// cached channel. Per spec §4.2: receiver retry is stop_stream + start_stream
-// with the same parameters — the JS side re-invokes main() which creates a
-// fresh Channel. Simplest V1 implementation: reload the page to re-run main().
+// Retry: call retry_session_stream IPC which handles stop+restart internally,
+// reusing the active Tauri channel. This avoids window.location.reload() which
+// would reset all JS state including the IPC channel reference (REQ-B2,
+// REQ-NO-RELOAD). The backend command mirrors retry_session on the sender side.
 if (receiverRetryBtn) {
   receiverRetryBtn.addEventListener("click", async function () {
     if (deadModal) deadModal.hidden = true;
     const invoke = window.__TAURI__?.core?.invoke;
-    if (invoke) {
-      try { await invoke("stop_stream"); } catch (_) {}
+    const Channel = window.__TAURI__?.core?.Channel;
+    if (invoke && Channel) {
+      try {
+        const channel = new Channel();
+        await invoke("retry_session_stream", { channel });
+      } catch (e) {
+        console.warn("[mse-client] retry_session_stream failed:", e);
+      }
     }
-    // Re-run main() by reloading the page (fresh Channel, fresh MSE session).
-    window.location.reload();
   });
 }
 

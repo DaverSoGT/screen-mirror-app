@@ -2,6 +2,8 @@
 // elements the SUTs query at module-parse time.
 // Phase 9 adds #retry and #cancel (hidden by default) for the dead-session UI.
 // hw-encoder-backend-disclosure adds #encoder-backend (hidden by default).
+// REQ-B2: adds #dead-modal, #dead-reason, #receiver-retry, #receiver-cancel
+//         for the receiver dead-modal UI (mse-client.js:145-180).
 export function installDom() {
   removeDom();
   document.body.innerHTML = `
@@ -13,6 +15,11 @@ export function installDom() {
     <a id="change-mode" href="#"></a>
     <button id="retry" style="display:none">Retry</button>
     <button id="cancel" style="display:none">Cancel</button>
+    <div id="dead-modal" hidden>
+      <p id="dead-reason"></p>
+      <button id="receiver-retry">Retry</button>
+      <button id="receiver-cancel">Cancel</button>
+    </div>
   `;
 }
 
