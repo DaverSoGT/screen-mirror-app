@@ -5573,11 +5573,13 @@ mod tests {
         // ── Call the REAL production function (not a reconstruction) ──
         // This is the exact function `build_production_bundle` calls. If anyone breaks
         // the production hook composition, this test fails while SC-F-001 might not.
-        // Pass a spy supervisor_signal_tx (5th param, D-3) so a Closed event after
-        // reset would still reach the supervisor — SC-F-002 verifies the offer path,
-        // so the supervisor channel is a no-op spy here.
+        // W-real (PR #2 follow-up): wire a real spy supervisor channel so the drain
+        // spawned after reset also forwards Closed → LocalFailure{PeerBye}. This
+        // confirms D-3 + D-4 work together: the reset hook's new drain is wired
+        // to both the receiver Arc (offer path) AND the supervisor channel (Bye path).
+        let (spy_sup_tx, spy_sup_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(8);
         let spy_supervisor_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-            Arc::new(Mutex::new(None));
+            Arc::new(Mutex::new(Some(spy_sup_tx)));
         let reset_hook = build_initiate_mdns_reset_hook(
             spy_sig,
             spy_recv,
@@ -5621,7 +5623,30 @@ mod tests {
              new sig_ev_tx"
         );
 
-        // Cleanup: signal the drain thread to exit.
+        // ── Tertiary assertion (W-real PR #2): drain also forwards Closed → supervisor ──
+        // Inject Closed after the offer to verify D-3 + D-4 work together.
+        // The drain thread should still be running (stop_flag not set yet).
+        sig_ev_tx
+            .send(SignalingEvent::Closed)
+            .expect("SC-F-002: inject Closed after offer");
+
+        let sup_signal = spy_sup_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect(
+                "SC-F-002 (W-real): post-reset drain must forward Closed → \
+                 LocalFailure{PeerBye} to supervisor within 500ms",
+            );
+        assert!(
+            matches!(
+                sup_signal,
+                SupervisorSignal::LocalFailure {
+                    trigger: sm_domain::session::ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-F-002 (W-real): expected LocalFailure{{PeerBye}} but got {sup_signal:?}"
+        );
+
+        // Cleanup: drain already exited on Closed; stop_flag signals remaining consumers.
         stop_flag.store(true, Ordering::Relaxed);
     }
 
