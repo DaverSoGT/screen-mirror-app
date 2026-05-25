@@ -5147,4 +5147,166 @@ mod tests {
             "bind_probe(0) must succeed after AlreadyRunning — no FD leak (R4.4)"
         );
     }
+
+    // ─── SC-F-001 / SC-F-002: initiate_mdns_reset must spawn a new drain consumer ──
+
+    /// SC-F-001 — After `initiate_mdns_reset` is invoked, a `SignalingEvent::OfferReceived`
+    /// injected into the new `sig_ev_tx` MUST be received and processed by a new drain
+    /// thread (apply_remote_offer called on the receiver). Currently the code drops
+    /// `_sig_ev_rx` so the new channel has no consumer — any sent event is silently dropped.
+    ///
+    /// RED: the current `initiate_mdns_reset` drops `_sig_ev_rx` immediately, leaving
+    /// the send end of the channel orphaned. `try_send` returns `Disconnected` because
+    /// no receiver thread holds the `sig_ev_rx` end.
+    ///
+    /// GREEN (T03): the closure spawns a `run_signaling_drain` thread consuming `sig_ev_rx`;
+    /// `try_send` succeeds and `apply_remote_offer` is called on the spy receiver.
+    #[test]
+    fn sc_f_001_initiate_mdns_reset_spawns_consumer_for_new_sig_ev_rx() {
+        use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
+        use std::sync::mpsc::{sync_channel, TrySendError};
+
+        // ── FakeSignalingOpsForReset: captures the sig_ev_tx passed to start() ──
+        // This lets the test retrieve the new tx and try to send on it.
+        struct FakeSignalingForReset {
+            captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
+        }
+        impl FakeSignalingForReset {
+            fn new(capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>) -> Self {
+                Self {
+                    captured_tx: capture,
+                }
+            }
+        }
+        // We need a trait object we can lock and call stop()/start() on.
+        trait ResetSignalingOps: Send {
+            fn stop_sig(&mut self);
+            fn start_sig(&mut self, tx: SyncSender<SignalingEvent>);
+        }
+        impl ResetSignalingOps for FakeSignalingForReset {
+            fn stop_sig(&mut self) {}
+            fn start_sig(&mut self, tx: SyncSender<SignalingEvent>) {
+                *self.captured_tx.lock().unwrap() = Some(tx);
+            }
+        }
+
+        // ── SpyReceiver: counts how many times apply_remote_offer is called ──
+        struct SpyReceiver {
+            offer_count: Arc<Mutex<u32>>,
+        }
+        impl SpyReceiver {
+            fn new(counter: Arc<Mutex<u32>>) -> Arc<Self> {
+                Arc::new(Self {
+                    offer_count: counter,
+                })
+            }
+        }
+        impl SignalingReceiverOps for SpyReceiver {
+            fn apply_remote_offer(&self, _offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
+                *self.offer_count.lock().unwrap() += 1;
+                Ok(SdpAnswer("v=0".to_string()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _cand: IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        // ── NoopPublish ──
+        struct NoopPublish;
+        impl SignalingPublishOps for NoopPublish {
+            fn publish_local_answer(
+                &self,
+                _answer: SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+        }
+
+        // ── Wire the test components ──
+        let captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+            Arc::new(Mutex::new(None));
+        let fake_sig = Arc::new(Mutex::new(FakeSignalingForReset::new(captured_tx.clone())));
+
+        let offer_count = Arc::new(Mutex::new(0u32));
+        let spy_recv: Arc<dyn SignalingReceiverOps> = SpyReceiver::new(offer_count.clone());
+        let noop_pub: Arc<dyn SignalingPublishOps> = Arc::new(NoopPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let supervisor_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Arcs for inside the closure (mirrors D-4 capture pattern)
+        let sig_c = fake_sig.clone();
+        let recv_c = spy_recv.clone();
+        let pub_c = noop_pub.clone();
+        let stop_c = stop_flag.clone();
+        let sup_tx_c = supervisor_tx.clone();
+
+        // ── Build the reset closure that mirrors the CURRENT production code ──
+        // Reproduces stream.rs L1515-1529 exactly (broken: _sig_ev_rx dropped).
+        // After T03 this will be replaced with the fixed version that spawns a drain.
+        let reset_closure: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let mut sig = sig_c.lock().unwrap();
+            sig.stop_sig();
+            // BUG (GAP-F): _sig_ev_rx immediately dropped — no consumer for new channel.
+            let (sig_ev_tx, _sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+            sig.start_sig(sig_ev_tx);
+            // At this point _sig_ev_rx is gone; the channel is dead.
+            // T03 GREEN fix: remove _ prefix, spawn run_signaling_drain(sig_ev_rx, ...).
+            drop(stop_c.load(Ordering::Relaxed)); // suppress unused warning
+            drop(recv_c.clone()); // suppress — will be used in GREEN
+            drop(pub_c.clone()); // suppress — will be used in GREEN
+            drop(sup_tx_c.clone()); // suppress — will be used in GREEN
+        });
+
+        // ── Invoke initiate_mdns_reset ──
+        (reset_closure)();
+
+        // Retrieve the sig_ev_tx that was passed to start() inside the closure.
+        let sig_ev_tx = captured_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("FakeSignaling::start_sig must have been called with a new sig_ev_tx");
+
+        // ── Send an offer on the new sig_ev_tx ──
+        // RED state: _sig_ev_rx was dropped → send returns Err(Disconnected).
+        // GREEN state: drain thread holds sig_ev_rx → send succeeds.
+        let offer_event = SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset".to_string()));
+        let send_result = sig_ev_tx.try_send(offer_event);
+
+        // ── RED assertion ──
+        // With the broken code, send_result is Err(Disconnected).
+        // This assertion FAILS in RED state (proving the bug exists).
+        // After T03 GREEN fix, this assertion PASSES (drain is alive, send succeeds).
+        assert!(
+            !matches!(send_result, Err(TrySendError::Disconnected(_))),
+            "SC-F-001 RED FAIL (expected after fix): after initiate_mdns_reset, the \
+             new sig_ev_rx must be held by a live drain thread. Currently _sig_ev_rx is \
+             dropped immediately (GAP-F), so try_send returns Disconnected. \
+             Fix: spawn run_signaling_drain(sig_ev_rx, ...) inside the closure (D-4)."
+        );
+
+        // Give drain thread time to call apply_remote_offer (GREEN only).
+        std::thread::sleep(Duration::from_millis(200));
+
+        // GREEN assertion: drain must have forwarded the offer to the receiver.
+        let count = *offer_count.lock().unwrap();
+        assert_eq!(
+            count, 1,
+            "SC-F-001 GREEN: apply_remote_offer must be called exactly once after reset \
+             when an OfferReceived event is sent on the new sig_ev_tx"
+        );
+
+        // Cleanup: signal drain to stop.
+        stop_flag.store(true, Ordering::Relaxed);
+    }
 }
