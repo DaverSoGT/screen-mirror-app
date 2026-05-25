@@ -5630,12 +5630,10 @@ mod tests {
             .send(SignalingEvent::Closed)
             .expect("SC-F-002: inject Closed after offer");
 
-        let sup_signal = spy_sup_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect(
-                "SC-F-002 (W-real): post-reset drain must forward Closed → \
+        let sup_signal = spy_sup_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-F-002 (W-real): post-reset drain must forward Closed → \
                  LocalFailure{PeerBye} to supervisor within 500ms",
-            );
+        );
         assert!(
             matches!(
                 sup_signal,
@@ -5686,32 +5684,20 @@ mod tests {
         // ── Minimal no-op spy impls ────────────────────────────────────────
         struct NoOpReceiverOps;
         impl SignalingReceiverOps for NoOpReceiverOps {
-            fn apply_remote_offer(
-                &self,
-                _offer: SdpOffer,
-            ) -> Result<SdpAnswer, TransportError> {
+            fn apply_remote_offer(&self, _offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
                 Err(TransportError::NotRunning)
             }
-            fn add_remote_candidate(
-                &self,
-                _cand: IceCandidate,
-            ) -> Result<(), TransportError> {
+            fn add_remote_candidate(&self, _cand: IceCandidate) -> Result<(), TransportError> {
                 Ok(())
             }
         }
 
         struct NoOpPublishOps;
         impl SignalingPublishOps for NoOpPublishOps {
-            fn publish_local_answer(
-                &self,
-                _answer: SdpAnswer,
-            ) -> Result<(), SignalingError> {
+            fn publish_local_answer(&self, _answer: SdpAnswer) -> Result<(), SignalingError> {
                 Ok(())
             }
-            fn publish_local_candidate(
-                &self,
-                _cand: IceCandidate,
-            ) -> Result<(), SignalingError> {
+            fn publish_local_candidate(&self, _cand: IceCandidate) -> Result<(), SignalingError> {
                 Ok(())
             }
         }
@@ -5743,9 +5729,9 @@ mod tests {
             .expect("send Closed event");
 
         // ── THEN: supervisor receives LocalFailure{PeerBye} within 500ms ──
-        let signal = sup_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("SC-A-001: supervisor_signal_rx must receive a signal within 500ms when Closed is sent");
+        let signal = sup_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-A-001: supervisor_signal_rx must receive a signal within 500ms when Closed is sent",
+        );
 
         assert!(
             matches!(
