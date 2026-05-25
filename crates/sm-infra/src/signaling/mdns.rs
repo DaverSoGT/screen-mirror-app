@@ -326,7 +326,19 @@ pub(crate) fn frame_to_event(
         SignalingFrame::Candidate { sdp } => {
             Some(SignalingEvent::CandidateReceived(IceCandidate(sdp)))
         }
-        SignalingFrame::Bye => Some(SignalingEvent::Closed),
+        SignalingFrame::Bye => {
+            // D-5 (REQ-S1): ALSO send LocalFailure{PeerBye} to the supervisor when wired.
+            // Best-effort try_send — if supervisor channel is None or full, the Closed
+            // event still flows normally via the signaling drain (defense-in-depth).
+            // This enables the S-1 eager wake: sender supervisor transitions to
+            // AwaitingAck at t≈0 on Bye, before the transport detects IceFailed.
+            if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
+                let _ = tx.try_send(SupervisorSignal::LocalFailure {
+                    trigger: sm_domain::session::ReconnectTrigger::PeerBye,
+                });
+            }
+            Some(SignalingEvent::Closed)
+        }
         SignalingFrame::ReconnectRequest {
             attempt,
             requester_role: _,
@@ -1643,6 +1655,82 @@ mod tests {
              (last occurrence, byte offset {frame_loop_pos}). \
              Fix (D-8): move `let _ = mdns.shutdown();` to AFTER `run_frame_loop(...)` \
              so the mDNS service stays published during the entire TCP session."
+        );
+    }
+
+    // ─── SC-S1-001 (mdns): frame_to_event(Bye) sends LocalFailure{PeerBye} ────
+    //
+    // REQ-S1 / D-5: frame_to_event(Bye) MUST send SupervisorSignal::LocalFailure
+    // { trigger: PeerBye } to supervisor_signal_tx when it is Some(_), IN ADDITION
+    // to returning Some(SignalingEvent::Closed).
+    //
+    // RED: currently `SignalingFrame::Bye => Some(SignalingEvent::Closed)` — no send.
+    // GREEN (T13): Bye-arm patched to try_send LocalFailure{PeerBye} first.
+
+    /// SC-S1-001 (mdns) — `frame_to_event(Bye)` sends `LocalFailure{PeerBye}` to
+    ///                     `supervisor_signal_tx` when `Some(_)`, AND returns `Some(Closed)`.
+    ///
+    /// GIVEN: A `supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>`
+    ///        pre-populated with `Some(sup_tx)`.
+    /// WHEN:  `frame_to_event(SignalingFrame::Bye, &supervisor_signal_tx)` is called.
+    /// THEN:  1. Returns `Some(SignalingEvent::Closed)` (existing behavior preserved).
+    ///        2. `sup_rx` receives `SupervisorSignal::LocalFailure { trigger: PeerBye }`
+    ///           within 100ms (NEW: S-1 eager wake).
+    #[test]
+    fn sc_s1_001_frame_to_event_bye_sends_local_failure_peer_bye_to_supervisor() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::session::ReconnectTrigger;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // ── Wire supervisor_signal_tx with Some(sup_tx) ──────────────────────
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let supervisor_signal_tx = Arc::new(Mutex::new(Some(sup_tx)));
+
+        // ── WHEN: call frame_to_event(Bye) ───────────────────────────────────
+        // RED: currently returns Closed but does NOT send to supervisor.
+        let event = frame_to_event(SignalingFrame::Bye, &supervisor_signal_tx);
+
+        // ── Assertion 1: still returns Some(Closed) ─────────────────────────
+        assert!(
+            matches!(event, Some(sm_domain::signaling::SignalingEvent::Closed)),
+            "SC-S1-001: frame_to_event(Bye) must still return Some(Closed)"
+        );
+
+        // ── Assertion 2: supervisor receives LocalFailure{PeerBye} ────────────
+        // RED: this fails until mdns.rs Bye-arm is patched (T13 GREEN).
+        let signal = sup_rx.recv_timeout(Duration::from_millis(100)).expect(
+            "SC-S1-001: frame_to_event(Bye) must send LocalFailure{PeerBye} to \
+                 supervisor_signal_tx when Some(_) — RED until mdns.rs Bye-arm patched",
+        );
+
+        assert!(
+            matches!(
+                signal,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-S1-001: expected LocalFailure{{PeerBye}} but got {signal:?}"
+        );
+    }
+
+    /// SC-S1-001b — `frame_to_event(Bye)` with `None` supervisor does NOT panic.
+    ///
+    /// When `supervisor_signal_tx` is `None`, the Bye-arm must silently skip the send.
+    /// Returns `Some(Closed)` as before.
+    #[test]
+    fn sc_s1_001b_frame_to_event_bye_with_none_supervisor_returns_closed() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+
+        let event = frame_to_event(SignalingFrame::Bye, &no_supervisor());
+        assert!(
+            matches!(event, Some(sm_domain::signaling::SignalingEvent::Closed)),
+            "SC-S1-001b: frame_to_event(Bye) with None supervisor must return Some(Closed)"
         );
     }
 }
