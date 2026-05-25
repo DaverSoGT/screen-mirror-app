@@ -1433,3 +1433,101 @@ fn transport_receiver_bundle_sequence_publishes_candidate_b6() {
 
     receiver.stop().unwrap();
 }
+
+// ─── SC-MLO-4: real-str0m m-line conflict reproduction (#[ignore]) ───────────
+//
+// REQ-MLO-2: A real-str0m integration test that documents the m-line order
+// failure when an OLD Str0mVideoReceiver processes a NEW Str0mVideoSender's
+// SDP offer. This is the root cause of Bug #2 (reconnect-rebuild-fixes cycle).
+//
+// Test is tagged #[ignore] — it confirms the BUG EXISTS (str0m's Rtc rejects the
+// second offer). The fix (stop_flag guard in run_signaling_drain) prevents the OLD
+// drain from ever calling apply_remote_offer on the NEW offer. This test remains
+// as a PROTOCOL SEMANTICS ANCHOR: if it ever starts PASSING without code changes,
+// str0m's upstream behavior changed.
+//
+// Run manually: cargo nextest run --workspace --run-ignored -E 'test(sc_mlo_4)'
+
+/// SC-MLO-4 — Real-str0m: OLD receiver rejects second offer with m-line order error.
+///
+/// Reproduces Bug #2 (reconnect-rebuild-fixes). str0m's `accept_offer` enforces
+/// m-line ordering across renegotiations (RFC 8843 / RFC 8829 semantics). When
+/// a fresh `Str0mVideoSender::new()` is created (new `Rtc` instance, different
+/// m-line internals) and its offer is applied to the ORIGINAL receiver (unmodified
+/// `Rtc` state from the first session), str0m rejects it with "Changed order for
+/// m-line". This is the exact failure observed in T22 R2 hardware logs.
+///
+/// ARCHIVE GATE note: if this test starts PASSING unexpectedly, str0m behavior
+/// changed upstream — document it before removing the test.
+///
+/// No network, no mDNS, no TCP — purely in-process `Rtc` instantiation.
+#[test]
+#[ignore = "Reproduction of Bug #2 (reconnect-rebuild-fixes). Confirms str0m rejects \
+             a second SDP offer from a fresh sender Rtc on the original receiver Rtc \
+             with 'Changed order for m-line'. Run with --run-ignored. \
+             See engram #1467 (design D-RBF-2) and #1466 (spec REQ-MLO-2). \
+             If this test PASSES without code changes, str0m behavior changed upstream."]
+fn sc_mlo_4_str0m_rejects_offer2_with_mline_conflict() {
+    use sm_domain::transport::{TransportError, VideoSender};
+
+    // First sender + receiver session: offer/answer exchange succeeds.
+    let sender_1 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-MLO-4: sender_1 new must succeed");
+
+    let receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("SC-MLO-4: receiver new must succeed");
+
+    let offer_1 = sender_1
+        .create_local_offer()
+        .expect("SC-MLO-4: sender_1 create_local_offer must succeed");
+
+    // First apply_remote_offer: MUST succeed (baseline session established).
+    let _answer_1 = receiver
+        .apply_remote_offer(offer_1)
+        .expect("SC-MLO-4: first apply_remote_offer must return Ok(SdpAnswer)");
+
+    // Simulate a rebuild: NEW sender with fresh Rtc, NEW offer.
+    // This mirrors what happens during a reconnect: Str0mVideoSender::new() creates
+    // a fresh Rtc instance with a different m-line ordering than the original sender.
+    let sender_2 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-MLO-4: sender_2 new must succeed");
+
+    let offer_2 = sender_2
+        .create_local_offer()
+        .expect("SC-MLO-4: sender_2 create_local_offer must succeed");
+
+    // Apply second offer to the ORIGINAL (unmodified, non-rebuilt) receiver.
+    // str0m MUST reject this with a "Changed order for m-line" or similar error.
+    let result = receiver.apply_remote_offer(offer_2);
+
+    assert!(
+        result.is_err(),
+        "SC-MLO-4 (REQ-MLO-2): expected Err from apply_remote_offer on second fresh-sender \
+         offer, but got Ok. str0m behavior may have changed upstream."
+    );
+
+    let err_str = match result.unwrap_err() {
+        TransportError::Internal(s) => s,
+        other => format!("{other:?}"),
+    };
+
+    // str0m error message contains "Changed order for m-line" or "accept_offer failed".
+    // The exact message depends on str0m version but both variants indicate the same
+    // protocol-level rejection.
+    assert!(
+        err_str.contains("Changed order for m-line")
+            || err_str.contains("accept_offer failed")
+            || err_str.contains("m-line"),
+        "SC-MLO-4 (REQ-MLO-2): error must reference m-line order conflict; got: {err_str}"
+    );
+}
