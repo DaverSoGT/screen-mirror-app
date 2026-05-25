@@ -757,6 +757,99 @@ mod tests {
         assert_eq!(result, Some(DeadReason::IceFailedRepeatedly));
     }
 
+    // ─── SC-DOUBLE-FAILURE-001: second LocalFailure ignored in AwaitingAck ──────
+    //
+    // REQ-DOUBLE-FAILURE: Supervisor MUST handle two concurrent LocalFailure signals
+    // (one from run_signaling_drain, one from run_stream_transport_event_drain) for the
+    // SAME Bye event without triggering a double-rebuild.
+    //
+    // The second LocalFailure arrives in AwaitingAck state and MUST be silently ignored
+    // (Ignore branch at supervisor.rs:348-352). No second state transition. No panic.
+    //
+    // T14: RED — written first (test exercises already-existing behavior).
+    // T15: GREEN — existing AwaitingAck Ignore branch makes this pass immediately.
+
+    /// SC-DOUBLE-FAILURE-001 — Second `LocalFailure` in `AwaitingAck` is silently ignored.
+    ///
+    /// GIVEN: A `ReconnectSupervisor` in `Connected` state.
+    /// WHEN:  Two `SupervisorSignal::LocalFailure` messages are sent back-to-back:
+    ///        first `{ trigger: PeerBye }`, then `{ trigger: ConnectionLost }`,
+    ///        without any `Ack` between them.
+    /// THEN:  The supervisor transitions to `AwaitingAck` EXACTLY ONCE (first signal).
+    ///        The second `LocalFailure` does NOT trigger a second `StateChanged` outcome.
+    ///        No panic. No second rebuild cycle initiated.
+    #[test]
+    fn sc_double_failure_001_second_local_failure_ignored_in_awaiting_ack() {
+        use crate::session::ReconnectTrigger;
+
+        let h = SupervisorHandle::spawn(fast_policy(), 42);
+
+        // ── Send two LocalFailure signals back-to-back ───────────────────────
+        // Both land in the channel before the supervisor processes either.
+        // The first transitions Connected → AwaitingAck (StateChanged + PublishReconnectRequest).
+        // The second arrives while the supervisor is in AwaitingAck and MUST be ignored (R-3).
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::PeerBye,
+        });
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::ConnectionLost {
+                reason: "test-double-failure".to_string(),
+            },
+        });
+
+        // ── Collect the two expected outcomes from the FIRST LocalFailure ────
+        // We receive deterministically so we don't race with the AwaitingAck timeout.
+        let outcome1 = h
+            .outcome_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("SC-DOUBLE-FAILURE-001: expected StateChanged(Reconnecting{1})");
+        let outcome2 = h
+            .outcome_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("SC-DOUBLE-FAILURE-001: expected PublishReconnectRequest");
+
+        // ── Stop immediately — prevents AwaitingAck timeout retry cycle ─────
+        // Sending Stop now puts it in the channel; the supervisor is either
+        // still in AwaitingAck (consuming the second LocalFailure, then Stop)
+        // or will pick it up on the next recv. Either way, it exits cleanly
+        // before any automatic retry StateChanged would be emitted.
+        h.send(SupervisorSignal::Stop);
+
+        // ── Drain any remaining outcomes (must be only Stopped) ──────────────
+        let mut extra_reconnecting = 0u32;
+        loop {
+            match h.outcome_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SupervisorOutcome::StateChanged(SessionState::Reconnecting { .. })) => {
+                    extra_reconnecting += 1;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        h.join();
+
+        // ── Assert: first LocalFailure produced exactly the expected outcomes ─
+        assert!(
+            matches!(
+                outcome1,
+                SupervisorOutcome::StateChanged(SessionState::Reconnecting { .. })
+            ),
+            "SC-DOUBLE-FAILURE-001: first outcome must be StateChanged(Reconnecting), got: {outcome1:?}"
+        );
+        assert!(
+            matches!(outcome2, SupervisorOutcome::PublishReconnectRequest { .. }),
+            "SC-DOUBLE-FAILURE-001: second outcome must be PublishReconnectRequest, got: {outcome2:?}"
+        );
+
+        // ── Assert: no extra Reconnecting transitions after Stop ──────────────
+        assert_eq!(
+            extra_reconnecting, 0,
+            "SC-DOUBLE-FAILURE-001: second LocalFailure in AwaitingAck must NOT produce \
+             a second StateChanged(Reconnecting). R-3 protection violated."
+        );
+    }
+
     // ─── AC-10: Nonce tie-break — lower wins ─────────────────────────────────
 
     /// AC-10 — When a PeerRequest arrives in AwaitingAck state with peer_nonce < my_nonce,
