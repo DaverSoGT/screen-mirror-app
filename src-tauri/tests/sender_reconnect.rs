@@ -509,7 +509,9 @@ fn hook_closures_noop_after_arc_drop_sc3() {
 // ─── SC-6: Gate A/B/C/D aborts emit tracing::warn! ───────────────────────────
 
 /// Helper: build a minimal RestartCache for gate-abort tests.
-fn make_test_restart_cache(ch: Arc<FakeJsonChannel>) -> screen_mirror_lib::commands::sender::RestartCache {
+fn make_test_restart_cache(
+    ch: Arc<FakeJsonChannel>,
+) -> screen_mirror_lib::commands::sender::RestartCache {
     screen_mirror_lib::commands::sender::RestartCache {
         udp_port: 0,
         service_name: "_test._tcp.local.".to_string(),
@@ -598,13 +600,13 @@ fn rebuild_gate_b_abort_emits_warn_sc6() {
         })),
         "sw_fake".to_string(),
     );
-    let bridge_session: Arc<Mutex<Option<SenderSession>>> =
-        Arc::new(Mutex::new(Some(session)));
+    let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
 
     // Builder must NOT be called (Gate B fires before builder).
-    let builder: SenderBuilderFn = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
-        panic!("Gate B: builder must not be called");
-    });
+    let builder: SenderBuilderFn =
+        Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+            panic!("Gate B: builder must not be called");
+        });
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
     // Spawn hook on separate thread and join — ensures worker thread finishes
@@ -712,11 +714,15 @@ fn rebuild_gate_d_abort_emits_warn_sc6() {
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let release_rx = Arc::new(Mutex::new(release_rx));
 
-    let builder: SenderBuilderFn = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
-        let _ = builder_started_tx.send(());
-        let _ = release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
-        Ok(SenderBundle::test_stub())
-    });
+    let builder: SenderBuilderFn =
+        Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+            let _ = builder_started_tx.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Ok(SenderBundle::test_stub())
+        });
 
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<SupervisorSignal>(4);
     let hook = make_sender_rebuild_hook(
