@@ -131,6 +131,12 @@ pub enum ReconnectTrigger {
         /// The peer's session nonce (used for race resolution).
         peer_nonce: u64,
     },
+    /// Remote peer cleanly closed the signaling channel by sending `Bye`.
+    ///
+    /// Sub-fix B: the signaling drain forwards this on `SignalingEvent::Closed` so the
+    /// supervisor enters `Rebuilding` and fires `initiate_mdns_reset`, allowing the sender
+    /// to republish its mDNS service and accept a new receiver connection.
+    PeerBye,
 }
 
 // ─── ReconnectAttempt ─────────────────────────────────────────────────────────

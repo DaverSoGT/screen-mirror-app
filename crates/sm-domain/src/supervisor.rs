@@ -487,7 +487,9 @@ impl ReconnectSupervisor {
 
 fn dead_reason_for_trigger(trigger: &ReconnectTrigger) -> DeadReason {
     match trigger {
-        ReconnectTrigger::IceFailed => DeadReason::IceFailedRepeatedly,
+        // PeerBye: receiver cleanly closed the signaling channel. Treat the same as
+        // IceFailed for dead-state reporting — the session is unrecoverable at this point.
+        ReconnectTrigger::IceFailed | ReconnectTrigger::PeerBye => DeadReason::IceFailedRepeatedly,
         ReconnectTrigger::ConnectionLost { .. } => DeadReason::ConnectionLostRepeatedly,
         ReconnectTrigger::PeerRequested { .. } => DeadReason::IceFailedRepeatedly,
     }
