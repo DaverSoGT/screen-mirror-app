@@ -1702,12 +1702,10 @@ mod tests {
 
         // ── Assertion 2: supervisor receives LocalFailure{PeerBye} ────────────
         // RED: this fails until mdns.rs Bye-arm is patched (T13 GREEN).
-        let signal = sup_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect(
-                "SC-S1-001: frame_to_event(Bye) must send LocalFailure{PeerBye} to \
-                 supervisor_signal_tx when Some(_) — RED until mdns.rs Bye-arm patched"
-            );
+        let signal = sup_rx.recv_timeout(Duration::from_millis(100)).expect(
+            "SC-S1-001: frame_to_event(Bye) must send LocalFailure{PeerBye} to \
+                 supervisor_signal_tx when Some(_) — RED until mdns.rs Bye-arm patched",
+        );
 
         assert!(
             matches!(

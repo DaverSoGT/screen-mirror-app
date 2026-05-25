@@ -1910,7 +1910,10 @@ mod tests {
 
         let fast_policy = ReconnectPolicy {
             max_attempts: std::num::NonZeroU8::new(3).unwrap(),
-            backoff: BackoffSchedule::Exponential { base_ms: 1, factor: 2 },
+            backoff: BackoffSchedule::Exponential {
+                base_ms: 1,
+                factor: 2,
+            },
         };
         let sup_handle = std::thread::Builder::new()
             .name("sc-s1-001-supervisor".into())
@@ -1928,18 +1931,19 @@ mod tests {
             sup_tx_guard.is_some(),
             "SC-S1-001: supervisor_signal_tx must be Some(_) — None window eliminated by S-1"
         );
-        let _ = sup_tx_guard.as_ref().unwrap().try_send(SupervisorSignal::LocalFailure {
-            trigger: ReconnectTrigger::PeerBye,
-        });
+        let _ = sup_tx_guard
+            .as_ref()
+            .unwrap()
+            .try_send(SupervisorSignal::LocalFailure {
+                trigger: ReconnectTrigger::PeerBye,
+            });
         drop(sup_tx_guard);
 
         // ── THEN: supervisor emits StateChanged(Reconnecting) within 100ms ───
-        let outcome = outcome_rx
-            .recv_timeout(Duration::from_millis(100))
-            .expect(
-                "SC-S1-001: supervisor must emit StateChanged(Reconnecting) within 100ms \
-                 — eager supervisor wires sup_tx before signaling starts"
-            );
+        let outcome = outcome_rx.recv_timeout(Duration::from_millis(100)).expect(
+            "SC-S1-001: supervisor must emit StateChanged(Reconnecting) within 100ms \
+                 — eager supervisor wires sup_tx before signaling starts",
+        );
         assert!(
             matches!(
                 outcome,
@@ -1973,7 +1977,10 @@ mod tests {
 
         let fast_policy = ReconnectPolicy {
             max_attempts: std::num::NonZeroU8::new(3).unwrap(),
-            backoff: BackoffSchedule::Exponential { base_ms: 1, factor: 2 },
+            backoff: BackoffSchedule::Exponential {
+                base_ms: 1,
+                factor: 2,
+            },
         };
 
         let sup_handle = std::thread::Builder::new()
