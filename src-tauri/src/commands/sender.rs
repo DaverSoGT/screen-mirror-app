@@ -523,13 +523,37 @@ pub trait SignalingSenderOps: Send + Sync {
 /// Per Amendment B: the offer was already published before this drain starts;
 /// `PeerFound` is log-only (no publish here).
 ///
-/// Exits when stop_flag is set, the channel disconnects, or `Closed` arrives.
+/// Sub-fix B: `supervisor_signal_tx` is forwarded `LocalFailure { PeerBye }` on
+/// `SignalingEvent::Closed`, so the supervisor enters `Rebuilding` and triggers
+/// `initiate_mdns_reset`.
+///
+/// Sub-fix C: `signaling_rx_cell` is a swap cell. At startup, the drain takes the
+/// initial `Receiver` from the cell. On `Closed` or `Disconnected`, the drain checks
+/// the cell for a fresh `Receiver` written by `initiate_mdns_reset`. If found, the
+/// drain swaps to the new `Receiver` and continues. If the cell is empty, the drain
+/// exits.
+///
+/// Exits when: stop_flag is set, cell is empty after Closed/Disconnected, or the
+/// stop_flag path fires.
 pub fn run_sender_signaling_drain(
-    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    signaling_rx_cell: Arc<Mutex<Option<std::sync::mpsc::Receiver<SignalingEvent>>>>,
     sender: Arc<dyn SignalingSenderOps>,
     stop_flag: Arc<AtomicBool>,
     channel: Arc<dyn ChannelLike>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
+    // Sub-fix C: take the initial Receiver from the cell at startup.
+    let mut ev_rx = match signaling_rx_cell.lock().unwrap().take() {
+        Some(rx) => rx,
+        None => {
+            tracing::error!(
+                target: "sender-signaling-drain",
+                "signaling_rx_cell empty at drain startup; exiting immediately",
+            );
+            return;
+        }
+    };
+
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -561,14 +585,75 @@ pub fn run_sender_signaling_drain(
                 }
                 SignalingEvent::Closed => {
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
-                    break;
+
+                    // Sub-fix B: forward PeerBye to supervisor so it enters Rebuilding.
+                    if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
+                        match tx.try_send(SupervisorSignal::LocalFailure {
+                            trigger: sm_domain::session::ReconnectTrigger::PeerBye,
+                        }) {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    target: "sender-signaling-drain",
+                                    trigger = "PeerBye",
+                                    "peer Bye received, notifying supervisor",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "sender-signaling-drain",
+                                    error = ?e,
+                                    "supervisor channel full or dropped; PeerBye signal lost",
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            target: "sender-signaling-drain",
+                            "peer Bye received but supervisor channel not registered; \
+                             drain checks cell for replacement Receiver",
+                        );
+                    }
+
+                    // Sub-fix C: check cell for a fresh Receiver (written by initiate_mdns_reset).
+                    // Lock is held only for the take() call — ~1µs.
+                    let next = signaling_rx_cell.lock().unwrap().take();
+                    match next {
+                        Some(new_rx) => {
+                            tracing::info!(
+                                target: "sender-signaling-drain",
+                                "swapped to fresh signaling Receiver after Closed",
+                            );
+                            ev_rx = new_rx;
+                            // Continue loop — do NOT break.
+                        }
+                        None => {
+                            tracing::debug!(
+                                target: "sender-signaling-drain",
+                                "Closed received and cell empty; drain exits",
+                            );
+                            break;
+                        }
+                    }
                 }
                 SignalingEvent::Error(e) => {
                     eprintln!("[sm-sender-signaling-drain] signaling error: {e}");
                 }
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Sub-fix C: Receiver disconnected — check for fresh one from initiate_mdns_reset.
+                let next = signaling_rx_cell.lock().unwrap().take();
+                if let Some(new_rx) = next {
+                    tracing::info!(
+                        target: "sender-signaling-drain",
+                        "swapped to fresh signaling Receiver after Disconnected",
+                    );
+                    ev_rx = new_rx;
+                    // Continue loop — do NOT break.
+                } else {
+                    break;
+                }
+            }
         }
     }
 }
@@ -1618,6 +1703,12 @@ fn build_production_sender_bundle(
     let (sig_ev_tx, sig_ev_rx) = sync_channel(CHANNEL_CAP);
     let (tr_ev_tx, tr_ev_rx) = sync_channel(CHANNEL_CAP);
 
+    // Sub-fix C: Receiver swap cell. initiate_mdns_reset hook writes a new Receiver here
+    // after calling MdnsSignaling::start(). The drain reads from this cell at startup and
+    // on every Closed/Disconnected event. sig_ev_rx is MOVED into the cell here.
+    let signaling_rx_cell: Arc<Mutex<Option<std::sync::mpsc::Receiver<SignalingEvent>>>> =
+        Arc::new(Mutex::new(Some(sig_ev_rx)));
+
     // ── 3. Start pipeline (canonical order from design §9) ───────────────────
     signaling
         .start(sig_ev_tx)
@@ -1699,6 +1790,9 @@ fn build_production_sender_bundle(
     let sig_for_req = Arc::downgrade(&signaling_for_hooks);
     let sig_for_ack = Arc::downgrade(&signaling_for_hooks);
     let sig_for_reset = Arc::downgrade(&signaling_for_hooks);
+    // Sub-fix C: hook captures the swap cell so initiate_mdns_reset can write the new
+    // Receiver before calling sig.start(). The drain reads from this same cell.
+    let sig_rx_cell_for_hook = signaling_rx_cell.clone();
 
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
@@ -1808,11 +1902,21 @@ fn build_production_sender_bundle(
                     "MdnsSignaling::stop() failed during reset",
                 );
             }
-            // Re-start with a fresh event channel. The supervisor_signal_tx Arc is
-            // shared via register_supervisor_signal_arc — the running thread automatically
-            // uses the bridge-level Arc after restart.
-            let (sig_ev_tx, _sig_ev_rx) = std::sync::mpsc::sync_channel(4);
-            if let Err(e) = sig.start(sig_ev_tx) {
+            // Sub-fix C: create fresh event channel and write the new Receiver into the
+            // swap cell BEFORE calling sig.start(). The drain will take the new Receiver
+            // on the next Closed/Disconnected check. Lock is released before start() —
+            // critical ordering per REQ-SSRL-26 (avoids deadlock if start() → frame loop
+            // tries to emit events via the old sig_ev_tx before drain swaps).
+            let (sig_ev_tx_new, sig_ev_rx_new) = std::sync::mpsc::sync_channel(4);
+            {
+                let mut cell = sig_rx_cell_for_hook.lock().unwrap();
+                *cell = Some(sig_ev_rx_new); // last-write-wins; any prior unread Receiver is dropped
+                tracing::info!(
+                    target: "sender-hooks",
+                    "initiate_mdns_reset — replaced signaling event receiver in drain cell",
+                );
+            } // lock released BEFORE sig.start()
+            if let Err(e) = sig.start(sig_ev_tx_new) {
                 tracing::error!(
                     target: "sender-hooks",
                     error = %e,
@@ -1829,10 +1933,20 @@ fn build_production_sender_bundle(
     let sig_stop = stop_flag.clone();
     let tr_stop = stop_flag.clone();
 
+    // Sub-fix C: pass the cell clone to the drain (not the raw Receiver).
+    let sig_rx_cell_for_drain = signaling_rx_cell.clone();
+    // Sub-fix B: pass the bridge supervisor_signal_tx to the drain.
+    let sig_sup_tx = _bridge_supervisor_signal_tx.clone();
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(sig_ev_rx, sender_ops, sig_stop, sig_channel);
+            run_sender_signaling_drain(
+                sig_rx_cell_for_drain,
+                sender_ops,
+                sig_stop,
+                sig_channel,
+                sig_sup_tx,
+            );
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
