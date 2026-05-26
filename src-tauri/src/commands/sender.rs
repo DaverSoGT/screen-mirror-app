@@ -1629,19 +1629,7 @@ fn build_production_sender_bundle(
     let (sig_ev_tx, sig_ev_rx) = sync_channel(CHANNEL_CAP);
     let (tr_ev_tx, tr_ev_rx) = sync_channel(CHANNEL_CAP);
 
-    // ── 3. Start pipeline (S-1 / D-5): create eager supervisor BEFORE start() ──
-    // Create (sup_tx, sup_rx) BEFORE signaling.start() so the Bye-arm in
-    // frame_to_event always finds Some(sup_tx) — no None-window for PeerBye.
-    //
-    // REQ-RBL-S1 / D-RBF-3: _relic_rx_eager is the predecessor PR-1 eager Receiver.
-    // After the D-RBF-1 fix, bridge_supervisor_signal_tx is seeded with sup_tx_eager
-    // (below) and becomes the authoritative slot. _relic_rx_eager is intentionally
-    // held but never polled — its only role is to keep the channel alive so the
-    // pre-start() sup_tx_eager send-path doesn't immediately see Disconnected.
-    // A future cleanup can drain or drop it once the supervisor lifecycle is stable.
-    let (sup_tx_eager, _relic_rx_eager) = std::sync::mpsc::sync_channel::<SupervisorSignal>(16);
-    // Register sup_tx on the signaling instance BEFORE start() (D-1).
-    signaling.set_supervisor_signal_tx(sup_tx_eager.clone());
+    // ── 3. Start pipeline ──
 
     signaling
         .start(sig_ev_tx)
@@ -1695,12 +1683,6 @@ fn build_production_sender_bundle(
     let signaling_arc = Arc::new(Mutex::new(signaling));
     // Clone for the production coordinator hooks BEFORE moving into shutdown.
     let signaling_for_hooks = signaling_arc.clone();
-
-    // D-RBF-1 (REQ-RBL-1): Seed the shared bridge Arc with sup_tx_eager so
-    // stop_sender_session_internal finds Some(tx) even before the first IceFailed.
-    // This also means the bridge Arc IS the authoritative slot — enter_supervisor_mode
-    // will overwrite it with the live signal_tx on every reconnect cycle.
-    *bridge_supervisor_signal_tx.lock().unwrap() = Some(sup_tx_eager);
 
     // D-RBF-1 (REQ-RBL-2): Wrap signaling_arc in the refresh adapter so
     // enter_supervisor_mode can push the live signal_tx into MdnsSignaling.
@@ -1825,10 +1807,10 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
     // Production transport drain with real coordinator hooks (CRITICAL-2).
-    // D-RBF-1 (REQ-RBL-1): use bridge_supervisor_signal_tx (already seeded with
-    // sup_tx_eager above) so IceFailed/ConnectionLost events reach the pre-wired
-    // supervisor — no None-window — AND enter_supervisor_mode writes back into
-    // the SAME Arc that stop_sender_session_internal reads.
+    // D-RBF-1 (REQ-RBL-1): bridge_supervisor_signal_tx starts None and is
+    // populated by enter_supervisor_mode on the first reconnect trigger.
+    // Both the transport drain and stop_sender_session_internal read from
+    // this same Arc — supervisor lifecycle owns the slot end-to-end.
     let sup_tx_for_drain = bridge_supervisor_signal_tx.clone();
     let tr_drain = std::thread::Builder::new()
         .name("sm-sender-transport-drain".into())
@@ -2185,7 +2167,7 @@ mod tests {
     // production builder threads the bridge Arc through instead of creating a local Arc.
     //
     // RED state: in the current code build_production_sender_bundle creates a LOCAL Arc
-    // (`let sup_tx = Arc::new(Mutex::new(Some(sup_tx_eager)))`). Since we test via a
+    // rather than using the passed-in bridge Arc. Since we test via a
     // fake builder here, this test passes even before WU-7 — it documents the INVARIANT
     // that must be preserved in production. SC-RBL-1 is a contract test for the
     // builder interface: the builder MUST write into the PASSED-IN Arc, not a local one.
