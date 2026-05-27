@@ -191,6 +191,11 @@ function triggerAutoRetry() {
 //
 // Phase 9 (Batch 6 CRITICAL-1): also shows/hides the reconnecting-overlay and
 // dead-modal elements added to viewer.html (spec §5.4).
+//
+// receiver-retry-on-exhaustion (D-RRE-2, D-RRE-3):
+//   • case "dead" arms AUTO_RETRY_DELAY_MS setTimeout after showing the modal.
+//   • All three branches call cancelAutoRetry() at their top (PQ-3 invariant).
+//   • The auto-retry fires triggerAutoRetry() → triggerRetry() (D-RRE-4).
 
 const reconnectingOverlay = document.getElementById("reconnecting-overlay");
 const deadModal = document.getElementById("dead-modal");
