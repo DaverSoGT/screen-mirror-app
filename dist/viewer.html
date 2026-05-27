@@ -70,6 +70,21 @@
       }
       #receiver-retry { border-color: #4a9; color: #8ef; }
       #receiver-cancel { border-color: #844; color: #f88; }
+      /* Role-change affordance (D-RRE-6): secondary visual weight between Retry and Cancel. */
+      #dead-role-change {
+        padding: 0.5rem 1.4rem;
+        font-size: 0.9rem;
+        font-family: inherit;
+        border-radius: 4px;
+        cursor: pointer;
+        border: 1px solid #666;
+        background: #1a1a1a;
+        color: #bbb;
+        text-decoration: none;
+        display: inline-block;
+      }
+      #dead-role-change:hover { color: #ddd; border-color: #888; }
+      #dead-role-change:focus { outline: 2px solid #4a9; outline-offset: 2px; }
       /* ── R10.2 smoke section (debug) ────────────────────────────────── */
       #smoke-section {
         position: fixed;
@@ -99,10 +114,15 @@
     <div id="reconnecting-overlay" hidden>Reconnecting…</div>
 
     <!-- Phase 9 — dead-session modal: hidden by default, shown by handleStatus("dead") -->
+    <!-- receiver-retry-on-exhaustion: added #dead-role-change affordance (D-RRE-5/6). -->
     <div id="dead-modal" hidden>
       <p id="dead-reason">Connection lost</p>
       <div class="dead-buttons">
         <button id="receiver-retry">Retry</button>
+        <a id="dead-role-change" href="./sender.html"
+           role="button" aria-label="Switch to sender mode and leave receiver">
+          Be the sender instead
+        </a>
         <button id="receiver-cancel">Cancel</button>
       </div>
     </div>

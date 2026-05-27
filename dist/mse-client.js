@@ -41,8 +41,14 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
 // After a snap, sit this far behind the edge (small playable cushion).
 const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
+// Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
+const AUTO_RETRY_DELAY_MS = 30_000;
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
+
+// Module-level auto-retry timer handle. NOT on window, NOT in mseState (D-RRE-1).
+// Null when no timer is armed; non-null between Dead-state entry and timer fire/cancel.
+let autoRetryTimerId = null;
 
 // ── Module-level MSE state ───────────────────────────────────────────────────
 // Lifted from main() so tearDownMse / setUpMse (called by handleStatus) can
@@ -62,6 +68,18 @@ const mseState = {
   /** True while a live MSE session is active (ms != null && sb ready). */
   active: false,
 };
+
+// ── cancelAutoRetry ──────────────────────────────────────────────────────────
+// Cancels any pending auto-retry timer. Idempotent — safe to call when no
+// timer is armed. MUST be called on every Dead-state exit (PQ-3 invariant,
+// D-RRE-3). Six call sites: case "dead" re-entry, case "streaming",
+// case "reconnecting", Retry click, Cancel click, role-change click.
+function cancelAutoRetry() {
+  if (autoRetryTimerId !== null) {
+    clearTimeout(autoRetryTimerId);
+    autoRetryTimerId = null;
+  }
+}
 
 // Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT / FRAME_STATUS
 // in stream.rs).
@@ -136,6 +154,36 @@ function setUpMse() {
   });
 }
 
+// ── triggerRetry / triggerAutoRetry ─────────────────────────────────────────
+// Shared retry implementation (D-RRE-4). Called by both the manual Retry
+// button and the auto-retry timer callback. Replicates the original click
+// handler semantics: hide dead-modal, create a new Channel, invoke
+// retry_session_stream. Does NOT call stop_stream (that would clear
+// restart_cache — I-NR-2 invariant). Does NOT call location.reload()
+// (REQ-NO-RELOAD). Does NOT rebind streamChannel.onmessage (Q-T1: pre-existing
+// gap in the manual Retry path; replicated faithfully per D-RRE-7 / R-6).
+async function triggerRetry() {
+  if (deadModal) deadModal.hidden = true;
+  const invoke = window.__TAURI__?.core?.invoke;
+  const Channel = window.__TAURI__?.core?.Channel;
+  if (invoke && Channel) {
+    try {
+      const channel = new Channel();
+      await invoke("retry_session_stream", { channel });
+    } catch (e) {
+      console.warn("[mse-client] retry_session_stream failed:", e);
+    }
+  }
+}
+
+// Auto-retry timer callback. Nulls the timer ID before calling triggerRetry()
+// so that any cancelAutoRetry() call racing with triggerRetry() is a no-op
+// (I-12 invariant: idempotent cancel after fire). D-RRE-4.
+function triggerAutoRetry() {
+  autoRetryTimerId = null;
+  triggerRetry();
+}
+
 // ── handleStatus ─────────────────────────────────────────────────────────────
 // Handle a decoded 0x02 JSON status payload from the Rust reconnect supervisor.
 // Spec §5.2, T10.1: routes reconnecting/dead/streaming lifecycle events to
@@ -154,25 +202,19 @@ const receiverCancelBtn = document.getElementById("receiver-cancel");
 // reusing the active Tauri channel. This avoids window.location.reload() which
 // would reset all JS state including the IPC channel reference (REQ-B2,
 // REQ-NO-RELOAD). The backend command mirrors retry_session on the sender side.
+// cancelAutoRetry() is prepended (PQ-3 invariant, D-RRE-3 call site 4).
 if (receiverRetryBtn) {
   receiverRetryBtn.addEventListener("click", async function () {
-    if (deadModal) deadModal.hidden = true;
-    const invoke = window.__TAURI__?.core?.invoke;
-    const Channel = window.__TAURI__?.core?.Channel;
-    if (invoke && Channel) {
-      try {
-        const channel = new Channel();
-        await invoke("retry_session_stream", { channel });
-      } catch (e) {
-        console.warn("[mse-client] retry_session_stream failed:", e);
-      }
-    }
+    cancelAutoRetry();
+    await triggerRetry();
   });
 }
 
 // Cancel: stop the stream and return to idle (no reload).
+// cancelAutoRetry() is prepended (PQ-3 invariant, D-RRE-3 call site 5).
 if (receiverCancelBtn) {
   receiverCancelBtn.addEventListener("click", async function () {
+    cancelAutoRetry();
     if (deadModal) deadModal.hidden = true;
     const invoke = window.__TAURI__?.core?.invoke;
     if (invoke) {
@@ -183,10 +225,28 @@ if (receiverCancelBtn) {
   });
 }
 
+// Role-change affordance: navigate to sender.html from the dead-modal.
+// cancelAutoRetry() is called first (PQ-3 invariant, D-RRE-3 call site 6).
+// localStorage write sets sm.lastMode so cold-relaunch boots into sender mode.
+// Wraps write in try/catch (R-8 mitigation). Does NOT preventDefault — lets
+// the native <a href> navigate. __sm_streamActive is already false (set in
+// case "dead"), so the beforeunload guard at viewer.html:125 is a no-op.
+// D-RRE-5 (PQ-4 LOCK).
+const deadRoleChangeEl = document.getElementById("dead-role-change");
+if (deadRoleChangeEl) {
+  deadRoleChangeEl.addEventListener("click", function () {
+    cancelAutoRetry();
+    try { localStorage.setItem("sm.lastMode", "sender"); } catch (_) {}
+    if (deadModal) deadModal.hidden = true;
+  });
+}
+
 function handleStatus(payload) {
   console.log("[mse-client] status:", payload.kind, payload);
   switch (payload.kind) {
     case "reconnecting":
+      // Cancel any pending auto-retry (PQ-3 invariant, D-RRE-3 call site 1).
+      cancelAutoRetry();
       // Reconnect in progress — tear down the stale MSE session immediately.
       // The receiver will emit FRAME_INIT again after the bundle is rebuilt.
       setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…");
@@ -200,6 +260,9 @@ function handleStatus(payload) {
       if (deadModal) deadModal.hidden = true;
       break;
     case "dead":
+      // Cancel any prior auto-retry before re-arming (PQ-3 invariant, D-RRE-3 call site 3).
+      // Handles both second-Dead re-entry and the normal first-entry (idempotent).
+      cancelAutoRetry();
       // All reconnect attempts exhausted — show dead-session modal with Retry/Cancel.
       setStatus("Disconnected — session lost");
       tearDownMse();
@@ -212,8 +275,12 @@ function handleStatus(payload) {
         }
         deadModal.hidden = false;
       }
+      // Arm the single bounded auto-retry timer (PQ-1, PQ-2, D-RRE-2).
+      autoRetryTimerId = setTimeout(triggerAutoRetry, AUTO_RETRY_DELAY_MS);
       break;
     case "streaming":
+      // Cancel any pending auto-retry (PQ-3 invariant, D-RRE-3 call site 2).
+      cancelAutoRetry();
       // Reconnect supervisor reports the rebuild succeeded. Prepare a fresh MSE
       // session so the next FRAME_INIT can re-initialize the SourceBuffer.
       if (reconnectingOverlay) reconnectingOverlay.hidden = true;
