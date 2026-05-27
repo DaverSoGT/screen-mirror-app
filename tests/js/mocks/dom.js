@@ -4,6 +4,8 @@
 // hw-encoder-backend-disclosure adds #encoder-backend (hidden by default).
 // REQ-B2: adds #dead-modal, #dead-reason, #receiver-retry, #receiver-cancel
 //         for the receiver dead-modal UI (mse-client.js:145-180).
+// receiver-retry-on-exhaustion (D-RRE-6): adds #dead-role-change inside
+//         .dead-buttons for the role-change affordance (backward-compatible).
 export function installDom() {
   removeDom();
   document.body.innerHTML = `
@@ -17,8 +19,14 @@ export function installDom() {
     <button id="cancel" style="display:none">Cancel</button>
     <div id="dead-modal" hidden>
       <p id="dead-reason"></p>
-      <button id="receiver-retry">Retry</button>
-      <button id="receiver-cancel">Cancel</button>
+      <div class="dead-buttons">
+        <button id="receiver-retry">Retry</button>
+        <a id="dead-role-change" href="./sender.html"
+           role="button" aria-label="Switch to sender mode and leave receiver">
+          Be the sender instead
+        </a>
+        <button id="receiver-cancel">Cancel</button>
+      </div>
     </div>
   `;
 }
