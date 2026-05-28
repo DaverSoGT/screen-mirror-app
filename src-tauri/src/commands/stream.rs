@@ -6724,4 +6724,171 @@ mod tests {
 
         drop(pkt_tx);
     }
+
+    // ─── D-RDF block: reconnect-reset-drain-fix (REQ-RRD-1/3) ───────────────
+    //
+    // These two tests verify the DrainRole::ResetSignalingOnly behaviour introduced
+    // by the reconnect-reset-drain-fix change.
+    //
+    // sc_rdf_1 — RED precondition (T2): before the role gate is added to
+    //   run_signaling_drain, the offer IS applied on a ResetSignalingOnly drain
+    //   (count==1). The test MUST fail until T3 (GREEN) adds the gate.
+    //
+    // sc_rdf_2 — structural RED: the D-3 Closed→PeerBye forward is already wired;
+    //   this test guards that a future implementer does NOT break it by using `break`
+    //   instead of `continue` for the ignored-offer path (D-RDF-3).
+
+    /// sc_rdf_1 — `DrainRole::ResetSignalingOnly` MUST NOT call `apply_remote_offer`.
+    ///
+    /// GIVEN: `CountingReceiverOps` spy, no-op publish ops, `stop_flag=false`,
+    ///        `DrainRole::ResetSignalingOnly` passed to `run_signaling_drain`.
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected, then the
+    ///        channel is dropped to let the drain exit.
+    /// THEN:  `apply_remote_offer` call count MUST be 0 AND `publish_local_answer`
+    ///        MUST NOT be called.
+    ///
+    /// RED precondition: without the role gate in run_signaling_drain the offer IS
+    /// applied (count==1) — this test fails until T3 adds the `if role ==
+    /// DrainRole::ResetSignalingOnly { continue; }` gate (D-RDF-2).
+    ///
+    /// Satisfies: SC-RRD-1, REQ-RRD-1, D-RDF-2.
+    #[test]
+    fn sc_rdf_1_reset_role_drops_offer_without_apply() {
+        use sm_domain::signaling::SignalingEvent;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::sync_channel;
+
+        let (counting_recv, call_count) = CountingReceiverOps::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+
+        let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let sup_clone = supervisor_signal_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-rdf-1-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
+            })
+            .expect("sc_rdf_1: spawn drain thread");
+
+        // Inject an offer — with ResetSignalingOnly the drain must log-and-skip it.
+        let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-1".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(fake_offer))
+            .expect("sc_rdf_1: send OfferReceived");
+
+        // Drop sender to close the channel, letting the drain exit on Disconnected.
+        drop(sig_ev_tx);
+
+        drain_handle
+            .join()
+            .expect("sc_rdf_1: drain thread must not panic");
+
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            0,
+            "SC-RRD-1: DrainRole::ResetSignalingOnly MUST NOT call apply_remote_offer \
+             (D-RDF-2). Count was non-zero — role gate missing in run_signaling_drain."
+        );
+    }
+
+    /// sc_rdf_2 — `DrainRole::ResetSignalingOnly` MUST still forward `Closed` to supervisor.
+    ///
+    /// GIVEN: spy `supervisor_signal_tx`, `DrainRole::ResetSignalingOnly`, `stop_flag=false`.
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected (must be ignored),
+    ///        THEN `SignalingEvent::Closed` is injected.
+    /// THEN:  `supervisor_signal_rx.recv_timeout(500ms)` returns
+    ///        `Ok(SupervisorSignal::LocalFailure { trigger: ReconnectTrigger::PeerBye })`.
+    ///
+    /// Structural RED: the Closed arm already works; this test guards that the role gate
+    /// uses `continue` (not `break`) so the drain survives to process Closed
+    /// (D-RDF-3, R-3). If a future implementer switches to `break`, this test fails.
+    ///
+    /// Satisfies: SC-RRD-3, REQ-RRD-3, D-RDF-3.
+    #[test]
+    fn sc_rdf_2_reset_role_still_forwards_closed_peerbye() {
+        use sm_domain::session::ReconnectTrigger;
+        use sm_domain::signaling::SignalingEvent;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(CountingReceiverOps::new().0);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(8);
+
+        let (spy_sup_tx, spy_sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(spy_sup_tx)));
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let sup_clone = supervisor_signal_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-rdf-2-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
+            })
+            .expect("sc_rdf_2: spawn drain thread");
+
+        // Inject an offer first — must be ignored (not break the drain).
+        let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-2".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(fake_offer))
+            .expect("sc_rdf_2: send OfferReceived");
+
+        // Small sleep so the drain can process the offer before we send Closed.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Now inject Closed — the drain must still forward PeerBye.
+        sig_ev_tx
+            .send(SignalingEvent::Closed)
+            .expect("sc_rdf_2: send Closed");
+
+        drain_handle
+            .join()
+            .expect("sc_rdf_2: drain thread must not panic");
+
+        let signal = spy_sup_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect(
+                "SC-RRD-3: DrainRole::ResetSignalingOnly MUST forward Closed as \
+                 LocalFailure{PeerBye} within 500ms (D-3, D-RDF-3). \
+                 Channel empty — drain did not forward, or used `break` on the offer.",
+            );
+
+        assert!(
+            matches!(
+                signal,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-RRD-3: expected LocalFailure{{PeerBye}} but got {signal:?}"
+        );
+    }
 }
