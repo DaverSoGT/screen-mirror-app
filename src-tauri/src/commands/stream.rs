@@ -5379,19 +5379,20 @@ mod tests {
     // ─── SC-F-001 / SC-F-002: initiate_mdns_reset must spawn a new drain consumer ──
 
     /// SC-F-001 — After `initiate_mdns_reset` is invoked, a `SignalingEvent::OfferReceived`
-    /// injected into the new `sig_ev_tx` MUST be received and processed by a new drain
-    /// thread (apply_remote_offer called on the receiver). Previously the code dropped
-    /// `_sig_ev_rx` so the new channel had no consumer — any sent event was silently dropped.
+    /// injected into the new `sig_ev_tx` MUST be received by a live drain thread (channel
+    /// not orphaned — D-4 / GAP-F contract). The reset hook spawns a
+    /// `DrainRole::ResetSignalingOnly` drain; the offer is CONSUMED (channel is live) but
+    /// `apply_remote_offer` is NOT called on the stale Rtc (REQ-RRD-1, D-RDF-2).
     ///
     /// Test approach: directly constructs the `initiate_mdns_reset` hook using the same
     /// D-4 pattern as production (spy signaling, spy receiver, noop publish). Calls the
     /// hook, then sends an `OfferReceived` event on the new `sig_ev_tx` captured by the
     /// spy. Asserts that:
-    ///   1. `try_send` succeeds (channel not orphaned).
-    ///   2. `apply_remote_offer` is called on the spy receiver (drain processed the offer).
+    ///   1. `try_send` succeeds (channel not orphaned / D-4 preserved).
+    ///   2. `apply_remote_offer` is NOT called (count == 0 — D-RDF-2 / REQ-RRD-1).
     ///
-    /// GREEN (D-4 fix in T03): closure spawns `run_signaling_drain` consuming the new
-    /// `sig_ev_rx` so send succeeds and offer reaches the receiver.
+    /// See SC-RRD-1 (sc_rdf_1) for the lower-level unit test of the same invariant.
+    /// The 0-count here is CORRECT behavior, NOT a regression.
     #[test]
     fn sc_f_001_initiate_mdns_reset_spawns_consumer_for_new_sig_ev_rx() {
         use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
@@ -5498,8 +5499,9 @@ mod tests {
             let pub_clone = pub_for_reset.clone();
             let stop_clone = stop_for_reset.clone();
 
-            // Spawn drain — this is exactly what the production D-4 fix does.
-            // SC-F-001 tests the drain spawn pattern only (no supervisor wiring needed).
+            // Spawn drain mirroring the production reset hook (D-4 pattern).
+            // SC-F-001 tests channel liveness only; role is ResetSignalingOnly
+            // to match the production build_initiate_mdns_reset_hook (REQ-RRD-1).
             if let Err(e) = std::thread::Builder::new()
                 .name("sm-signaling-event-drain-reset-test".into())
                 .spawn(move || {
@@ -5509,7 +5511,7 @@ mod tests {
                         pub_clone,
                         stop_clone,
                         Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
-                        DrainRole::Primary,
+                        DrainRole::ResetSignalingOnly,
                     );
                 })
             {
@@ -5542,13 +5544,18 @@ mod tests {
              (GAP-F). Fix: spawn run_signaling_drain(sig_ev_rx, ...) in the closure (D-4)."
         );
 
-        // ── Secondary assertion: drain forwarded the offer to the receiver ──
+        // ── Secondary assertion: drain does NOT forward the offer to the receiver ──
+        // After REQ-RRD-1 (D-RDF-2): the reset hook spawns a DrainRole::ResetSignalingOnly
+        // drain. The OfferReceived event is consumed (channel is live — D-4) but
+        // apply_remote_offer is NOT called on the stale Rtc. Count MUST be 0.
+        // A future reader: 0 here is CORRECT behavior, NOT a regression.
         std::thread::sleep(Duration::from_millis(200));
         let count = *offer_count.lock().unwrap();
         assert_eq!(
-            count, 1,
-            "SC-F-001: apply_remote_offer must be called exactly once after reset \
-             when an OfferReceived event is sent on the new sig_ev_tx"
+            count, 0,
+            "SC-F-001: after initiate_mdns_reset the reset drain MUST NOT call \
+             apply_remote_offer (DrainRole::ResetSignalingOnly, D-RDF-2). \
+             Primary assertion (channel liveness) remains above."
         );
 
         // Cleanup.
@@ -5557,7 +5564,10 @@ mod tests {
 
     /// SC-F-002 — `build_initiate_mdns_reset_hook` (the REAL production function called
     /// by `build_production_bundle`) must spawn a drain thread that consumes the fresh
-    /// `sig_ev_rx` after reset.
+    /// `sig_ev_rx` after reset. The reset drain spawns with `DrainRole::ResetSignalingOnly`:
+    /// the channel is LIVE (D-4 / GAP-F contract preserved) but `apply_remote_offer` is
+    /// NOT called on the stale Rtc (REQ-RRD-1 / D-RDF-2). The Closed→PeerBye forward
+    /// (D-3) is also verified (tertiary assertion, preserved verbatim).
     ///
     /// **Gap closed by this test (W-real from verify #1452):** SC-F-001 reconstructed
     /// the `initiate_mdns_reset` closure with spy types — it tested the *pattern*, not
@@ -5570,9 +5580,8 @@ mod tests {
     /// function that `build_production_bundle` delegates to. Spy implementations satisfy
     /// the generic type bounds (`T: Signaling`), so no real mDNS or UDP stack is started.
     ///
-    /// GREEN first run: the production impl was verified line-level by verify #1452;
-    /// this test exercises the same code through the extracted function rather than a
-    /// reconstruction, confirming the hook composition is correct end-to-end.
+    /// The offer-apply count is 0 after REQ-RRD-1. This is CORRECT — NOT a regression.
+    /// See SC-RRD-1 (sc_rdf_1) for the lower-level unit test of the same invariant.
     #[test]
     fn sc_f_002_build_initiate_mdns_reset_hook_production_fn_spawns_consumer() {
         use sm_domain::signaling::{
@@ -5733,14 +5742,15 @@ mod tests {
              production hook is NOT consuming the new receiver (GAP-F regression)."
         );
 
-        // ── Secondary assertion: drain forwarded the offer to the receiver ──
+        // ── Secondary assertion: drain does NOT apply the offer (ResetSignalingOnly) ──
+        // D-RDF-2: build_initiate_mdns_reset_hook spawns a ResetSignalingOnly drain.
+        // Offer is consumed (channel live) but apply_remote_offer is NOT called. Count == 0.
         std::thread::sleep(Duration::from_millis(200));
         let count = *offer_count.lock().unwrap();
         assert_eq!(
-            count, 1,
-            "SC-F-002: apply_remote_offer must be called exactly once after the \
-             production hook reset when an OfferReceived event is injected on the \
-             new sig_ev_tx"
+            count, 0,
+            "SC-F-002: production reset hook drain MUST NOT call apply_remote_offer \
+             (DrainRole::ResetSignalingOnly, D-RDF-2, REQ-RRD-1)."
         );
 
         // ── Tertiary assertion (W-real PR #2): drain also forwards Closed → supervisor ──
