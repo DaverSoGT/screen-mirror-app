@@ -1450,23 +1450,37 @@ fn transport_receiver_bundle_sequence_publishes_candidate_b6() {
 
 /// SC-MLO-4 — Real-str0m: OLD receiver rejects second offer with m-line order error.
 ///
-/// Reproduces Bug #2 (reconnect-rebuild-fixes). str0m's `accept_offer` enforces
-/// m-line ordering across renegotiations (RFC 8843 / RFC 8829 semantics). When
-/// a fresh `Str0mVideoSender::new()` is created (new `Rtc` instance, different
-/// m-line internals) and its offer is applied to the ORIGINAL receiver (unmodified
-/// `Rtc` state from the first session), str0m rejects it with "Changed order for
-/// m-line". This is the exact failure observed in T22 R2 hardware logs.
+/// Protocol anchor (D-RDF-6, reconnect-reset-drain-fix): documents that str0m's
+/// `accept_offer` enforces m-line ordering across renegotiations (RFC 8843 /
+/// RFC 8829 semantics). When a fresh `Str0mVideoSender::new()` is created (new
+/// `Rtc` instance, different m-line internals) and its offer is applied to the
+/// ORIGINAL receiver (unmodified `Rtc` state from the first session), str0m
+/// rejects it with "Changed order for m-line with mid: X".
+///
+/// **Post-fix meaning (reconnect-reset-drain-fix / REQ-RRD-1):** The receiver
+/// code path no longer triggers this scenario. After REQ-RRD-1 the reset drain
+/// (`DrainRole::ResetSignalingOnly`, D-RDF-2) no longer applies offers to the
+/// stale Rtc — the rebuild worker's fresh Rtc (DrainRole::Primary drain) is the
+/// sole offer-application owner. This test now serves as an upstream str0m
+/// behavior anchor only: if str0m ever changes such that a second offer on the
+/// SAME Rtc succeeds, document the behavioral change before removing this test.
+///
+/// Run with `--run-ignored` to verify str0m still rejects (should still fail).
 ///
 /// ARCHIVE GATE note: if this test starts PASSING unexpectedly, str0m behavior
-/// changed upstream — document it before removing the test.
+/// changed upstream — document it before removing the test. This note MUST be
+/// preserved.
 ///
 /// No network, no mDNS, no TCP — purely in-process `Rtc` instantiation.
 #[test]
-#[ignore = "Reproduction of Bug #2 (reconnect-rebuild-fixes). Confirms str0m rejects \
-             a second SDP offer from a fresh sender Rtc on the original receiver Rtc \
-             with 'Changed order for m-line'. Run with --run-ignored. \
-             See engram #1467 (design D-RBF-2) and #1466 (spec REQ-MLO-2). \
-             If this test PASSES without code changes, str0m behavior changed upstream."]
+#[ignore = "Protocol anchor (D-RDF-6): documents that str0m rejects a second SDP offer \
+             on the SAME (stale) Rtc with 'Changed order for m-line'. \
+             After REQ-RRD-1 (reconnect-reset-drain-fix), the receiver code path no \
+             longer triggers this: the reset drain (DrainRole::ResetSignalingOnly) no \
+             longer applies offers to the stale Rtc. \
+             Run with --run-ignored to verify str0m still rejects (should still fail). \
+             If this test PASSES without code changes, str0m behavior changed upstream -- \
+             document before removing. ARCHIVE-GATE: see doc-comment above."]
 fn sc_mlo_4_str0m_rejects_offer2_with_mline_conflict() {
     use sm_domain::transport::{TransportError, VideoSender};
 
