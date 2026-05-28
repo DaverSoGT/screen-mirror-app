@@ -1491,7 +1491,14 @@ where
         if let Err(e) = std::thread::Builder::new()
             .name("sm-signaling-event-drain-reset".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone, DrainRole::ResetSignalingOnly);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_clone,
+                    pub_clone,
+                    stop_clone,
+                    sup_tx_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
             })
         {
             eprintln!("[sm-stream-coord] failed to spawn reset drain thread: {e}");
@@ -1707,8 +1714,8 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain,    // D-3 REQ-A
-                DrainRole::Primary,  // D-RDF-1: primary drain owns offer application
+                sup_tx_for_drain,   // D-3 REQ-A
+                DrainRole::Primary, // D-RDF-1: primary drain owns offer application
             );
         })?;
 
@@ -6411,7 +6418,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-1-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-1: spawn drain thread");
 
@@ -6475,7 +6489,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-2-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-2: spawn drain thread");
 
@@ -6545,7 +6566,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-3-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-3: spawn drain thread");
 
@@ -6894,13 +6922,11 @@ mod tests {
             .join()
             .expect("sc_rdf_2: drain thread must not panic");
 
-        let signal = spy_sup_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect(
-                "SC-RRD-3: DrainRole::ResetSignalingOnly MUST forward Closed as \
+        let signal = spy_sup_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-RRD-3: DrainRole::ResetSignalingOnly MUST forward Closed as \
                  LocalFailure{PeerBye} within 500ms (D-3, D-RDF-3). \
                  Channel empty — drain did not forward, or used `break` on the offer.",
-            );
+        );
 
         assert!(
             matches!(
