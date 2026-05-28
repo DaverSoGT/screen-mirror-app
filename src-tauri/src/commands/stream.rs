@@ -934,6 +934,17 @@ fn run_signaling_drain(
                         );
                         break;
                     }
+                    // D-RDF-2: reset drain is signaling-only. Its receiver Arc points at the STALE
+                    // pre-rebuild Rtc; applying a restarted sender's offer here triggers str0m
+                    // "Changed order for m-line" (root cause #870). The rebuild worker's fresh Rtc
+                    // owns offer application. log-and-skip with `continue` (NOT break) so the drain
+                    // stays alive for Candidate/Closed/PeerBye (R-3, SC-F-001/002, D-3, D-RDF-3).
+                    if role == DrainRole::ResetSignalingOnly {
+                        eprintln!(
+                            "[sm-signaling-drain-reset] OfferReceived ignored (signaling-only, D-RDF-2)"
+                        );
+                        continue;
+                    }
                     match receiver.apply_remote_offer(offer) {
                         Ok(answer) => {
                             if let Err(e) = signaling.publish_local_answer(answer) {
@@ -1480,7 +1491,7 @@ where
         if let Err(e) = std::thread::Builder::new()
             .name("sm-signaling-event-drain-reset".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone, DrainRole::Primary);
+                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone, DrainRole::ResetSignalingOnly);
             })
         {
             eprintln!("[sm-stream-coord] failed to spawn reset drain thread: {e}");
