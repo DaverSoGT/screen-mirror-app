@@ -863,11 +863,27 @@ pub struct ReceiverBundle {
 
 // ─── Drain functions (W2-fix-B, W2-fix-C) ────────────────────────────────────
 
+/// Role of a signaling-event drain (D-RDF-1, reconnect-reset-drain-fix).
+///
+/// Disambiguates the TWO consumers that share `run_signaling_drain`:
+/// - `Primary`: the drain spawned by `build_production_bundle` for the
+///   FRESH receiver Rtc. Owns first-negotiation offer application.
+/// - `ResetSignalingOnly`: the drain spawned by `build_initiate_mdns_reset_hook`
+///   AFTER an `InitiateMdnsReset`. Its receiver Arc points at the OLD/STALE Rtc
+///   whose m-line state conflicts with a restarted sender. It MUST NOT apply
+///   offers — the rebuild worker's fresh Rtc is the sole offer-application owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainRole {
+    Primary,
+    ResetSignalingOnly,
+}
+
 /// Signaling-event drain loop.
 ///
 /// Runs on its own OS thread spawned by `build_production_bundle`.
 /// Dispatches `SignalingEvent`s:
 /// - `OfferReceived(offer)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
+///   (Primary role only; ResetSignalingOnly drains log-and-skip per D-RDF-2)
 /// - `CandidateReceived(c)` → `receiver.add_remote_candidate(c)`
 /// - `PeerFound` → log
 /// - `Closed` → forward `LocalFailure{PeerBye}` to supervisor (D-3, REQ-A) then exit
@@ -881,12 +897,18 @@ pub struct ReceiverBundle {
 /// `None` (receiver lazy-init: set later) or full (capacity 16), but a Closed event
 /// means the peer has gone away so the forward is fire-and-forget. The drain exits
 /// immediately after forwarding regardless of whether the send succeeded.
+///
+/// # Parameters (D-RDF-1)
+/// The `role` parameter (6th) controls whether the `OfferReceived` arm calls
+/// `apply_remote_offer`. `Primary` applies offers (first negotiation). `ResetSignalingOnly`
+/// log-and-skips them (the stale Rtc must never see a fresh sender offer).
 fn run_signaling_drain(
     ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
     receiver: Arc<dyn SignalingReceiverOps>,
     signaling: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
+    role: DrainRole,                                                        // D-RDF-1
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -1458,7 +1480,7 @@ where
         if let Err(e) = std::thread::Builder::new()
             .name("sm-signaling-event-drain-reset".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone);
+                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone, DrainRole::Primary);
             })
         {
             eprintln!("[sm-stream-coord] failed to spawn reset drain thread: {e}");
@@ -1674,7 +1696,8 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain, // D-3 REQ-A
+                sup_tx_for_drain,    // D-3 REQ-A
+                DrainRole::Primary,  // D-RDF-1: primary drain owns offer application
             );
         })?;
 
@@ -3398,6 +3421,7 @@ mod tests {
                 sig_clone,
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
+                DrainRole::Primary,
             );
         });
 
@@ -3489,6 +3513,7 @@ mod tests {
                 Arc::new(NoopSignalingPublish),
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
+                DrainRole::Primary,
             );
         });
 
@@ -5473,6 +5498,7 @@ mod tests {
                         pub_clone,
                         stop_clone,
                         Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
+                        DrainRole::Primary,
                     );
                 })
             {
@@ -5802,6 +5828,7 @@ mod tests {
                     pub_ops,
                     stop_clone,
                     supervisor_signal_tx, // 5th param — added in T09
+                    DrainRole::Primary,
                 );
             })
             .expect("spawn drain thread");
@@ -5905,6 +5932,7 @@ mod tests {
                     Arc::new(NoOpPub) as Arc<dyn SignalingPublishOps>,
                     stop_clone,
                     sup_tx_clone,
+                    DrainRole::Primary,
                 );
             })
             .expect("spawn drain");
@@ -6362,7 +6390,7 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-1-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
             })
             .expect("SC-MLO-1: spawn drain thread");
 
@@ -6426,7 +6454,7 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-2-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
             })
             .expect("SC-MLO-2: spawn drain thread");
 
@@ -6496,7 +6524,7 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-3-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone, DrainRole::Primary);
             })
             .expect("SC-MLO-3: spawn drain thread");
 
