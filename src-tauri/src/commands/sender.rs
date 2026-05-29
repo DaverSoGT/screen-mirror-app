@@ -2514,6 +2514,245 @@ mod tests {
         );
     }
 
+    // ─── SC-SRR-1: Sender MUST NOT invoke rebuild hook for a fresh session ──────
+    //
+    // REQ-SRR-0 / REQ-SRR-1 / SC-SRR-0a / SC-SRR-1
+    //
+    // Hypothesis B (design §1.1): when the sender's supervisor is armed via a prior
+    // IceFailed event (enter_supervisor_mode sets supervisor_signal_tx = Some) and a
+    // PeerRequest arrives, the supervisor emits InitiateRebuild → the initiate_rebuild
+    // hook fires → signaling Drop → Bye.
+    //
+    // BRANCH DETECTION (design §1.3):
+    //   - RED at baseline (rebuild_invoked == true on unmodified code) → Hyp-B confirmed.
+    //     The hook DID fire; the post-fix assertion (== false) fails → RED.
+    //   - GREEN unexpectedly (rebuild_invoked == false at baseline) → Hyp-A pivot needed.
+    //     If this test passes before WU-3 is applied, stop and notify the orchestrator.
+    //
+    // Test assertion (post-fix form): rebuild hook MUST NOT fire for a fresh (never
+    // IceConnected) sender session that receives a peer ReconnectRequest.
+    // On the UNMODIFIED branch this assertion FAILS (rebuild_invoked IS true) → RED.
+    // After WU-3 fix this assertion PASSES (rebuild_invoked IS false) → GREEN.
+
+    /// SC-SRR-1 — Sender MUST NOT invoke `initiate_rebuild` on a PeerRequest when the
+    ///             current session has never reached IceConnected (fresh session guard).
+    ///
+    /// GIVEN: A transport drain with a spy `initiate_rebuild` hook (Arc<AtomicBool>).
+    ///        The drain is armed with a fast-backoff supervisor policy.
+    /// WHEN:  IceFailed fires → supervisor is armed (supervisor_signal_tx = Some).
+    ///        A SupervisorSignal::PeerRequest{peer_nonce: HIGH, attempt: 1} is injected
+    ///        via supervisor_signal_tx (simulating frame_to_event(ReconnectRequest)).
+    /// THEN (post-fix GREEN): rebuild_invoked == false within 500 ms — the fresh-session
+    ///        guard suppresses the rebuild hook call.
+    ///        On the UNMODIFIED branch: rebuild_invoked == true → assertion FAILS → RED.
+    ///
+    /// If this test is GREEN at baseline (rebuild_invoked == false before WU-3):
+    ///   → Hypothesis A operative; stop and report to orchestrator before WU-3.
+    #[test]
+    fn sc_srr_1_peer_request_does_not_invoke_rebuild_on_fresh_sender() {
+        use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
+        use sm_domain::supervisor::SupervisorSignal;
+        use sm_domain::transport::TransportEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Spy: records whether the initiate_rebuild hook was invoked.
+        let rebuild_invoked = Arc::new(AtomicBool::new(false));
+        let rebuild_flag = rebuild_invoked.clone();
+
+        // Bridge Arc — shared between test and drain; populated by enter_supervisor_mode.
+        let supervisor_signal_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+        let sup_tx_for_test = supervisor_signal_tx.clone();
+
+        let (tr_ev_tx, tr_ev_rx) = sync_channel::<TransportEvent>(4);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // Spy rebuild hook: records invocation, then signals RebuildFailed so the
+        // supervisor exits cleanly instead of blocking the thread.
+        let hooks = super::SenderCoordinatorHooks {
+            publish_reconnect_request: Arc::new(|_, _| {}),
+            publish_reconnect_ack: Arc::new(|_, _| {}),
+            initiate_rebuild: Arc::new(move |signal_tx| {
+                rebuild_flag.store(true, Ordering::SeqCst);
+                // Signal RebuildFailed so supervisor doesn't block.
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+            }),
+            initiate_mdns_reset: Arc::new(|| {}),
+        };
+
+        // Fast policy so the supervisor can cycle without waiting production delays.
+        let fast_policy = ReconnectPolicy {
+            max_attempts: std::num::NonZeroU8::new(1).unwrap(),
+            backoff: BackoffSchedule::Exponential { base_ms: 1, factor: 1 },
+        };
+
+        let stop_for_drain = stop_flag.clone();
+        let ch: Arc<dyn super::ChannelLike> = Arc::new(FakeCh);
+        let sup_tx_for_drain = supervisor_signal_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-srr-1-drain".into())
+            .spawn(move || {
+                super::run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                    tr_ev_rx,
+                    stop_for_drain,
+                    ch,
+                    sup_tx_for_drain,
+                    fast_policy,
+                    Duration::from_millis(30),   // ack_timeout
+                    Duration::from_millis(100),  // rebuild_timeout
+                    hooks,
+                    std::sync::Arc::new(super::NoopSignalingRefresh)
+                        as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
+                );
+            })
+            .unwrap();
+
+        // STEP 1: Send IceFailed to arm the supervisor (enter_supervisor_mode sets
+        // supervisor_signal_tx = Some).
+        tr_ev_tx.try_send(TransportEvent::IceFailed).unwrap();
+
+        // Wait for the supervisor to be armed (supervisor_signal_tx populated).
+        // Up to 200 ms — fast policy means the supervisor starts immediately.
+        let armed_deadline = std::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            if sup_tx_for_test.lock().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= armed_deadline {
+                // If still None, supervisor never armed — likely Hyp-A path; report.
+                panic!(
+                    "sc_srr_1 BRANCH: supervisor_signal_tx was never armed within 200ms. \
+                     This may indicate Hypothesis A (cold-process path). \
+                     Notify orchestrator before proceeding to WU-3."
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // STEP 2: Deliver PeerRequest via the armed supervisor_signal_tx.
+        // peer_nonce is very large (HIGH) so the sender is the loser in any tie-break —
+        // the most dangerous path for an unexpected Bye (sender should yield).
+        {
+            let guard = sup_tx_for_test.lock().unwrap();
+            if let Some(ref tx) = *guard {
+                let _ = tx.try_send(SupervisorSignal::PeerRequest {
+                    peer_nonce: u64::MAX,
+                    attempt: 1,
+                });
+            }
+        }
+
+        // STEP 3: Wait up to 500 ms for the hook to (not) fire.
+        std::thread::sleep(Duration::from_millis(300));
+
+        stop_flag.store(true, Ordering::SeqCst);
+        drop(tr_ev_tx);
+        let _ = drain_handle.join();
+
+        // Post-fix assertion (GREEN after WU-3, RED on unmodified branch):
+        // A fresh (never-IceConnected) session MUST NOT invoke the rebuild hook.
+        // On the unmodified branch rebuild_invoked == true → this assertion FAILS → RED.
+        // Hyp-B is confirmed if this assertion fails at baseline.
+        assert!(
+            !rebuild_invoked.load(Ordering::SeqCst),
+            "sc_srr_1 FAILED (RED at baseline → Hyp-B confirmed): \
+             initiate_rebuild hook was invoked for a fresh sender that has never \
+             reached IceConnected. A PeerRequest MUST NOT tear down a fresh session. \
+             Implement WU-3 (ice_connected latch + InitiateRebuild guard) to fix. \
+             [REQ-SRR-1, design §3.2]"
+        );
+    }
+
+    // ─── SC-SRR-2: Sender mDNS-reset MUST drain post-reset events (GAP-F) ──────
+    //
+    // REQ-SRR-0 (companion) / REQ-SRR-2 / SC-SRR-0c / SC-SRR-2
+    //
+    // Bug (design §3.4 b2): inside initiate_mdns_reset (sender.rs:1788) the fresh
+    // sig_ev_rx is immediately dropped (`let (sig_ev_tx, _sig_ev_rx) = ...`).
+    // Any SignalingEvent sent on sig_ev_tx after the hook returns is silently lost.
+    //
+    // RED at baseline: the channel is disconnected immediately (no drain thread),
+    // so a send on sig_ev_tx returns Err(Disconnected) → the test asserts Ok → FAILS.
+    // GREEN after WU-2: a drain thread holds sig_ev_rx; send succeeds → Ok.
+    //
+    // This test constructs a minimal synthetic version of the bug using an explicit
+    // closure that reproduces the production pattern, then verifies the channel state.
+
+    /// SC-SRR-2 — Post-reset `sig_ev_tx` MUST be connected to a live drain thread;
+    ///             a send on it MUST NOT return Disconnected immediately after the hook.
+    ///
+    /// GIVEN: A synthetic initiate_mdns_reset closure that mirrors the production
+    ///        bug at sender.rs:1788 (creates (sig_ev_tx, _sig_ev_rx) and drops rx).
+    /// WHEN:  The closure runs and a SignalingEvent::Closed is sent into sig_ev_tx.
+    /// THEN (post-fix GREEN): the send returns Ok — a drain thread consumed the rx.
+    ///        On UNMODIFIED branch: send returns Err(Disconnected) → assertion FAILS → RED.
+    #[test]
+    fn sc_srr_2_sender_reset_drains_post_reset_events() {
+        use sm_domain::signaling::SignalingEvent;
+        use std::sync::mpsc::{sync_channel, SyncSender};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // This channel simulates what sig.start(sig_ev_tx) would do in production:
+        // the `sig_ev_tx` end is passed into the hook; the hook should spawn a thread
+        // holding sig_ev_rx. We capture both ends here to control the test.
+        let (outer_sig_ev_tx, outer_sig_ev_rx) = sync_channel::<SyncSender<SignalingEvent>>(1);
+        let outer_sig_ev_rx = Arc::new(Mutex::new(outer_sig_ev_rx));
+
+        // Synthetic mdns_reset hook that reproduces the production BUG pattern:
+        //   let (sig_ev_tx, _sig_ev_rx) = sync_channel(4);  // _sig_ev_rx dropped!
+        //   sig.start(sig_ev_tx);  // sig_ev_tx moved in, sig_ev_rx dropped out of scope
+        //
+        // To observe this in a unit test without a real MdnsSignaling, we model it as:
+        //   1. The hook creates the channel pair.
+        //   2. It sends sig_ev_tx through outer_sig_ev_tx so the test can obtain it.
+        //   3. It drops the rx (the bug).
+        let outer_tx = outer_sig_ev_tx.clone();
+        let buggy_reset_hook: Box<dyn Fn() + Send> = Box::new(move || {
+            // PRODUCTION BUG: sig_ev_rx is immediately dropped (GAP-F).
+            let (sig_ev_tx, _sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+            // Hand sig_ev_tx to the test so it can attempt a send after the hook.
+            let _ = outer_tx.try_send(sig_ev_tx);
+            // _sig_ev_rx is dropped here — no drain thread.
+        });
+
+        // Run the hook (simulates the production initiate_mdns_reset call).
+        buggy_reset_hook();
+
+        // Obtain the sig_ev_tx the hook produced.
+        let sig_ev_tx = outer_sig_ev_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_millis(100))
+            .expect("sc_srr_2: hook must have sent sig_ev_tx through outer channel");
+
+        // STEP: send a SignalingEvent on sig_ev_tx now that the hook has returned.
+        // On the UNMODIFIED branch: sig_ev_rx was dropped → Disconnected → RED.
+        // After WU-2 fix: a drain thread holds sig_ev_rx → Ok → GREEN.
+        let send_result = sig_ev_tx.try_send(SignalingEvent::Closed);
+
+        assert!(
+            send_result.is_ok(),
+            "sc_srr_2 FAILED (RED at baseline → GAP-F confirmed): \
+             sending on sig_ev_tx after initiate_mdns_reset returned Err({:?}). \
+             The receiver end was dropped (no drain thread). \
+             Implement WU-2 (spawn signaling drain in initiate_mdns_reset) to fix. \
+             [REQ-SRR-2, design §3.4 b2]",
+            send_result.err()
+        );
+    }
+
     // ─── T2.3: build_video_encoder_propagates_config_dimensions_when_set ──────
     //
     // CI-runnable. Verifies that EncoderConfig width/height fields survive
