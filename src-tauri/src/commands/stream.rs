@@ -792,6 +792,14 @@ pub trait ReceiverOps: Send {
     fn request_keyframe(&self) -> Result<(), TransportError>;
     /// Count of dropped frames (backpressure).
     fn dropped_frames(&self) -> u64;
+    /// Stop the receiver explicitly. Idempotent. MUST be called in teardown BEFORE
+    /// `mux.join()` to guarantee the tick thread exits regardless of lingering Arc
+    /// refs to the underlying `Arc<Mutex<Str0mVideoReceiver>>`.
+    ///
+    /// MUST NOT touch `StreamSession.stop_flag` — that invariant is owned exclusively
+    /// by the teardown INVARIANT block at stream.rs:1830-1835 (fix #509/T12.2). This
+    /// method targets ONLY `ReceiverShared.stop` inside the receiver instance.
+    fn stop(&mut self) -> Result<(), TransportError>;
 }
 
 /// Minimal interface needed from the signaling adapter by the bridge.
@@ -1365,6 +1373,9 @@ impl ReceiverOps for Str0mReceiverOps {
     }
     fn dropped_frames(&self) -> u64 {
         self.0.lock().unwrap().dropped_frames()
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().stop()
     }
 }
 
@@ -2691,6 +2702,10 @@ mod tests {
 
         fn dropped_frames(&self) -> u64 {
             0
+        }
+
+        fn stop(&mut self) -> Result<(), TransportError> {
+            Ok(())
         }
     }
 

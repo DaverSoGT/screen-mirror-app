@@ -54,13 +54,6 @@ impl ReceiverOps for FakeReceiverOps {
     fn dropped_frames(&self) -> u64 {
         0
     }
-}
-
-// Compile-only stub for the `stop()` method that WU-D2 will add to the
-// `ReceiverOps` trait. Adding it as an inherent method now means WU-D2 can
-// simply move it into the `impl ReceiverOps` block without a second edit here.
-impl FakeReceiverOps {
-    #[allow(dead_code)]
     fn stop(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
@@ -79,6 +72,9 @@ impl ReceiverOps for RealReceiverOps {
     }
     fn dropped_frames(&self) -> u64 {
         self.0.lock().unwrap().dropped_frames()
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().stop()
     }
 }
 
