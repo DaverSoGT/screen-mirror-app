@@ -792,6 +792,14 @@ pub trait ReceiverOps: Send {
     fn request_keyframe(&self) -> Result<(), TransportError>;
     /// Count of dropped frames (backpressure).
     fn dropped_frames(&self) -> u64;
+    /// Stop the receiver explicitly. Idempotent. MUST be called in teardown BEFORE
+    /// `mux.join()` to guarantee the tick thread exits regardless of lingering Arc
+    /// refs to the underlying `Arc<Mutex<Str0mVideoReceiver>>`.
+    ///
+    /// MUST NOT touch `StreamSession.stop_flag` — that invariant is owned exclusively
+    /// by the teardown INVARIANT block at stream.rs:1830-1835 (fix #509/T12.2). This
+    /// method targets ONLY `ReceiverShared.stop` inside the receiver instance.
+    fn stop(&mut self) -> Result<(), TransportError>;
 }
 
 /// Minimal interface needed from the signaling adapter by the bridge.
@@ -863,11 +871,27 @@ pub struct ReceiverBundle {
 
 // ─── Drain functions (W2-fix-B, W2-fix-C) ────────────────────────────────────
 
+/// Role of a signaling-event drain (D-RDF-1, reconnect-reset-drain-fix).
+///
+/// Disambiguates the TWO consumers that share `run_signaling_drain`:
+/// - `Primary`: the drain spawned by `build_production_bundle` for the
+///   FRESH receiver Rtc. Owns first-negotiation offer application.
+/// - `ResetSignalingOnly`: the drain spawned by `build_initiate_mdns_reset_hook`
+///   AFTER an `InitiateMdnsReset`. Its receiver Arc points at the OLD/STALE Rtc
+///   whose m-line state conflicts with a restarted sender. It MUST NOT apply
+///   offers — the rebuild worker's fresh Rtc is the sole offer-application owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainRole {
+    Primary,
+    ResetSignalingOnly,
+}
+
 /// Signaling-event drain loop.
 ///
 /// Runs on its own OS thread spawned by `build_production_bundle`.
 /// Dispatches `SignalingEvent`s:
 /// - `OfferReceived(offer)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
+///   (Primary role only; ResetSignalingOnly drains log-and-skip per D-RDF-2)
 /// - `CandidateReceived(c)` → `receiver.add_remote_candidate(c)`
 /// - `PeerFound` → log
 /// - `Closed` → forward `LocalFailure{PeerBye}` to supervisor (D-3, REQ-A) then exit
@@ -881,12 +905,18 @@ pub struct ReceiverBundle {
 /// `None` (receiver lazy-init: set later) or full (capacity 16), but a Closed event
 /// means the peer has gone away so the forward is fire-and-forget. The drain exits
 /// immediately after forwarding regardless of whether the send succeeded.
+///
+/// # Parameters (D-RDF-1)
+/// The `role` parameter (6th) controls whether the `OfferReceived` arm calls
+/// `apply_remote_offer`. `Primary` applies offers (first negotiation). `ResetSignalingOnly`
+/// log-and-skips them (the stale Rtc must never see a fresh sender offer).
 fn run_signaling_drain(
     ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
     receiver: Arc<dyn SignalingReceiverOps>,
     signaling: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
+    role: DrainRole,                                                        // D-RDF-1
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -911,6 +941,17 @@ fn run_signaling_drain(
                             "[sm-signaling-drain] OfferReceived after stop_flag set; dropping (D-RBF-2)"
                         );
                         break;
+                    }
+                    // D-RDF-2: reset drain is signaling-only. Its receiver Arc points at the STALE
+                    // pre-rebuild Rtc; applying a restarted sender's offer here triggers str0m
+                    // "Changed order for m-line" (root cause #870). The rebuild worker's fresh Rtc
+                    // owns offer application. log-and-skip with `continue` (NOT break) so the drain
+                    // stays alive for Candidate/Closed/PeerBye (R-3, SC-F-001/002, D-3, D-RDF-3).
+                    if role == DrainRole::ResetSignalingOnly {
+                        eprintln!(
+                            "[sm-signaling-drain-reset] OfferReceived ignored (signaling-only, D-RDF-2)"
+                        );
+                        continue;
                     }
                     match receiver.apply_remote_offer(offer) {
                         Ok(answer) => {
@@ -1284,7 +1325,11 @@ fn handle_stream_supervisor_outcome(
 /// and a fresh disconnected `pkt_rx`.
 ///
 /// The mux thread takes ownership of `bundle.pkt_rx`.
-fn build_stream_session(
+///
+/// Made `pub` so integration tests (e.g., stream_rebuild_cancel.rs) can install a
+/// real `Str0mVideoReceiver` session and exercise the rebuild-worker teardown path
+/// against the full Arc topology (deadlock test WU-D1).
+pub fn build_stream_session(
     channel: Arc<dyn ChannelLike>,
     bundle: ReceiverBundle,
     stop_flag: Arc<AtomicBool>,
@@ -1328,6 +1373,9 @@ impl ReceiverOps for Str0mReceiverOps {
     }
     fn dropped_frames(&self) -> u64 {
         self.0.lock().unwrap().dropped_frames()
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().stop()
     }
 }
 
@@ -1420,15 +1468,25 @@ fn build_initiate_mdns_reset_hook<T>(
     sig_publish: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
+    // NO-COMPETE seam (AR-C2): optional cell that receives a clone of sig_ev_tx after
+    // the fresh channel is created. Production callers pass `None`; SC-F-001/002 pass
+    // `Some(cell)` to retrieve the sender without relying on a spy `sig.start()` call.
+    // This is the ONLY purpose of the cell — it does NOT affect drain lifecycle.
+    channel_capture: Option<Arc<Mutex<Option<SyncSender<SignalingEvent>>>>>,
 ) -> Arc<dyn Fn() + Send + Sync>
 where
     T: sm_domain::signaling::Signaling + 'static,
 {
     Arc::new(move || {
-        // MdnsSignaling::reset() consumes self. Since we hold Arc<Mutex<>>,
-        // call stop() in-place then start() again to re-engage discovery.
+        // NO-COMPETE (M-C1b, REQ-SRR-4): stop the dead gen-G signaling thread and
+        // its associated TCP connection so no stale browse races the rebuild's fresh
+        // browse. We do NOT call sig.start() here — the rebuild worker exclusively owns
+        // the fresh gen-G+1 browse via build_production_bundle. The reset hook's sole
+        // responsibilities are: (1) drop the dead TCP, (2) keep the event channel LIVE
+        // for D-4/GAP-F (drain consumes post-reset events), (3) preserve D-3 Closed
+        // forwarding. The competing re-browse (old: stop+start) is eliminated.
         eprintln!(
-            "[sm-stream-coord] InitiateMdnsReset — calling Signaling::stop() + re-engaging discovery"
+            "[sm-stream-coord] InitiateMdnsReset — stopping gen-G signaling (NO-COMPETE, M-C1b)"
         );
         let mut sig = sig_for_reset.lock().unwrap();
         if let Err(e) = sig.stop() {
@@ -1437,11 +1495,17 @@ where
         // D-4 (GAP-F fix): create a fresh channel pair — do NOT use underscore prefix
         // on sig_ev_rx. A new drain thread MUST consume it; dropping _sig_ev_rx here
         // would silently discard all post-reset SDP/ICE events (the pre-fix bug).
+        // NO sig.start() — the rebuild's gen-G+1 build_production_bundle provides the
+        // only connecting browse. This removes the second competing racer (design-c §2.2).
         let (sig_ev_tx, sig_ev_rx) = std::sync::mpsc::sync_channel(4);
-        if let Err(e) = sig.start(sig_ev_tx) {
-            eprintln!("[sm-stream-coord] MdnsSignaling::start() after reset failed: {e}");
-            return;
+
+        // NO-COMPETE seam: write tx clone into the capture cell (for SC-F-001/002).
+        // In production this is None — no overhead. In tests this makes the tx
+        // retrievable without requiring sig.start() to be called.
+        if let Some(ref cell) = channel_capture {
+            *cell.lock().unwrap() = Some(sig_ev_tx.clone());
         }
+
         // Drop the signaling lock before spawning the consumer thread so the
         // drain can call back into signaling (publish_local_answer) without deadlock.
         drop(sig);
@@ -1458,7 +1522,14 @@ where
         if let Err(e) = std::thread::Builder::new()
             .name("sm-signaling-event-drain-reset".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_clone, pub_clone, stop_clone, sup_tx_clone);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_clone,
+                    pub_clone,
+                    stop_clone,
+                    sup_tx_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
             })
         {
             eprintln!("[sm-stream-coord] failed to spawn reset drain thread: {e}");
@@ -1636,6 +1707,7 @@ fn build_production_bundle(
             sig_publish_for_reset_drain,
             stop_flag_for_reset,
             supervisor_signal_tx.clone(), // D-3 REQ-A: wired to reset drain
+            None, // NO-COMPETE: no capture cell needed in production (AR-C2 seam)
         ),
     };
 
@@ -1674,7 +1746,8 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain, // D-3 REQ-A
+                sup_tx_for_drain,   // D-3 REQ-A
+                DrainRole::Primary, // D-RDF-1: primary drain owns offer application
             );
         })?;
 
@@ -1785,11 +1858,22 @@ pub fn make_stream_rebuild_hook(
                 // receiver here causes the channel to disconnect → mux exits promptly).
                 let old_session = { bridge_session.lock().unwrap().take() };
                 if let Some(mut s) = old_session {
-                    // Drop the receiver first — this disconnects the `pkt_tx` side,
-                    // which causes the mux thread's `pkt_rx.recv_timeout()` to return
-                    // `Disconnected` → mux thread exits on the next iteration.
-                    // The receiver's Drop impl stops the tick thread, releasing the
-                    // UDP socket FD (so bind_probe at step 7 can succeed).
+                    // Stop the receiver tick thread explicitly BEFORE dropping the
+                    // bridge Arc. Rationale: the reset-hook closure
+                    // (coordinator_hooks.initiate_mdns_reset, stream.rs:1689-1696)
+                    // holds a second strong ref to the underlying
+                    // Arc<Mutex<Str0mVideoReceiver>>; dropping the bridge Arc here does
+                    // NOT make it the last ref, so the receiver's Drop (and tick-thread
+                    // join) would not run. mux.join() below then blocks forever waiting
+                    // for pkt_rx to become Disconnected.
+                    // Calling stop() directly sets ReceiverShared.stop
+                    // (str0m_receiver.rs:88) — NOT the shared stop_flag (stream.rs:759)
+                    // — and joins the tick thread in-place (≤200ms), dropping pkt_tx
+                    // and allowing mux.join() to return promptly regardless of how many
+                    // Arc refs to the inner mutex still exist.
+                    if let Some(r) = s.receiver.as_mut() {
+                        let _ = r.stop();
+                    }
                     drop(s.receiver.take());
 
                     // Join the mux thread AFTER dropping the receiver (so pkt_tx is
@@ -2630,6 +2714,10 @@ mod tests {
         fn dropped_frames(&self) -> u64 {
             0
         }
+
+        fn stop(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
     }
 
     // ─── FakeChannel: captures raw frames for assertions ─────────────────────
@@ -3398,6 +3486,7 @@ mod tests {
                 sig_clone,
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
+                DrainRole::Primary,
             );
         });
 
@@ -3489,6 +3578,7 @@ mod tests {
                 Arc::new(NoopSignalingPublish),
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
+                DrainRole::Primary,
             );
         });
 
@@ -5343,49 +5433,83 @@ mod tests {
     // ─── SC-F-001 / SC-F-002: initiate_mdns_reset must spawn a new drain consumer ──
 
     /// SC-F-001 — After `initiate_mdns_reset` is invoked, a `SignalingEvent::OfferReceived`
-    /// injected into the new `sig_ev_tx` MUST be received and processed by a new drain
-    /// thread (apply_remote_offer called on the receiver). Previously the code dropped
-    /// `_sig_ev_rx` so the new channel had no consumer — any sent event was silently dropped.
+    /// injected into the new `sig_ev_tx` MUST be received by a live drain thread (channel
+    /// not orphaned — D-4 / GAP-F contract). The reset hook spawns a
+    /// `DrainRole::ResetSignalingOnly` drain; the offer is CONSUMED (channel is live) but
+    /// `apply_remote_offer` is NOT called on the stale Rtc (REQ-RRD-1, D-RDF-2).
+    ///
+    /// **NO-COMPETE update (WU-C3, AR-C2)**: the hook no longer calls `sig.start()` to
+    /// re-browse — that was the competing second racer. The fresh channel tx is now wired
+    /// via the `channel_capture` seam (design-c §2.3/§7.2) instead of a spy `start()`.
+    /// The liveness assertion (channel not Disconnected) and the apply-count assertion
+    /// (count == 0) are UNCHANGED — the test exercises the same invariants, only the
+    /// tx-retrieval path is updated (INV-5b: no assertion is weakened or removed).
     ///
     /// Test approach: directly constructs the `initiate_mdns_reset` hook using the same
-    /// D-4 pattern as production (spy signaling, spy receiver, noop publish). Calls the
-    /// hook, then sends an `OfferReceived` event on the new `sig_ev_tx` captured by the
-    /// spy. Asserts that:
-    ///   1. `try_send` succeeds (channel not orphaned).
-    ///   2. `apply_remote_offer` is called on the spy receiver (drain processed the offer).
+    /// M-C1b pattern as production (spy signaling, spy receiver, noop publish). Calls the
+    /// hook, then sends an `OfferReceived` event on the new `sig_ev_tx` retrieved from the
+    /// `channel_capture` cell. Asserts that:
+    ///   1. `try_send` succeeds (channel not orphaned / D-4 preserved).
+    ///   2. `apply_remote_offer` is NOT called (count == 0 — D-RDF-2 / REQ-RRD-1).
     ///
-    /// GREEN (D-4 fix in T03): closure spawns `run_signaling_drain` consuming the new
-    /// `sig_ev_rx` so send succeeds and offer reaches the receiver.
+    /// See SC-RRD-1 (sc_rdf_1) for the lower-level unit test of the same invariant.
+    /// The 0-count here is CORRECT behavior, NOT a regression.
     #[test]
     fn sc_f_001_initiate_mdns_reset_spawns_consumer_for_new_sig_ev_rx() {
         use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
-        use std::sync::mpsc::{TrySendError, sync_channel};
+        use std::sync::mpsc::TrySendError;
 
-        // ── SpySignaling: captures the sig_ev_tx passed to start() ──
-        // Shared via Arc<Mutex<Option<SyncSender<_>>>> so the test can retrieve it.
-        struct SpySignaling {
-            captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-        }
+        // ── SpySignaling: no longer needs to capture tx (NO-COMPETE M-C1b) ──
+        // stop() is a no-op (no real thread). start() is never called by the
+        // production hook after the NO-COMPETE seam — the channel_capture cell
+        // is the new tx-retrieval path. SpySignaling is kept to satisfy the
+        // Arc<Mutex<T: Signaling>> type bound on build_initiate_mdns_reset_hook.
+        struct SpySignaling;
         impl SpySignaling {
-            fn new_arc(
-                capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-            ) -> Arc<Mutex<Self>> {
-                Arc::new(Mutex::new(Self {
-                    captured_tx: capture,
-                }))
+            fn new_arc() -> Arc<Mutex<Self>> {
+                Arc::new(Mutex::new(Self))
             }
         }
-        // We need to call stop/start on it, but via Arc<Mutex<>> — use a simple trait.
-        trait SpySignalingOps: Send {
-            fn stop_spy(&mut self) -> Result<(), String>;
-            fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String>;
-        }
-        impl SpySignalingOps for SpySignaling {
-            fn stop_spy(&mut self) -> Result<(), String> {
+        impl sm_domain::signaling::Signaling for SpySignaling {
+            fn new(
+                _config: sm_domain::signaling::SignalingConfig,
+            ) -> Result<Self, sm_domain::signaling::SignalingError>
+            where
+                Self: Sized,
+            {
+                Err(sm_domain::signaling::SignalingError::Io(
+                    "SpySignaling::new not supported".into(),
+                ))
+            }
+            fn start(
+                &mut self,
+                _event_tx: SyncSender<SignalingEvent>,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                // NO-COMPETE: production hook no longer calls start() — if this is
+                // called it means the competing re-browse was re-introduced (regression).
+                panic!(
+                    "SC-F-001: SpySignaling::start must NOT be called — NO-COMPETE seam (M-C1b)"
+                );
+            }
+            fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
-            fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String> {
-                *self.captured_tx.lock().unwrap() = Some(tx);
+            fn publish_local_offer(
+                &self,
+                _offer: sm_domain::signaling::SdpOffer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_answer(
+                &self,
+                _answer: sm_domain::signaling::SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
         }
@@ -5429,66 +5553,39 @@ mod tests {
         }
 
         // ── Wire ──
-        let captured_tx_outer: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+        // NO-COMPETE seam (AR-C2): channel_capture receives the fresh sig_ev_tx
+        // created inside the hook closure. No spy start() needed.
+        let channel_capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
             Arc::new(Mutex::new(None));
-        let spy_sig = SpySignaling::new_arc(captured_tx_outer.clone());
+        let spy_sig = SpySignaling::new_arc();
 
         let offer_count = Arc::new(Mutex::new(0u32));
         let spy_recv: Arc<dyn SignalingReceiverOps> = SpyReceiver::new_arc(offer_count.clone());
         let noop_pub: Arc<dyn SignalingPublishOps> = Arc::new(NoopPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // ── Build the FIXED initiate_mdns_reset closure (mirrors D-4 production code) ──
-        // Capture clones once outside the closure; clone again inside on each call.
-        let sig_for_reset = spy_sig.clone();
-        let recv_for_reset = spy_recv.clone();
-        let pub_for_reset = noop_pub.clone();
-        let stop_for_reset = stop_flag.clone();
-
-        let reset_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let mut sig = sig_for_reset.lock().unwrap();
-            if let Err(e) = sig.stop_spy() {
-                eprintln!("[test] stop failed: {e}");
-            }
-            // D-4 fix: no underscore — sig_ev_rx MUST be consumed by a drain thread.
-            let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
-            if let Err(e) = sig.start_spy(sig_ev_tx) {
-                eprintln!("[test] start failed: {e}");
-                return;
-            }
-            drop(sig); // release lock before spawning drain
-
-            let recv_clone = recv_for_reset.clone();
-            let pub_clone = pub_for_reset.clone();
-            let stop_clone = stop_for_reset.clone();
-
-            // Spawn drain — this is exactly what the production D-4 fix does.
-            // SC-F-001 tests the drain spawn pattern only (no supervisor wiring needed).
-            if let Err(e) = std::thread::Builder::new()
-                .name("sm-signaling-event-drain-reset-test".into())
-                .spawn(move || {
-                    run_signaling_drain(
-                        sig_ev_rx,
-                        recv_clone,
-                        pub_clone,
-                        stop_clone,
-                        Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
-                    );
-                })
-            {
-                eprintln!("[test] spawn failed: {e}");
-            }
-        });
+        // ── Build the FIXED initiate_mdns_reset hook via the real production function ──
+        // SC-F-001 now calls build_initiate_mdns_reset_hook (same as SC-F-002) so that
+        // it exercises the REAL production code path, not a manual reconstruction.
+        // channel_capture is passed so we can retrieve sig_ev_tx after the hook fires.
+        let reset_hook = build_initiate_mdns_reset_hook(
+            spy_sig,
+            spy_recv,
+            noop_pub,
+            stop_flag.clone(),
+            Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
+            Some(channel_capture.clone()),
+        );
 
         // ── Invoke the hook ──
         (reset_hook)();
 
-        // Retrieve sig_ev_tx captured by SpySignaling::start_spy.
-        let sig_ev_tx = captured_tx_outer
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SpySignaling::start_spy must have been called");
+        // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
+        // The hook writes a clone of sig_ev_tx into the cell before spawning the drain.
+        let sig_ev_tx =
+            channel_capture.lock().unwrap().clone().expect(
+                "SC-F-001: channel_capture must be populated by the hook (NO-COMPETE seam)",
+            );
 
         // ── Send an offer on the new sig_ev_tx ──
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
@@ -5505,13 +5602,18 @@ mod tests {
              (GAP-F). Fix: spawn run_signaling_drain(sig_ev_rx, ...) in the closure (D-4)."
         );
 
-        // ── Secondary assertion: drain forwarded the offer to the receiver ──
+        // ── Secondary assertion: drain does NOT forward the offer to the receiver ──
+        // After REQ-RRD-1 (D-RDF-2): the reset hook spawns a DrainRole::ResetSignalingOnly
+        // drain. The OfferReceived event is consumed (channel is live — D-4) but
+        // apply_remote_offer is NOT called on the stale Rtc. Count MUST be 0.
+        // A future reader: 0 here is CORRECT behavior, NOT a regression.
         std::thread::sleep(Duration::from_millis(200));
         let count = *offer_count.lock().unwrap();
         assert_eq!(
-            count, 1,
-            "SC-F-001: apply_remote_offer must be called exactly once after reset \
-             when an OfferReceived event is sent on the new sig_ev_tx"
+            count, 0,
+            "SC-F-001: after initiate_mdns_reset the reset drain MUST NOT call \
+             apply_remote_offer (DrainRole::ResetSignalingOnly, D-RDF-2). \
+             Primary assertion (channel liveness) remains above."
         );
 
         // Cleanup.
@@ -5520,7 +5622,10 @@ mod tests {
 
     /// SC-F-002 — `build_initiate_mdns_reset_hook` (the REAL production function called
     /// by `build_production_bundle`) must spawn a drain thread that consumes the fresh
-    /// `sig_ev_rx` after reset.
+    /// `sig_ev_rx` after reset. The reset drain spawns with `DrainRole::ResetSignalingOnly`:
+    /// the channel is LIVE (D-4 / GAP-F contract preserved) but `apply_remote_offer` is
+    /// NOT called on the stale Rtc (REQ-RRD-1 / D-RDF-2). The Closed→PeerBye forward
+    /// (D-3) is also verified (tertiary assertion, preserved verbatim).
     ///
     /// **Gap closed by this test (W-real from verify #1452):** SC-F-001 reconstructed
     /// the `initiate_mdns_reset` closure with spy types — it tested the *pattern*, not
@@ -5533,9 +5638,8 @@ mod tests {
     /// function that `build_production_bundle` delegates to. Spy implementations satisfy
     /// the generic type bounds (`T: Signaling`), so no real mDNS or UDP stack is started.
     ///
-    /// GREEN first run: the production impl was verified line-level by verify #1452;
-    /// this test exercises the same code through the extracted function rather than a
-    /// reconstruction, confirming the hook composition is correct end-to-end.
+    /// The offer-apply count is 0 after REQ-RRD-1. This is CORRECT — NOT a regression.
+    /// See SC-RRD-1 (sc_rdf_1) for the lower-level unit test of the same invariant.
     #[test]
     fn sc_f_002_build_initiate_mdns_reset_hook_production_fn_spawns_consumer() {
         use sm_domain::signaling::{
@@ -5544,26 +5648,23 @@ mod tests {
         use std::sync::mpsc::TrySendError;
 
         // ── SpyMdnsSignaling: implements sm_domain::signaling::Signaling ──
-        // `start()` captures the sender so we can inject events after the reset.
-        // `stop()` is a no-op — no real thread to join.
-        // All other Signaling methods are stubs (never called by the hook).
-        struct SpyMdnsSignaling {
-            captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-        }
+        // NO-COMPETE update: start() now panics (the hook must NOT call it after M-C1b).
+        // stop() is a no-op — no real thread to join.
+        // The capture cell pattern is kept in new_shared() return type for call-site
+        // compatibility, but the inner cell is unused (replaced by channel_capture seam).
+        struct SpyMdnsSignaling;
         impl SpyMdnsSignaling {
-            // The return type nests Arc<Mutex<Option<SyncSender<_>>>> by necessity —
-            // the outer Arc is the shared spy handle, the inner is the capture cell.
+            // Returns (spy, unused_cell): the cell is kept for backwards call-site
+            // compatibility; channel_capture is the new tx-retrieval path.
             #[allow(clippy::type_complexity)]
             fn new_shared() -> (
                 Arc<Mutex<Self>>,
                 Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
             ) {
-                let capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+                let unused_cell: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
                     Arc::new(Mutex::new(None));
-                let spy = Arc::new(Mutex::new(Self {
-                    captured_tx: capture.clone(),
-                }));
-                (spy, capture)
+                let spy = Arc::new(Mutex::new(Self));
+                (spy, unused_cell)
             }
         }
         impl sm_domain::signaling::Signaling for SpyMdnsSignaling {
@@ -5578,11 +5679,14 @@ mod tests {
             }
             fn start(
                 &mut self,
-                event_tx: SyncSender<SignalingEvent>,
+                _event_tx: SyncSender<SignalingEvent>,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
-                // Capture the sender so the test can inject events after reset.
-                *self.captured_tx.lock().unwrap() = Some(event_tx);
-                Ok(())
+                // NO-COMPETE: production hook no longer calls start() after the M-C1b seam.
+                // If start() is called it means the competing re-browse was re-introduced.
+                panic!(
+                    "SC-F-002: SpyMdnsSignaling::start must NOT be called after NO-COMPETE seam \
+                     (M-C1b, design-c §2.5). The production hook must use channel_capture instead."
+                );
             }
             fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
@@ -5646,12 +5750,20 @@ mod tests {
         }
 
         // ── Wire ──
-        let (spy_sig, captured_tx_outer) = SpyMdnsSignaling::new_shared();
+        // SpyMdnsSignaling::new_shared still returns a capture cell but it is no longer
+        // populated by start() (start() panics on NO-COMPETE M-C1b). We use
+        // channel_capture instead — the seam added to build_initiate_mdns_reset_hook.
+        let (spy_sig, _unused_spy_capture) = SpyMdnsSignaling::new_shared();
 
         let offer_count = Arc::new(Mutex::new(0u32));
         let spy_recv: Arc<dyn SignalingReceiverOps> = SpyReceiver002::new_arc(offer_count.clone());
         let noop_pub: Arc<dyn SignalingPublishOps> = Arc::new(NoopPublish002);
         let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // NO-COMPETE seam (AR-C2): channel_capture receives the fresh sig_ev_tx created
+        // inside the hook closure. This replaces the old SpyMdnsSignaling::start() capture.
+        let channel_capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+            Arc::new(Mutex::new(None));
 
         // ── Call the REAL production function (not a reconstruction) ──
         // This is the exact function `build_production_bundle` calls. If anyone breaks
@@ -5669,17 +5781,17 @@ mod tests {
             noop_pub,
             stop_flag.clone(),
             spy_supervisor_tx,
+            Some(channel_capture.clone()), // NO-COMPETE seam: retrieve tx via capture cell
         );
 
         // ── Invoke the hook (mimics supervisor calling InitiateMdnsReset) ──
         (reset_hook)();
 
-        // Retrieve sig_ev_tx captured by SpyMdnsSignaling::start().
-        let sig_ev_tx = captured_tx_outer
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SpyMdnsSignaling::start must have been called by the hook");
+        // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
+        // The hook writes a clone of sig_ev_tx before spawning the drain.
+        let sig_ev_tx = channel_capture.lock().unwrap().clone().expect(
+            "SC-F-002: channel_capture must be populated by build_initiate_mdns_reset_hook",
+        );
 
         // ── Inject an OfferReceived event on the new channel ──
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
@@ -5696,14 +5808,15 @@ mod tests {
              production hook is NOT consuming the new receiver (GAP-F regression)."
         );
 
-        // ── Secondary assertion: drain forwarded the offer to the receiver ──
+        // ── Secondary assertion: drain does NOT apply the offer (ResetSignalingOnly) ──
+        // D-RDF-2: build_initiate_mdns_reset_hook spawns a ResetSignalingOnly drain.
+        // Offer is consumed (channel live) but apply_remote_offer is NOT called. Count == 0.
         std::thread::sleep(Duration::from_millis(200));
         let count = *offer_count.lock().unwrap();
         assert_eq!(
-            count, 1,
-            "SC-F-002: apply_remote_offer must be called exactly once after the \
-             production hook reset when an OfferReceived event is injected on the \
-             new sig_ev_tx"
+            count, 0,
+            "SC-F-002: production reset hook drain MUST NOT call apply_remote_offer \
+             (DrainRole::ResetSignalingOnly, D-RDF-2, REQ-RRD-1)."
         );
 
         // ── Tertiary assertion (W-real PR #2): drain also forwards Closed → supervisor ──
@@ -5802,6 +5915,7 @@ mod tests {
                     pub_ops,
                     stop_clone,
                     supervisor_signal_tx, // 5th param — added in T09
+                    DrainRole::Primary,
                 );
             })
             .expect("spawn drain thread");
@@ -5905,6 +6019,7 @@ mod tests {
                     Arc::new(NoOpPub) as Arc<dyn SignalingPublishOps>,
                     stop_clone,
                     sup_tx_clone,
+                    DrainRole::Primary,
                 );
             })
             .expect("spawn drain");
@@ -6362,7 +6477,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-1-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-1: spawn drain thread");
 
@@ -6426,7 +6548,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-2-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-2: spawn drain thread");
 
@@ -6496,7 +6625,14 @@ mod tests {
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-3-drain".into())
             .spawn(move || {
-                run_signaling_drain(sig_ev_rx, recv_ops, pub_ops, stop_clone, sup_clone);
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                );
             })
             .expect("SC-MLO-3: spawn drain thread");
 
@@ -6695,5 +6831,170 @@ mod tests {
         );
 
         drop(pkt_tx);
+    }
+
+    // ─── D-RDF block: reconnect-reset-drain-fix (REQ-RRD-1/3) ───────────────
+    //
+    // These two tests verify the DrainRole::ResetSignalingOnly behaviour introduced
+    // by the reconnect-reset-drain-fix change.
+    //
+    // sc_rdf_1 — RED precondition (T2): before the role gate is added to
+    //   run_signaling_drain, the offer IS applied on a ResetSignalingOnly drain
+    //   (count==1). The test MUST fail until T3 (GREEN) adds the gate.
+    //
+    // sc_rdf_2 — structural RED: the D-3 Closed→PeerBye forward is already wired;
+    //   this test guards that a future implementer does NOT break it by using `break`
+    //   instead of `continue` for the ignored-offer path (D-RDF-3).
+
+    /// sc_rdf_1 — `DrainRole::ResetSignalingOnly` MUST NOT call `apply_remote_offer`.
+    ///
+    /// GIVEN: `CountingReceiverOps` spy, no-op publish ops, `stop_flag=false`,
+    ///        `DrainRole::ResetSignalingOnly` passed to `run_signaling_drain`.
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected, then the
+    ///        channel is dropped to let the drain exit.
+    /// THEN:  `apply_remote_offer` call count MUST be 0 AND `publish_local_answer`
+    ///        MUST NOT be called.
+    ///
+    /// RED precondition: without the role gate in run_signaling_drain the offer IS
+    /// applied (count==1) — this test fails until T3 adds the `if role ==
+    /// DrainRole::ResetSignalingOnly { continue; }` gate (D-RDF-2).
+    ///
+    /// Satisfies: SC-RRD-1, REQ-RRD-1, D-RDF-2.
+    #[test]
+    fn sc_rdf_1_reset_role_drops_offer_without_apply() {
+        use sm_domain::signaling::SignalingEvent;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc::sync_channel;
+
+        let (counting_recv, call_count) = CountingReceiverOps::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+
+        let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let sup_clone = supervisor_signal_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-rdf-1-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
+            })
+            .expect("sc_rdf_1: spawn drain thread");
+
+        // Inject an offer — with ResetSignalingOnly the drain must log-and-skip it.
+        let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-1".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(fake_offer))
+            .expect("sc_rdf_1: send OfferReceived");
+
+        // Drop sender to close the channel, letting the drain exit on Disconnected.
+        drop(sig_ev_tx);
+
+        drain_handle
+            .join()
+            .expect("sc_rdf_1: drain thread must not panic");
+
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            0,
+            "SC-RRD-1: DrainRole::ResetSignalingOnly MUST NOT call apply_remote_offer \
+             (D-RDF-2). Count was non-zero — role gate missing in run_signaling_drain."
+        );
+    }
+
+    /// sc_rdf_2 — `DrainRole::ResetSignalingOnly` MUST still forward `Closed` to supervisor.
+    ///
+    /// GIVEN: spy `supervisor_signal_tx`, `DrainRole::ResetSignalingOnly`, `stop_flag=false`.
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected (must be ignored),
+    ///        THEN `SignalingEvent::Closed` is injected.
+    /// THEN:  `supervisor_signal_rx.recv_timeout(500ms)` returns
+    ///        `Ok(SupervisorSignal::LocalFailure { trigger: ReconnectTrigger::PeerBye })`.
+    ///
+    /// Structural RED: the Closed arm already works; this test guards that the role gate
+    /// uses `continue` (not `break`) so the drain survives to process Closed
+    /// (D-RDF-3, R-3). If a future implementer switches to `break`, this test fails.
+    ///
+    /// Satisfies: SC-RRD-3, REQ-RRD-3, D-RDF-3.
+    #[test]
+    fn sc_rdf_2_reset_role_still_forwards_closed_peerbye() {
+        use sm_domain::session::ReconnectTrigger;
+        use sm_domain::signaling::SignalingEvent;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(CountingReceiverOps::new().0);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(8);
+
+        let (spy_sup_tx, spy_sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(Some(spy_sup_tx)));
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let sup_clone = supervisor_signal_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-rdf-2-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::ResetSignalingOnly,
+                );
+            })
+            .expect("sc_rdf_2: spawn drain thread");
+
+        // Inject an offer first — must be ignored (not break the drain).
+        let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-2".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(fake_offer))
+            .expect("sc_rdf_2: send OfferReceived");
+
+        // Small sleep so the drain can process the offer before we send Closed.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Now inject Closed — the drain must still forward PeerBye.
+        sig_ev_tx
+            .send(SignalingEvent::Closed)
+            .expect("sc_rdf_2: send Closed");
+
+        drain_handle
+            .join()
+            .expect("sc_rdf_2: drain thread must not panic");
+
+        let signal = spy_sup_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-RRD-3: DrainRole::ResetSignalingOnly MUST forward Closed as \
+                 LocalFailure{PeerBye} within 500ms (D-3, D-RDF-3). \
+                 Channel empty — drain did not forward, or used `break` on the offer.",
+        );
+
+        assert!(
+            matches!(
+                signal,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-RRD-3: expected LocalFailure{{PeerBye}} but got {signal:?}"
+        );
     }
 }

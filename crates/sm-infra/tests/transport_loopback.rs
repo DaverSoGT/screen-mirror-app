@@ -1450,23 +1450,37 @@ fn transport_receiver_bundle_sequence_publishes_candidate_b6() {
 
 /// SC-MLO-4 — Real-str0m: OLD receiver rejects second offer with m-line order error.
 ///
-/// Reproduces Bug #2 (reconnect-rebuild-fixes). str0m's `accept_offer` enforces
-/// m-line ordering across renegotiations (RFC 8843 / RFC 8829 semantics). When
-/// a fresh `Str0mVideoSender::new()` is created (new `Rtc` instance, different
-/// m-line internals) and its offer is applied to the ORIGINAL receiver (unmodified
-/// `Rtc` state from the first session), str0m rejects it with "Changed order for
-/// m-line". This is the exact failure observed in T22 R2 hardware logs.
+/// Protocol anchor (D-RDF-6, reconnect-reset-drain-fix): documents that str0m's
+/// `accept_offer` enforces m-line ordering across renegotiations (RFC 8843 /
+/// RFC 8829 semantics). When a fresh `Str0mVideoSender::new()` is created (new
+/// `Rtc` instance, different m-line internals) and its offer is applied to the
+/// ORIGINAL receiver (unmodified `Rtc` state from the first session), str0m
+/// rejects it with "Changed order for m-line with mid: X".
+///
+/// **Post-fix meaning (reconnect-reset-drain-fix / REQ-RRD-1):** The receiver
+/// code path no longer triggers this scenario. After REQ-RRD-1 the reset drain
+/// (`DrainRole::ResetSignalingOnly`, D-RDF-2) no longer applies offers to the
+/// stale Rtc — the rebuild worker's fresh Rtc (DrainRole::Primary drain) is the
+/// sole offer-application owner. This test now serves as an upstream str0m
+/// behavior anchor only: if str0m ever changes such that a second offer on the
+/// SAME Rtc succeeds, document the behavioral change before removing this test.
+///
+/// Run with `--run-ignored` to verify str0m still rejects (should still fail).
 ///
 /// ARCHIVE GATE note: if this test starts PASSING unexpectedly, str0m behavior
-/// changed upstream — document it before removing the test.
+/// changed upstream — document it before removing the test. This note MUST be
+/// preserved.
 ///
 /// No network, no mDNS, no TCP — purely in-process `Rtc` instantiation.
 #[test]
-#[ignore = "Reproduction of Bug #2 (reconnect-rebuild-fixes). Confirms str0m rejects \
-             a second SDP offer from a fresh sender Rtc on the original receiver Rtc \
-             with 'Changed order for m-line'. Run with --run-ignored. \
-             See engram #1467 (design D-RBF-2) and #1466 (spec REQ-MLO-2). \
-             If this test PASSES without code changes, str0m behavior changed upstream."]
+#[ignore = "Protocol anchor (D-RDF-6): documents that str0m rejects a second SDP offer \
+             on the SAME (stale) Rtc with 'Changed order for m-line'. \
+             After REQ-RRD-1 (reconnect-reset-drain-fix), the receiver code path no \
+             longer triggers this: the reset drain (DrainRole::ResetSignalingOnly) no \
+             longer applies offers to the stale Rtc. \
+             Run with --run-ignored to verify str0m still rejects (should still fail). \
+             If this test PASSES without code changes, str0m behavior changed upstream -- \
+             document before removing. ARCHIVE-GATE: see doc-comment above."]
 fn sc_mlo_4_str0m_rejects_offer2_with_mline_conflict() {
     use sm_domain::transport::{TransportError, VideoSender};
 
@@ -1529,5 +1543,211 @@ fn sc_mlo_4_str0m_rejects_offer2_with_mline_conflict() {
             || err_str.contains("accept_offer failed")
             || err_str.contains("m-line"),
         "SC-MLO-4 (REQ-MLO-2): error must reference m-line order conflict; got: {err_str}"
+    );
+}
+
+// ─── SC-RRD-2: fresh-Rtc offer acceptance anchor (reconnect-reset-drain-fix) ──
+
+/// SC-RRD-2 — A FRESH receiver Rtc MUST accept a FRESH sender Rtc's offer
+/// without m-line conflict (REQ-RRD-2).
+///
+/// This is the CORRECT code path that the fix enables: after a sender-process
+/// restart the rebuild worker creates a brand-new `Str0mVideoReceiver` (fresh
+/// Rtc) and the `DrainRole::Primary` drain on that fresh receiver applies the
+/// fresh sender's offer without any "Changed order for m-line" error.
+///
+/// **Contrast with sc_mlo_4:** sc_mlo_4 (still `#[ignore]`, D-RDF-6) shows
+/// that applying a fresh sender's offer to the STALE receiver Rtc FAILS. This
+/// test shows that applying it to a FRESH receiver Rtc SUCCEEDS — confirming
+/// that the fix (DrainRole::ResetSignalingOnly suppresses the stale path while
+/// DrainRole::Primary on the fresh path remains the sole offer-application owner)
+/// is correct end-to-end.
+///
+/// **Note:** This test passes even on the baseline (it exercises the correct
+/// path, not the buggy one). Its purpose is to document the invariant and guard
+/// against future regressions in the fresh-Rtc acceptance flow.
+///
+/// No network, no mDNS, no TCP — purely in-process `Rtc` instantiation.
+///
+/// Satisfies: SC-RRD-2, REQ-RRD-2.
+#[test]
+fn sc_rdf_3_fresh_rtc_accepts_fresh_sender_offer() {
+    use sm_domain::transport::VideoSender;
+
+    // ── First session: sender_1 + receiver_1 complete initial offer/answer ──
+    let sender_1 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-2: sender_1 new must succeed");
+
+    let receiver_1 = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-2: receiver_1 new must succeed");
+
+    let offer_1 = sender_1
+        .create_local_offer()
+        .expect("SC-RRD-2: sender_1 create_local_offer must succeed");
+
+    // First apply_remote_offer: MUST succeed (baseline session established).
+    let _answer_1 = receiver_1
+        .apply_remote_offer(offer_1)
+        .expect("SC-RRD-2: first apply_remote_offer (sender_1 -> receiver_1) must return Ok");
+    // Note: Str0mVideoReceiver does not expose apply_local_answer — the answer
+    // is used by the signaling layer externally; the receiver's Rtc state is
+    // updated internally by apply_remote_offer itself.
+
+    // ── Second session: fresh sender_2 + fresh receiver_2 (rebuild worker path) ──
+    // Simulates: sender process fully restarted (new Rtc, new m-lines) AND
+    // rebuild worker produced a fresh Str0mVideoReceiver (DrainRole::Primary drain).
+    let sender_2 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-2: sender_2 new must succeed");
+
+    let receiver_2 = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-2: receiver_2 (fresh Rtc) new must succeed");
+
+    let offer_2 = sender_2
+        .create_local_offer()
+        .expect("SC-RRD-2: sender_2 create_local_offer must succeed");
+
+    // Apply fresh sender's offer to the FRESH receiver — MUST succeed (no m-line conflict).
+    // This is the DrainRole::Primary path in the fix. The stale-Rtc rejection is documented
+    // by sc_mlo_4 (still #[ignore], D-RDF-6). A fresh Rtc MUST accept a fresh sender's offer.
+    let result = receiver_2.apply_remote_offer(offer_2);
+
+    assert!(
+        result.is_ok(),
+        "SC-RRD-2: fresh receiver Rtc MUST accept a fresh sender's Offer without \
+         m-line conflict (REQ-RRD-2). This is the DrainRole::Primary path. \
+         Got Err: {:?}",
+        result.err()
+    );
+}
+
+/// SC-RRD-C — NO-COMPETE invariant: the restarted sender's Offer MUST land only on
+/// the fresh (gen-G+1) Rtc; the stale (gen-G) Rtc MUST NEVER receive it.
+///
+/// This test closes the blind-spot that PR-B's `sc_srr_4` left open: that test used
+/// a single `CountingReceiverOps` spy and asserted `apply_remote_offer` call count==1.
+/// It could not distinguish *which* Rtc received the offer — a stale Rtc with the right
+/// count is structurally identical to a fresh Rtc with the right count in that test.
+///
+/// This test uses TWO DISTINCT REAL `Str0mVideoReceiver` instances (no spy):
+/// - `stale_1` simulates the gen-G receiver Rtc (pre-reset, has prior m-line state).
+/// - `fresh_2` simulates the gen-G+1 receiver Rtc (rebuild's Primary drain target).
+/// - `sender_2` simulates the RESTARTED sender process (fresh Offer, new m-lines).
+///
+/// ## Assertions
+///
+/// 1. `fresh_2.apply_remote_offer(offer_b)` MUST return `Ok` — the fresh Rtc accepts
+///    the restarted sender's Offer (no prior m-line state conflict). This is the target
+///    state that Approach C (NO-COMPETE) achieves: only the fresh Primary drain receives
+///    the Offer.
+///
+/// 2. `stale_1.apply_remote_offer(offer_b)` MUST return `Err` — the stale Rtc REJECTS
+///    the same Offer because it already has m-line state from `offer_a` (a different
+///    sender's session). This is the exact defect PR-B's bypass triggered: when the reset
+///    drain (bound to `stale_1`) applied `offer_b`, str0m returned "Changed order for
+///    m-line" (issue #870). The ONLY fix is to ensure `stale_1` NEVER sees `offer_b`.
+///
+/// Together the two assertions prove: applying a fresh sender's Offer to a stale Rtc
+/// is FATAL (Err), therefore the routing MUST guarantee stale_1 is never offered.
+/// Approach C achieves this by construction — no competing reset browse, so only the
+/// fresh Primary drain can receive the restarted sender's single Offer.
+///
+/// No network, no mDNS, no TCP — purely in-process `Rtc` instantiation.
+///
+/// Satisfies: REQ-SRR-4 (NO-COMPETE redefined), REQ-SRR-5 INV-5b.
+#[test]
+fn sc_rrd_c_fresh_offer_lands_on_fresh_rtc_only() {
+    use sm_domain::transport::VideoSender;
+
+    // ── Session 1: stale gen-G Rtc — sender_1 + stale_1 ──────────────────────
+    // Simulates the established session BEFORE sender restart. stale_1 is the
+    // receiver Rtc that the reset hook's ResetSignalingOnly drain is bound to.
+    let sender_1 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-C: sender_1 new must succeed");
+
+    let stale_1 = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-C: stale_1 (gen-G Rtc) new must succeed");
+
+    let offer_a = sender_1
+        .create_local_offer()
+        .expect("SC-RRD-C: sender_1 create_local_offer must succeed");
+
+    // Establish m-line state on stale_1 — this is what makes stale_1 unable to
+    // accept a new sender's offer (m-line ordering conflict = issue #870).
+    stale_1
+        .apply_remote_offer(offer_a)
+        .expect("SC-RRD-C: stale_1 must accept offer_a (initial session negotiation)");
+
+    // ── Session 2: fresh gen-G+1 Rtc — sender_2 + fresh_2 ────────────────────
+    // Simulates the RESTARTED sender process and the rebuild worker's new Rtc.
+    // sender_2 is the restarted sender; fresh_2 is the DrainRole::Primary drain's Rtc.
+    let sender_2 = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-C: sender_2 (restarted sender) new must succeed");
+
+    let fresh_2 = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("SC-RRD-C: fresh_2 (gen-G+1 Rtc) new must succeed");
+
+    let offer_b = sender_2
+        .create_local_offer()
+        .expect("SC-RRD-C: sender_2 (restarted sender) create_local_offer must succeed");
+
+    // ── WHEN: NO-COMPETE routing — fresh_2 (Primary) receives offer_b ────────
+    //
+    // Approach C guarantees: only the rebuild's gen-G+1 Primary drain can connect
+    // to the restarted sender (no competing reset re-browse). Therefore offer_b
+    // reaches ONLY fresh_2. We simulate this by calling apply_remote_offer directly
+    // on fresh_2 (the Primary drain path).
+    let result_fresh = fresh_2.apply_remote_offer(offer_b.clone());
+
+    // ── THEN (Assertion 1): fresh Rtc accepts the restarted sender's Offer ────
+    assert!(
+        result_fresh.is_ok(),
+        "SC-RRD-C (Assertion 1): fresh_2 (gen-G+1 Rtc, DrainRole::Primary) MUST accept \
+         the restarted sender's Offer (no prior m-line state conflict). \
+         Got Err: {:?}",
+        result_fresh.err()
+    );
+
+    // ── THEN (Assertion 2): stale Rtc REJECTS the same Offer (m-line conflict) ─
+    //
+    // This is the exact failure mode PR-B's bypass triggered: when the reset drain
+    // (bound to stale_1) applied offer_b to the stale Rtc, str0m returned
+    // "Changed order for m-line" (#870). The stale Rtc's m-line state (from offer_a)
+    // is incompatible with a fresh sender's m-line ordering.
+    //
+    // Approach C: stale_1 NEVER sees offer_b — but this assertion proves WHY it must
+    // not: applying offer_b to stale_1 is FATAL. If routing ever delivers offer_b to
+    // stale_1, reconnect fails deterministically.
+    let result_stale = stale_1.apply_remote_offer(offer_b);
+
+    assert!(
+        result_stale.is_err(),
+        "SC-RRD-C (Assertion 2): stale_1 (gen-G Rtc, ResetSignalingOnly) MUST reject \
+         the restarted sender's Offer (m-line conflict with prior offer_a session state). \
+         Got Ok — which means the Rtc accepted a conflicting offer, indicating str0m \
+         m-line state was not established correctly in this test setup."
     );
 }
