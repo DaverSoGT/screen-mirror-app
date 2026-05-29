@@ -109,6 +109,9 @@ impl screen_mirror_lib::commands::stream::ReceiverOps for FakeReceiverOps {
     fn dropped_frames(&self) -> u64 {
         0
     }
+    fn stop(&mut self) -> Result<(), sm_domain::transport::TransportError> {
+        Ok(())
+    }
 }
 
 /// Build a `StreamBridge` that:
