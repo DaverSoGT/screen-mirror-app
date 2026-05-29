@@ -478,11 +478,12 @@ fn sc_rrd_deadlock_teardown_joins_with_live_reset_hook_ref() {
         role: TransportRole::Receiver,
         ..TransportConfig::default()
     };
-    let mut recv = Str0mVideoReceiver::new(transport_config)
-        .expect("Str0mVideoReceiver::new must succeed");
+    let mut recv =
+        Str0mVideoReceiver::new(transport_config).expect("Str0mVideoReceiver::new must succeed");
 
     // Start the receiver: binds UDP, spawns tick thread, pkt_tx goes to pkt_rx.
-    let (pkt_tx, pkt_rx) = sync_channel::<sm_domain::encode::EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+    let (pkt_tx, pkt_rx) =
+        sync_channel::<sm_domain::encode::EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
     let (event_tx, _event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
     recv.start(pkt_tx, event_tx)
         .expect("Str0mVideoReceiver::start must succeed");
