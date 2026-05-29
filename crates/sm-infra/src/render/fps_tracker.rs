@@ -43,6 +43,14 @@ pub(crate) struct FpsTracker {
     state: FpsState,
     window: VecDeque<u32>,
     last_dts: Option<u64>,
+    /// Last rejected median that was logged, for per-value dedupe of the R6
+    /// warm-up rejection line. `None` until the first rejection is logged.
+    /// No reset is needed: once `Locked` (R8) this path is never reached again.
+    last_reject_log: Option<u32>,
+    /// Number of R6-rejection log lines actually emitted (post-dedupe).
+    /// Test-only: lets white-box tests assert the warm-up log is deduped.
+    #[cfg(test)]
+    reject_log_count: u32,
 }
 
 impl FpsTracker {
@@ -52,6 +60,9 @@ impl FpsTracker {
             state: FpsState::WarmingUp,
             window: VecDeque::with_capacity(WINDOW_SIZE),
             last_dts: None,
+            last_reject_log: None,
+            #[cfg(test)]
+            reject_log_count: 0,
         }
     }
 
@@ -111,13 +122,24 @@ impl FpsTracker {
 
         // Plausibility check (R6): median must be within [MIN_PLAUSIBLE_TICKS, MAX_PLAUSIBLE_TICKS].
         if !(MIN_PLAUSIBLE_TICKS..=MAX_PLAUSIBLE_TICKS).contains(&median) {
-            tracing::warn!(
-                rejected_ticks = median,
-                "fps inference rejected: median tick {} outside [5, 240] fps bounds [{}, {}]",
-                median,
-                MIN_PLAUSIBLE_TICKS,
-                MAX_PLAUSIBLE_TICKS,
-            );
+            // Warm-up rejection is normal flow (DTS often non-advancing early on),
+            // so log at debug level — aligned with the `debug!` locked line below —
+            // and dedupe per distinct rejected median to avoid ~30 identical lines
+            // before DTS advance. No reset needed: once Locked (R8) we never return here.
+            if self.last_reject_log != Some(median) {
+                tracing::debug!(
+                    rejected_ticks = median,
+                    "fps inference rejected: median tick {} outside [5, 240] fps bounds [{}, {}]",
+                    median,
+                    MIN_PLAUSIBLE_TICKS,
+                    MAX_PLAUSIBLE_TICKS,
+                );
+                self.last_reject_log = Some(median);
+                #[cfg(test)]
+                {
+                    self.reject_log_count += 1;
+                }
+            }
             return; // Window keeps sliding; stays WarmingUp.
         }
 
@@ -144,6 +166,14 @@ impl FpsTracker {
     #[cfg(test)]
     pub(crate) fn is_locked(&self) -> bool {
         matches!(self.state, FpsState::Locked { .. })
+    }
+
+    /// Number of R6-rejection log lines actually emitted so far (post-dedupe).
+    ///
+    /// Only available in test builds to allow white-box assertions on log noise.
+    #[cfg(test)]
+    pub(crate) fn reject_log_count(&self) -> u32 {
+        self.reject_log_count
     }
 }
 
@@ -420,6 +450,51 @@ mod tests {
                 ticks
             );
         }
+    }
+
+    // T1.12 — R6-rejection log is deduped per distinct rejected median (warm-up noise fix).
+    //
+    // At warm-up, a stable implausible median (e.g. uniform 300-tick spacing → median 300,
+    // below the 375 lower bound) makes `try_lock` reject on every full-window observation.
+    // Pre-fix this emitted one log line per rejecting observation (~N lines); post-fix the
+    // dedupe collapses identical rejected medians to a single line. A DIFFERENT implausible
+    // median (uniform 200-tick spacing → median 200) must log again, proving the dedupe is
+    // per-distinct-value rather than log-once-forever.
+    #[test]
+    fn fps_tracker_rejection_log_is_deduped_per_distinct_median() {
+        let mut tracker = FpsTracker::new();
+
+        // Phase 1: 30 observations at uniform 300-tick spacing.
+        // Every delta is 300 → window median is a stable 300 (implausible: 300 < 375).
+        // This triggers many rejecting `try_lock` calls (one per full-window observation).
+        feed_uniform(&mut tracker, 30, 300);
+        assert!(
+            !tracker.is_locked(),
+            "uniform 300-tick spacing (300 fps) is below the 375 lower bound — must stay warming up"
+        );
+        assert_eq!(
+            tracker.reject_log_count(),
+            1,
+            "≥20 rejections at the SAME implausible median (300) must collapse to a single log line"
+        );
+
+        // Phase 2: continue with a DIFFERENT implausible median (uniform 200-tick spacing).
+        // First flush the window of 300s, then keep feeding so the new median (200) rejects.
+        // delta becomes 200 only after the dts step changes; feed 30 to fully replace the window.
+        let mut dts: u64 = 30u64 * 300; // continue from where feed_uniform left off
+        for _ in 0..30 {
+            dts += 200;
+            tracker.observe_dts(dts);
+        }
+        assert!(
+            !tracker.is_locked(),
+            "uniform 200-tick spacing (450 fps) is also below the 375 lower bound — must stay warming up"
+        );
+        assert_eq!(
+            tracker.reject_log_count(),
+            2,
+            "a DIFFERENT rejected median (200) must log once more — dedupe is per-distinct-value, not log-once-forever"
+        );
     }
 
     #[test]
