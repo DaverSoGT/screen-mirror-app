@@ -1858,11 +1858,22 @@ pub fn make_stream_rebuild_hook(
                 // receiver here causes the channel to disconnect → mux exits promptly).
                 let old_session = { bridge_session.lock().unwrap().take() };
                 if let Some(mut s) = old_session {
-                    // Drop the receiver first — this disconnects the `pkt_tx` side,
-                    // which causes the mux thread's `pkt_rx.recv_timeout()` to return
-                    // `Disconnected` → mux thread exits on the next iteration.
-                    // The receiver's Drop impl stops the tick thread, releasing the
-                    // UDP socket FD (so bind_probe at step 7 can succeed).
+                    // Stop the receiver tick thread explicitly BEFORE dropping the
+                    // bridge Arc. Rationale: the reset-hook closure
+                    // (coordinator_hooks.initiate_mdns_reset, stream.rs:1689-1696)
+                    // holds a second strong ref to the underlying
+                    // Arc<Mutex<Str0mVideoReceiver>>; dropping the bridge Arc here does
+                    // NOT make it the last ref, so the receiver's Drop (and tick-thread
+                    // join) would not run. mux.join() below then blocks forever waiting
+                    // for pkt_rx to become Disconnected.
+                    // Calling stop() directly sets ReceiverShared.stop
+                    // (str0m_receiver.rs:88) — NOT the shared stop_flag (stream.rs:759)
+                    // — and joins the tick thread in-place (≤200ms), dropping pkt_tx
+                    // and allowing mux.join() to return promptly regardless of how many
+                    // Arc refs to the inner mutex still exist.
+                    if let Some(r) = s.receiver.as_mut() {
+                        let _ = r.stop();
+                    }
                     drop(s.receiver.take());
 
                     // Join the mux thread AFTER dropping the receiver (so pkt_tx is
