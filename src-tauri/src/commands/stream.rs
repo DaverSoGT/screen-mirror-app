@@ -1317,7 +1317,11 @@ fn handle_stream_supervisor_outcome(
 /// and a fresh disconnected `pkt_rx`.
 ///
 /// The mux thread takes ownership of `bundle.pkt_rx`.
-fn build_stream_session(
+///
+/// Made `pub` so integration tests (e.g., stream_rebuild_cancel.rs) can install a
+/// real `Str0mVideoReceiver` session and exercise the rebuild-worker teardown path
+/// against the full Arc topology (deadlock test WU-D1).
+pub fn build_stream_session(
     channel: Arc<dyn ChannelLike>,
     bundle: ReceiverBundle,
     stop_flag: Arc<AtomicBool>,
