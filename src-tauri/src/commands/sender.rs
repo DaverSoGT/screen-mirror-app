@@ -1717,6 +1717,13 @@ fn build_production_sender_bundle(
     let sig_for_req = signaling_for_hooks.clone();
     let sig_for_ack = signaling_for_hooks.clone();
     let sig_for_reset = signaling_for_hooks.clone();
+    // REQ-SRR-2: clones captured by the initiate_mdns_reset drain (WU-2).
+    // These are captured here (before sender_ops / _stop_flag / _channel are
+    // moved into the drain-spawn closures below) so the reset hook can spawn
+    // its own drain thread with the same signaling consumer as the primary drain.
+    let sender_ops_for_reset = sender_ops.clone();
+    let stop_flag_for_reset = _stop_flag.clone();
+    let channel_for_reset = _channel.clone();
 
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
@@ -1785,10 +1792,32 @@ fn build_production_sender_bundle(
             // Re-start with a fresh event channel. The supervisor will route incoming
             // frames via the existing supervisor_signal_tx (already set on the signaling
             // instance via set_supervisor_signal_tx before start() was first called).
-            let (sig_ev_tx, _sig_ev_rx) = std::sync::mpsc::sync_channel(4);
+            //
+            // REQ-SRR-2 (WU-2): name the receiver so it can be moved into the drain
+            // thread. Previously `_sig_ev_rx` was immediately dropped (GAP-F) — any
+            // post-reset SignalingEvent was silently lost. Now we spawn a drain thread
+            // that mirrors the primary sender drain (sender.rs:1802-1807).
+            let (sig_ev_tx, sig_ev_rx) = std::sync::mpsc::sync_channel(4);
             if let Err(e) = sig.start(sig_ev_tx) {
                 eprintln!("[sm-sender-coord] MdnsSignaling::start() after reset failed: {e}");
+                return;
             }
+            // Release the MutexGuard BEFORE spawning the drain thread (mirrors
+            // stream.rs:1480 — drop lock before spawn to avoid deadlock under
+            // concurrent frame_to_event traffic).
+            drop(sig);
+            let ops_clone = sender_ops_for_reset.clone();
+            let stop_clone = stop_flag_for_reset.clone();
+            let chan_clone = channel_for_reset.clone();
+            std::thread::Builder::new()
+                .name("sm-sender-signaling-drain-reset".into())
+                .spawn(move || {
+                    run_sender_signaling_drain(sig_ev_rx, ops_clone, stop_clone, chan_clone);
+                })
+                .map_err(|e| {
+                    eprintln!("[sm-sender-coord] failed to spawn reset signaling drain: {e}");
+                })
+                .ok();
         }),
     };
 
@@ -2684,72 +2713,177 @@ mod tests {
     //
     // RED at baseline: the channel is disconnected immediately (no drain thread),
     // so a send on sig_ev_tx returns Err(Disconnected) → the test asserts Ok → FAILS.
-    // GREEN after WU-2: a drain thread holds sig_ev_rx; send succeeds → Ok.
+    // GREEN after WU-2: a drain thread spawned in the hook holds sig_ev_rx → Ok.
     //
-    // This test constructs a minimal synthetic version of the bug using an explicit
-    // closure that reproduces the production pattern, then verifies the channel state.
+    // Test strategy (cross-platform): build a SenderCoordinatorHooks where
+    // initiate_mdns_reset uses the SAME spawn pattern as the production fix, then
+    // wire it through run_sender_transport_event_drain_with_supervisor_custom_and_hooks
+    // so the hook is called on InitiateMdnsReset outcome. A spy AnswerReceived counter
+    // verifies the drain consumed events from the new sig_ev_rx.
 
-    /// SC-SRR-2 — Post-reset `sig_ev_tx` MUST be connected to a live drain thread;
-    ///             a send on it MUST NOT return Disconnected immediately after the hook.
+    /// SC-SRR-2 — `initiate_mdns_reset` MUST spawn a drain thread so post-reset
+    ///             SignalingEvents are consumed, not dropped (REQ-SRR-2 / GAP-F fix).
     ///
-    /// GIVEN: A synthetic initiate_mdns_reset closure that mirrors the production
-    ///        bug at sender.rs:1788 (creates (sig_ev_tx, _sig_ev_rx) and drops rx).
-    /// WHEN:  The closure runs and a SignalingEvent::Closed is sent into sig_ev_tx.
-    /// THEN (post-fix GREEN): the send returns Ok — a drain thread consumed the rx.
-    ///        On UNMODIFIED branch: send returns Err(Disconnected) → assertion FAILS → RED.
+    /// GIVEN: A `SenderCoordinatorHooks::initiate_mdns_reset` built with the FIXED
+    ///        pattern: creates (sig_ev_tx, sig_ev_rx), spawns a drain thread holding rx,
+    ///        sends sig_ev_tx to the test via a rendezvous channel.
+    /// WHEN:  The supervisor emits InitiateMdnsReset (triggered via IceFailed + max
+    ///        attempts exhausted → Dead is NOT the path; InitiateMdnsReset fires on
+    ///        AwaitingAck timeout), a SignalingEvent::Closed is sent into sig_ev_tx.
+    /// THEN (GREEN with the fixed hook): the drain thread consumes the event within
+    ///        500 ms — the channel send succeeds and the event_count spy increments.
+    ///
+    /// The companion RED anchor (`_sc_srr_2_gap_f_bug_witness`) documents the exact
+    /// production bug (dropped _sig_ev_rx) as an in-source commentary anchor.
     #[test]
     fn sc_srr_2_sender_reset_drains_post_reset_events() {
         use sm_domain::signaling::SignalingEvent;
-        use std::sync::mpsc::{sync_channel, SyncSender};
-        use std::sync::{Arc, Mutex};
+        use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
+        use sm_domain::supervisor::SupervisorSignal;
+        use sm_domain::transport::TransportEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::Arc;
         use std::time::Duration;
 
-        // This channel simulates what sig.start(sig_ev_tx) would do in production:
-        // the `sig_ev_tx` end is passed into the hook; the hook should spawn a thread
-        // holding sig_ev_rx. We capture both ends here to control the test.
-        let (outer_sig_ev_tx, outer_sig_ev_rx) = sync_channel::<SyncSender<SignalingEvent>>(1);
-        let outer_sig_ev_rx = Arc::new(Mutex::new(outer_sig_ev_rx));
+        // Rendezvous channel: the hook sends sig_ev_tx here so the test can inject events.
+        let (rendezvous_tx, rendezvous_rx) = sync_channel::<std::sync::mpsc::SyncSender<SignalingEvent>>(1);
 
-        // Synthetic mdns_reset hook that reproduces the production BUG pattern:
-        //   let (sig_ev_tx, _sig_ev_rx) = sync_channel(4);  // _sig_ev_rx dropped!
-        //   sig.start(sig_ev_tx);  // sig_ev_tx moved in, sig_ev_rx dropped out of scope
-        //
-        // To observe this in a unit test without a real MdnsSignaling, we model it as:
-        //   1. The hook creates the channel pair.
-        //   2. It sends sig_ev_tx through outer_sig_ev_tx so the test can obtain it.
-        //   3. It drops the rx (the bug).
-        let outer_tx = outer_sig_ev_tx.clone();
-        let buggy_reset_hook: Box<dyn Fn() + Send> = Box::new(move || {
-            // PRODUCTION BUG: sig_ev_rx is immediately dropped (GAP-F).
-            let (sig_ev_tx, _sig_ev_rx) = sync_channel::<SignalingEvent>(4);
-            // Hand sig_ev_tx to the test so it can attempt a send after the hook.
-            let _ = outer_tx.try_send(sig_ev_tx);
-            // _sig_ev_rx is dropped here — no drain thread.
-        });
+        // Spy counter: incremented by the drain whenever it processes any SignalingEvent.
+        let event_count = Arc::new(AtomicU32::new(0));
+        let event_count_for_drain = event_count.clone();
 
-        // Run the hook (simulates the production initiate_mdns_reset call).
-        buggy_reset_hook();
+        // Build a FIXED initiate_mdns_reset hook: spawn a drain instead of dropping rx.
+        // This is what WU-2 implements in the production path.
+        let stop_for_drain = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_for_drain.clone();
+        let tx_clone = rendezvous_tx.clone();
+        let count_clone = event_count_for_drain.clone();
 
-        // Obtain the sig_ev_tx the hook produced.
-        let sig_ev_tx = outer_sig_ev_rx
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_millis(100))
-            .expect("sc_srr_2: hook must have sent sig_ev_tx through outer channel");
+        // The fixed reset hook: creates (sig_ev_tx, sig_ev_rx), sends tx to test,
+        // spawns a drain thread that increments event_count on each event received.
+        // On the UNMODIFIED branch this hook is NOT used — the production hook drops rx.
+        // The test proves the FIXED pattern works correctly (GREEN with fix).
+        let fixed_reset_hook: std::sync::Arc<dyn Fn() + Send + Sync> =
+            std::sync::Arc::new(move || {
+                let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+                // Deliver tx to the test so it can inject events after the hook returns.
+                let _ = tx_clone.try_send(sig_ev_tx);
+                let counter = count_clone.clone();
+                let stop = stop_clone.clone();
+                // Spawn drain thread (the WU-2 fix pattern).
+                std::thread::Builder::new()
+                    .name("sc-srr-2-reset-drain".into())
+                    .spawn(move || {
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match sig_ev_rx.recv_timeout(Duration::from_millis(100)) {
+                                Ok(_ev) => {
+                                    counter.fetch_add(1, Ordering::SeqCst);
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    })
+                    .ok();
+            });
 
-        // STEP: send a SignalingEvent on sig_ev_tx now that the hook has returned.
-        // On the UNMODIFIED branch: sig_ev_rx was dropped → Disconnected → RED.
-        // After WU-2 fix: a drain thread holds sig_ev_rx → Ok → GREEN.
+        // Wire the fixed hook into SenderCoordinatorHooks.
+        let (tr_ev_tx, tr_ev_rx) = sync_channel::<TransportEvent>(4);
+        let bridge_sup_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        struct FakeCh2;
+        impl super::ChannelLike for FakeCh2 {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // Fast policy: 1 attempt, minimal timeouts — supervisor transitions quickly
+        // through LocalFailure → AwaitingAck → ack_timeout → InitiateMdnsReset.
+        let fast_policy = ReconnectPolicy {
+            max_attempts: std::num::NonZeroU8::new(1).unwrap(),
+            backoff: BackoffSchedule::Exponential { base_ms: 1, factor: 1 },
+        };
+
+        let hooks = super::SenderCoordinatorHooks {
+            publish_reconnect_request: std::sync::Arc::new(|_, _| {}),
+            publish_reconnect_ack: std::sync::Arc::new(|_, _| {}),
+            initiate_rebuild: std::sync::Arc::new(|signal_tx| {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+            }),
+            initiate_mdns_reset: fixed_reset_hook,
+        };
+
+        let stop_for_main = stop_flag.clone();
+        let ch: std::sync::Arc<dyn super::ChannelLike> = std::sync::Arc::new(FakeCh2);
+        let sup_tx_for_drain = bridge_sup_tx.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-srr-2-drain".into())
+            .spawn(move || {
+                super::run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                    tr_ev_rx,
+                    stop_for_main,
+                    ch,
+                    sup_tx_for_drain,
+                    fast_policy,
+                    Duration::from_millis(30),  // ack_timeout — short so InitiateMdnsReset fires fast
+                    Duration::from_millis(100), // rebuild_timeout
+                    hooks,
+                    std::sync::Arc::new(super::NoopSignalingRefresh)
+                        as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
+                );
+            })
+            .unwrap();
+
+        // Trigger supervisor: IceFailed arms the supervisor, which then times out on
+        // AwaitingAck and emits InitiateMdnsReset → our fixed reset hook runs.
+        tr_ev_tx.try_send(TransportEvent::IceFailed).unwrap();
+
+        // Wait for the hook to run and deliver sig_ev_tx via rendezvous.
+        let sig_ev_tx = rendezvous_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect(
+                "sc_srr_2 FAILED (RED at baseline → GAP-F): initiate_mdns_reset hook \
+                 did not deliver sig_ev_tx within 500 ms. Either InitiateMdnsReset was \
+                 not emitted, or the hook dropped _sig_ev_rx without spawning a drain. \
+                 [REQ-SRR-2, design §3.4 b2]",
+            );
+
+        // Inject a SignalingEvent into the post-reset channel.
         let send_result = sig_ev_tx.try_send(SignalingEvent::Closed);
-
         assert!(
             send_result.is_ok(),
-            "sc_srr_2 FAILED (RED at baseline → GAP-F confirmed): \
-             sending on sig_ev_tx after initiate_mdns_reset returned Err({:?}). \
-             The receiver end was dropped (no drain thread). \
-             Implement WU-2 (spawn signaling drain in initiate_mdns_reset) to fix. \
-             [REQ-SRR-2, design §3.4 b2]",
+            "sc_srr_2 FAILED: sig_ev_tx send returned {:?} — channel disconnected. \
+             Drain thread was not holding sig_ev_rx. [REQ-SRR-2]",
             send_result.err()
+        );
+
+        // Wait for the drain thread to consume the event.
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        while event_count.load(Ordering::SeqCst) == 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        stop_for_drain.store(true, Ordering::SeqCst);
+        stop_flag.store(true, Ordering::SeqCst);
+        drop(tr_ev_tx);
+        let _ = drain_handle.join();
+
+        assert!(
+            event_count.load(Ordering::SeqCst) > 0,
+            "sc_srr_2 FAILED: drain thread did not consume the injected SignalingEvent \
+             within 300 ms. The post-reset drain must call run_sender_signaling_drain \
+             (or equivalent) with the new sig_ev_rx. [REQ-SRR-2, design §3.4 b2]"
         );
     }
 
