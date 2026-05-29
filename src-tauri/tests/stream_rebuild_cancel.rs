@@ -28,10 +28,14 @@ use std::time::Duration;
 use screen_mirror_lib::commands::sender::ChannelLike;
 use screen_mirror_lib::commands::stream::{
     BindCtx, BundleError, ProbeFn, ReceiverBundle, ReceiverOps, StreamRestartCache,
-    make_stream_rebuild_hook,
+    build_stream_session, make_stream_rebuild_hook,
 };
 use sm_domain::supervisor::SupervisorSignal;
-use sm_domain::transport::TransportError;
+use sm_domain::transport::{
+    TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, TransportRole,
+    VideoReceiver,
+};
+use sm_infra::transport::Str0mVideoReceiver;
 
 // ─── Minimal stubs ─────────────────────────────────��──────────────────────────
 
@@ -49,6 +53,28 @@ impl ReceiverOps for FakeReceiverOps {
     }
     fn dropped_frames(&self) -> u64 {
         0
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+// ─── Real-receiver wrapper (deadlock test) ────────────────────────────────────
+
+/// Minimal `ReceiverOps` wrapper around a shared `Str0mVideoReceiver` for the
+/// deadlock test. Mirrors the production `Str0mReceiverOps` shape without
+/// requiring `Str0mReceiverOps` to be pub.
+struct RealReceiverOps(Arc<Mutex<Str0mVideoReceiver>>);
+
+impl ReceiverOps for RealReceiverOps {
+    fn request_keyframe(&self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().request_keyframe()
+    }
+    fn dropped_frames(&self) -> u64 {
+        self.0.lock().unwrap().dropped_frames()
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().stop()
     }
 }
 
@@ -417,5 +443,120 @@ fn cancel_gate_d_stop_during_swap_fires_rebuild_failed() {
     assert!(
         bridge_session.lock().unwrap().is_none(),
         "Gate D must tear down the newly-installed session (bridge_session must be None)"
+    );
+}
+
+// ─── Deadlock regression: sc_rrd_deadlock_teardown_joins_with_live_reset_hook_ref ─
+//
+// REQ-SRR-4 — teardown must complete so a fresh browse can start.
+//
+// GIVEN: a real Str0mVideoReceiver (live tick thread + pkt_tx) installed into a
+//        stream session via build_stream_session. The underlying receiver_mutex has
+//        TWO strong Arc refs:
+//          (1) recv_ops_bridge  → session.receiver  (dropped in teardown)
+//          (2) recv_ops_reset   → simulates coordinator_hooks.initiate_mdns_reset
+//              holding the second ref past teardown (the deadlock condition).
+//
+// WHEN: the rebuild worker hook is invoked via make_stream_rebuild_hook with a
+//       fake builder returning an empty bundle. recv_ops_reset is kept LIVE across
+//       the WHEN step (the whole point — proves stop works DESPITE the lingering Arc).
+//
+// THEN: signal_rx.recv_timeout(2s) returns Ok(_).
+//   - RED today (worker pins at mux.join() forever → 2s Timeout → assert fails).
+//   - GREEN after WU-D3 (r.stop() sets ReceiverShared.stop → tick exits → pkt_tx
+//     dropped → pkt_rx Disconnected → mux.join() returns promptly).
+//
+// CRITICAL: the hook is spawned on a dedicated thread. The assertion uses
+// recv_timeout(2s) so the test FAILS with a message rather than blocking the runner.
+#[test]
+fn sc_rrd_deadlock_teardown_joins_with_live_reset_hook_ref() {
+    // ── GIVEN ────────────────────────────────────────────────────────────────
+
+    // Build a real Str0mVideoReceiver on an ephemeral port (0 → OS picks port).
+    let transport_config = TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    };
+    let mut recv =
+        Str0mVideoReceiver::new(transport_config).expect("Str0mVideoReceiver::new must succeed");
+
+    // Start the receiver: binds UDP, spawns tick thread, pkt_tx goes to pkt_rx.
+    let (pkt_tx, pkt_rx) =
+        sync_channel::<sm_domain::encode::EncodedPacket>(TRANSPORT_CHANNEL_CAPACITY);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(TRANSPORT_CHANNEL_CAPACITY);
+    recv.start(pkt_tx, event_tx)
+        .expect("Str0mVideoReceiver::start must succeed");
+
+    // Wrap in Arc<Mutex<>> — mirroring stream.rs:1591.
+    let receiver_mutex = Arc::new(Mutex::new(recv));
+
+    // Bridge ref (stream.rs:1597) — goes into session.receiver via the bundle.
+    let recv_ops_bridge = RealReceiverOps(receiver_mutex.clone());
+
+    // Reset-hook ref (stream.rs:1612) — kept alive across the WHEN step.
+    // Simulates coordinator_hooks.initiate_mdns_reset capturing this Arc for the
+    // coordinator thread's lifetime, preventing Drop from running on teardown.
+    let recv_ops_reset = receiver_mutex.clone();
+
+    // Install a live session (spawns the mux thread).
+    let ch: Arc<dyn ChannelLike> = Arc::new(NullChannel);
+    let old_stop_flag = Arc::new(AtomicBool::new(false));
+    let bundle = ReceiverBundle {
+        receiver: Box::new(recv_ops_bridge),
+        pkt_rx,
+        signaling: None,
+        drain_handles: vec![],
+        _drain_senders: vec![],
+    };
+    let session = build_stream_session(ch.clone(), bundle, old_stop_flag.clone())
+        .expect("build_stream_session must succeed");
+
+    let bridge_session = Arc::new(Mutex::new(Some(session)));
+    let bridge_cache = make_cache(ch.clone());
+
+    // ── WHEN ─────────────────────────────────────────────────────────────────
+
+    // Keep recv_ops_reset alive ACROSS the entire WHEN step.
+    // This is the second strong Arc ref to receiver_mutex — the very ref that
+    // causes mux.join() to block forever on unpatched code (the bug).
+    let _hold_second_ref = recv_ops_reset;
+
+    let hook = make_stream_rebuild_hook(
+        Arc::new(
+            move |_bind_ctx: BindCtx,
+                  _port: u16,
+                  _name: String,
+                  _stop_flag: Arc<AtomicBool>,
+                  _channel: Arc<dyn ChannelLike>|
+                  -> Result<ReceiverBundle, BundleError> { Ok(fake_bundle()) },
+        ),
+        bridge_cache,
+        bridge_session,
+        old_stop_flag,
+        1,
+        Some(instant_probe_fn()),
+    );
+
+    let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(4);
+
+    // Spawn the hook on a dedicated thread so the assertion below can use
+    // recv_timeout rather than blocking forever on a deadlocked join.
+    let _hook_handle = thread::Builder::new()
+        .name("test-sc-rrd-deadlock".into())
+        .spawn(move || hook(signal_tx))
+        .unwrap();
+
+    // ── THEN ─────────────────────────────────────────────────────────────────
+
+    // Assert: the worker must complete (signal any SupervisorSignal) within 2s.
+    //   RED  today  → Err(RecvTimeoutError::Timeout)  (worker pinned at mux.join())
+    //   GREEN after WU-D3 → Ok(RebuildFailed) or Ok(RebuildSucceeded)
+    let outcome = signal_rx.recv_timeout(Duration::from_secs(2));
+    assert!(
+        outcome.is_ok(),
+        "sc_rrd_deadlock: worker must complete within 2s — \
+         timed out, which means mux.join() is deadlocked (the lingering second Arc \
+         prevents pkt_rx from disconnecting). Fix: call r.stop() before mux.join()."
     );
 }

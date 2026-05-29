@@ -792,6 +792,14 @@ pub trait ReceiverOps: Send {
     fn request_keyframe(&self) -> Result<(), TransportError>;
     /// Count of dropped frames (backpressure).
     fn dropped_frames(&self) -> u64;
+    /// Stop the receiver explicitly. Idempotent. MUST be called in teardown BEFORE
+    /// `mux.join()` to guarantee the tick thread exits regardless of lingering Arc
+    /// refs to the underlying `Arc<Mutex<Str0mVideoReceiver>>`.
+    ///
+    /// MUST NOT touch `StreamSession.stop_flag` — that invariant is owned exclusively
+    /// by the teardown INVARIANT block at stream.rs:1830-1835 (fix #509/T12.2). This
+    /// method targets ONLY `ReceiverShared.stop` inside the receiver instance.
+    fn stop(&mut self) -> Result<(), TransportError>;
 }
 
 /// Minimal interface needed from the signaling adapter by the bridge.
@@ -1317,7 +1325,11 @@ fn handle_stream_supervisor_outcome(
 /// and a fresh disconnected `pkt_rx`.
 ///
 /// The mux thread takes ownership of `bundle.pkt_rx`.
-fn build_stream_session(
+///
+/// Made `pub` so integration tests (e.g., stream_rebuild_cancel.rs) can install a
+/// real `Str0mVideoReceiver` session and exercise the rebuild-worker teardown path
+/// against the full Arc topology (deadlock test WU-D1).
+pub fn build_stream_session(
     channel: Arc<dyn ChannelLike>,
     bundle: ReceiverBundle,
     stop_flag: Arc<AtomicBool>,
@@ -1361,6 +1373,9 @@ impl ReceiverOps for Str0mReceiverOps {
     }
     fn dropped_frames(&self) -> u64 {
         self.0.lock().unwrap().dropped_frames()
+    }
+    fn stop(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().stop()
     }
 }
 
@@ -1453,15 +1468,25 @@ fn build_initiate_mdns_reset_hook<T>(
     sig_publish: Arc<dyn SignalingPublishOps>,
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
+    // NO-COMPETE seam (AR-C2): optional cell that receives a clone of sig_ev_tx after
+    // the fresh channel is created. Production callers pass `None`; SC-F-001/002 pass
+    // `Some(cell)` to retrieve the sender without relying on a spy `sig.start()` call.
+    // This is the ONLY purpose of the cell — it does NOT affect drain lifecycle.
+    channel_capture: Option<Arc<Mutex<Option<SyncSender<SignalingEvent>>>>>,
 ) -> Arc<dyn Fn() + Send + Sync>
 where
     T: sm_domain::signaling::Signaling + 'static,
 {
     Arc::new(move || {
-        // MdnsSignaling::reset() consumes self. Since we hold Arc<Mutex<>>,
-        // call stop() in-place then start() again to re-engage discovery.
+        // NO-COMPETE (M-C1b, REQ-SRR-4): stop the dead gen-G signaling thread and
+        // its associated TCP connection so no stale browse races the rebuild's fresh
+        // browse. We do NOT call sig.start() here — the rebuild worker exclusively owns
+        // the fresh gen-G+1 browse via build_production_bundle. The reset hook's sole
+        // responsibilities are: (1) drop the dead TCP, (2) keep the event channel LIVE
+        // for D-4/GAP-F (drain consumes post-reset events), (3) preserve D-3 Closed
+        // forwarding. The competing re-browse (old: stop+start) is eliminated.
         eprintln!(
-            "[sm-stream-coord] InitiateMdnsReset — calling Signaling::stop() + re-engaging discovery"
+            "[sm-stream-coord] InitiateMdnsReset — stopping gen-G signaling (NO-COMPETE, M-C1b)"
         );
         let mut sig = sig_for_reset.lock().unwrap();
         if let Err(e) = sig.stop() {
@@ -1470,11 +1495,17 @@ where
         // D-4 (GAP-F fix): create a fresh channel pair — do NOT use underscore prefix
         // on sig_ev_rx. A new drain thread MUST consume it; dropping _sig_ev_rx here
         // would silently discard all post-reset SDP/ICE events (the pre-fix bug).
+        // NO sig.start() — the rebuild's gen-G+1 build_production_bundle provides the
+        // only connecting browse. This removes the second competing racer (design-c §2.2).
         let (sig_ev_tx, sig_ev_rx) = std::sync::mpsc::sync_channel(4);
-        if let Err(e) = sig.start(sig_ev_tx) {
-            eprintln!("[sm-stream-coord] MdnsSignaling::start() after reset failed: {e}");
-            return;
+
+        // NO-COMPETE seam: write tx clone into the capture cell (for SC-F-001/002).
+        // In production this is None — no overhead. In tests this makes the tx
+        // retrievable without requiring sig.start() to be called.
+        if let Some(ref cell) = channel_capture {
+            *cell.lock().unwrap() = Some(sig_ev_tx.clone());
         }
+
         // Drop the signaling lock before spawning the consumer thread so the
         // drain can call back into signaling (publish_local_answer) without deadlock.
         drop(sig);
@@ -1676,6 +1707,7 @@ fn build_production_bundle(
             sig_publish_for_reset_drain,
             stop_flag_for_reset,
             supervisor_signal_tx.clone(), // D-3 REQ-A: wired to reset drain
+            None, // NO-COMPETE: no capture cell needed in production (AR-C2 seam)
         ),
     };
 
@@ -1826,11 +1858,22 @@ pub fn make_stream_rebuild_hook(
                 // receiver here causes the channel to disconnect → mux exits promptly).
                 let old_session = { bridge_session.lock().unwrap().take() };
                 if let Some(mut s) = old_session {
-                    // Drop the receiver first — this disconnects the `pkt_tx` side,
-                    // which causes the mux thread's `pkt_rx.recv_timeout()` to return
-                    // `Disconnected` → mux thread exits on the next iteration.
-                    // The receiver's Drop impl stops the tick thread, releasing the
-                    // UDP socket FD (so bind_probe at step 7 can succeed).
+                    // Stop the receiver tick thread explicitly BEFORE dropping the
+                    // bridge Arc. Rationale: the reset-hook closure
+                    // (coordinator_hooks.initiate_mdns_reset, stream.rs:1689-1696)
+                    // holds a second strong ref to the underlying
+                    // Arc<Mutex<Str0mVideoReceiver>>; dropping the bridge Arc here does
+                    // NOT make it the last ref, so the receiver's Drop (and tick-thread
+                    // join) would not run. mux.join() below then blocks forever waiting
+                    // for pkt_rx to become Disconnected.
+                    // Calling stop() directly sets ReceiverShared.stop
+                    // (str0m_receiver.rs:88) — NOT the shared stop_flag (stream.rs:759)
+                    // — and joins the tick thread in-place (≤200ms), dropping pkt_tx
+                    // and allowing mux.join() to return promptly regardless of how many
+                    // Arc refs to the inner mutex still exist.
+                    if let Some(r) = s.receiver.as_mut() {
+                        let _ = r.stop();
+                    }
                     drop(s.receiver.take());
 
                     // Join the mux thread AFTER dropping the receiver (so pkt_tx is
@@ -2670,6 +2713,10 @@ mod tests {
 
         fn dropped_frames(&self) -> u64 {
             0
+        }
+
+        fn stop(&mut self) -> Result<(), TransportError> {
+            Ok(())
         }
     }
 
@@ -5391,10 +5438,17 @@ mod tests {
     /// `DrainRole::ResetSignalingOnly` drain; the offer is CONSUMED (channel is live) but
     /// `apply_remote_offer` is NOT called on the stale Rtc (REQ-RRD-1, D-RDF-2).
     ///
+    /// **NO-COMPETE update (WU-C3, AR-C2)**: the hook no longer calls `sig.start()` to
+    /// re-browse — that was the competing second racer. The fresh channel tx is now wired
+    /// via the `channel_capture` seam (design-c §2.3/§7.2) instead of a spy `start()`.
+    /// The liveness assertion (channel not Disconnected) and the apply-count assertion
+    /// (count == 0) are UNCHANGED — the test exercises the same invariants, only the
+    /// tx-retrieval path is updated (INV-5b: no assertion is weakened or removed).
+    ///
     /// Test approach: directly constructs the `initiate_mdns_reset` hook using the same
-    /// D-4 pattern as production (spy signaling, spy receiver, noop publish). Calls the
-    /// hook, then sends an `OfferReceived` event on the new `sig_ev_tx` captured by the
-    /// spy. Asserts that:
+    /// M-C1b pattern as production (spy signaling, spy receiver, noop publish). Calls the
+    /// hook, then sends an `OfferReceived` event on the new `sig_ev_tx` retrieved from the
+    /// `channel_capture` cell. Asserts that:
     ///   1. `try_send` succeeds (channel not orphaned / D-4 preserved).
     ///   2. `apply_remote_offer` is NOT called (count == 0 — D-RDF-2 / REQ-RRD-1).
     ///
@@ -5403,33 +5457,59 @@ mod tests {
     #[test]
     fn sc_f_001_initiate_mdns_reset_spawns_consumer_for_new_sig_ev_rx() {
         use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
-        use std::sync::mpsc::{TrySendError, sync_channel};
+        use std::sync::mpsc::TrySendError;
 
-        // ── SpySignaling: captures the sig_ev_tx passed to start() ──
-        // Shared via Arc<Mutex<Option<SyncSender<_>>>> so the test can retrieve it.
-        struct SpySignaling {
-            captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-        }
+        // ── SpySignaling: no longer needs to capture tx (NO-COMPETE M-C1b) ──
+        // stop() is a no-op (no real thread). start() is never called by the
+        // production hook after the NO-COMPETE seam — the channel_capture cell
+        // is the new tx-retrieval path. SpySignaling is kept to satisfy the
+        // Arc<Mutex<T: Signaling>> type bound on build_initiate_mdns_reset_hook.
+        struct SpySignaling;
         impl SpySignaling {
-            fn new_arc(
-                capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-            ) -> Arc<Mutex<Self>> {
-                Arc::new(Mutex::new(Self {
-                    captured_tx: capture,
-                }))
+            fn new_arc() -> Arc<Mutex<Self>> {
+                Arc::new(Mutex::new(Self))
             }
         }
-        // We need to call stop/start on it, but via Arc<Mutex<>> — use a simple trait.
-        trait SpySignalingOps: Send {
-            fn stop_spy(&mut self) -> Result<(), String>;
-            fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String>;
-        }
-        impl SpySignalingOps for SpySignaling {
-            fn stop_spy(&mut self) -> Result<(), String> {
+        impl sm_domain::signaling::Signaling for SpySignaling {
+            fn new(
+                _config: sm_domain::signaling::SignalingConfig,
+            ) -> Result<Self, sm_domain::signaling::SignalingError>
+            where
+                Self: Sized,
+            {
+                Err(sm_domain::signaling::SignalingError::Io(
+                    "SpySignaling::new not supported".into(),
+                ))
+            }
+            fn start(
+                &mut self,
+                _event_tx: SyncSender<SignalingEvent>,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                // NO-COMPETE: production hook no longer calls start() — if this is
+                // called it means the competing re-browse was re-introduced (regression).
+                panic!(
+                    "SC-F-001: SpySignaling::start must NOT be called — NO-COMPETE seam (M-C1b)"
+                );
+            }
+            fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
-            fn start_spy(&mut self, tx: SyncSender<SignalingEvent>) -> Result<(), String> {
-                *self.captured_tx.lock().unwrap() = Some(tx);
+            fn publish_local_offer(
+                &self,
+                _offer: sm_domain::signaling::SdpOffer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_answer(
+                &self,
+                _answer: sm_domain::signaling::SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
         }
@@ -5473,68 +5553,39 @@ mod tests {
         }
 
         // ── Wire ──
-        let captured_tx_outer: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+        // NO-COMPETE seam (AR-C2): channel_capture receives the fresh sig_ev_tx
+        // created inside the hook closure. No spy start() needed.
+        let channel_capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
             Arc::new(Mutex::new(None));
-        let spy_sig = SpySignaling::new_arc(captured_tx_outer.clone());
+        let spy_sig = SpySignaling::new_arc();
 
         let offer_count = Arc::new(Mutex::new(0u32));
         let spy_recv: Arc<dyn SignalingReceiverOps> = SpyReceiver::new_arc(offer_count.clone());
         let noop_pub: Arc<dyn SignalingPublishOps> = Arc::new(NoopPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        // ── Build the FIXED initiate_mdns_reset closure (mirrors D-4 production code) ──
-        // Capture clones once outside the closure; clone again inside on each call.
-        let sig_for_reset = spy_sig.clone();
-        let recv_for_reset = spy_recv.clone();
-        let pub_for_reset = noop_pub.clone();
-        let stop_for_reset = stop_flag.clone();
-
-        let reset_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let mut sig = sig_for_reset.lock().unwrap();
-            if let Err(e) = sig.stop_spy() {
-                eprintln!("[test] stop failed: {e}");
-            }
-            // D-4 fix: no underscore — sig_ev_rx MUST be consumed by a drain thread.
-            let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
-            if let Err(e) = sig.start_spy(sig_ev_tx) {
-                eprintln!("[test] start failed: {e}");
-                return;
-            }
-            drop(sig); // release lock before spawning drain
-
-            let recv_clone = recv_for_reset.clone();
-            let pub_clone = pub_for_reset.clone();
-            let stop_clone = stop_for_reset.clone();
-
-            // Spawn drain mirroring the production reset hook (D-4 pattern).
-            // SC-F-001 tests channel liveness only; role is ResetSignalingOnly
-            // to match the production build_initiate_mdns_reset_hook (REQ-RRD-1).
-            if let Err(e) = std::thread::Builder::new()
-                .name("sm-signaling-event-drain-reset-test".into())
-                .spawn(move || {
-                    run_signaling_drain(
-                        sig_ev_rx,
-                        recv_clone,
-                        pub_clone,
-                        stop_clone,
-                        Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
-                        DrainRole::ResetSignalingOnly,
-                    );
-                })
-            {
-                eprintln!("[test] spawn failed: {e}");
-            }
-        });
+        // ── Build the FIXED initiate_mdns_reset hook via the real production function ──
+        // SC-F-001 now calls build_initiate_mdns_reset_hook (same as SC-F-002) so that
+        // it exercises the REAL production code path, not a manual reconstruction.
+        // channel_capture is passed so we can retrieve sig_ev_tx after the hook fires.
+        let reset_hook = build_initiate_mdns_reset_hook(
+            spy_sig,
+            spy_recv,
+            noop_pub,
+            stop_flag.clone(),
+            Arc::new(Mutex::new(None)), // D-3: no supervisor in SC-F-001
+            Some(channel_capture.clone()),
+        );
 
         // ── Invoke the hook ──
         (reset_hook)();
 
-        // Retrieve sig_ev_tx captured by SpySignaling::start_spy.
-        let sig_ev_tx = captured_tx_outer
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SpySignaling::start_spy must have been called");
+        // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
+        // The hook writes a clone of sig_ev_tx into the cell before spawning the drain.
+        let sig_ev_tx =
+            channel_capture.lock().unwrap().clone().expect(
+                "SC-F-001: channel_capture must be populated by the hook (NO-COMPETE seam)",
+            );
 
         // ── Send an offer on the new sig_ev_tx ──
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
@@ -5597,26 +5648,23 @@ mod tests {
         use std::sync::mpsc::TrySendError;
 
         // ── SpyMdnsSignaling: implements sm_domain::signaling::Signaling ──
-        // `start()` captures the sender so we can inject events after the reset.
-        // `stop()` is a no-op — no real thread to join.
-        // All other Signaling methods are stubs (never called by the hook).
-        struct SpyMdnsSignaling {
-            captured_tx: Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
-        }
+        // NO-COMPETE update: start() now panics (the hook must NOT call it after M-C1b).
+        // stop() is a no-op — no real thread to join.
+        // The capture cell pattern is kept in new_shared() return type for call-site
+        // compatibility, but the inner cell is unused (replaced by channel_capture seam).
+        struct SpyMdnsSignaling;
         impl SpyMdnsSignaling {
-            // The return type nests Arc<Mutex<Option<SyncSender<_>>>> by necessity —
-            // the outer Arc is the shared spy handle, the inner is the capture cell.
+            // Returns (spy, unused_cell): the cell is kept for backwards call-site
+            // compatibility; channel_capture is the new tx-retrieval path.
             #[allow(clippy::type_complexity)]
             fn new_shared() -> (
                 Arc<Mutex<Self>>,
                 Arc<Mutex<Option<SyncSender<SignalingEvent>>>>,
             ) {
-                let capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+                let unused_cell: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
                     Arc::new(Mutex::new(None));
-                let spy = Arc::new(Mutex::new(Self {
-                    captured_tx: capture.clone(),
-                }));
-                (spy, capture)
+                let spy = Arc::new(Mutex::new(Self));
+                (spy, unused_cell)
             }
         }
         impl sm_domain::signaling::Signaling for SpyMdnsSignaling {
@@ -5631,11 +5679,14 @@ mod tests {
             }
             fn start(
                 &mut self,
-                event_tx: SyncSender<SignalingEvent>,
+                _event_tx: SyncSender<SignalingEvent>,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
-                // Capture the sender so the test can inject events after reset.
-                *self.captured_tx.lock().unwrap() = Some(event_tx);
-                Ok(())
+                // NO-COMPETE: production hook no longer calls start() after the M-C1b seam.
+                // If start() is called it means the competing re-browse was re-introduced.
+                panic!(
+                    "SC-F-002: SpyMdnsSignaling::start must NOT be called after NO-COMPETE seam \
+                     (M-C1b, design-c §2.5). The production hook must use channel_capture instead."
+                );
             }
             fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
@@ -5699,12 +5750,20 @@ mod tests {
         }
 
         // ── Wire ──
-        let (spy_sig, captured_tx_outer) = SpyMdnsSignaling::new_shared();
+        // SpyMdnsSignaling::new_shared still returns a capture cell but it is no longer
+        // populated by start() (start() panics on NO-COMPETE M-C1b). We use
+        // channel_capture instead — the seam added to build_initiate_mdns_reset_hook.
+        let (spy_sig, _unused_spy_capture) = SpyMdnsSignaling::new_shared();
 
         let offer_count = Arc::new(Mutex::new(0u32));
         let spy_recv: Arc<dyn SignalingReceiverOps> = SpyReceiver002::new_arc(offer_count.clone());
         let noop_pub: Arc<dyn SignalingPublishOps> = Arc::new(NoopPublish002);
         let stop_flag = Arc::new(AtomicBool::new(false));
+
+        // NO-COMPETE seam (AR-C2): channel_capture receives the fresh sig_ev_tx created
+        // inside the hook closure. This replaces the old SpyMdnsSignaling::start() capture.
+        let channel_capture: Arc<Mutex<Option<SyncSender<SignalingEvent>>>> =
+            Arc::new(Mutex::new(None));
 
         // ── Call the REAL production function (not a reconstruction) ──
         // This is the exact function `build_production_bundle` calls. If anyone breaks
@@ -5722,17 +5781,17 @@ mod tests {
             noop_pub,
             stop_flag.clone(),
             spy_supervisor_tx,
+            Some(channel_capture.clone()), // NO-COMPETE seam: retrieve tx via capture cell
         );
 
         // ── Invoke the hook (mimics supervisor calling InitiateMdnsReset) ──
         (reset_hook)();
 
-        // Retrieve sig_ev_tx captured by SpyMdnsSignaling::start().
-        let sig_ev_tx = captured_tx_outer
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SpyMdnsSignaling::start must have been called by the hook");
+        // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
+        // The hook writes a clone of sig_ev_tx before spawning the drain.
+        let sig_ev_tx = channel_capture.lock().unwrap().clone().expect(
+            "SC-F-002: channel_capture must be populated by build_initiate_mdns_reset_hook",
+        );
 
         // ── Inject an OfferReceived event on the new channel ──
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
