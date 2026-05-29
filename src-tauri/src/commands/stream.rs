@@ -5457,7 +5457,9 @@ mod tests {
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 // NO-COMPETE: production hook no longer calls start() — if this is
                 // called it means the competing re-browse was re-introduced (regression).
-                panic!("SC-F-001: SpySignaling::start must NOT be called — NO-COMPETE seam (M-C1b)");
+                panic!(
+                    "SC-F-001: SpySignaling::start must NOT be called — NO-COMPETE seam (M-C1b)"
+                );
             }
             fn stop(&mut self) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
@@ -5550,11 +5552,10 @@ mod tests {
 
         // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
         // The hook writes a clone of sig_ev_tx into the cell before spawning the drain.
-        let sig_ev_tx = channel_capture
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SC-F-001: channel_capture must be populated by the hook (NO-COMPETE seam)");
+        let sig_ev_tx =
+            channel_capture.lock().unwrap().clone().expect(
+                "SC-F-001: channel_capture must be populated by the hook (NO-COMPETE seam)",
+            );
 
         // ── Send an offer on the new sig_ev_tx ──
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
@@ -5758,11 +5759,9 @@ mod tests {
 
         // Retrieve sig_ev_tx from the channel_capture cell (NO-COMPETE seam).
         // The hook writes a clone of sig_ev_tx before spawning the drain.
-        let sig_ev_tx = channel_capture
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("SC-F-002: channel_capture must be populated by build_initiate_mdns_reset_hook");
+        let sig_ev_tx = channel_capture.lock().unwrap().clone().expect(
+            "SC-F-002: channel_capture must be populated by build_initiate_mdns_reset_hook",
+        );
 
         // ── Inject an OfferReceived event on the new channel ──
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
