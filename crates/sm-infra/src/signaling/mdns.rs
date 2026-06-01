@@ -341,14 +341,19 @@ pub(crate) fn frame_to_event(
         }
         SignalingFrame::ReconnectRequest {
             attempt,
-            requester_role: _,
+            requester_role,
             session_nonce,
         } => {
             // Route to supervisor channel; do NOT produce a SignalingEvent.
-            // `session_nonce` from the peer acts as the peer's nonce for tie-breaking.
+            // `session_nonce` from the peer acts as the peer's nonce for the
+            // role-equal tie-break fallback. `requester_role` is forwarded as
+            // `peer_role` so the supervisor's role-aware tie-break (design #963 D1)
+            // can elect the offerer (Sender) as the active reconnector — previously
+            // this field was discarded (#962), making the tie-break role-blind.
             if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
                 let _ = tx.try_send(SupervisorSignal::PeerRequest {
                     peer_nonce: session_nonce,
+                    peer_role: requester_role,
                     attempt,
                 });
             }
@@ -1172,6 +1177,7 @@ mod tests {
             signal,
             SupervisorSignal::PeerRequest {
                 peer_nonce: 42_000,
+                peer_role: SignalingRole::Sender,
                 attempt: 2,
             }
         );

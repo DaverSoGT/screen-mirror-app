@@ -382,9 +382,12 @@ fn coordinator_calls_publish_reconnect_ack_hook_on_outcome() {
     // the signal is not silently dropped if the supervisor's signal channel
     // buffer is momentarily full.
     let peer_nonce: u64 = 0;
+    // Role-equal (both Sender) so the legacy nonce fallback decides: peer_nonce=0
+    // < my_nonce ⇒ the sender supervisor takes the "peer wins" / loser branch.
     sup_tx
         .send(SupervisorSignal::PeerRequest {
             peer_nonce,
+            peer_role: sm_domain::signaling::SignalingRole::Sender,
             attempt: 1,
         })
         .expect("supervisor signal channel must accept PeerRequest");

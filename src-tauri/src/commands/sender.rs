@@ -2113,7 +2113,13 @@ mod tests {
         let sup_handle = std::thread::Builder::new()
             .name("sc-s1-001-supervisor".into())
             .spawn(move || {
-                let mut sup = ReconnectSupervisor::new(fast_policy, 42, sup_rx, outcome_tx);
+                let mut sup = ReconnectSupervisor::new(
+                    fast_policy,
+                    42,
+                    sm_domain::signaling::SignalingRole::Sender,
+                    sup_rx,
+                    outcome_tx,
+                );
                 sup.run(Duration::from_millis(50), Duration::from_millis(50))
             })
             .expect("spawn supervisor");
@@ -2181,7 +2187,13 @@ mod tests {
         let sup_handle = std::thread::Builder::new()
             .name("sc-s1-002-supervisor".into())
             .spawn(move || {
-                let mut sup = ReconnectSupervisor::new(fast_policy, 99, sup_rx, outcome_tx);
+                let mut sup = ReconnectSupervisor::new(
+                    fast_policy,
+                    99,
+                    sm_domain::signaling::SignalingRole::Sender,
+                    sup_rx,
+                    outcome_tx,
+                );
                 sup.run(Duration::from_millis(50), Duration::from_millis(50))
             })
             .expect("spawn supervisor");
@@ -2786,8 +2798,11 @@ mod tests {
         {
             let guard = sup_tx_for_test.lock().unwrap();
             if let Some(ref tx) = *guard {
+                // Role-equal (both Sender) so the legacy nonce fallback decides:
+                // peer_nonce=0 < my_nonce ⇒ sender defers (the loser path).
                 let _ = tx.try_send(SupervisorSignal::PeerRequest {
                     peer_nonce: 0, // sender always loses when my_nonce > 0
+                    peer_role: sm_domain::signaling::SignalingRole::Sender,
                     attempt: 1,
                 });
             }
