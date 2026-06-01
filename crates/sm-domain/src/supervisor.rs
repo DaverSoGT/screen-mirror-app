@@ -581,6 +581,129 @@ mod tests {
         );
     }
 
+    // ─── SC-DR-1 / SC-DR-2a / SC-DR-2b: AwaitingAck role-aware tie-break ──────
+    //
+    // D1 (design #963): in a simultaneous reconnect race, the Sender (offerer) is
+    // ALWAYS the active reconnector regardless of nonce; the Receiver (answerer)
+    // ALWAYS defers and Acks. These tests exercise the AwaitingAck branch — the
+    // exact gate that the old nonce-only rule inverted (#962): the live failure
+    // had the Sender carrying the HIGH nonce, so the old rule wrongly made the
+    // Sender the loser. Role-aware: Sender wins regardless.
+
+    /// SC-DR-1 — Sender with the HIGH nonce stays the active reconnector.
+    ///
+    /// my=Sender(nonce 99), peer=Receiver(nonce 42). Under the OLD nonce rule the
+    /// lower peer nonce would win and we (higher) would defer+Ack. Role-aware: the
+    /// Sender is always active ⇒ we do NOT emit `PublishReconnectAck`.
+    #[test]
+    fn sc_dr_1_sender_high_nonce_is_active() {
+        let h = SupervisorHandle::spawn_with_role(fast_policy(), 99, SignalingRole::Sender);
+
+        // Enter AwaitingAck.
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let _state = h.recv_outcome(); // StateChanged(Reconnecting{1})
+        let _req = h.recv_outcome(); // PublishReconnectRequest
+
+        // Peer (Receiver) sends ReconnectRequest with the LOWER nonce.
+        h.send(SupervisorSignal::PeerRequest {
+            peer_nonce: 42,
+            peer_role: SignalingRole::Receiver,
+            attempt: 1,
+        });
+
+        // As the active reconnector we MUST NOT Ack the peer — drain a short window
+        // and assert no PublishReconnectAck appears.
+        assert_no_reconnect_ack(&h, 42);
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    /// SC-DR-2a — Sender with the LOW nonce is STILL the active reconnector.
+    ///
+    /// my=Sender(nonce 42), peer=Receiver(nonce 99). Role-aware: nonce is
+    /// irrelevant when roles differ ⇒ Sender stays active ⇒ no Ack.
+    #[test]
+    fn sc_dr_2a_sender_low_nonce_still_active() {
+        let h = SupervisorHandle::spawn_with_role(fast_policy(), 42, SignalingRole::Sender);
+
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let _state = h.recv_outcome();
+        let _req = h.recv_outcome();
+
+        h.send(SupervisorSignal::PeerRequest {
+            peer_nonce: 99,
+            peer_role: SignalingRole::Receiver,
+            attempt: 1,
+        });
+
+        assert_no_reconnect_ack(&h, 99);
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    /// SC-DR-2b — Receiver with the HIGH nonce defers and Acks.
+    ///
+    /// my=Receiver(nonce 99), peer=Sender(nonce 42). Role-aware: the answerer
+    /// always defers ⇒ we emit `PublishReconnectAck` for the peer's nonce, then
+    /// `InitiateRebuild` (the existing loser path).
+    #[test]
+    fn sc_dr_2b_receiver_high_nonce_defers() {
+        let h = SupervisorHandle::spawn_with_role(fast_policy(), 99, SignalingRole::Receiver);
+
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let _state = h.recv_outcome();
+        let _req = h.recv_outcome();
+
+        h.send(SupervisorSignal::PeerRequest {
+            peer_nonce: 42,
+            peer_role: SignalingRole::Sender,
+            attempt: 1,
+        });
+
+        // Defer ⇒ Ack the peer's nonce, then rebuild.
+        let ack = h.recv_outcome();
+        assert_eq!(
+            ack,
+            SupervisorOutcome::PublishReconnectAck {
+                attempt: 1,
+                session_nonce: 42,
+            }
+        );
+        let rebuild = h.recv_outcome();
+        assert_eq!(rebuild, SupervisorOutcome::InitiateRebuild);
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    /// Drain outcomes for a short window and panic if a `PublishReconnectAck` for
+    /// `forbidden_nonce` appears — used by the "we are active" tie-break tests.
+    fn assert_no_reconnect_ack(h: &SupervisorHandle, forbidden_nonce: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            match h.outcome_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(SupervisorOutcome::PublishReconnectAck { session_nonce, .. })
+                    if session_nonce == forbidden_nonce =>
+                {
+                    panic!(
+                        "active reconnector MUST NOT emit PublishReconnectAck for \
+                         peer_nonce={forbidden_nonce}"
+                    );
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+
     // ─── T4.2: session_state() accessor ──────────────────────────────────────
 
     /// T4.2 — `session_state()` returns `Connected` before any signal.
@@ -653,7 +776,27 @@ mod tests {
 
     impl SupervisorHandle {
         fn spawn(policy: ReconnectPolicy, my_nonce: u64) -> Self {
-            Self::spawn_with_timeouts(policy, my_nonce, TEST_ACK_TIMEOUT, TEST_REBUILD_TIMEOUT)
+            // Default role for legacy tests that don't exercise the role rule:
+            // Sender (these tests rely on the nonce-based outcomes that still hold
+            // under the role-equal / Sender-as-active semantics).
+            Self::spawn_with_timeouts(
+                policy,
+                my_nonce,
+                SignalingRole::Sender,
+                TEST_ACK_TIMEOUT,
+                TEST_REBUILD_TIMEOUT,
+            )
+        }
+
+        /// Spawn with an explicit local role (default timeouts).
+        fn spawn_with_role(policy: ReconnectPolicy, my_nonce: u64, my_role: SignalingRole) -> Self {
+            Self::spawn_with_timeouts(
+                policy,
+                my_nonce,
+                my_role,
+                TEST_ACK_TIMEOUT,
+                TEST_REBUILD_TIMEOUT,
+            )
         }
 
         /// Spawn with explicit ack/rebuild timeouts. Use this when a test needs
@@ -662,13 +805,15 @@ mod tests {
         fn spawn_with_timeouts(
             policy: ReconnectPolicy,
             my_nonce: u64,
+            my_role: SignalingRole,
             ack_timeout: Duration,
             rebuild_timeout: Duration,
         ) -> Self {
             let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
             let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
             let join = std::thread::spawn(move || {
-                let mut sup = ReconnectSupervisor::new(policy, my_nonce, signal_rx, outcome_tx);
+                let mut sup =
+                    ReconnectSupervisor::new(policy, my_nonce, my_role, signal_rx, outcome_tx);
                 sup.run(ack_timeout, rebuild_timeout)
             });
             Self {
