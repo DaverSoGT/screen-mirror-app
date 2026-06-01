@@ -88,33 +88,41 @@ describe('mse-client — tearDownMse / setUpMse (T10.1)', () => {
   });
 
   // SC-T10-2 REWRITE (REQ-SSR-4):
-  // VIDEO_EL.src must remain set during the silent window (deferred teardown).
-  // It is cleared only after streaming arrives.
-  // This test is RED under the current code (which clears src on reconnecting).
-  it('SC-T10-2: kind="reconnecting" → VIDEO_EL.src remains set during silent window; cleared on streaming', async () => {
-    const videoEl = document.getElementById('player');
-    const originalSrc = videoEl.src;
-    expect(originalSrc).toBeTruthy(); // was set by setUpMse
+  // VIDEO_EL.src must remain set (non-empty) during the silent window.
+  // After streaming arrives, deferred teardown fires: the MediaSource is
+  // ended (endOfStream called) proving teardown was deferred, not immediate.
+  // This test is RED under the current code (which calls tearDownMse on reconnecting,
+  // clearing src and calling endOfStream immediately).
+  it('SC-T10-2: kind="reconnecting" → VIDEO_EL.src stays set during silent window; teardown deferred to streaming', async () => {
+    const ms = MockMediaSourceCtor._lastInstance;
+    expect(ms).not.toBeNull();
 
-    // Dispatch reconnecting — src must remain set (teardown deferred).
+    const videoEl = document.getElementById('player');
+    const srcBeforeReconnect = videoEl.src;
+    expect(srcBeforeReconnect).toBeTruthy(); // was set by setUpMse
+
+    // Dispatch reconnecting — src must remain set, teardown deferred.
     ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 }).buffer);
     await Promise.resolve();
     await Promise.resolve();
 
-    // During silent window: src must still be set (NOT cleared yet).
+    // During silent window: src must still be set (NOT cleared by tearDownMse yet).
     expect(videoEl.src).toBeTruthy();
     expect(videoEl.src).not.toBe('');
     expect(videoEl.src).not.toBe('null');
+    // Deferred: endOfStream must NOT have been called yet.
+    expect(ms.endOfStream).not.toHaveBeenCalled();
 
-    // Now dispatch streaming — teardown fires, src gets cleared before setUpMse re-sets it.
+    // Now dispatch streaming — deferred teardown fires before setUpMse.
     ch._dispatch(makeStatusFrame({ kind: 'streaming' }).buffer);
     await vi.advanceTimersByTimeAsync(0);
     await Promise.resolve();
     await Promise.resolve();
 
-    // After streaming + setUpMse, src should be a new object URL (not the original one).
-    // The key assertion: src changed from originalSrc (teardown + re-setup happened).
-    expect(videoEl.src).not.toBe(originalSrc);
+    // After streaming: teardown must have been called (endOfStream invoked).
+    // This confirms teardown was deferred to the streaming path, not immediate.
+    expect(ms.endOfStream).toHaveBeenCalledTimes(1);
+    expect(ms.endOfStream).toHaveBeenCalledWith('decode');
   });
 
   it('SC-T10-3: kind="streaming" after teardown + FRAME_INIT → fresh MediaSource created', async () => {
