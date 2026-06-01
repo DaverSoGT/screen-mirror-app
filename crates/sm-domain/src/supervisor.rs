@@ -483,6 +483,60 @@ impl ReconnectSupervisor {
     }
 }
 
+// ─── Role-aware tie-break (design #963 D1) ──────────────────────────────────────
+
+/// Outcome of a simultaneous-reconnect tie-break, from the perspective of the
+/// local supervisor that received a peer `ReconnectRequest`.
+///
+/// See [`decide_tiebreak`] for the decision rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TieOutcome {
+    /// The local side is the active reconnector: it re-offers (Sender) and does
+    /// NOT defer to the peer. In the supervisor this keeps the local side driving
+    /// the rebuild without sending a `ReconnectAck`.
+    ActiveReconnector,
+    /// The local side defers to the peer: it acknowledges the peer's request and
+    /// follows the peer-driven rebuild (the existing loser / Ack+Rebuild path).
+    Defer,
+}
+
+/// Decide the simultaneous-reconnect tie-break, role-aware (design #963 D1).
+///
+/// The WebRTC offerer (`Sender`) is ALWAYS the active reconnector because it is
+/// the only side that can publish a fresh Offer; the answerer (`Receiver`) ALWAYS
+/// defers and waits for that Offer. The session nonce is consulted ONLY when the
+/// roles are equal (a degenerate/test case the production wire never produces),
+/// where the legacy rule applies: the LOWER nonce is the active reconnector
+/// (preserves the historical AC-10 semantics — `peer_nonce < my_nonce` ⇒ peer
+/// wins ⇒ we defer).
+///
+/// | `my_role` | `peer_role` | outcome |
+/// |-----------|-------------|---------|
+/// | `Sender`  | `Receiver`  | `ActiveReconnector` (we re-offer) |
+/// | `Receiver`| `Sender`    | `Defer` (wait for the peer's Offer) |
+/// | equal     | equal       | nonce fallback: `my_nonce < peer_nonce` ⇒ `ActiveReconnector`, else `Defer` |
+pub fn decide_tiebreak(
+    my_role: crate::signaling::SignalingRole,
+    peer_role: crate::signaling::SignalingRole,
+    my_nonce: u64,
+    peer_nonce: u64,
+) -> TieOutcome {
+    use crate::signaling::SignalingRole;
+    match (my_role, peer_role) {
+        // Roles differ: the Sender (offerer) is always the active reconnector.
+        (SignalingRole::Sender, SignalingRole::Receiver) => TieOutcome::ActiveReconnector,
+        (SignalingRole::Receiver, SignalingRole::Sender) => TieOutcome::Defer,
+        // Roles equal (degenerate): fall back to nonce — lower nonce is active.
+        _ => {
+            if my_nonce < peer_nonce {
+                TieOutcome::ActiveReconnector
+            } else {
+                TieOutcome::Defer
+            }
+        }
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn dead_reason_for_trigger(trigger: &ReconnectTrigger) -> DeadReason {
