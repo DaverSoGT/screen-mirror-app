@@ -60,6 +60,12 @@ let autoRetryTimerId = null;
 // episode (null-guard in case "reconnecting" prevents re-arm on attempt 2/3).
 let silentRecoveryTimerId = null;
 
+// Sentinel: true once the overlay has been revealed (Stage 2 entered) for this loss
+// episode (D-SSR-6). Prevents a post-reveal reconnecting{n} frame from re-arming a
+// second silent-recovery timer after the first one fired and nulled silentRecoveryTimerId.
+// Reset to false by cancelSilentRecovery() so a new loss episode can arm the timer again.
+let overlayRevealed = false;
+
 // Most-recent {attempt, max} from reconnecting frames during Stage 1 (D-SSR-3).
 // Updated on every reconnecting frame so the deferred reveal shows the current counter.
 // Reset to null by cancelSilentRecovery() (on streaming/dead/retry/cancel).
@@ -108,6 +114,7 @@ function cancelSilentRecovery() {
     silentRecoveryTimerId = null;
   }
   pendingReconnectAttempt = null;
+  overlayRevealed = false; // reset sentinel so a new loss episode can arm the timer (D-SSR-6)
 }
 
 // ── revealReconnectingOverlay ────────────────────────────────────────────────
@@ -120,6 +127,7 @@ function cancelSilentRecovery() {
 // available when the timer fires). D-SSR-5.
 function revealReconnectingOverlay() {
   silentRecoveryTimerId = null; // null FIRST (mirrors triggerAutoRetry pattern)
+  overlayRevealed = true;       // set sentinel: Stage 2 entered (D-SSR-6)
   tearDownMse();                // deferred teardown fires at Stage 2 reveal
   // reconnectingOverlay is the module-scoped variable assigned below at parse
   // time; by the time this timer callback fires it is fully initialized.
@@ -375,10 +383,15 @@ function handleStatus(payload) {
       // so the last frozen video frame stays visible during the silent window (REQ-SSR-4).
       // DO NOT show the overlay yet — Stage 1 is silent (REQ-SSR-3).
       // Arm one-shot total-elapsed timer ONLY on the FIRST reconnecting frame of this
-      // episode. The null-guard IS the total-elapsed singleton — subsequent frames
-      // (attempt 2, attempt 3) update pendingReconnectAttempt but cannot re-arm or reset
-      // the 10s window (REQ-SSR-2, D-SSR-6).
-      if (silentRecoveryTimerId === null) {
+      // episode. Two-part guard (D-SSR-6):
+      //   1. silentRecoveryTimerId === null: prevents re-arm while Stage 1 is still active
+      //      (subsequent reconnecting{2,3} frames cannot reset the 10s window).
+      //   2. !overlayRevealed: prevents re-arm AFTER Stage 2 entry — once the overlay is
+      //      revealed (timer fired, silentRecoveryTimerId nulled itself), a later
+      //      reconnecting{n} must NOT start a new 10s window (REQ-SSR-2, D-SSR-6).
+      //      overlayRevealed is reset by cancelSilentRecovery() (streaming/dead/retry) so
+      //      a genuinely new loss episode can arm the timer again.
+      if (silentRecoveryTimerId === null && !overlayRevealed) {
         silentRecoveryTimerId = setTimeout(
           revealReconnectingOverlay,
           SILENT_RECOVERY_THRESHOLD_MS
