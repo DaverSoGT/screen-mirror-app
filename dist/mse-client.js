@@ -90,6 +90,20 @@ const mseState = {
   active: false,
 };
 
+// ── Init-segment recovery state (D-IR-1, D-IR-5) ────────────────────────────
+// Single-slot queue for a FRAME_INIT that arrived before the MediaSource
+// reached readyState "open". The latest wins — a second pre-open init
+// overwrites the first (D-IR-1). Drained on sourceopen (D-IR-2).
+// Nulled by tearDownMse so a stale init from session N cannot bleed into
+// session N+1 (D-IR-2). Value: { data: Uint8Array, frameBytes: Uint8Array }.
+let pendingInit = null;
+
+// Guard: true while a setUpMse() call is in flight (MediaSource constructed
+// but sourceopen not yet fired). Prevents the onInitFrame self-arm (D-IR-4)
+// from spawning a second concurrent MediaSource when one is already in
+// progress (D-IR-5). Reset to false by both the sourceopen and error handlers.
+let setUpInFlight = false;
+
 // ── cancelAutoRetry ──────────────────────────────────────────────────────────
 // Cancels any pending auto-retry timer. Idempotent — safe to call when no
 // timer is armed. MUST be called on every Dead-state exit (PQ-3 invariant,
@@ -238,16 +252,27 @@ function tearDownMse() {
   mseState.pending = [];
   mseState.initReceived = false;
   mseState.active = false;
+  // D-IR-2: discard any queued init from the torn-down session so it cannot
+  // bleed into the next session's sourceopen drain. Also reset setUpInFlight
+  // since this teardown ends any in-progress setUpMse (the MediaSource we just
+  // nulled will never fire sourceopen again).
+  pendingInit = null;
+  setUpInFlight = false;
 }
 
 // ── setUpMse ─────────────────────────────────────────────────────────────────
 // Spec §5.2: re-attach a fresh MediaSource and await sourceopen.
 // setUpMse prepares VIDEO_EL for the next init segment; the first FRAME_INIT
 // received after setUpMse creates the SourceBuffer (existing lazy-init path).
+// If a FRAME_INIT arrived during the async sourceopen gap (before readyState
+// became "open"), it was stored in pendingInit (D-IR-1) and is drained here
+// on sourceopen (D-IR-2) instead of waiting for a new init that may never come.
 //
 // Returns a Promise that resolves when sourceopen fires (or rejects on error).
-// Called by handleStatus on "streaming" event following a reconnect.
+// Called by handleStatus on "streaming" event following a reconnect, and by
+// onInitFrame's self-arm fallback when ms===null (D-IR-4).
 function setUpMse() {
+  setUpInFlight = true; // D-IR-5: mark in-flight before construction
   const ms = new MediaSource();
   mseState.ms = ms;
   const url = URL.createObjectURL(ms);
@@ -260,11 +285,20 @@ function setUpMse() {
 
   return new Promise((resolve, reject) => {
     ms.addEventListener("sourceopen", () => {
+      setUpInFlight = false; // D-IR-5: clear flag — MS is now open
       mseState.active = true;
       setStatus("MSE ready (reconnect) — awaiting fresh init segment…");
+      // D-IR-2: drain a FRAME_INIT that arrived during the async gap. At this
+      // point ms.readyState === "open" so addSourceBuffer is safe.
+      if (pendingInit !== null && mseState.sb === null) {
+        const { data, frameBytes } = pendingInit;
+        pendingInit = null;
+        applyInit(ms, data, frameBytes);
+      }
       resolve();
     }, { once: true });
     ms.addEventListener("error", (e) => {
+      setUpInFlight = false; // D-IR-5: clear flag on error too
       reject(e);
     }, { once: true });
   });
@@ -557,25 +591,13 @@ function seekToLiveEdge() {
   }
 }
 
-// ── onInitFrame — lazy SourceBuffer creation on first FRAME_INIT ─────────────
-// Extracted from main() so setUpMse() reconnects can also receive a fresh init.
-// Reads mseState.ms (current MediaSource) and writes mseState.sb.
-function onInitFrame(data, frameBytes) {
-  if (mseState.sb !== null) {
-    // Already have a SourceBuffer — re-init not supported in v1; ignore.
-    // After tearDownMse + setUpMse, mseState.sb is reset to null so this
-    // branch only fires if two FRAME_INIT arrive without a teardown in between.
-    console.warn("[mse] additional init segment ignored");
-    return;
-  }
-
-  const ms = mseState.ms;
-  if (!ms) {
-    // No active MediaSource yet (should not happen in normal flow).
-    console.warn("[mse] FRAME_INIT arrived with no active MediaSource — ignoring");
-    return;
-  }
-
+// ── applyInit — commit an init segment to an open MediaSource (D-IR-3) ───────
+// Extracted verbatim from the original onInitFrame body. Requires:
+//   ms.readyState === "open" (addSourceBuffer throws otherwise — R-IR-7)
+//   mseState.sb === null (called only when creating a fresh SourceBuffer)
+// Called by onInitFrame (normal path) and by the setUpMse sourceopen drain
+// (D-IR-2 — when a FRAME_INIT arrived before sourceopen and was queued).
+function applyInit(ms, data, frameBytes) {
   // B11 diagnostic: dump the first 128 bytes of the init segment in hex.
   const initBytes = new Uint8Array(frameBytes);
   const previewLen = Math.min(128, initBytes.length);
@@ -640,6 +662,62 @@ function onInitFrame(data, frameBytes) {
   );
   mseState.initReceived = true;
   enqueue(frameBytes);
+}
+
+// ── onInitFrame — resilient SourceBuffer creation on FRAME_INIT (D-IR-1..5) ──
+// Extracted from main() so setUpMse() reconnects can also receive a fresh init.
+// Reads mseState.ms (current MediaSource) and writes mseState.sb via applyInit.
+//
+// Recovery behavior (the HW Procedure B fix):
+// - Guard 1 (ms === null): queue the init in pendingInit and self-arm setUpMse
+//   ONCE (guarded by setUpInFlight). The setUpMse sourceopen drain (D-IR-2)
+//   applies pendingInit when the MS opens. Previously: silent drop + no retry.
+// - Guard 2 (ms exists but readyState !== "open"): queue in pendingInit; drain
+//   on sourceopen. Real browsers throw on addSourceBuffer here (InvalidStateError);
+//   queueing avoids the throw-and-drop. Previously: fell through to addSourceBuffer
+//   → threw → caught → dropped; no retry.
+// - Guard 3 (sb !== null, same session): same-session duplicate init; ignored as
+//   before (tearDownMse always nulls sb for a new session).
+function onInitFrame(data, frameBytes) {
+  // Guard 3: already have a SourceBuffer for this session — same-session
+  // duplicate init not supported in v1; ignore. A genuinely new session always
+  // went through tearDownMse (which nulls sb), so sb!==null here means duplicate.
+  if (mseState.sb !== null) {
+    console.warn("[mse] additional init segment ignored");
+    return;
+  }
+
+  const ms = mseState.ms;
+
+  // Guard 1: no active MediaSource yet. Queue the init and self-arm setUpMse
+  // so the sourceopen drain can apply it. Only self-arm when the stream is still
+  // live (window.__sm_streamActive) and no setUpMse is already in flight (D-IR-5).
+  if (!ms) {
+    pendingInit = { data, frameBytes };
+    if (!setUpInFlight && window.__sm_streamActive) {
+      setUpMse().catch((e) => {
+        console.error("[mse-client] setUpMse (self-arm) failed:", e);
+      });
+    }
+    return;
+  }
+
+  // Guard 2: MediaSource exists but sourceopen has not yet fired (mseState.active
+  // is false while the async sourceopen gap is open). Queue the init (latest wins)
+  // and wait for the setUpMse sourceopen drain (D-IR-2). Previously the code fell
+  // through to addSourceBuffer which threw when readyState !== "open" (real browser
+  // behaviour) and dropped the init with no retry.
+  // Using mseState.active (set in BOTH the main() and setUpMse() sourceopen handlers)
+  // rather than ms.readyState directly, because some test stubs only flip readyState
+  // inside addSourceBuffer itself (the original mock pattern). mseState.active is the
+  // canonical "sourceopen has fired and addSourceBuffer is safe" signal.
+  if (!mseState.active) {
+    pendingInit = { data, frameBytes };
+    return;
+  }
+
+  // Happy path: MS is open and no SourceBuffer yet — apply immediately.
+  applyInit(ms, data, frameBytes);
 }
 
 async function main() {
@@ -790,5 +868,6 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     seekToLiveEdge,
     LIVE_EDGE_MAX_DRIFT_SEC,
     LIVE_EDGE_TARGET_LEAD_SEC,
+    mseState, // D-IR-8: expose for init-recovery drain assertions
   });
 }
