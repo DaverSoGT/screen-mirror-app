@@ -2039,4 +2039,75 @@ mod tests {
 
         handle.join().expect("frame loop thread must join");
     }
+
+    // ─── SC-D3-4: reset must NOT re-flush a stale ReconnectRequest (D3c, #967) ──
+    //
+    // The InitiateMdnsReset hook reuses the SAME inbox Arc across stop()+start().
+    // A ReconnectRequest queued for the OLD connection but not yet drained must be
+    // cleared before re-start, or it re-flushes onto the NEW connection — keeping
+    // the superseded gen-G competing as an offer-less listener (design #967 §3).
+    // The clear MUST be targeted: only ReconnectRequest entries are removed; any
+    // legitimately-queued Offer / Answer / Candidate / ReconnectAck is preserved.
+
+    /// SC-D3-4 — `drain_stale_reconnect_requests()` removes ONLY queued
+    /// `ReconnectRequest` entries from the inbox, leaving every other variant intact.
+    ///
+    /// RED: the method does not exist yet (compile failure).
+    /// GREEN (WU-D3c): targeted retain that drops only `ReconnectRequest`.
+    #[test]
+    fn sc_d3_4_drain_stale_reconnect_requests_is_targeted() {
+        use super::MdnsControl;
+        use sm_domain::signaling::{SdpOffer, SignalingConfig, SignalingRole};
+
+        let sig = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        })
+        .expect("new signaling");
+
+        // Seed the reused inbox with a stale ReconnectRequest plus benign frames
+        // that MUST survive the targeted drain.
+        {
+            let mut inbox = sig.inbox_for_test().lock().unwrap();
+            inbox.push(MdnsControl::Offer(SdpOffer("v=0".into())));
+            inbox.push(MdnsControl::ReconnectRequest {
+                attempt: 1,
+                requester_role: SignalingRole::Sender,
+                session_nonce: 42,
+            });
+            inbox.push(MdnsControl::ReconnectAck {
+                attempt: 1,
+                session_nonce: 42,
+            });
+        }
+
+        let removed = sig.drain_stale_reconnect_requests();
+        assert_eq!(
+            removed, 1,
+            "SC-D3-4 FAIL: exactly one stale ReconnectRequest must be drained, got {removed}"
+        );
+
+        let kinds: Vec<&'static str> = sig
+            .inbox_for_test()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| match m {
+                MdnsControl::Offer(_) => "Offer",
+                MdnsControl::Answer(_) => "Answer",
+                MdnsControl::Candidate(_) => "Candidate",
+                MdnsControl::ReconnectRequest { .. } => "ReconnectRequest",
+                MdnsControl::ReconnectAck { .. } => "ReconnectAck",
+            })
+            .collect();
+
+        assert!(
+            !kinds.contains(&"ReconnectRequest"),
+            "SC-D3-4 FAIL: stale ReconnectRequest must be removed; inbox still has {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"Offer") && kinds.contains(&"ReconnectAck"),
+            "SC-D3-4 FAIL: non-ReconnectRequest frames must be preserved; inbox has {kinds:?}"
+        );
+    }
 }
