@@ -87,6 +87,64 @@ const FRAME_INIT = 0x00;
 const FRAME_SEGMENT = 0x01;
 const FRAME_STATUS = 0x02;
 
+// ── dispatchChannelMessage ───────────────────────────────────────────────────
+// Module-scoped frame dispatcher, extracted from the inline onmessage closure
+// that was previously defined only inside main(). Extraction enables the R-6
+// fix: triggerRetry() can now bind this same function on the fresh Channel it
+// creates, so post-retry frames (FRAME_INIT, FRAME_SEGMENT, FRAME_STATUS) reach
+// JS exactly as they did on the initial channel.
+//
+// R-6 FIX (REQ-SSR-9): the old code bound onmessage once in main() on the
+// initial streamChannel; after triggerRetry() constructed a new Channel and
+// passed it to retry_session_stream, Rust correctly delivered frames into that
+// new Channel, but JS had no onmessage on it — frames were silently dropped.
+// Binding dispatchChannelMessage on every Channel instance (initial + retry)
+// closes the gap.
+//
+// The body only references module-scoped identifiers (FRAME_INIT, FRAME_SEGMENT,
+// FRAME_STATUS, mseState, onInitFrame, enqueue, handleStatus) — no main()-local
+// closure captures, so extraction is behavior-preserving.
+function dispatchChannelMessage(payload) {
+  // payload is ArrayBuffer (InvokeResponseBody::Raw path).
+  const data = new Uint8Array(payload);
+  if (data.length === 0) {
+    console.warn("[mse] empty frame received — ignoring");
+    return;
+  }
+
+  const discriminant = data[0];
+  // B11-S7: pass the Uint8Array view directly (NOT `.buffer`). `subarray(1)`
+  // yields a typed-array view starting at byte 1, but `.buffer` returns the
+  // FULL underlying ArrayBuffer ignoring the byteOffset — so appendBuffer
+  // would receive the entire payload including byte 0 (the discriminant)
+  // and the mp4 box parser at offset 0 would read size=0x00000000 instead
+  // of size=0x00000020, closing the MediaSource on init parse failure.
+  const frameBytes = data.subarray(1);
+
+  if (discriminant === FRAME_INIT) {
+    onInitFrame(data, frameBytes);
+  } else if (discriminant === FRAME_SEGMENT) {
+    if (!mseState.initReceived) {
+      console.warn("[mse] segment arrived before init — discarding");
+      return;
+    }
+    enqueue(frameBytes);
+  } else if (discriminant === FRAME_STATUS) {
+    // 0x02 — JSON status event from the reconnect supervisor (Phase 8, T8.2).
+    // Decode the payload bytes as UTF-8 JSON and forward to handleStatus.
+    // Must NOT feed bytes to the SourceBuffer.
+    try {
+      const json = new TextDecoder().decode(frameBytes);
+      const statusPayload = JSON.parse(json);
+      handleStatus(statusPayload);
+    } catch (e) {
+      console.warn("[mse-client] 0x02 frame JSON parse error:", e);
+    }
+  } else {
+    console.warn("[mse] unknown frame discriminant: 0x" + discriminant.toString(16));
+  }
+}
+
 function setStatus(msg) {
   if (STATUS_EL) STATUS_EL.textContent = msg;
   console.log("[mse]", msg);
@@ -160,8 +218,11 @@ function setUpMse() {
 // handler semantics: hide dead-modal, create a new Channel, invoke
 // retry_session_stream. Does NOT call stop_stream (that would clear
 // restart_cache — I-NR-2 invariant). Does NOT call location.reload()
-// (REQ-NO-RELOAD). Does NOT rebind streamChannel.onmessage (Q-T1: pre-existing
-// gap in the manual Retry path; replicated faithfully per D-RRE-7 / R-6).
+// (REQ-NO-RELOAD).
+// R-6 FIX (REQ-SSR-9): binds dispatchChannelMessage on the new Channel BEFORE
+// invoke() so Rust-delivered frames (FRAME_INIT, FRAME_SEGMENT, FRAME_STATUS)
+// reach JS after retry. Previously onmessage was never set here — frames were
+// silently dropped on the manual-Retry and 30s-auto-retry paths.
 async function triggerRetry() {
   if (deadModal) deadModal.hidden = true;
   const invoke = window.__TAURI__?.core?.invoke;
@@ -169,6 +230,7 @@ async function triggerRetry() {
   if (invoke && Channel) {
     try {
       const channel = new Channel();
+      channel.onmessage = dispatchChannelMessage; // R-6: bind before invoke
       await invoke("retry_session_stream", { channel });
     } catch (e) {
       console.warn("[mse-client] retry_session_stream failed:", e);
@@ -586,46 +648,10 @@ async function main() {
   const Channel = window.__TAURI__.core.Channel;
   const streamChannel = new Channel();
 
-  streamChannel.onmessage = (payload) => {
-    // payload is ArrayBuffer (InvokeResponseBody::Raw path).
-    const data = new Uint8Array(payload);
-    if (data.length === 0) {
-      console.warn("[mse] empty frame received — ignoring");
-      return;
-    }
-
-    const discriminant = data[0];
-    // B11-S7: pass the Uint8Array view directly (NOT `.buffer`). `subarray(1)`
-    // yields a typed-array view starting at byte 1, but `.buffer` returns the
-    // FULL underlying ArrayBuffer ignoring the byteOffset — so appendBuffer
-    // would receive the entire payload including byte 0 (the discriminant)
-    // and the mp4 box parser at offset 0 would read size=0x00000000 instead
-    // of size=0x00000020, closing the MediaSource on init parse failure.
-    const frameBytes = data.subarray(1);
-
-    if (discriminant === FRAME_INIT) {
-      onInitFrame(data, frameBytes);
-    } else if (discriminant === FRAME_SEGMENT) {
-      if (!mseState.initReceived) {
-        console.warn("[mse] segment arrived before init — discarding");
-        return;
-      }
-      enqueue(frameBytes);
-    } else if (discriminant === FRAME_STATUS) {
-      // 0x02 — JSON status event from the reconnect supervisor (Phase 8, T8.2).
-      // Decode the payload bytes as UTF-8 JSON and forward to handleStatus.
-      // Must NOT feed bytes to the SourceBuffer.
-      try {
-        const json = new TextDecoder().decode(frameBytes);
-        const statusPayload = JSON.parse(json);
-        handleStatus(statusPayload);
-      } catch (e) {
-        console.warn("[mse-client] 0x02 frame JSON parse error:", e);
-      }
-    } else {
-      console.warn("[mse] unknown frame discriminant: 0x" + discriminant.toString(16));
-    }
-  };
+  // R-6 FIX: use the module-scoped dispatchChannelMessage so triggerRetry()
+  // can bind the same function on any future Channel — see dispatchChannelMessage
+  // and triggerRetry() comments above.
+  streamChannel.onmessage = dispatchChannelMessage;
 
   // ── 4. Invoke start_stream, passing the Channel ref (F-fix-3) ────────────
   //
