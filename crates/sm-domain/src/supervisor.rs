@@ -283,30 +283,39 @@ impl ReconnectSupervisor {
                         }
                         Ok(SupervisorSignal::PeerRequest {
                             peer_nonce,
-                            peer_role: _,
+                            peer_role,
                             attempt,
                         }) => {
-                            // One-sided: peer initiated, we are the loser.
-                            // (WU-3 makes this branch role-aware; for now the
-                            // existing unconditional-loser behavior is preserved.)
-                            let attempt_nz =
-                                NonZeroU8::new(attempt.max(1)).expect("max(1) nonzero");
-                            let trigger = ReconnectTrigger::PeerRequested { peer_nonce };
-                            self.emit(SupervisorOutcome::PublishReconnectAck {
-                                attempt,
-                                session_nonce: peer_nonce,
-                            });
-                            self.emit(SupervisorOutcome::StateChanged(
-                                SessionState::Reconnecting {
+                            // Role-aware tie-break (design #963 D1, NR-1 redefinition).
+                            // If we are the active reconnector (the Sender/offerer, or
+                            // the lower-nonce side when roles are equal), we stay
+                            // Connected and re-offer via our own failure-detection /
+                            // rebuild hook — we do NOT take the loser path. Otherwise
+                            // (we are the answerer / deferring side) we run the existing
+                            // loser path UNCHANGED: Ack + Reconnecting + InitiateRebuild.
+                            if self.is_active_reconnector(peer_role, peer_nonce) {
+                                // Active reconnector — ignore the peer's request; we
+                                // drive the rebuild ourselves. Keep Connected.
+                            } else {
+                                let attempt_nz =
+                                    NonZeroU8::new(attempt.max(1)).expect("max(1) nonzero");
+                                let trigger = ReconnectTrigger::PeerRequested { peer_nonce };
+                                self.emit(SupervisorOutcome::PublishReconnectAck {
+                                    attempt,
+                                    session_nonce: peer_nonce,
+                                });
+                                self.emit(SupervisorOutcome::StateChanged(
+                                    SessionState::Reconnecting {
+                                        attempt: attempt_nz,
+                                        max: self.policy.max_attempts,
+                                    },
+                                ));
+                                self.state = SupervisorState::Rebuilding {
                                     attempt: attempt_nz,
-                                    max: self.policy.max_attempts,
-                                },
-                            ));
-                            self.state = SupervisorState::Rebuilding {
-                                attempt: attempt_nz,
-                                trigger,
-                            };
-                            self.emit(SupervisorOutcome::InitiateRebuild);
+                                    trigger,
+                                };
+                                self.emit(SupervisorOutcome::InitiateRebuild);
+                            }
                         }
                         Ok(_) => {
                             // Ignore PeerAck, RebuildSucceeded, RebuildFailed in Connected state.
