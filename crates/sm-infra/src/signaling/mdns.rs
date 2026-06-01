@@ -288,6 +288,36 @@ impl MdnsSignaling {
         self.suppress_bye.load(Ordering::Acquire)
     }
 
+    /// Remove any queued `ReconnectRequest` frames from the outbound inbox,
+    /// returning how many were dropped (D3 stale-Bye fix, design #967 §3).
+    ///
+    /// `InitiateMdnsReset` reuses the SAME inbox `Arc` across `stop()` + `start()`.
+    /// A `ReconnectRequest` queued for the OLD connection but not yet drained would
+    /// otherwise re-flush onto the NEW connection, keeping the superseded generation
+    /// competing as an offer-less listener. This clear is TARGETED: only
+    /// `ReconnectRequest` entries are removed; `Offer` / `Answer` / `Candidate` /
+    /// `ReconnectAck` stay queued so no legitimately-needed frame is lost.
+    ///
+    /// MUST be called while no frame-loop thread is draining the inbox (i.e. between
+    /// `stop()` — which joins the old thread — and the next `start()`), so the retain
+    /// is race-free.
+    pub fn drain_stale_reconnect_requests(&self) -> usize {
+        let mut inbox = self.inbox.lock().unwrap();
+        let before = inbox.len();
+        inbox.retain(|msg| !matches!(msg, MdnsControl::ReconnectRequest { .. }));
+        before - inbox.len()
+    }
+
+    /// Test-only accessor for the outbound inbox (D3, design #967).
+    ///
+    /// Lets `SC-D3-4` seed and inspect inbox contents to verify
+    /// `drain_stale_reconnect_requests` is targeted. Kept module-private (matching
+    /// `MdnsControl`'s visibility) and only reachable from the in-module test child.
+    #[cfg(test)]
+    fn inbox_for_test(&self) -> &Arc<Mutex<Vec<MdnsControl>>> {
+        &self.inbox
+    }
+
     /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
     ///
     /// Uses the existing inbox mechanism — the frame loop writes it on the next

@@ -1902,6 +1902,17 @@ fn build_production_sender_bundle(
             if let Err(e) = sig.stop() {
                 eprintln!("[sm-sender-coord] MdnsSignaling::stop() failed: {e}");
             }
+            // D3c (design #967 §3): stop() has joined the old frame-loop thread, so
+            // the inbox is now quiescent. Drop any stale ReconnectRequest queued for
+            // the OLD connection BEFORE start() re-engages, so the reused gen-G does
+            // NOT re-flush it onto the new connection and keep competing as an
+            // offer-less listener. Targeted: other queued frames are preserved.
+            let drained = sig.drain_stale_reconnect_requests();
+            if drained > 0 {
+                eprintln!(
+                    "[sm-sender-coord] InitiateMdnsReset — dropped {drained} stale ReconnectRequest(s) before re-start (D3c)"
+                );
+            }
             // Re-start with a fresh event channel. The supervisor will route incoming
             // frames via the existing supervisor_signal_tx (already set on the signaling
             // instance via set_supervisor_signal_tx before start() was first called).
