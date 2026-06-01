@@ -504,6 +504,28 @@ mod tests {
 
     use super::*;
     use crate::session::{BackoffSchedule, ReconnectPolicy};
+    use crate::signaling::SignalingRole;
+
+    // ─── SC-DR-3: role-equal tie-break falls back to nonce ───────────────────
+    //
+    // D1 (design #963): when both peers carry the SAME role (degenerate/test
+    // case), the role rule cannot decide, so the tie-break falls back to the
+    // legacy nonce rule — LOWER nonce is the active reconnector (matches the
+    // existing AC-10 semantics: `peer_nonce < my_nonce` ⇒ peer wins ⇒ we defer).
+    //
+    // Here my_nonce=200, peer_nonce=100 (peer is lower) ⇒ the PEER is the active
+    // reconnector ⇒ WE defer. The outcome from OUR perspective is `Defer`.
+
+    /// SC-DR-3 — role-equal (Sender/Sender) falls back to nonce: lower nonce wins.
+    #[test]
+    fn sc_dr_3_role_equal_lower_nonce_wins() {
+        // Peer (nonce 100) is lower than us (nonce 200) ⇒ peer is the active
+        // reconnector ⇒ we defer.
+        assert_eq!(
+            decide_tiebreak(SignalingRole::Sender, SignalingRole::Sender, 200, 100),
+            TieOutcome::Defer
+        );
+    }
 
     // ─── T4.2: session_state() accessor ──────────────────────────────────────
 
