@@ -6188,7 +6188,9 @@ mod tests {
         // If Rust ever stops threading the caller-provided channel through to the
         // rebuilt session, this assertion will fail — catching the R-6 regression.
         let cache_guard = bridge.restart_cache.lock().unwrap();
-        let cache = cache_guard.as_ref().expect("SC-SSR-14: restart_cache must be set after retry");
+        let cache = cache_guard
+            .as_ref()
+            .expect("SC-SSR-14: restart_cache must be set after retry");
         let cached_ch_ptr = Arc::as_ptr(&cache.channel);
 
         assert_eq!(
