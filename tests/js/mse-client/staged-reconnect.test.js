@@ -328,4 +328,75 @@ describe('mse-client — staged silent reconnect timer gate (SC-SSR-1..10)', () 
     const timerCountAfterSecond = vi.getTimerCount();
     expect(timerCountAfterSecond).toBe(timerCountAfterFirst);
   });
+
+  // ── SC-SSR-11 ────────────────────────────────────────────────────────────────
+  // D-SSR-6 sentinel: after the overlay is revealed (Stage 2, timer fires and
+  // silentRecoveryTimerId is nulled), a subsequent reconnecting{n} frame must NOT
+  // re-arm the silent-recovery timer. Also verifies that after the episode ends
+  // (streaming → cancelSilentRecovery resets overlayRevealed), a fresh loss
+  // episode CAN arm the timer and reveal the overlay again.
+  //
+  // RED against current code: current guard is only `silentRecoveryTimerId === null`
+  // which is true after the timer fires → post-reveal reconnecting{n} re-arms.
+  // GREEN requires the overlayRevealed sentinel (part 1) and its reset in
+  // cancelSilentRecovery (part 2).
+  it('SC-SSR-11: overlayRevealed sentinel blocks post-reveal re-arm; episode reset allows fresh arm (D-SSR-6)', async () => {
+    const overlay = document.getElementById('reconnecting-overlay');
+
+    // ── Part 1: post-reveal reconnecting must NOT re-arm ──────────────────────
+    // Episode 1, attempt 1: arm the timer.
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 }).buffer);
+    await Promise.resolve();
+
+    // Advance to threshold: timer fires, overlay revealed, silentRecoveryTimerId = null.
+    await vi.advanceTimersByTimeAsync(THRESHOLD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(overlay.hidden).toBe(false); // Stage 2 confirmed
+
+    // Record the timer count after Stage 2 reveal (the silent-recovery timer is gone).
+    const timerCountAfterReveal = vi.getTimerCount();
+
+    // Send a post-reveal reconnecting{2} frame. With the sentinel this must NOT
+    // re-arm the timer; without the sentinel it WILL re-arm (current code → RED).
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 2, max: 3 }).buffer);
+    await Promise.resolve();
+
+    const timerCountAfterPostRevealReconnect = vi.getTimerCount();
+    // Sentinel assertion: timer count must NOT increase after post-reveal reconnecting.
+    expect(timerCountAfterPostRevealReconnect).toBe(timerCountAfterReveal);
+
+    // Advance another full threshold to prove no second reveal/teardown fires.
+    const msAfterReveal = MockMediaSourceCtor._lastInstance;
+    const endOfStreamCallsAfterReveal = msAfterReveal.endOfStream.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(THRESHOLD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(msAfterReveal.endOfStream.mock.calls.length).toBe(endOfStreamCallsAfterReveal);
+
+    // ── Part 2: episode reset via streaming → new episode can arm ─────────────
+    // End episode 1 via streaming (cancelSilentRecovery resets overlayRevealed).
+    ch._dispatch(makeStatusFrame({ kind: 'streaming' }).buffer);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    // Overlay must be hidden again (streaming hides it).
+    expect(overlay.hidden).toBe(true);
+
+    // Episode 2, attempt 1: NEW reconnecting on the SAME channel.
+    // With the sentinel reset, the timer must re-arm → overlay reveals at THRESHOLD.
+    const timerCountBeforeEpisode2 = vi.getTimerCount();
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 2 }).buffer);
+    await Promise.resolve();
+
+    const timerCountAfterEpisode2Arm = vi.getTimerCount();
+    // Timer must have been armed for episode 2 (count increased by 1).
+    expect(timerCountAfterEpisode2Arm).toBe(timerCountBeforeEpisode2 + 1);
+
+    // Advance to threshold: episode 2 overlay must reveal.
+    await vi.advanceTimersByTimeAsync(THRESHOLD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(overlay.hidden).toBe(false);
+  });
 });
