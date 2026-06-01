@@ -1889,6 +1889,16 @@ fn build_production_sender_bundle(
                 "[sm-sender-coord] InitiateMdnsReset — calling MdnsSignaling::stop() + re-engaging discovery"
             );
             let mut sig = sig_for_reset.lock().unwrap();
+            // D3 stale-Bye fix (design #967): InitiateMdnsReset always precedes an
+            // InitiateRebuild that supersedes THIS generation. Mute this gen-G
+            // instance's teardown Bye BEFORE stop() so neither the reset's own
+            // stop() nor the later rebuild Drop-teardown emits a spurious Bye on a
+            // connection the receiver may still be using. The flag persists across
+            // the stop()+start() reuse cycle (it is not reset by start()), so the
+            // eventual Drop in make_sender_rebuild_hook stays muted too. Genuine
+            // shutdown never sets this flag → its Bye (receiver PeerBye eager-wake
+            // fast-path) is preserved.
+            sig.suppress_outbound_bye();
             if let Err(e) = sig.stop() {
                 eprintln!("[sm-sender-coord] MdnsSignaling::stop() failed: {e}");
             }
