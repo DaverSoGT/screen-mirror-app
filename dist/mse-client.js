@@ -43,12 +43,33 @@ const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
 const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
+// Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
+// is revealed (Stage 2). Tunable single constant (D-SSR-1). Default 10s gives
+// comfortable margin over a healthy ~5s ICE rebuild without immediately alarming
+// the user on brief disruptions.
+const SILENT_RECOVERY_THRESHOLD_MS = 10_000;
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
 // Module-level auto-retry timer handle. NOT on window, NOT in mseState (D-RRE-1).
 // Null when no timer is armed; non-null between Dead-state entry and timer fire/cancel.
 let autoRetryTimerId = null;
+
+// Module-level silent-recovery timer handle (D-SSR-2). Null = no Stage-1 window active.
+// Non-null = Stage 1 silent window armed, overlay NOT yet shown. Armed ONCE per loss
+// episode (null-guard in case "reconnecting" prevents re-arm on attempt 2/3).
+let silentRecoveryTimerId = null;
+
+// Sentinel: true once the overlay has been revealed (Stage 2 entered) for this loss
+// episode (D-SSR-6). Prevents a post-reveal reconnecting{n} frame from re-arming a
+// second silent-recovery timer after the first one fired and nulled silentRecoveryTimerId.
+// Reset to false by cancelSilentRecovery() so a new loss episode can arm the timer again.
+let overlayRevealed = false;
+
+// Most-recent {attempt, max} from reconnecting frames during Stage 1 (D-SSR-3).
+// Updated on every reconnecting frame so the deferred reveal shows the current counter.
+// Reset to null by cancelSilentRecovery() (on streaming/dead/retry/cancel).
+let pendingReconnectAttempt = null;
 
 // ── Module-level MSE state ───────────────────────────────────────────────────
 // Lifted from main() so tearDownMse / setUpMse (called by handleStatus) can
@@ -78,6 +99,43 @@ function cancelAutoRetry() {
   if (autoRetryTimerId !== null) {
     clearTimeout(autoRetryTimerId);
     autoRetryTimerId = null;
+  }
+}
+
+// ── cancelSilentRecovery ─────────────────────────────────────────────────────
+// Cancels any pending Stage-1 silent-recovery timer. Idempotent (D-SSR-4).
+// Mirrors cancelAutoRetry discipline exactly. Four mandatory call sites:
+//   case "streaming" top, case "dead" top, Retry click, Cancel click.
+// Also resets pendingReconnectAttempt so stale attempt counters are not leaked
+// into a subsequent loss episode.
+function cancelSilentRecovery() {
+  if (silentRecoveryTimerId !== null) {
+    clearTimeout(silentRecoveryTimerId);
+    silentRecoveryTimerId = null;
+  }
+  pendingReconnectAttempt = null;
+  overlayRevealed = false; // reset sentinel so a new loss episode can arm the timer (D-SSR-6)
+}
+
+// ── revealReconnectingOverlay ────────────────────────────────────────────────
+// Timer callback: fires SILENT_RECOVERY_THRESHOLD_MS after the first
+// reconnecting frame. Transitions from Stage 1 (silent) to Stage 2 (visible).
+// Deferred teardown fires HERE — the last frozen frame was visible throughout
+// Stage 1; we teardown now because the overlay will cover the blanked video.
+// Uses pendingReconnectAttempt (the LATEST counter, not attempt 1) for text.
+// Uses module-scoped reconnectingOverlay (assigned at parse time, always
+// available when the timer fires). D-SSR-5.
+function revealReconnectingOverlay() {
+  silentRecoveryTimerId = null; // null FIRST (mirrors triggerAutoRetry pattern)
+  overlayRevealed = true;       // set sentinel: Stage 2 entered (D-SSR-6)
+  tearDownMse();                // deferred teardown fires at Stage 2 reveal
+  // reconnectingOverlay is the module-scoped variable assigned below at parse
+  // time; by the time this timer callback fires it is fully initialized.
+  if (reconnectingOverlay && pendingReconnectAttempt) {
+    reconnectingOverlay.textContent =
+      "Reconnecting (attempt " + pendingReconnectAttempt.attempt +
+      "/" + pendingReconnectAttempt.max + ")...";
+    reconnectingOverlay.hidden = false;
   }
 }
 
@@ -270,18 +328,22 @@ const receiverCancelBtn = document.getElementById("receiver-cancel");
 // would reset all JS state including the IPC channel reference (REQ-B2,
 // REQ-NO-RELOAD). The backend command mirrors retry_session on the sender side.
 // cancelAutoRetry() is prepended (PQ-3 invariant, D-RRE-3 call site 4).
+// cancelSilentRecovery() clears any Stage-1 timer still pending (D-SSR-4).
 if (receiverRetryBtn) {
   receiverRetryBtn.addEventListener("click", async function () {
     cancelAutoRetry();
+    cancelSilentRecovery();
     await triggerRetry();
   });
 }
 
 // Cancel: stop the stream and return to idle (no reload).
 // cancelAutoRetry() is prepended (PQ-3 invariant, D-RRE-3 call site 5).
+// cancelSilentRecovery() clears any Stage-1 timer still pending (D-SSR-4).
 if (receiverCancelBtn) {
   receiverCancelBtn.addEventListener("click", async function () {
     cancelAutoRetry();
+    cancelSilentRecovery();
     if (deadModal) deadModal.hidden = true;
     const invoke = window.__TAURI__?.core?.invoke;
     if (invoke) {
@@ -314,15 +376,26 @@ function handleStatus(payload) {
     case "reconnecting":
       // Cancel any pending auto-retry (PQ-3 invariant, D-RRE-3 call site 1).
       cancelAutoRetry();
-      // Reconnect in progress — tear down the stale MSE session immediately.
-      // The receiver will emit FRAME_INIT again after the bundle is rebuilt.
-      setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…");
-      tearDownMse();
-      // Show reconnecting overlay; hide dead modal (in case a previous dead was shown).
-      if (reconnectingOverlay) {
-        reconnectingOverlay.textContent =
-          "Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")…";
-        reconnectingOverlay.hidden = false;
+      // Capture most-recent attempt/max for the deferred overlay reveal (D-SSR-3).
+      pendingReconnectAttempt = { attempt: payload.attempt, max: payload.max };
+      setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")...");
+      // DO NOT call tearDownMse() here — deferred to Stage 2 reveal or streaming/dead
+      // so the last frozen video frame stays visible during the silent window (REQ-SSR-4).
+      // DO NOT show the overlay yet — Stage 1 is silent (REQ-SSR-3).
+      // Arm one-shot total-elapsed timer ONLY on the FIRST reconnecting frame of this
+      // episode. Two-part guard (D-SSR-6):
+      //   1. silentRecoveryTimerId === null: prevents re-arm while Stage 1 is still active
+      //      (subsequent reconnecting{2,3} frames cannot reset the 10s window).
+      //   2. !overlayRevealed: prevents re-arm AFTER Stage 2 entry — once the overlay is
+      //      revealed (timer fired, silentRecoveryTimerId nulled itself), a later
+      //      reconnecting{n} must NOT start a new 10s window (REQ-SSR-2, D-SSR-6).
+      //      overlayRevealed is reset by cancelSilentRecovery() (streaming/dead/retry) so
+      //      a genuinely new loss episode can arm the timer again.
+      if (silentRecoveryTimerId === null && !overlayRevealed) {
+        silentRecoveryTimerId = setTimeout(
+          revealReconnectingOverlay,
+          SILENT_RECOVERY_THRESHOLD_MS
+        );
       }
       if (deadModal) deadModal.hidden = true;
       break;
@@ -330,6 +403,10 @@ function handleStatus(payload) {
       // Cancel any prior auto-retry before re-arming (PQ-3 invariant, D-RRE-3 call site 3).
       // Handles both second-Dead re-entry and the normal first-entry (idempotent).
       cancelAutoRetry();
+      // Cancel the Stage-1 silent-recovery timer if still active (D-SSR-9, REQ-SSR-7).
+      // Fast-exhaustion edge: dead arrives before 10s → silent overlay never shown.
+      // Stage-2 edge: dead arrives after reveal → cancel is a no-op (timer already null).
+      cancelSilentRecovery();
       // All reconnect attempts exhausted — show dead-session modal with Retry/Cancel.
       setStatus("Disconnected — session lost");
       tearDownMse();
@@ -348,10 +425,19 @@ function handleStatus(payload) {
     case "streaming":
       // Cancel any pending auto-retry (PQ-3 invariant, D-RRE-3 call site 2).
       cancelAutoRetry();
+      // Cancel Stage-1 silent-recovery timer (D-SSR-8, REQ-SSR-5, REQ-SSR-8).
+      // Silent success path: streaming arrived before 10s → overlay was never shown.
+      // Post-Stage-2 path: streaming arrived after reveal → cancel is a no-op (timer
+      // already null) but we still hide the overlay below.
+      cancelSilentRecovery();
       // Reconnect supervisor reports the rebuild succeeded. Prepare a fresh MSE
       // session so the next FRAME_INIT can re-initialize the SourceBuffer.
       if (reconnectingOverlay) reconnectingOverlay.hidden = true;
       if (deadModal) deadModal.hidden = true;
+      // Deferred teardown: MSE was kept alive during Stage 1 to hold the frozen frame.
+      // tearDownMse() MUST be called here BEFORE setUpMse() to end the stale MediaSource
+      // and give setUpMse a clean slate (REQ-SSR-4, REQ-SSR-5, D-SSR-8, R-SSR-3).
+      tearDownMse();
       setUpMse().catch((e) => {
         console.error("[mse-client] setUpMse failed after reconnect:", e);
       });

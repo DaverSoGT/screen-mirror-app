@@ -6,6 +6,8 @@
 //         for the receiver dead-modal UI (mse-client.js:145-180).
 // receiver-retry-on-exhaustion (D-RRE-6): adds #dead-role-change inside
 //         .dead-buttons for the role-change affordance (backward-compatible).
+// staged-silent-reconnect: adds #reconnecting-overlay (hidden by default) for
+//         the 3-stage timer-gate overlay (REQ-SSR-3, REQ-SSR-6).
 export function installDom() {
   removeDom();
   document.body.innerHTML = `
@@ -17,6 +19,7 @@ export function installDom() {
     <a id="change-mode" href="#"></a>
     <button id="retry" style="display:none">Retry</button>
     <button id="cancel" style="display:none">Cancel</button>
+    <div id="reconnecting-overlay" hidden></div>
     <div id="dead-modal" hidden>
       <p id="dead-reason"></p>
       <div class="dead-buttons">
