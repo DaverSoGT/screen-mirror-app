@@ -947,7 +947,15 @@ fn enter_supervisor_mode(
     let sup_join = std::thread::Builder::new()
         .name("sm-sender-supervisor".into())
         .spawn(move || {
-            let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
+            // Role-aware tie-break (design #963 D1): the sender is the WebRTC
+            // offerer, so it is always the active reconnector in a simultaneous race.
+            let mut sup = ReconnectSupervisor::new(
+                policy,
+                session_nonce,
+                sm_domain::signaling::SignalingRole::Sender,
+                signal_rx,
+                outcome_tx,
+            );
             sup.run(ack_timeout, rebuild_timeout)
         })
         .expect("supervisor thread spawn must not fail");

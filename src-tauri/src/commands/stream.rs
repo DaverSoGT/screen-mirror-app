@@ -1179,7 +1179,15 @@ fn enter_stream_supervisor_mode(
     let sup_join = std::thread::Builder::new()
         .name("sm-stream-supervisor".into())
         .spawn(move || {
-            let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
+            // Role-aware tie-break (design #963 D1): the receiver is the WebRTC
+            // answerer, so it always defers to the sender's fresh Offer.
+            let mut sup = ReconnectSupervisor::new(
+                policy,
+                session_nonce,
+                SignalingRole::Receiver,
+                signal_rx,
+                outcome_tx,
+            );
             sup.run(ack_timeout, rebuild_timeout)
         })
         .expect("supervisor thread spawn must not fail");
