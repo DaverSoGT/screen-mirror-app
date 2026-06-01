@@ -1639,7 +1639,10 @@ fn build_production_sender_bundle(
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
-    use sm_infra::transport::{Str0mVideoSender, publish_host_candidate};
+    use sm_infra::transport::{
+        publish_host_candidate, resolve_candidate_with_retry, Str0mVideoSender,
+        CANDIDATE_RETRY_ATTEMPTS,
+    };
     use std::sync::mpsc::sync_channel;
 
     const CHANNEL_CAP: usize = 4;
@@ -1735,12 +1738,36 @@ fn build_production_sender_bundle(
 
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
     // Offer → Candidate in FIFO order (design §3.1 revised ordering).
-    if let Some(addr) = sender.candidate_addr() {
-        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
-            eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
-        });
-    } else {
-        eprintln!("[sm-sender-bundle] no non-loopback NIC; skipping candidate publish");
+    //
+    // The probe is NOT one-shot: on a real reconnect the supervisor fires
+    // InitiateMdnsReset then immediately InitiateRebuild, and the mDNS reset
+    // transiently drops the NIC ("no IPv4 network interfaces found"). A single
+    // `candidate_addr()` call during that window would skip the publish for the
+    // ENTIRE WebRTC generation, leaving str0m with no local candidate to
+    // nominate → media never flows → WSAECONNRESET → IceFailed → rebuild loop.
+    // `resolve_candidate_with_retry` polls across the NIC-down window (15×100ms
+    // ≈ 1.5s, comfortably under the 15s rebuild_timeout) so the publish recovers
+    // once the interface returns.
+    match resolve_candidate_with_retry(
+        || sender.candidate_addr(),
+        CANDIDATE_RETRY_ATTEMPTS,
+        std::thread::sleep,
+    ) {
+        Some(addr) => {
+            // WU-3 log #3: positive branch — proves THIS generation published.
+            eprintln!("[sm-sender-bundle] published host candidate addr={addr}");
+            publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
+                eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
+            });
+        }
+        None => {
+            // Budget exhausted: NIC never returned in the retry window. LOUD log
+            // so the HW gate shows this generation published NO candidate.
+            eprintln!(
+                "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
+                 skipping candidate publish — this WebRTC generation will have NO local host candidate"
+            );
+        }
     }
 
     // ── 4. Wrap in Arc<Mutex<>> for drain thread sharing ──────────────────────

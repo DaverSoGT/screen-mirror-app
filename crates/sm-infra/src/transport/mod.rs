@@ -103,11 +103,11 @@ impl Drop for NicOverrideGuard {
 /// total wait to ~1.5s — comfortably less than the supervisor's 15s
 /// `rebuild_timeout` (sender.rs / stream.rs), so a NIC flap during the
 /// `InitiateMdnsReset → InitiateRebuild` window cannot starve the rebuild.
-pub(crate) const CANDIDATE_RETRY_ATTEMPTS: u32 = 15;
+pub const CANDIDATE_RETRY_ATTEMPTS: u32 = 15;
 
 /// Sleep between probe attempts in [`resolve_candidate_with_retry`].
 /// 15 attempts × 100ms ≈ 1.5s total budget (no sleep after the final attempt).
-pub(crate) const CANDIDATE_RETRY_INTERVAL: std::time::Duration =
+pub const CANDIDATE_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 
 /// Probe for a usable host candidate, retrying up to `attempts` times with a
@@ -131,7 +131,7 @@ pub(crate) const CANDIDATE_RETRY_INTERVAL: std::time::Duration =
 /// Returns `Some(addr)` as soon as a probe yields one, or `None` if every
 /// attempt within the budget returns `None`. Never exceeds `attempts` probe
 /// calls.
-pub(crate) fn resolve_candidate_with_retry<P, D>(
+pub fn resolve_candidate_with_retry<P, D>(
     mut probe: P,
     attempts: u32,
     mut delay: D,
@@ -140,11 +140,16 @@ where
     P: FnMut() -> Option<std::net::SocketAddr>,
     D: FnMut(std::time::Duration),
 {
-    // RED stub: one-shot probe (current production behaviour). Retries not yet
-    // implemented — the retry test must fail against this.
-    let _ = &mut delay;
-    let _ = attempts;
-    probe()
+    for attempt in 0..attempts {
+        if let Some(addr) = probe() {
+            return Some(addr);
+        }
+        // Delay only BETWEEN attempts — never after the final probe.
+        if attempt + 1 < attempts {
+            delay(CANDIDATE_RETRY_INTERVAL);
+        }
+    }
+    None
 }
 
 // ─── publish_host_candidate helper ───────────────────────────────────────────
