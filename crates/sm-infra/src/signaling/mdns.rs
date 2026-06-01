@@ -1212,6 +1212,45 @@ mod tests {
         );
     }
 
+    /// SC-DR-5 — `frame_to_event` MUST forward the wire `requester_role` into the
+    /// `SupervisorSignal::PeerRequest { peer_role }` instead of discarding it.
+    ///
+    /// Root cause #962: `mdns.rs` dropped `requester_role` (`requester_role: _`),
+    /// so the supervisor's tie-break was role-blind. Design #963 D1 plumbs the role
+    /// through. This pins the plumbing: a `Receiver`-role request must arrive as
+    /// `peer_role: Receiver` on the supervisor channel.
+    #[test]
+    fn sc_dr_5_requester_role_not_discarded() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(8);
+        let supervisor_signal_tx = std::sync::Arc::new(Mutex::new(Some(sup_tx)));
+
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Receiver,
+            session_nonce: 42,
+        };
+
+        let result = frame_to_event(frame, &supervisor_signal_tx);
+        assert!(result.is_none(), "ReconnectRequest must not produce a SignalingEvent");
+
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("supervisor channel must receive PeerRequest within 100ms");
+        assert_eq!(
+            signal,
+            SupervisorSignal::PeerRequest {
+                peer_nonce: 42,
+                peer_role: SignalingRole::Receiver,
+                attempt: 1,
+            }
+        );
+    }
+
     /// T5.1 — `ReconnectRequest` returns None silently when no supervisor channel is set.
     #[test]
     fn frame_to_event_reconnect_request_returns_none_without_supervisor() {
