@@ -470,6 +470,12 @@ fn run_receiver_loop(
 ) {
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
+    // Instrumentation (HW gate): once-per-generation flag + start instant so the
+    // FIRST inbound datagram is logged exactly once with elapsed time. This
+    // distinguishes a dead socket (no datagram ever) from an ICE-level failure
+    // (datagrams arrive but no working pair).
+    let mut first_datagram_logged = false;
+    let loop_start = Instant::now();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -548,6 +554,17 @@ fn run_receiver_loop(
 
         match udp.recv_from(&mut buf) {
             Ok((n, source)) => {
+                // Instrumentation (HW gate, log #5): log the FIRST inbound
+                // datagram (typically a STUN binding request) with elapsed time.
+                // Proves whether ANY packet reaches the rebuilt socket → dead
+                // socket vs ICE-level failure.
+                if !first_datagram_logged {
+                    first_datagram_logged = true;
+                    eprintln!(
+                        "[sm-receiver-tick] first datagram in from {source} at +{}ms (n={n})",
+                        loop_start.elapsed().as_millis()
+                    );
+                }
                 let bytes: &[u8] = &buf[..n];
                 let now = Instant::now();
                 if let Ok(dgram) = bytes.try_into() {
@@ -601,14 +618,25 @@ fn handle_receiver_event(
         // and gathering is done. With a single candidate pair (loopback tests, most
         // prod scenarios), the state jumps directly to `Completed`, skipping `Connected`.
         // We map both to `TransportEvent::IceConnected`.
-        Event::IceConnectionStateChange(IceConnectionState::Connected)
-        | Event::IceConnectionStateChange(IceConnectionState::Completed) => {
-            let _ = event_tx.try_send(TransportEvent::IceConnected);
-        }
-        Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-            let _ = event_tx.try_send(TransportEvent::IceFailed);
+        Event::IceConnectionStateChange(state) => {
+            // Instrumentation (HW gate, log #6): log EVERY ICE state transition
+            // (incl. Checking/Disconnected/New), not just Connected — shows if
+            // ICE stalls in `Checking` on the rebuilt Rtc.
+            eprintln!("[sm-receiver] ICE state -> {state:?}");
+            match state {
+                IceConnectionState::Connected | IceConnectionState::Completed => {
+                    let _ = event_tx.try_send(TransportEvent::IceConnected);
+                }
+                IceConnectionState::Disconnected => {
+                    let _ = event_tx.try_send(TransportEvent::IceFailed);
+                }
+                _ => {}
+            }
         }
         Event::MediaAdded(added) => {
+            // Instrumentation (HW gate, log #4 — HIGHEST VALUE): proves whether
+            // MediaAdded ever fires on the rebuilt Rtc post-reconnect.
+            eprintln!("[sm-receiver] MediaAdded mid={:?} on rebuilt Rtc", added.mid);
             // Capture the mid so we can send PLI later.
             *mid_slot = Some(added.mid);
         }
