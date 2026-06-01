@@ -43,12 +43,27 @@ const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
 const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
+// Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
+// is revealed (Stage 2). Tunable single constant (D-SSR-1). Default 10s gives
+// comfortable margin over a healthy ~5s ICE rebuild without immediately alarming
+// the user on brief disruptions.
+const SILENT_RECOVERY_THRESHOLD_MS = 10_000;
 const VIDEO_EL = document.getElementById("player");
 const STATUS_EL = document.getElementById("status");
 
 // Module-level auto-retry timer handle. NOT on window, NOT in mseState (D-RRE-1).
 // Null when no timer is armed; non-null between Dead-state entry and timer fire/cancel.
 let autoRetryTimerId = null;
+
+// Module-level silent-recovery timer handle (D-SSR-2). Null = no Stage-1 window active.
+// Non-null = Stage 1 silent window armed, overlay NOT yet shown. Armed ONCE per loss
+// episode (null-guard in case "reconnecting" prevents re-arm on attempt 2/3).
+let silentRecoveryTimerId = null;
+
+// Most-recent {attempt, max} from reconnecting frames during Stage 1 (D-SSR-3).
+// Updated on every reconnecting frame so the deferred reveal shows the current counter.
+// Reset to null by cancelSilentRecovery() (on streaming/dead/retry/cancel).
+let pendingReconnectAttempt = null;
 
 // ── Module-level MSE state ───────────────────────────────────────────────────
 // Lifted from main() so tearDownMse / setUpMse (called by handleStatus) can
