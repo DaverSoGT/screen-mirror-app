@@ -145,9 +145,9 @@ describe('mse-client — warn-hardening (SC-W1-1, SC-W2-1, SC-W2-2)', () => {
     expect(statusEl.textContent).toContain('missing avcC');
 
     // RED: console.error NOT called (only console.log via setStatus).
-    // GREEN: console.error called with a message about the codec/avcC failure.
-    const errorCalls = errorSpy.mock.calls.filter(
-      (call) => typeof call[0] === 'string' && /avcC|codec|init/i.test(call[0])
+    // GREEN: console.error called; combined arguments mention avcC, codec, or init.
+    const errorCalls = errorSpy.mock.calls.filter((call) =>
+      call.some((arg) => typeof arg === 'string' && /avcC|codec|init/i.test(arg))
     );
     expect(errorCalls.length).toBeGreaterThanOrEqual(1);
   });
@@ -187,9 +187,9 @@ describe('mse-client — warn-hardening (SC-W1-1, SC-W2-1, SC-W2-2)', () => {
     expect(statusEl.textContent).toContain('not supported');
 
     // RED: console.error NOT called.
-    // GREEN: console.error called with a message about codec/support failure.
-    const errorCalls = errorSpy.mock.calls.filter(
-      (call) => typeof call[0] === 'string' && /codec|supported|FATAL/i.test(call[0])
+    // GREEN: console.error called; the combined arguments mention codec or support.
+    const errorCalls = errorSpy.mock.calls.filter((call) =>
+      call.some((arg) => typeof arg === 'string' && /codec|supported|FATAL/i.test(arg))
     );
     expect(errorCalls.length).toBeGreaterThanOrEqual(1);
   });

@@ -610,11 +610,19 @@ function applyInit(ms, data, frameBytes) {
 
   const derived = deriveCodecFromInitSegment(frameBytes);
   if (!derived) {
-    setStatus("init segment missing avcC — cannot derive codec");
+    // W-2: permanent failure — loud error so operator sees an unrecoverable session
+    // in the console, not just the status bar. Re-queueing would not help: the same
+    // init would fail identically (no avcC box cannot be fixed by retrying).
+    const msg = "init segment missing avcC — cannot derive codec";
+    setStatus(msg);
+    console.error("[mse] applyInit permanent failure:", msg);
     return;
   }
   if (!MediaSource.isTypeSupported(derived)) {
-    setStatus("FATAL: derived codec not supported: " + derived);
+    // W-2: permanent failure — same rationale as above.
+    const msg = "FATAL: derived codec not supported: " + derived;
+    setStatus(msg);
+    console.error("[mse] applyInit permanent failure:", msg);
     return;
   }
   let sb;
@@ -652,9 +660,14 @@ function applyInit(ms, data, frameBytes) {
     console.warn("[mse] SourceBuffer abort event");
   });
   ms.addEventListener("sourceended", () => {
+    // W-1: reset active so a subsequent FRAME_INIT takes Guard 2 (queued) instead
+    // of the happy path → addSourceBuffer on a non-open MS → throw → drop.
+    mseState.active = false;
     console.warn("[mse] MediaSource sourceended");
   });
   ms.addEventListener("sourceclose", () => {
+    // W-1: same defense-in-depth reset as sourceended.
+    mseState.active = false;
     console.warn("[mse] MediaSource sourceclose — readyState=" + ms.readyState);
   });
   setStatus(
