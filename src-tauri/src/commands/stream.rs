@@ -6132,6 +6132,72 @@ mod tests {
         );
     }
 
+    // ─── SC-SSR-14 — retry_session_stream_inner threads passed channel (REQ-SSR-9) ──
+
+    /// SC-SSR-14: `retry_session_stream_inner` wires the caller-supplied channel into
+    /// the rebuilt session's frame sink (R-6 regression guard).
+    ///
+    /// GIVEN: A StreamBridge with a populated restart_cache and a prior active session.
+    ///        A distinct FakeChannel is created to represent the new post-retry Channel.
+    /// WHEN:  `retry_session_stream_inner` is called with the new FakeChannel.
+    /// THEN:  The new session's restart_cache stores the SAME channel Arc that was passed
+    ///        in (pointer equality), proving the passed channel — not some internally
+    ///        constructed one — is the frame sink for the rebuilt session.
+    ///
+    /// # Limitation
+    ///
+    /// Because `FakeBuilder` creates an empty `pkt_rx` channel, the mux thread has
+    /// no packets to deliver so we cannot observe frames landing on the channel without
+    /// a prod-code change. Instead, we assert Arc-pointer identity on
+    /// `restart_cache.channel` post-retry, which is set to the passed channel by
+    /// `start_stream_inner` at the cache-refresh step. This guards against a future
+    /// Rust refactor that silently drops the retry channel and constructs a new one
+    /// internally — the guard would fail at the pointer-equality assertion.
+    #[test]
+    fn sc_ssr_14_retry_session_stream_inner_threads_passed_channel_into_new_session_frame_sink() {
+        let port = pick_free_udp_port();
+        let service_name = "_screen-mirror._tcp.local.".to_string();
+
+        // Bridge pre-seeded with restart_cache (simulates a prior started session).
+        let bridge = make_fake_bridge_with_cache(port, service_name.clone());
+
+        // Start an initial session so retry has something to stop.
+        let initial_ch: Arc<dyn ChannelLike> = FakeChannel::new();
+        start_stream_inner(&bridge, initial_ch, Some(port), Some(service_name))
+            .expect("SC-SSR-14: initial start must succeed");
+
+        // Create the channel that will be passed to the retry call.
+        // This represents the new JS Channel created by triggerRetry().
+        let retry_ch: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        // Capture a raw pointer to the retry channel for identity comparison.
+        // `Arc::as_ptr` gives us the pointer to the inner data — same value only
+        // if both Arcs refer to the same allocation.
+        let retry_ch_ptr = Arc::as_ptr(&retry_ch);
+
+        // WHEN: retry_session_stream_inner is called with the new channel.
+        let result = retry_session_stream_inner(&bridge, retry_ch);
+
+        // THEN: must succeed.
+        assert!(
+            result.is_ok(),
+            "SC-SSR-14: retry_session_stream_inner must return Ok; got {result:?}"
+        );
+
+        // The restart_cache must now hold the SAME channel that was passed in.
+        // If Rust ever stops threading the caller-provided channel through to the
+        // rebuilt session, this assertion will fail — catching the R-6 regression.
+        let cache_guard = bridge.restart_cache.lock().unwrap();
+        let cache = cache_guard.as_ref().expect("SC-SSR-14: restart_cache must be set after retry");
+        let cached_ch_ptr = Arc::as_ptr(&cache.channel);
+
+        assert_eq!(
+            retry_ch_ptr, cached_ch_ptr,
+            "SC-SSR-14: restart_cache.channel must be the same Arc passed to retry_session_stream_inner \
+             (i.e. the caller-supplied channel IS the frame sink for the rebuilt session)"
+        );
+    }
+
     // ─── helpers for SC-B-001 / SC-B-002 ────────────────────────────────────────
 
     /// Build a fake bundle-builder that succeeds without real sockets/mDNS.
