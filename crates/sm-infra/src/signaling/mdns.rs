@@ -74,6 +74,24 @@ const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Read timeout for the TCP frame loop — allows periodic stop-flag checks.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Process-global monotonic counter assigning a unique id to each signaling
+/// connection (one per `run_frame_loop` invocation).
+///
+/// D6 instrumentation (design #963): during a dual-reconnect, the sender may have
+/// two overlapping listeners on port 7889 (the reset listener and the rebuild
+/// listener bound via SO_REUSEADDR). The receiver connects to exactly one of them.
+/// Tagging each connection with a stable instance id lets the HW operator correlate
+/// — across the `connection up`, `accept`, and `Bye` log lines — WHICH listener
+/// served the connection that carried (or failed to carry) the fresh Offer, and
+/// WHICH torn-down generation emitted the stale Bye. This settles the DEFERRED D3
+/// dual-listener question at the next HW gate without changing any behavior.
+static SIGNALING_INSTANCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Allocate the next signaling-instance id (monotonic, process-global).
+fn next_signaling_instance_id() -> u64 {
+    SIGNALING_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 // ─── Internal control messages ────────────────────────────────────────────────
 
 /// Outbound frames queued from the public API into the signaling thread.
@@ -626,9 +644,17 @@ fn run_frame_loop(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
+    // D6 instrumentation: assign a unique signaling-instance id to this connection
+    // so the HW operator can correlate which listener/connection served it (and,
+    // on teardown, which instance emitted a stale Bye) across overlapping
+    // dual-listener generations during a dual-reconnect.
+    let instance_id = next_signaling_instance_id();
+
     // Diagnostic: log the actual TCP endpoints so loopback/dup-connect can be
     // distinguished from cross-host. Should always be peer != local; equal
-    // would indicate the writer is feeding the reader on the same machine.
+    // would indicate the writer is feeding the reader on the same machine. The
+    // `local` endpoint identifies WHICH listener (e.g. reset vs rebuild on 7889)
+    // accepted/served this connection.
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -637,7 +663,9 @@ fn run_frame_loop(
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("<local_addr err: {e}>"));
-    eprintln!("[sm-signaling-frame-loop] connection up: local={local} peer={peer}");
+    eprintln!(
+        "[sm-signaling-frame-loop] connection up: instance={instance_id} local={local} peer={peer}"
+    );
 
     // Set read timeout so the loop can check the stop flag and drain the inbox.
     if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
@@ -680,7 +708,14 @@ fn run_frame_loop(
 
     loop {
         if stop.load(Ordering::Acquire) {
-            eprintln!("[sm-signaling-frame-loop] EXIT: stop flag set, sending Bye");
+            // D6: tag the stop-flag Bye with the instance id. Per #962 this is the
+            // stale-Bye source during a dual-reconnect — a torn-down OLD generation
+            // emitting Bye on a connection the peer may still be using. The instance
+            // id lets the HW operator confirm whether the Bye came from the offer-
+            // bearing generation or a stale one.
+            eprintln!(
+                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, sending Bye"
+            );
             let _ = write_frame(&mut writer, &SignalingFrame::Bye);
             break;
         }
@@ -725,7 +760,7 @@ fn run_frame_loop(
                     session_nonce,
                 } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
             };
-            eprintln!("[sm-signaling-frame-loop] OUT → {kind}");
+            eprintln!("[sm-signaling-frame-loop] OUT → instance={instance_id} {kind}");
             if let Err(e) = write_frame(&mut writer, &frame) {
                 eprintln!("[sm-signaling-frame-loop] write_frame error: {e}");
                 emit_error(&event_tx, SignalingError::Io(e.to_string()));
@@ -759,7 +794,7 @@ fn run_frame_loop(
                         session_nonce,
                     } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
                 };
-                eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
+                eprintln!("[sm-signaling-frame-loop] IN  ← instance={instance_id} {kind}");
                 match frame_to_event(frame, &supervisor_signal_tx) {
                     Some(SignalingEvent::Closed) => {
                         eprintln!("[sm-signaling-frame-loop] EXIT: peer sent Bye → emit Closed");
