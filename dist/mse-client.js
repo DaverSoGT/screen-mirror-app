@@ -96,6 +96,39 @@ function cancelAutoRetry() {
   }
 }
 
+// ── cancelSilentRecovery ─────────────────────────────────────────────────────
+// Cancels any pending Stage-1 silent-recovery timer. Idempotent (D-SSR-4).
+// Mirrors cancelAutoRetry discipline exactly. Four mandatory call sites:
+//   case "streaming" top, case "dead" top, Retry click, Cancel click.
+// Also resets pendingReconnectAttempt so stale attempt counters are not leaked
+// into a subsequent loss episode.
+function cancelSilentRecovery() {
+  if (silentRecoveryTimerId !== null) {
+    clearTimeout(silentRecoveryTimerId);
+    silentRecoveryTimerId = null;
+  }
+  pendingReconnectAttempt = null;
+}
+
+// ── revealReconnectingOverlay ────────────────────────────────────────────────
+// Timer callback: fires SILENT_RECOVERY_THRESHOLD_MS after the first
+// reconnecting frame. Transitions from Stage 1 (silent) to Stage 2 (visible).
+// Deferred teardown fires HERE — the last frozen frame was visible throughout
+// Stage 1; we teardown now because the overlay will cover the blanked video.
+// Uses pendingReconnectAttempt (the LATEST counter, not attempt 1) for text.
+// D-SSR-5.
+function revealReconnectingOverlay() {
+  silentRecoveryTimerId = null; // null FIRST (mirrors triggerAutoRetry pattern)
+  tearDownMse();                // deferred teardown fires at Stage 2 reveal
+  const overlay = document.getElementById("reconnecting-overlay");
+  if (overlay && pendingReconnectAttempt) {
+    overlay.textContent =
+      "Reconnecting (attempt " + pendingReconnectAttempt.attempt +
+      "/" + pendingReconnectAttempt.max + ")...";
+    overlay.hidden = false;
+  }
+}
+
 // Frame discriminant constants (must match FRAME_INIT / FRAME_SEGMENT / FRAME_STATUS
 // in stream.rs).
 const FRAME_INIT = 0x00;
