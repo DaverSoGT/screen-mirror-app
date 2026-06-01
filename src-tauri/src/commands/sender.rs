@@ -3053,4 +3053,106 @@ mod tests {
             "non-zero height must not be replaced with sentinel"
         );
     }
+
+    // ─── SC-D3-3: InitiateMdnsReset suppresses the gen-G teardown Bye (D3 #967) ──
+    //
+    // The sender's InitiateMdnsReset hook reuses the SAME gen-G MdnsSignaling
+    // instance (sig_for_reset) and the supervisor immediately follows with
+    // InitiateRebuild that supersedes this generation. The hook MUST call
+    // `suppress_outbound_bye()` on the gen-G instance so the superseded
+    // generation's eventual teardown (Drop → stop()) does NOT emit a spurious Bye
+    // on a connection the receiver may still be using.
+
+    /// SC-D3-3a — Behavioral: `suppress_outbound_bye()` raises an observable flag on
+    /// a real `MdnsSignaling` that PERSISTS across the hook's `stop()` + `start()`
+    /// reuse cycle, so the later Drop-teardown stays muted.
+    ///
+    /// RED would fail to compile before WU-D3a added the API; with D3a present this
+    /// proves the API the production hook depends on behaves correctly across reuse.
+    #[test]
+    fn sc_d3_3a_suppress_persists_across_reset_stop_start() {
+        use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+        use sm_infra::signaling::mdns::MdnsSignaling;
+        use std::sync::mpsc::sync_channel;
+
+        // gen-G instance: receiver role avoids binding the sender control port and
+        // keeps the test free of network side effects (new()/start() touch no peer).
+        let cfg = SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        };
+        let mut sig = MdnsSignaling::new(cfg).expect("new gen-G signaling");
+        assert!(
+            !sig.is_bye_suppressed(),
+            "fresh instance must default to Bye NOT suppressed"
+        );
+
+        // Production reset-hook order: suppress BEFORE stop()+start().
+        sig.suppress_outbound_bye();
+        assert!(
+            sig.is_bye_suppressed(),
+            "suppress_outbound_bye() must raise the flag"
+        );
+
+        let _ = sig.stop();
+        let (tx, _rx) = sync_channel::<SignalingEvent>(4);
+        let _ = sig.start(tx);
+
+        assert!(
+            sig.is_bye_suppressed(),
+            "SC-D3-3a FAIL: suppression MUST persist across stop()+start() so the \
+             superseded gen-G's later Drop-teardown stays muted (D3 #967)"
+        );
+
+        let _ = sig.stop();
+    }
+
+    /// SC-D3-3b — Structural: the production `initiate_mdns_reset` hook MUST call
+    /// `suppress_outbound_bye()` on the gen-G `sig` BEFORE `sig.stop()`.
+    ///
+    /// RED (before WU-D3b): the hook body has no `suppress_outbound_bye()` call.
+    /// GREEN (WU-D3b): the call appears before `sig.stop()` inside the hook.
+    ///
+    /// Mirrors the SC-D-001 source-ordering gate already used in mdns.rs: a refactor
+    /// that drops the suppression call (re-introducing the stale-Bye) fails here.
+    #[test]
+    fn sc_d3_3b_production_reset_hook_suppresses_before_stop() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path =
+            std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        // Normalize line endings so the structural bound is CRLF/LF-agnostic.
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
+            .replace("\r\n", "\n");
+
+        // Scope the search to the production initiate_mdns_reset hook body ONLY.
+        // The closure is the LAST field of the production SenderCoordinatorHooks
+        // literal, terminated by `}),` followed by the struct's closing `};`. Bound
+        // the region there so the gate cannot match the string in this test's own
+        // source further down the file.
+        let hook_start = source
+            .find("initiate_mdns_reset: Arc::new(move || {")
+            .expect("production initiate_mdns_reset hook must exist");
+        let hook_rel_end = source[hook_start..]
+            .find("\n        }),\n    };")
+            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+        let hook_region = &source[hook_start..hook_start + hook_rel_end];
+
+        let suppress_pos = hook_region.find("suppress_outbound_bye()").expect(
+            "SC-D3-3b FAIL: the production initiate_mdns_reset hook must call \
+             `suppress_outbound_bye()` on the gen-G instance (D3 #967). \
+             Fix (WU-D3b): add `sig.suppress_outbound_bye();` before `sig.stop()`.",
+        );
+        let stop_pos = hook_region
+            .find("sig.stop()")
+            .expect("hook must call sig.stop()");
+
+        assert!(
+            suppress_pos < stop_pos,
+            "SC-D3-3b FAIL: `suppress_outbound_bye()` (offset {suppress_pos}) must appear \
+             BEFORE `sig.stop()` (offset {stop_pos}) in the initiate_mdns_reset hook, so the \
+             reset path's own teardown and the later rebuild Drop-teardown are both muted."
+        );
+    }
 }

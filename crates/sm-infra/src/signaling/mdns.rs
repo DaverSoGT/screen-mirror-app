@@ -279,6 +279,15 @@ impl MdnsSignaling {
         self.suppress_bye.store(true, Ordering::Release);
     }
 
+    /// Read-only observer for the suppress-Bye flag (D3, design #967).
+    ///
+    /// Diagnostic accessor (sibling to the D6 instance-id instrumentation): lets the
+    /// sender-coordinator reset-hook test (SC-D3-3) assert that the superseded
+    /// generation had its teardown Bye muted. Loads with `Acquire`.
+    pub fn is_bye_suppressed(&self) -> bool {
+        self.suppress_bye.load(Ordering::Acquire)
+    }
+
     /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
     ///
     /// Uses the existing inbox mechanism — the frame loop writes it on the next
