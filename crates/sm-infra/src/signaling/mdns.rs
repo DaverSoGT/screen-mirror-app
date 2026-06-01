@@ -150,6 +150,15 @@ pub struct MdnsSignaling {
     /// `None` until `set_supervisor_signal_tx` is called. When `None`, reconnect
     /// frames are silently consumed (backward-compatible — frame_to_event returns None).
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    /// When raised, the frame loop exits on the stop flag WITHOUT sending the
+    /// teardown `Bye` frame (D3 stale-Bye fix, design #967).
+    ///
+    /// Default `false` — genuine shutdown still emits `Bye` so the receiver's
+    /// `PeerBye` eager-wake fast-path is preserved. It is set to `true` ONLY on a
+    /// generation that is being superseded by a fast rebuild, so the old
+    /// generation's eventual teardown does not emit a spurious `Bye` on a
+    /// connection the receiver may still be using (see `suppress_outbound_bye`).
+    suppress_bye: Arc<AtomicBool>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -161,6 +170,7 @@ impl Signaling for MdnsSignaling {
             inbox: Arc::new(Mutex::new(Vec::new())),
             handle: None,
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
+            suppress_bye: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -177,11 +187,19 @@ impl Signaling for MdnsSignaling {
         let stop = Arc::clone(&self.stop);
         let inbox = Arc::clone(&self.inbox);
         let supervisor_signal_tx = Arc::clone(&self.supervisor_signal_tx);
+        let suppress_bye = Arc::clone(&self.suppress_bye);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
             .spawn(move || {
-                run_signaling_thread(config, stop, inbox, event_tx, supervisor_signal_tx);
+                run_signaling_thread(
+                    config,
+                    stop,
+                    inbox,
+                    event_tx,
+                    supervisor_signal_tx,
+                    suppress_bye,
+                );
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
 
@@ -244,6 +262,21 @@ impl MdnsSignaling {
     /// `start()` is safe but may miss frames that arrive before the channel is set.
     pub fn set_supervisor_signal_tx(&self, tx: SyncSender<SupervisorSignal>) {
         *self.supervisor_signal_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Suppress the teardown `Bye` frame for this signaling instance (D3 stale-Bye
+    /// fix, design #967).
+    ///
+    /// Once set, the frame loop exits on the stop flag WITHOUT writing a `Bye`.
+    /// Call this on a generation that is being superseded by a fast rebuild so its
+    /// eventual teardown does not emit a spurious `Bye` on a connection the receiver
+    /// may still be using. Genuine shutdown leaves this unset and still emits `Bye`,
+    /// preserving the receiver's `PeerBye` eager-wake fast-path.
+    ///
+    /// Ordering: stores with `Release` to pair with the frame loop's `Acquire` load
+    /// at the stop-flag Bye gate.
+    pub fn suppress_outbound_bye(&self) {
+        self.suppress_bye.store(true, Ordering::Release);
     }
 
     /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
@@ -402,14 +435,25 @@ fn run_signaling_thread(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
     match config.role {
-        SignalingRole::Sender => {
-            run_sender_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
-        }
-        SignalingRole::Receiver => {
-            run_receiver_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
-        }
+        SignalingRole::Sender => run_sender_thread(
+            config,
+            stop,
+            inbox,
+            event_tx,
+            supervisor_signal_tx,
+            suppress_bye,
+        ),
+        SignalingRole::Receiver => run_receiver_thread(
+            config,
+            stop,
+            inbox,
+            event_tx,
+            supervisor_signal_tx,
+            suppress_bye,
+        ),
     }
 }
 
@@ -440,6 +484,7 @@ fn run_sender_thread(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
     let port = config.control_port;
 
@@ -536,7 +581,14 @@ fn run_sender_thread(
     // stays published throughout the entire TCP session. A reconnecting receiver can
     // still discover the sender while streaming. When run_frame_loop exits (Bye, error,
     // or stop_flag), shutdown() sends the goodbye packet to clean up the mDNS entry.
-    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    run_frame_loop(
+        stream,
+        stop,
+        inbox,
+        event_tx,
+        supervisor_signal_tx,
+        suppress_bye,
+    );
     let _ = mdns.shutdown();
 }
 
@@ -548,6 +600,7 @@ fn run_receiver_thread(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -628,7 +681,14 @@ fn run_receiver_thread(
     // stays published throughout the entire TCP session. The mDNS entry remains active
     // until the TCP session ends, ensuring a reconnecting sender can still be discovered
     // by other receivers. Shutdown sends the goodbye packet to clean up the mDNS entry.
-    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    run_frame_loop(
+        stream,
+        stop,
+        inbox,
+        event_tx,
+        supervisor_signal_tx,
+        suppress_bye,
+    );
     let _ = mdns.shutdown();
 }
 
@@ -643,6 +703,7 @@ fn run_frame_loop(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
     // D6 instrumentation: assign a unique signaling-instance id to this connection
     // so the HW operator can correlate which listener/connection served it (and,
@@ -708,6 +769,19 @@ fn run_frame_loop(
 
     loop {
         if stop.load(Ordering::Acquire) {
+            // D3 stale-Bye fix (design #967): a superseded generation muting its
+            // teardown Bye exits here WITHOUT writing Bye. Acquire pairs with the
+            // Release store in `suppress_outbound_bye`. Genuine shutdown leaves the
+            // flag false and still emits Bye, preserving the receiver's PeerBye
+            // eager-wake fast-path.
+            if suppress_bye.load(Ordering::Acquire) {
+                // D6: the instance id lets the HW operator confirm the suppressed
+                // teardown came from the stale (offer-less) generation.
+                eprintln!(
+                    "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, Bye SUPPRESSED (D3)"
+                );
+                break;
+            }
             // D6: tag the stop-flag Bye with the instance id. Per #962 this is the
             // stale-Bye source during a dual-reconnect — a torn-down OLD generation
             // emitting Bye on a connection the peer may still be using. The instance
