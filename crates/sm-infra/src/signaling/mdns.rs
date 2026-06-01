@@ -1813,4 +1813,147 @@ mod tests {
             "SC-S1-001b: frame_to_event(Bye) with None supervisor must return Some(Closed)"
         );
     }
+
+    // ─── SC-D3-1 / SC-D3-2: suppress_bye gates the stop-flag teardown Bye ──────
+    //
+    // D3 stale-Bye fix (design #967): a superseded sender generation, on
+    // rebuild teardown, must NOT emit the spurious stop-flag Bye on a
+    // connection the receiver may still be using. The Bye is gated by a
+    // per-instance `suppress_bye` flag, set ONLY on the superseded generation.
+    // Genuine shutdown (default `suppress_bye=false`) MUST still emit Bye so the
+    // receiver's PeerBye eager-wake fast-path is preserved.
+    //
+    // Strategy: drive `run_frame_loop` on the server side of a real loopback TCP
+    // pair, let it send Hello, then set the stop flag and observe what the client
+    // side reads next:
+    //   - suppress_bye=true  → no Bye frame; the peer sees EOF (connection closes).
+    //   - suppress_bye=false → a Bye frame arrives before close.
+
+    /// Read the next frame from `stream` with a bounded timeout, mapping a clean
+    /// peer-close (EOF) to `Ok(None)`. Used by the SC-D3 frame-loop tests.
+    #[cfg(test)]
+    fn read_next_frame_or_eof(
+        stream: &mut std::net::TcpStream,
+    ) -> std::io::Result<Option<crate::signaling::wire::SignalingFrame>> {
+        use crate::signaling::wire::read_frame;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("set_read_timeout");
+        match read_frame(stream) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Spawn `run_frame_loop` on the accepted server side of a loopback TCP pair.
+    /// Returns the client stream, the stop flag, and the loop's thread handle.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_frame_loop_over_loopback(
+        suppress_bye: Arc<AtomicBool>,
+    ) -> (
+        std::net::TcpStream,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).expect("connect loopback client");
+        let (server, _peer) = listener.accept().expect("accept loopback server");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let suppress_loop = Arc::clone(&suppress_bye);
+        let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
+        let inbox: Arc<Mutex<Vec<super::MdnsControl>>> = Arc::new(Mutex::new(Vec::new()));
+        let supervisor: Arc<
+            Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
+        > = Arc::new(Mutex::new(None));
+
+        let handle = std::thread::spawn(move || {
+            super::run_frame_loop(
+                server,
+                stop_loop,
+                inbox,
+                event_tx,
+                supervisor,
+                suppress_loop,
+            );
+        });
+
+        (client, stop, handle)
+    }
+
+    /// SC-D3-1 — With `suppress_bye=true`, the frame loop exits on the stop flag
+    /// WITHOUT writing a Bye frame; the peer observes only Hello then EOF.
+    ///
+    /// RED: `run_frame_loop` has no `suppress_bye` parameter and the stop-flag
+    ///      branch unconditionally writes Bye, so the peer reads a Bye frame.
+    /// GREEN (WU-D3a): the Bye write is gated behind `!suppress_bye.load(Acquire)`.
+    #[test]
+    fn sc_d3_1_suppressed_frame_loop_exits_without_bye() {
+        use crate::signaling::wire::SignalingFrame;
+
+        let suppress_bye = Arc::new(AtomicBool::new(true));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        // The loop first sends Hello.
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        // Trigger teardown.
+        stop.store(true, std::sync::atomic::Ordering::Release);
+
+        // With suppression on, the next read must be EOF (clean close), NOT a Bye.
+        let next = read_next_frame_or_eof(&mut client).expect("read after stop");
+        assert!(
+            next.is_none(),
+            "SC-D3-1 FAIL: with suppress_bye=true the loop must close WITHOUT a Bye, \
+             but the peer read {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
+    }
+
+    /// SC-D3-2 — With `suppress_bye=false` (default), the frame loop STILL writes a
+    /// Bye frame on stop. Protects genuine-shutdown and the receiver PeerBye
+    /// eager-wake fast-path.
+    ///
+    /// RED: `run_frame_loop` has no `suppress_bye` parameter (compile failure).
+    /// GREEN (WU-D3a): default path remains Bye-on-stop.
+    #[test]
+    fn sc_d3_2_default_frame_loop_still_writes_bye() {
+        use crate::signaling::wire::SignalingFrame;
+
+        let suppress_bye = Arc::new(AtomicBool::new(false));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+
+        let next = read_next_frame_or_eof(&mut client)
+            .expect("read after stop")
+            .expect("SC-D3-2 FAIL: default path must emit a Bye frame on stop");
+        assert!(
+            matches!(next, SignalingFrame::Bye),
+            "SC-D3-2 FAIL: default (suppress_bye=false) must emit Bye on stop, got {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
+    }
 }
