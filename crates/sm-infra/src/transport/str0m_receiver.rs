@@ -90,6 +90,15 @@ struct ReceiverShared {
     dropped: AtomicU64,
     /// Monotonically increasing sequence counter reset to 0 on `start()`.
     seq: AtomicU64,
+    /// One-shot guard for the first-media `TransportEvent::MediaData` emit
+    /// (media-arrival watchdog, design #971 §D4/O4).
+    ///
+    /// `false` on construction → set `true` by `emit_first_media_once` on the first
+    /// `str0m::Event::MediaData`. Because this lives on `ReceiverShared` (a fresh
+    /// instance per `new()` / per generation), each rebuilt receiver re-arms it
+    /// naturally — it is NOT a process-wide static, so a new generation emits a
+    /// fresh `MediaData` and the watchdog disarms per generation.
+    media_emitted: AtomicBool,
 }
 
 impl ReceiverShared {
@@ -98,7 +107,29 @@ impl ReceiverShared {
             stop: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             seq: AtomicU64::new(0),
+            media_emitted: AtomicBool::new(false),
         })
+    }
+}
+
+/// Emit `TransportEvent::MediaData` exactly ONCE per generation, on the first media.
+///
+/// Media-arrival watchdog signal source (design #971 §D4/O4): the drain arms a
+/// deadline after a rebuild reports success; the FIRST media on the new transport
+/// generation disarms it via this event. Subsequent media on the same generation
+/// is silent (one-shot) so the channel is not flooded — the actual `EncodedPacket`
+/// still flows on the packet channel, unchanged.
+///
+/// The guard uses `compare_exchange` (Acquire/Relaxed) so concurrent first-media
+/// observations still emit exactly once. The `try_send` is best-effort: a full or
+/// closed channel is ignored (the watchdog tolerates a missed disarm by re-arming
+/// — never blocks the tick loop).
+fn emit_first_media_once(media_emitted: &AtomicBool, event_tx: &SyncSender<TransportEvent>) {
+    if media_emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        let _ = event_tx.try_send(TransportEvent::MediaData);
     }
 }
 
@@ -641,6 +672,12 @@ fn handle_receiver_event(
             *mid_slot = Some(added.mid);
         }
         Event::MediaData(media) => {
+            // Media-arrival watchdog (design #971 §D4/O4): signal the FIRST media of
+            // this generation so the post-rebuild watchdog in the drain can disarm.
+            // One-shot per generation (guarded by `state.media_emitted`); subsequent
+            // media is silent. Does NOT affect packet delivery below.
+            emit_first_media_once(&state.media_emitted, event_tx);
+
             // Reconstruct Annex-B from whatever framing str0m used.
             // str0m's H264Depacketizer with is_avc=false outputs Annex-B directly;
             // reconstruct_annex_b detects this and passes through without double-prefix.
