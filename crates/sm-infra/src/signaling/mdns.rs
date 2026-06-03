@@ -159,6 +159,20 @@ pub struct MdnsSignaling {
     /// generation's eventual teardown does not emit a spurious `Bye` on a
     /// connection the receiver may still be using (see `suppress_outbound_bye`).
     suppress_bye: Arc<AtomicBool>,
+    /// When raised, the sender accept loop stops accepting NEW TCP connections
+    /// (listener-handover accept-gate, design #971 §B option iii-a).
+    ///
+    /// Default `false`. Set to `true` ONLY on a generation that is being
+    /// superseded by a fast rebuild, BEFORE the reset hook re-`start()`s it, so the
+    /// re-started gen-G comes up already-superseded and never competes for the
+    /// receiver's reconnect — only the offer-bearing gen-(G+1) accepts. This closes
+    /// the dual-listener RST race (HW gate v4, #970): an offer-less gen-G socket
+    /// must not steal and then RST the receiver's rebuilt connection.
+    ///
+    /// CRITICAL: this flag governs ONLY the pre-accept poll loop. It is NOT
+    /// threaded into `run_frame_loop`, so raising it never closes an
+    /// already-accepted live connection (SC-HO-1b). Sibling seam to `suppress_bye`.
+    superseded: Arc<AtomicBool>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -171,6 +185,7 @@ impl Signaling for MdnsSignaling {
             handle: None,
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
             suppress_bye: Arc::new(AtomicBool::new(false)),
+            superseded: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -188,6 +203,7 @@ impl Signaling for MdnsSignaling {
         let inbox = Arc::clone(&self.inbox);
         let supervisor_signal_tx = Arc::clone(&self.supervisor_signal_tx);
         let suppress_bye = Arc::clone(&self.suppress_bye);
+        let superseded = Arc::clone(&self.superseded);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
@@ -199,6 +215,7 @@ impl Signaling for MdnsSignaling {
                     event_tx,
                     supervisor_signal_tx,
                     suppress_bye,
+                    superseded,
                 );
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
@@ -286,6 +303,35 @@ impl MdnsSignaling {
     /// generation had its teardown Bye muted. Loads with `Acquire`.
     pub fn is_bye_suppressed(&self) -> bool {
         self.suppress_bye.load(Ordering::Acquire)
+    }
+
+    /// Mark this signaling generation as superseded by a fast rebuild
+    /// (listener-handover accept-gate, design #971 §B option iii-a).
+    ///
+    /// Once set, the sender accept loop stops accepting NEW TCP connections so only
+    /// the offer-bearing gen-(G+1) answers the receiver's reconnect — closing the
+    /// dual-listener RST race (#970). Call this in the `InitiateMdnsReset` hook
+    /// right after `suppress_outbound_bye()` and BEFORE the reset's re-`start()`, so
+    /// the re-started gen-G comes up already-superseded. The flag persists across
+    /// the `stop()` + `start()` reuse cycle (it is cloned into the freshly-spawned
+    /// accept thread), so the re-started listener never accepts.
+    ///
+    /// Does NOT close any already-accepted connection — the flag is never threaded
+    /// into `run_frame_loop` (SC-HO-1b). Sibling seam to `suppress_outbound_bye`.
+    ///
+    /// Ordering: stores with `Release` to pair with the accept loop's `Acquire`
+    /// load at the top-of-loop gate.
+    pub fn mark_superseded(&self) {
+        self.superseded.store(true, Ordering::Release);
+    }
+
+    /// Read-only observer for the superseded accept-gate flag (B, design #971).
+    ///
+    /// Diagnostic accessor (sibling to `is_bye_suppressed`): lets the
+    /// sender-coordinator reset-hook test (SC-HO-2) assert that the superseded
+    /// generation had its accept gate raised. Loads with `Acquire`.
+    pub fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::Acquire)
     }
 
     /// Remove any queued `ReconnectRequest` frames from the outbound inbox,
@@ -475,8 +521,11 @@ fn run_signaling_thread(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
+    superseded: Arc<AtomicBool>,
 ) {
     match config.role {
+        // `superseded` gates ONLY the sender accept loop (listener handover, B).
+        // The receiver is a TCP client and never accepts, so it does not need it.
         SignalingRole::Sender => run_sender_thread(
             config,
             stop,
@@ -484,6 +533,7 @@ fn run_signaling_thread(
             event_tx,
             supervisor_signal_tx,
             suppress_bye,
+            superseded,
         ),
         SignalingRole::Receiver => run_receiver_thread(
             config,
@@ -517,6 +567,69 @@ fn bind_tcp_listener_reusable(addr: SocketAddr) -> io::Result<TcpListener> {
 
 // ─── Sender thread ────────────────────────────────────────────────────────────
 
+/// Outcome of the gated accept poll loop.
+///
+/// Distinguishes a real accepted connection from a clean gate-driven exit (stop or
+/// superseded) and from an I/O error, so the caller can run the right cleanup
+/// (mDNS shutdown) on each path.
+enum AcceptOutcome {
+    /// A peer connected and was accepted; carries the stream.
+    Accepted(std::net::TcpStream),
+    /// The loop exited cleanly because `stop` or `superseded` was raised — no
+    /// connection was accepted.
+    Gated,
+    /// `accept()` returned a hard I/O error (already emitted to `event_tx`).
+    Errored,
+}
+
+/// Poll `listener.accept()` non-blocking, gated by `stop` and `superseded`.
+///
+/// Returns:
+/// - [`AcceptOutcome::Accepted`] with the stream + emits `PeerFound`, on a real connect.
+/// - [`AcceptOutcome::Gated`] when `stop` OR `superseded` is raised before a connect —
+///   the superseded gate (design #971 §B) is what makes a re-started, offer-less
+///   gen-G NOT compete for the receiver's reconnect.
+/// - [`AcceptOutcome::Errored`] on a hard `accept()` error (already emitted).
+///
+/// The listener MUST already be in non-blocking mode. Both flags are loaded with
+/// `Acquire` to pair with the `Release` stores in `stop()` / `mark_superseded()`.
+fn accept_one_with_gate(
+    listener: &std::net::TcpListener,
+    stop: &Arc<AtomicBool>,
+    superseded: &Arc<AtomicBool>,
+    event_tx: &SyncSender<SignalingEvent>,
+) -> AcceptOutcome {
+    loop {
+        // Gate at the TOP of the loop, alongside the stop check. A superseded
+        // generation stops accepting NEW connections so only the offer-bearing
+        // gen-(G+1) answers (listener handover, B). It does NOT touch any
+        // already-accepted connection — that lives in `run_frame_loop`.
+        if stop.load(Ordering::Acquire) || superseded.load(Ordering::Acquire) {
+            return AcceptOutcome::Gated;
+        }
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                let _ = emit(
+                    event_tx,
+                    SignalingEvent::PeerFound {
+                        host: addr.ip().to_string(),
+                        port: addr.port(),
+                    },
+                );
+                return AcceptOutcome::Accepted(stream);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                emit_error(event_tx, SignalingError::Io(e.to_string()));
+                return AcceptOutcome::Errored;
+            }
+        }
+    }
+}
+
 fn run_sender_thread(
     config: SignalingConfig,
     stop: Arc<AtomicBool>,
@@ -524,6 +637,7 @@ fn run_sender_thread(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
+    superseded: Arc<AtomicBool>,
 ) {
     let port = config.control_port;
 
@@ -587,32 +701,15 @@ fn run_sender_thread(
         return;
     }
 
-    // Accept one TCP connection (non-blocking with stop-flag polling).
-    let stream = loop {
-        if stop.load(Ordering::Acquire) {
+    // Accept one TCP connection (non-blocking with stop + superseded polling).
+    // The `superseded` accept-gate (listener handover, design #971 §B option iii-a)
+    // makes a re-started, offer-less gen-G stop accepting NEW connections so only
+    // the offer-bearing gen-(G+1) answers the receiver's reconnect.
+    let stream = match accept_one_with_gate(&listener, &stop, &superseded, &event_tx) {
+        AcceptOutcome::Accepted(stream) => stream,
+        AcceptOutcome::Gated | AcceptOutcome::Errored => {
             let _ = mdns.shutdown();
             return;
-        }
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                let _ = emit(
-                    &event_tx,
-                    SignalingEvent::PeerFound {
-                        host: addr.ip().to_string(),
-                        port: addr.port(),
-                    },
-                );
-                break stream;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            Err(e) => {
-                emit_error(&event_tx, SignalingError::Io(e.to_string()));
-                let _ = mdns.shutdown();
-                return;
-            }
         }
     };
 
