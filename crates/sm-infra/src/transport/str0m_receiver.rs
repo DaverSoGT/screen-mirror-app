@@ -1119,4 +1119,55 @@ mod tests {
         );
         receiver.stop().unwrap();
     }
+
+    // ─── WU-D1: first-media one-shot emit (media-arrival watchdog, #971 §D4) ───
+    //
+    // The receiver emits exactly ONE `TransportEvent::MediaData` per generation on
+    // the first `str0m::Event::MediaData`, so the drain's post-rebuild watchdog can
+    // disarm when media genuinely flows. The one-shot guard is a per-generation
+    // `AtomicBool` (on `ReceiverShared`, reset to `false` by each `new()` — NOT a
+    // static), so a fresh generation re-arms naturally.
+
+    use super::emit_first_media_once;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    /// D1.1 — `emit_first_media_once` sends `TransportEvent::MediaData` on the FIRST
+    /// call and is silent on every subsequent call (one-shot per generation). A new
+    /// flag instance (new generation) emits again.
+    ///
+    /// RED: `emit_first_media_once` does not exist yet (compile failure).
+    /// GREEN (WU-D1): compare-and-set guard + `try_send(MediaData)` on first media.
+    #[test]
+    fn sc_wd_media_data_emitted_on_first_event_media() {
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(4);
+        let media_emitted = AtomicBool::new(false);
+
+        // First media → exactly one MediaData event.
+        emit_first_media_once(&media_emitted, &event_tx);
+        let first = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            matches!(first, Ok(TransportEvent::MediaData)),
+            "first media must emit exactly one TransportEvent::MediaData, got {first:?}"
+        );
+
+        // Second (and third) media on the SAME generation → no further emit.
+        emit_first_media_once(&media_emitted, &event_tx);
+        emit_first_media_once(&media_emitted, &event_tx);
+        let none = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            none.is_err(),
+            "subsequent media on the same generation must NOT re-emit MediaData, got {none:?}"
+        );
+
+        // A NEW generation (fresh flag) re-arms and emits again — proves the guard
+        // lives per-generation, not as a process-wide static.
+        let media_emitted_gen2 = AtomicBool::new(false);
+        emit_first_media_once(&media_emitted_gen2, &event_tx);
+        let gen2 = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            matches!(gen2, Ok(TransportEvent::MediaData)),
+            "a fresh generation must re-emit MediaData on its first media, got {gen2:?}"
+        );
+    }
 }
