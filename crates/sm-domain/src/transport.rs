@@ -99,6 +99,17 @@ pub enum TransportEvent {
         /// Cumulative dropped count at time of emission.
         count: u64,
     },
+    /// First media frame observed on the current transport generation.
+    ///
+    /// Emitted ONCE per generation by the receiver adapter on the first
+    /// `str0m::Event::MediaData` (`str0m_receiver.rs`). It is the disarm signal
+    /// for the post-rebuild media-arrival watchdog (design #971 §D4/O4): after a
+    /// rebuild reports success the drain arms a deadline; this event proves media
+    /// actually flowed and disarms the watchdog. If it never arrives, the watchdog
+    /// re-injects `IceFailed` to arm a fresh supervisor cycle. Purely a control
+    /// signal — it carries no payload (the actual `EncodedPacket` still flows on
+    /// the packet channel, unchanged).
+    MediaData,
 }
 
 /// Errors produced by transport operations.
