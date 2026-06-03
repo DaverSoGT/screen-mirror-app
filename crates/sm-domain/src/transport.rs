@@ -600,6 +600,24 @@ mod tests {
         assert_send_sync::<TransportEvent>();
     }
 
+    // ─── WU-D0: TransportEvent::MediaData variant (media-arrival watchdog) ─────
+
+    /// D0.1 RED — `TransportEvent::MediaData` is constructible and `matches!`.
+    ///
+    /// The media-arrival watchdog (design #971 §D4/O4) needs a first-media signal
+    /// on the transport event channel: the receiver emits ONE `MediaData` per
+    /// generation on the first `str0m::Event::MediaData`, and the drain's watchdog
+    /// disarms on it. This is the foundation variant — its absence is the RED
+    /// (compile failure), since the enum has no `MediaData` arm yet.
+    #[test]
+    fn sc_wd_0_media_data_variant_exists() {
+        let ev = TransportEvent::MediaData;
+        assert!(
+            matches!(ev, TransportEvent::MediaData),
+            "TransportEvent::MediaData must be constructible and matchable"
+        );
+    }
+
     // ─── S4.3: TransportError Display contains keyword ────────────────────────
 
     #[test]
