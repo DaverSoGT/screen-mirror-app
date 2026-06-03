@@ -2140,4 +2140,160 @@ mod tests {
             "SC-D3-4 FAIL: non-ReconnectRequest frames must be preserved; inbox has {kinds:?}"
         );
     }
+
+    // ─── SC-HO-1 / SC-HO-1b: superseded accept-gate (listener handover, B) ────
+    //
+    // Listener handover (design #971 §B, option iii-a): on the dual-reconnect /
+    // severance path the reset hook re-`start()`s gen-G, which re-binds :7889 and
+    // accepts AGAIN — but gen-G has no Offer (its inbox was drained, D3c). The
+    // receiver's rebuilt connection can then land on the offer-less gen-G socket
+    // and RST (HW gate v4, #970). The fix: a per-instance `superseded` accept-gate
+    // that, once raised, stops gen-G from accepting NEW connections so only the
+    // offer-bearing gen-(G+1) answers. CRITICAL: the flag must NOT close an
+    // already-accepted live connection — it gates ONLY the pre-accept loop, never
+    // `run_frame_loop`.
+
+    /// Spawn just the accept-gate poll loop (`accept_one_with_gate`) over a
+    /// loopback `TcpListener`. Returns the bound port, the stop + superseded flags,
+    /// the event receiver, and the loop's join handle. This exercises the accept
+    /// gate in isolation WITHOUT mDNS registration (no multicast needed).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_accept_gate_over_loopback(
+        superseded: Arc<AtomicBool>,
+    ) -> (
+        u16,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        std::sync::mpsc::Receiver<SignalingEvent>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback accept-gate listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking on accept-gate listener");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let superseded_loop = Arc::clone(&superseded);
+        let (event_tx, event_rx) = sync_channel::<SignalingEvent>(16);
+
+        let handle = std::thread::spawn(move || {
+            // The gate returns Some(stream) on accept, None on stop/superseded exit.
+            let _ = super::accept_one_with_gate(&listener, &stop_loop, &superseded_loop, &event_tx);
+        });
+
+        (port, stop, superseded, event_rx, handle)
+    }
+
+    /// SC-HO-1 — With `superseded=false` the accept gate accepts a new TCP
+    /// connection and emits `PeerFound`; with `superseded=true` it does NOT accept
+    /// (no `PeerFound` within 200 ms) and exits cleanly on stop.
+    ///
+    /// RED: `accept_one_with_gate` does not exist yet (compile failure).
+    /// GREEN (WU-B1): the gate checks `superseded` at the TOP of the poll loop,
+    ///      alongside `stop`, and returns without accepting when raised.
+    #[test]
+    fn sc_ho_1_superseded_flag_stops_accept() {
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        // ── Case A: not superseded → connection IS accepted (PeerFound). ──
+        let superseded_off = Arc::new(AtomicBool::new(false));
+        let (port, stop, _sup, event_rx, handle) = spawn_accept_gate_over_loopback(superseded_off);
+
+        let _client = TcpStream::connect(("127.0.0.1", port)).expect("connect to accept gate");
+        let ev = event_rx.recv_timeout(Duration::from_millis(500));
+        assert!(
+            matches!(ev, Ok(SignalingEvent::PeerFound { .. })),
+            "SC-HO-1 FAIL: with superseded=false the gate MUST accept and emit PeerFound, got {ev:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        handle.join().expect("accept-gate thread (case A) must join");
+
+        // ── Case B: superseded → connection is NOT accepted (no PeerFound). ──
+        let superseded_on = Arc::new(AtomicBool::new(true));
+        let (port_b, stop_b, _sup_b, event_rx_b, handle_b) =
+            spawn_accept_gate_over_loopback(superseded_on);
+
+        // The kernel SYN backlog still completes the TCP handshake, but the gate
+        // must NOT call accept() → no PeerFound is emitted.
+        let _client_b = TcpStream::connect(("127.0.0.1", port_b));
+        let ev_b = event_rx_b.recv_timeout(Duration::from_millis(200));
+        assert!(
+            ev_b.is_err(),
+            "SC-HO-1 FAIL: with superseded=true the gate MUST NOT accept (no PeerFound), got {ev_b:?}"
+        );
+        stop_b.store(true, std::sync::atomic::Ordering::Release);
+        handle_b.join().expect("accept-gate thread (case B) must join");
+    }
+
+    /// SC-HO-1b — Raising `superseded` does NOT close an already-accepted
+    /// connection: the live `run_frame_loop` is structurally independent of the
+    /// accept gate (the flag is NOT threaded into `run_frame_loop`). With
+    /// `suppress_bye=false`, the live frame loop STILL emits its Bye only on the
+    /// stop flag — proving `superseded` neither tears down the connection nor
+    /// suppresses its Bye.
+    ///
+    /// RED: shares the SC-HO-1 compile failure (`accept_one_with_gate` missing);
+    ///      this test compiles only once the gate exists and the frame loop is
+    ///      left untouched by the gate.
+    /// GREEN (WU-B1): `superseded` governs ONLY the pre-accept loop.
+    #[test]
+    fn sc_ho_1b_superseded_does_not_kill_existing_frame_loop() {
+        use crate::signaling::wire::SignalingFrame;
+
+        // suppress_bye=false so a genuine stop still emits Bye; superseded must
+        // have NO bearing on the already-accepted frame loop.
+        let suppress_bye = Arc::new(AtomicBool::new(false));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        // The frame loop first sends Hello on the already-accepted connection.
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive on the live connection");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        // Raise a SEPARATE superseded flag. Because `run_frame_loop` does NOT take
+        // `superseded`, this must NOT close the connection nor inject a Bye. The
+        // live frame loop keeps running; the connection stays open.
+        let superseded = Arc::new(AtomicBool::new(true));
+        superseded.store(true, std::sync::atomic::Ordering::Release);
+
+        // The connection must STILL be alive: no spurious Bye, no EOF yet. A short
+        // read must time out (WouldBlock) rather than return a frame or EOF.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 1];
+        let read_res = std::io::Read::read(&mut client, &mut buf);
+        match read_res {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            other => panic!(
+                "SC-HO-1b FAIL: raising superseded must NOT disturb the live frame loop \
+                 (expected the connection to stay open with no Bye/EOF), got {other:?}"
+            ),
+        }
+
+        // Now a genuine stop with suppress_bye=false MUST still emit a Bye —
+        // proving the live connection was untouched by superseded.
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let next = read_next_frame_or_eof(&mut client)
+            .expect("read after stop")
+            .expect("SC-HO-1b FAIL: default path must still emit a Bye on stop");
+        assert!(
+            matches!(next, SignalingFrame::Bye),
+            "SC-HO-1b FAIL: live frame loop must emit Bye on stop (superseded irrelevant), got {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
+    }
 }
