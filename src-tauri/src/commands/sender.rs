@@ -1899,6 +1899,17 @@ fn build_production_sender_bundle(
             // shutdown never sets this flag → its Bye (receiver PeerBye eager-wake
             // fast-path) is preserved.
             sig.suppress_outbound_bye();
+            // Listener handover (design #971 §B option iii-a): raise the accept-gate
+            // on this gen-G instance BEFORE stop()+re-start(). The flag persists
+            // across the reuse cycle, so the re-started gen-G comes up
+            // already-superseded — its accept loop never accepts a NEW connection.
+            // Only the offer-bearing gen-(G+1) answers the receiver's reconnect,
+            // closing the dual-listener RST race (HW gate v4, #970). This does NOT
+            // close the already-accepted connection (the flag is not threaded into
+            // run_frame_loop). SC-T22-safe: this hook only fires when the sender's
+            // OWN supervisor runs reset+rebuild, which never happens on the cold
+            // single-side SC-T22 path (supervisor_signal_tx = None).
+            sig.mark_superseded();
             if let Err(e) = sig.stop() {
                 eprintln!("[sm-sender-coord] MdnsSignaling::stop() failed: {e}");
             }
