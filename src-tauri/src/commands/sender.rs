@@ -3176,4 +3176,106 @@ mod tests {
              reset path's own teardown and the later rebuild Drop-teardown are both muted."
         );
     }
+
+    // ─── SC-HO-2: InitiateMdnsReset raises the superseded accept-gate (B, #971) ──
+    //
+    // Listener handover (design #971 §B option iii-a): the sender's reset hook
+    // re-`start()`s gen-G, which re-binds :7889 and would accept AGAIN as an
+    // offer-less listener, stealing+RSTing the receiver's rebuilt connection
+    // (HW gate v4, #970). The fix raises the per-instance `superseded` accept-gate
+    // in the hook BEFORE re-`start()`, alongside the existing `suppress_outbound_bye`,
+    // so the re-started gen-G comes up already-superseded and only gen-(G+1) accepts.
+
+    /// SC-HO-2a — Behavioral: `mark_superseded()` raises an observable flag on a real
+    /// `MdnsSignaling` that PERSISTS across the hook's `stop()` + `start()` reuse
+    /// cycle, so the re-started gen-G accept loop never accepts. Also confirms that
+    /// the reset-hook order raises BOTH flags (`suppress_bye` AND `superseded`).
+    ///
+    /// RED (before WU-B2 GREEN): `mark_superseded`/`is_superseded` are present (from
+    /// WU-B1), so this test compiles; it pins the persistence + both-flags contract
+    /// that the production hook (WU-B2) must satisfy.
+    #[test]
+    fn sc_ho_2a_superseded_persists_across_reset_stop_start() {
+        use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+        use sm_infra::signaling::mdns::MdnsSignaling;
+        use std::sync::mpsc::sync_channel;
+
+        // gen-G instance: receiver role avoids binding the sender control port and
+        // keeps the test free of network side effects.
+        let cfg = SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        };
+        let mut sig = MdnsSignaling::new(cfg).expect("new gen-G signaling");
+        assert!(
+            !sig.is_superseded(),
+            "fresh instance must default to NOT superseded"
+        );
+
+        // Production reset-hook order: suppress Bye THEN mark superseded, BEFORE
+        // stop()+start().
+        sig.suppress_outbound_bye();
+        sig.mark_superseded();
+        assert!(
+            sig.is_bye_suppressed() && sig.is_superseded(),
+            "SC-HO-2a FAIL: reset hook must raise BOTH suppress_bye AND superseded"
+        );
+
+        let _ = sig.stop();
+        let (tx, _rx) = sync_channel::<SignalingEvent>(4);
+        let _ = sig.start(tx);
+
+        assert!(
+            sig.is_superseded(),
+            "SC-HO-2a FAIL: superseded MUST persist across stop()+start() so the \
+             re-started gen-G accept loop comes up already-superseded (B, #971)"
+        );
+
+        let _ = sig.stop();
+    }
+
+    /// SC-HO-2b — Structural: the production `initiate_mdns_reset` hook MUST call
+    /// `mark_superseded()` on the gen-G `sig` AFTER `suppress_outbound_bye()` and
+    /// BEFORE `sig.stop()`.
+    ///
+    /// RED (before WU-B2 GREEN): the hook body has no `mark_superseded()` call.
+    /// GREEN (WU-B2): the call appears after suppress and before stop.
+    #[test]
+    fn sc_ho_2b_production_reset_hook_marks_superseded_before_stop() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path =
+            std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
+            .replace("\r\n", "\n");
+
+        let hook_start = source
+            .find("initiate_mdns_reset: Arc::new(move || {")
+            .expect("production initiate_mdns_reset hook must exist");
+        let hook_rel_end = source[hook_start..]
+            .find("\n        }),\n    };")
+            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+        let hook_region = &source[hook_start..hook_start + hook_rel_end];
+
+        let suppress_pos = hook_region
+            .find("suppress_outbound_bye()")
+            .expect("hook must call suppress_outbound_bye()");
+        let superseded_pos = hook_region.find("mark_superseded()").expect(
+            "SC-HO-2b FAIL: the production initiate_mdns_reset hook must call \
+             `mark_superseded()` on the gen-G instance (B, #971). \
+             Fix (WU-B2): add `sig.mark_superseded();` after `suppress_outbound_bye()` \
+             and before `sig.stop()`.",
+        );
+        let stop_pos = hook_region
+            .find("sig.stop()")
+            .expect("hook must call sig.stop()");
+
+        assert!(
+            suppress_pos < superseded_pos && superseded_pos < stop_pos,
+            "SC-HO-2b FAIL: `mark_superseded()` (offset {superseded_pos}) must appear AFTER \
+             `suppress_outbound_bye()` (offset {suppress_pos}) and BEFORE `sig.stop()` \
+             (offset {stop_pos}), so the re-started gen-G comes up already-superseded."
+        );
+    }
 }
