@@ -1250,8 +1250,8 @@ fn enter_stream_supervisor_mode(
                         if let Some(n) = media_watchdog_timeout {
                             watchdog_deadline = Some(std::time::Instant::now() + n);
                             eprintln!(
-                                "[sm-stream-media-watchdog] armed — expecting first media within \
-                                 {n:?} (no media → IceFailed re-arm)"
+                                "[sm-stream-media-watchdog n={session_nonce}] armed — expecting \
+                                 first media within {n:?} (no media → IceFailed re-arm)"
                             );
                         }
                     }
@@ -1280,8 +1280,8 @@ fn enter_stream_supervisor_mode(
             if std::time::Instant::now() >= deadline {
                 watchdog_deadline = None;
                 eprintln!(
-                    "[sm-stream-media-watchdog] fired — NO media within deadline; injecting \
-                     IceFailed to arm a fresh supervisor cycle"
+                    "[sm-stream-media-watchdog n={session_nonce}] fired — NO media within \
+                     deadline; injecting IceFailed to arm a fresh supervisor cycle"
                 );
                 let _ = signal_tx.try_send(SupervisorSignal::LocalFailure {
                     trigger: ReconnectTrigger::IceFailed,
@@ -1315,8 +1315,8 @@ fn enter_stream_supervisor_mode(
                 // First media on the new generation — disarm the watchdog.
                 if watchdog_deadline.take().is_some() {
                     eprintln!(
-                        "[sm-stream-media-watchdog] disarmed — first media arrived on the new \
-                         generation"
+                        "[sm-stream-media-watchdog n={session_nonce}] disarmed — first media \
+                         arrived on the new generation"
                     );
                 }
             }
