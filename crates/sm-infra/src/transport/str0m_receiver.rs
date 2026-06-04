@@ -90,6 +90,15 @@ struct ReceiverShared {
     dropped: AtomicU64,
     /// Monotonically increasing sequence counter reset to 0 on `start()`.
     seq: AtomicU64,
+    /// One-shot guard for the first-media `TransportEvent::MediaData` emit
+    /// (media-arrival watchdog, design #971 §D4/O4).
+    ///
+    /// `false` on construction → set `true` by `emit_first_media_once` on the first
+    /// `str0m::Event::MediaData`. Because this lives on `ReceiverShared` (a fresh
+    /// instance per `new()` / per generation), each rebuilt receiver re-arms it
+    /// naturally — it is NOT a process-wide static, so a new generation emits a
+    /// fresh `MediaData` and the watchdog disarms per generation.
+    media_emitted: AtomicBool,
 }
 
 impl ReceiverShared {
@@ -98,7 +107,29 @@ impl ReceiverShared {
             stop: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
             seq: AtomicU64::new(0),
+            media_emitted: AtomicBool::new(false),
         })
+    }
+}
+
+/// Emit `TransportEvent::MediaData` exactly ONCE per generation, on the first media.
+///
+/// Media-arrival watchdog signal source (design #971 §D4/O4): the drain arms a
+/// deadline after a rebuild reports success; the FIRST media on the new transport
+/// generation disarms it via this event. Subsequent media on the same generation
+/// is silent (one-shot) so the channel is not flooded — the actual `EncodedPacket`
+/// still flows on the packet channel, unchanged.
+///
+/// The guard uses `compare_exchange` (Acquire/Relaxed) so concurrent first-media
+/// observations still emit exactly once. The `try_send` is best-effort: a full or
+/// closed channel is ignored (the watchdog tolerates a missed disarm by re-arming
+/// — never blocks the tick loop).
+fn emit_first_media_once(media_emitted: &AtomicBool, event_tx: &SyncSender<TransportEvent>) {
+    if media_emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        let _ = event_tx.try_send(TransportEvent::MediaData);
     }
 }
 
@@ -470,6 +501,12 @@ fn run_receiver_loop(
 ) {
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
+    // Instrumentation (HW gate): once-per-generation flag + start instant so the
+    // FIRST inbound datagram is logged exactly once with elapsed time. This
+    // distinguishes a dead socket (no datagram ever) from an ICE-level failure
+    // (datagrams arrive but no working pair).
+    let mut first_datagram_logged = false;
+    let loop_start = Instant::now();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -548,6 +585,17 @@ fn run_receiver_loop(
 
         match udp.recv_from(&mut buf) {
             Ok((n, source)) => {
+                // Instrumentation (HW gate, log #5): log the FIRST inbound
+                // datagram (typically a STUN binding request) with elapsed time.
+                // Proves whether ANY packet reaches the rebuilt socket → dead
+                // socket vs ICE-level failure.
+                if !first_datagram_logged {
+                    first_datagram_logged = true;
+                    eprintln!(
+                        "[sm-receiver-tick] first datagram in from {source} at +{}ms (n={n})",
+                        loop_start.elapsed().as_millis()
+                    );
+                }
                 let bytes: &[u8] = &buf[..n];
                 let now = Instant::now();
                 if let Ok(dgram) = bytes.try_into() {
@@ -601,18 +649,38 @@ fn handle_receiver_event(
         // and gathering is done. With a single candidate pair (loopback tests, most
         // prod scenarios), the state jumps directly to `Completed`, skipping `Connected`.
         // We map both to `TransportEvent::IceConnected`.
-        Event::IceConnectionStateChange(IceConnectionState::Connected)
-        | Event::IceConnectionStateChange(IceConnectionState::Completed) => {
-            let _ = event_tx.try_send(TransportEvent::IceConnected);
-        }
-        Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-            let _ = event_tx.try_send(TransportEvent::IceFailed);
+        Event::IceConnectionStateChange(state) => {
+            // Instrumentation (HW gate, log #6): log EVERY ICE state transition
+            // (incl. Checking/Disconnected/New), not just Connected — shows if
+            // ICE stalls in `Checking` on the rebuilt Rtc.
+            eprintln!("[sm-receiver] ICE state -> {state:?}");
+            match state {
+                IceConnectionState::Connected | IceConnectionState::Completed => {
+                    let _ = event_tx.try_send(TransportEvent::IceConnected);
+                }
+                IceConnectionState::Disconnected => {
+                    let _ = event_tx.try_send(TransportEvent::IceFailed);
+                }
+                _ => {}
+            }
         }
         Event::MediaAdded(added) => {
+            // Instrumentation (HW gate, log #4 — HIGHEST VALUE): proves whether
+            // MediaAdded ever fires on the rebuilt Rtc post-reconnect.
+            eprintln!(
+                "[sm-receiver] MediaAdded mid={:?} on rebuilt Rtc",
+                added.mid
+            );
             // Capture the mid so we can send PLI later.
             *mid_slot = Some(added.mid);
         }
         Event::MediaData(media) => {
+            // Media-arrival watchdog (design #971 §D4/O4): signal the FIRST media of
+            // this generation so the post-rebuild watchdog in the drain can disarm.
+            // One-shot per generation (guarded by `state.media_emitted`); subsequent
+            // media is silent. Does NOT affect packet delivery below.
+            emit_first_media_once(&state.media_emitted, event_tx);
+
             // Reconstruct Annex-B from whatever framing str0m used.
             // str0m's H264Depacketizer with is_avc=false outputs Annex-B directly;
             // reconstruct_annex_b detects this and passes through without double-prefix.
@@ -1090,5 +1158,56 @@ mod tests {
             "start_with_socket must return Ok(()) for a fresh prebound socket, got: {result:?}"
         );
         receiver.stop().unwrap();
+    }
+
+    // ─── WU-D1: first-media one-shot emit (media-arrival watchdog, #971 §D4) ───
+    //
+    // The receiver emits exactly ONE `TransportEvent::MediaData` per generation on
+    // the first `str0m::Event::MediaData`, so the drain's post-rebuild watchdog can
+    // disarm when media genuinely flows. The one-shot guard is a per-generation
+    // `AtomicBool` (on `ReceiverShared`, reset to `false` by each `new()` — NOT a
+    // static), so a fresh generation re-arms naturally.
+
+    use super::emit_first_media_once;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    /// D1.1 — `emit_first_media_once` sends `TransportEvent::MediaData` on the FIRST
+    /// call and is silent on every subsequent call (one-shot per generation). A new
+    /// flag instance (new generation) emits again.
+    ///
+    /// RED: `emit_first_media_once` does not exist yet (compile failure).
+    /// GREEN (WU-D1): compare-and-set guard + `try_send(MediaData)` on first media.
+    #[test]
+    fn sc_wd_media_data_emitted_on_first_event_media() {
+        let (event_tx, event_rx) = sync_channel::<TransportEvent>(4);
+        let media_emitted = AtomicBool::new(false);
+
+        // First media → exactly one MediaData event.
+        emit_first_media_once(&media_emitted, &event_tx);
+        let first = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            matches!(first, Ok(TransportEvent::MediaData)),
+            "first media must emit exactly one TransportEvent::MediaData, got {first:?}"
+        );
+
+        // Second (and third) media on the SAME generation → no further emit.
+        emit_first_media_once(&media_emitted, &event_tx);
+        emit_first_media_once(&media_emitted, &event_tx);
+        let none = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            none.is_err(),
+            "subsequent media on the same generation must NOT re-emit MediaData, got {none:?}"
+        );
+
+        // A NEW generation (fresh flag) re-arms and emits again — proves the guard
+        // lives per-generation, not as a process-wide static.
+        let media_emitted_gen2 = AtomicBool::new(false);
+        emit_first_media_once(&media_emitted_gen2, &event_tx);
+        let gen2 = event_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            matches!(gen2, Ok(TransportEvent::MediaData)),
+            "a fresh generation must re-emit MediaData on its first media, got {gen2:?}"
+        );
     }
 }

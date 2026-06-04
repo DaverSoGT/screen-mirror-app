@@ -475,6 +475,10 @@ fn run_sender_loop(
     // or when SetIceReadyForTest is processed in test builds.
     // Monotonic within one generation: never reset to false.
     let mut ice_ready = false;
+    // Instrumentation (HW gate): once-per-generation flag so the first RTP
+    // Transmit destination is logged exactly once. Reveals whether THIS
+    // generation targets a usable receiver media addr:port.
+    let mut first_transmit_logged = false;
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -606,6 +610,16 @@ fn run_sender_loop(
             match rtc.poll_output() {
                 Ok(Output::Timeout(t)) => break t,
                 Ok(Output::Transmit(t)) => {
+                    // Instrumentation (HW gate, log #1): log the FIRST send_to
+                    // destination per generation — shows whether the sender is
+                    // targeting a valid/new receiver media addr:port.
+                    if !first_transmit_logged {
+                        first_transmit_logged = true;
+                        eprintln!(
+                            "[sm-sender-tick] first Transmit dest={} local={local_addr}",
+                            t.destination
+                        );
+                    }
                     let _ = udp.send_to(&t.contents, t.destination);
                 }
                 Ok(Output::Event(ev)) => {
@@ -624,6 +638,15 @@ fn run_sender_loop(
                     // competing with the supervisor; the supervisor owns rebuild via
                     // IceFailed → ReconnectSupervisor (per auto-rebuild-from-drain).
                     if is_ice_ready_event(&ev) {
+                        // Instrumentation (HW gate, log #2): on the ICE-ready
+                        // transition, log the local addr + the state event so the
+                        // gate can correlate the nominated pair with the Transmit
+                        // destination. Logged once (ice_ready is monotonic).
+                        if !ice_ready {
+                            eprintln!(
+                                "[sm-sender-tick] IceConnected local={local_addr} event={ev:?}"
+                            );
+                        }
                         ice_ready = true;
                     }
                     handle_sender_event(ev, &state, &encoder, &event_tx);

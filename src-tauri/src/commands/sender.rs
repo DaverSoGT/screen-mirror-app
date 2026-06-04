@@ -947,7 +947,15 @@ fn enter_supervisor_mode(
     let sup_join = std::thread::Builder::new()
         .name("sm-sender-supervisor".into())
         .spawn(move || {
-            let mut sup = ReconnectSupervisor::new(policy, session_nonce, signal_rx, outcome_tx);
+            // Role-aware tie-break (design #963 D1): the sender is the WebRTC
+            // offerer, so it is always the active reconnector in a simultaneous race.
+            let mut sup = ReconnectSupervisor::new(
+                policy,
+                session_nonce,
+                sm_domain::signaling::SignalingRole::Sender,
+                signal_rx,
+                outcome_tx,
+            );
             sup.run(ack_timeout, rebuild_timeout)
         })
         .expect("supervisor thread spawn must not fail");
@@ -1639,7 +1647,10 @@ fn build_production_sender_bundle(
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
-    use sm_infra::transport::{Str0mVideoSender, publish_host_candidate};
+    use sm_infra::transport::{
+        CANDIDATE_RETRY_ATTEMPTS, Str0mVideoSender, publish_host_candidate,
+        resolve_candidate_with_retry,
+    };
     use std::sync::mpsc::sync_channel;
 
     const CHANNEL_CAP: usize = 4;
@@ -1735,12 +1746,36 @@ fn build_production_sender_bundle(
 
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
     // Offer → Candidate in FIFO order (design §3.1 revised ordering).
-    if let Some(addr) = sender.candidate_addr() {
-        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
-            eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
-        });
-    } else {
-        eprintln!("[sm-sender-bundle] no non-loopback NIC; skipping candidate publish");
+    //
+    // The probe is NOT one-shot: on a real reconnect the supervisor fires
+    // InitiateMdnsReset then immediately InitiateRebuild, and the mDNS reset
+    // transiently drops the NIC ("no IPv4 network interfaces found"). A single
+    // `candidate_addr()` call during that window would skip the publish for the
+    // ENTIRE WebRTC generation, leaving str0m with no local candidate to
+    // nominate → media never flows → WSAECONNRESET → IceFailed → rebuild loop.
+    // `resolve_candidate_with_retry` polls across the NIC-down window (15×100ms
+    // ≈ 1.5s, comfortably under the 15s rebuild_timeout) so the publish recovers
+    // once the interface returns.
+    match resolve_candidate_with_retry(
+        || sender.candidate_addr(),
+        CANDIDATE_RETRY_ATTEMPTS,
+        std::thread::sleep,
+    ) {
+        Some(addr) => {
+            // WU-3 log #3: positive branch — proves THIS generation published.
+            eprintln!("[sm-sender-bundle] published host candidate addr={addr}");
+            publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
+                eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
+            });
+        }
+        None => {
+            // Budget exhausted: NIC never returned in the retry window. LOUD log
+            // so the HW gate shows this generation published NO candidate.
+            eprintln!(
+                "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
+                 skipping candidate publish — this WebRTC generation will have NO local host candidate"
+            );
+        }
     }
 
     // ── 4. Wrap in Arc<Mutex<>> for drain thread sharing ──────────────────────
@@ -1854,8 +1889,40 @@ fn build_production_sender_bundle(
                 "[sm-sender-coord] InitiateMdnsReset — calling MdnsSignaling::stop() + re-engaging discovery"
             );
             let mut sig = sig_for_reset.lock().unwrap();
+            // D3 stale-Bye fix (design #967): InitiateMdnsReset always precedes an
+            // InitiateRebuild that supersedes THIS generation. Mute this gen-G
+            // instance's teardown Bye BEFORE stop() so neither the reset's own
+            // stop() nor the later rebuild Drop-teardown emits a spurious Bye on a
+            // connection the receiver may still be using. The flag persists across
+            // the stop()+start() reuse cycle (it is not reset by start()), so the
+            // eventual Drop in make_sender_rebuild_hook stays muted too. Genuine
+            // shutdown never sets this flag → its Bye (receiver PeerBye eager-wake
+            // fast-path) is preserved.
+            sig.suppress_outbound_bye();
+            // Listener handover (design #971 §B option iii-a): raise the accept-gate
+            // on this gen-G instance BEFORE stop()+re-start(). The flag persists
+            // across the reuse cycle, so the re-started gen-G comes up
+            // already-superseded — its accept loop never accepts a NEW connection.
+            // Only the offer-bearing gen-(G+1) answers the receiver's reconnect,
+            // closing the dual-listener RST race (HW gate v4, #970). This does NOT
+            // close the already-accepted connection (the flag is not threaded into
+            // run_frame_loop). SC-T22-safe: this hook only fires when the sender's
+            // OWN supervisor runs reset+rebuild, which never happens on the cold
+            // single-side SC-T22 path (supervisor_signal_tx = None).
+            sig.mark_superseded();
             if let Err(e) = sig.stop() {
                 eprintln!("[sm-sender-coord] MdnsSignaling::stop() failed: {e}");
+            }
+            // D3c (design #967 §3): stop() has joined the old frame-loop thread, so
+            // the inbox is now quiescent. Drop any stale ReconnectRequest queued for
+            // the OLD connection BEFORE start() re-engages, so the reused gen-G does
+            // NOT re-flush it onto the new connection and keep competing as an
+            // offer-less listener. Targeted: other queued frames are preserved.
+            let drained = sig.drain_stale_reconnect_requests();
+            if drained > 0 {
+                eprintln!(
+                    "[sm-sender-coord] InitiateMdnsReset — dropped {drained} stale ReconnectRequest(s) before re-start (D3c)"
+                );
             }
             // Re-start with a fresh event channel. The supervisor will route incoming
             // frames via the existing supervisor_signal_tx (already set on the signaling
@@ -2078,7 +2145,13 @@ mod tests {
         let sup_handle = std::thread::Builder::new()
             .name("sc-s1-001-supervisor".into())
             .spawn(move || {
-                let mut sup = ReconnectSupervisor::new(fast_policy, 42, sup_rx, outcome_tx);
+                let mut sup = ReconnectSupervisor::new(
+                    fast_policy,
+                    42,
+                    sm_domain::signaling::SignalingRole::Sender,
+                    sup_rx,
+                    outcome_tx,
+                );
                 sup.run(Duration::from_millis(50), Duration::from_millis(50))
             })
             .expect("spawn supervisor");
@@ -2146,7 +2219,13 @@ mod tests {
         let sup_handle = std::thread::Builder::new()
             .name("sc-s1-002-supervisor".into())
             .spawn(move || {
-                let mut sup = ReconnectSupervisor::new(fast_policy, 99, sup_rx, outcome_tx);
+                let mut sup = ReconnectSupervisor::new(
+                    fast_policy,
+                    99,
+                    sm_domain::signaling::SignalingRole::Sender,
+                    sup_rx,
+                    outcome_tx,
+                );
                 sup.run(Duration::from_millis(50), Duration::from_millis(50))
             })
             .expect("spawn supervisor");
@@ -2751,8 +2830,11 @@ mod tests {
         {
             let guard = sup_tx_for_test.lock().unwrap();
             if let Some(ref tx) = *guard {
+                // Role-equal (both Sender) so the legacy nonce fallback decides:
+                // peer_nonce=0 < my_nonce ⇒ sender defers (the loser path).
                 let _ = tx.try_send(SupervisorSignal::PeerRequest {
                     peer_nonce: 0, // sender always loses when my_nonce > 0
+                    peer_role: sm_domain::signaling::SignalingRole::Sender,
                     attempt: 1,
                 });
             }
@@ -3001,6 +3083,208 @@ mod tests {
         assert_ne!(
             encoder_config.height, 0,
             "non-zero height must not be replaced with sentinel"
+        );
+    }
+
+    // ─── SC-D3-3: InitiateMdnsReset suppresses the gen-G teardown Bye (D3 #967) ──
+    //
+    // The sender's InitiateMdnsReset hook reuses the SAME gen-G MdnsSignaling
+    // instance (sig_for_reset) and the supervisor immediately follows with
+    // InitiateRebuild that supersedes this generation. The hook MUST call
+    // `suppress_outbound_bye()` on the gen-G instance so the superseded
+    // generation's eventual teardown (Drop → stop()) does NOT emit a spurious Bye
+    // on a connection the receiver may still be using.
+
+    /// SC-D3-3a — Behavioral: `suppress_outbound_bye()` raises an observable flag on
+    /// a real `MdnsSignaling` that PERSISTS across the hook's `stop()` + `start()`
+    /// reuse cycle, so the later Drop-teardown stays muted.
+    ///
+    /// RED would fail to compile before WU-D3a added the API; with D3a present this
+    /// proves the API the production hook depends on behaves correctly across reuse.
+    #[test]
+    fn sc_d3_3a_suppress_persists_across_reset_stop_start() {
+        use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+        use sm_infra::signaling::mdns::MdnsSignaling;
+        use std::sync::mpsc::sync_channel;
+
+        // gen-G instance: receiver role avoids binding the sender control port and
+        // keeps the test free of network side effects (new()/start() touch no peer).
+        let cfg = SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        };
+        let mut sig = MdnsSignaling::new(cfg).expect("new gen-G signaling");
+        assert!(
+            !sig.is_bye_suppressed(),
+            "fresh instance must default to Bye NOT suppressed"
+        );
+
+        // Production reset-hook order: suppress BEFORE stop()+start().
+        sig.suppress_outbound_bye();
+        assert!(
+            sig.is_bye_suppressed(),
+            "suppress_outbound_bye() must raise the flag"
+        );
+
+        let _ = sig.stop();
+        let (tx, _rx) = sync_channel::<SignalingEvent>(4);
+        let _ = sig.start(tx);
+
+        assert!(
+            sig.is_bye_suppressed(),
+            "SC-D3-3a FAIL: suppression MUST persist across stop()+start() so the \
+             superseded gen-G's later Drop-teardown stays muted (D3 #967)"
+        );
+
+        let _ = sig.stop();
+    }
+
+    /// SC-D3-3b — Structural: the production `initiate_mdns_reset` hook MUST call
+    /// `suppress_outbound_bye()` on the gen-G `sig` BEFORE `sig.stop()`.
+    ///
+    /// RED (before WU-D3b): the hook body has no `suppress_outbound_bye()` call.
+    /// GREEN (WU-D3b): the call appears before `sig.stop()` inside the hook.
+    ///
+    /// Mirrors the SC-D-001 source-ordering gate already used in mdns.rs: a refactor
+    /// that drops the suppression call (re-introducing the stale-Bye) fails here.
+    #[test]
+    fn sc_d3_3b_production_reset_hook_suppresses_before_stop() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        // Normalize line endings so the structural bound is CRLF/LF-agnostic.
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
+            .replace("\r\n", "\n");
+
+        // Scope the search to the production initiate_mdns_reset hook body ONLY.
+        // The closure is the LAST field of the production SenderCoordinatorHooks
+        // literal, terminated by `}),` followed by the struct's closing `};`. Bound
+        // the region there so the gate cannot match the string in this test's own
+        // source further down the file.
+        let hook_start = source
+            .find("initiate_mdns_reset: Arc::new(move || {")
+            .expect("production initiate_mdns_reset hook must exist");
+        let hook_rel_end = source[hook_start..]
+            .find("\n        }),\n    };")
+            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+        let hook_region = &source[hook_start..hook_start + hook_rel_end];
+
+        let suppress_pos = hook_region.find("suppress_outbound_bye()").expect(
+            "SC-D3-3b FAIL: the production initiate_mdns_reset hook must call \
+             `suppress_outbound_bye()` on the gen-G instance (D3 #967). \
+             Fix (WU-D3b): add `sig.suppress_outbound_bye();` before `sig.stop()`.",
+        );
+        let stop_pos = hook_region
+            .find("sig.stop()")
+            .expect("hook must call sig.stop()");
+
+        assert!(
+            suppress_pos < stop_pos,
+            "SC-D3-3b FAIL: `suppress_outbound_bye()` (offset {suppress_pos}) must appear \
+             BEFORE `sig.stop()` (offset {stop_pos}) in the initiate_mdns_reset hook, so the \
+             reset path's own teardown and the later rebuild Drop-teardown are both muted."
+        );
+    }
+
+    // ─── SC-HO-2: InitiateMdnsReset raises the superseded accept-gate (B, #971) ──
+    //
+    // Listener handover (design #971 §B option iii-a): the sender's reset hook
+    // re-`start()`s gen-G, which re-binds :7889 and would accept AGAIN as an
+    // offer-less listener, stealing+RSTing the receiver's rebuilt connection
+    // (HW gate v4, #970). The fix raises the per-instance `superseded` accept-gate
+    // in the hook BEFORE re-`start()`, alongside the existing `suppress_outbound_bye`,
+    // so the re-started gen-G comes up already-superseded and only gen-(G+1) accepts.
+
+    /// SC-HO-2a — Behavioral: `mark_superseded()` raises an observable flag on a real
+    /// `MdnsSignaling` that PERSISTS across the hook's `stop()` + `start()` reuse
+    /// cycle, so the re-started gen-G accept loop never accepts. Also confirms that
+    /// the reset-hook order raises BOTH flags (`suppress_bye` AND `superseded`).
+    ///
+    /// RED (before WU-B2 GREEN): `mark_superseded`/`is_superseded` are present (from
+    /// WU-B1), so this test compiles; it pins the persistence + both-flags contract
+    /// that the production hook (WU-B2) must satisfy.
+    #[test]
+    fn sc_ho_2a_superseded_persists_across_reset_stop_start() {
+        use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+        use sm_infra::signaling::mdns::MdnsSignaling;
+        use std::sync::mpsc::sync_channel;
+
+        // gen-G instance: receiver role avoids binding the sender control port and
+        // keeps the test free of network side effects.
+        let cfg = SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        };
+        let mut sig = MdnsSignaling::new(cfg).expect("new gen-G signaling");
+        assert!(
+            !sig.is_superseded(),
+            "fresh instance must default to NOT superseded"
+        );
+
+        // Production reset-hook order: suppress Bye THEN mark superseded, BEFORE
+        // stop()+start().
+        sig.suppress_outbound_bye();
+        sig.mark_superseded();
+        assert!(
+            sig.is_bye_suppressed() && sig.is_superseded(),
+            "SC-HO-2a FAIL: reset hook must raise BOTH suppress_bye AND superseded"
+        );
+
+        let _ = sig.stop();
+        let (tx, _rx) = sync_channel::<SignalingEvent>(4);
+        let _ = sig.start(tx);
+
+        assert!(
+            sig.is_superseded(),
+            "SC-HO-2a FAIL: superseded MUST persist across stop()+start() so the \
+             re-started gen-G accept loop comes up already-superseded (B, #971)"
+        );
+
+        let _ = sig.stop();
+    }
+
+    /// SC-HO-2b — Structural: the production `initiate_mdns_reset` hook MUST call
+    /// `mark_superseded()` on the gen-G `sig` AFTER `suppress_outbound_bye()` and
+    /// BEFORE `sig.stop()`.
+    ///
+    /// RED (before WU-B2 GREEN): the hook body has no `mark_superseded()` call.
+    /// GREEN (WU-B2): the call appears after suppress and before stop.
+    #[test]
+    fn sc_ho_2b_production_reset_hook_marks_superseded_before_stop() {
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        let source = std::fs::read_to_string(&source_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
+            .replace("\r\n", "\n");
+
+        let hook_start = source
+            .find("initiate_mdns_reset: Arc::new(move || {")
+            .expect("production initiate_mdns_reset hook must exist");
+        let hook_rel_end = source[hook_start..]
+            .find("\n        }),\n    };")
+            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+        let hook_region = &source[hook_start..hook_start + hook_rel_end];
+
+        let suppress_pos = hook_region
+            .find("suppress_outbound_bye()")
+            .expect("hook must call suppress_outbound_bye()");
+        let superseded_pos = hook_region.find("mark_superseded()").expect(
+            "SC-HO-2b FAIL: the production initiate_mdns_reset hook must call \
+             `mark_superseded()` on the gen-G instance (B, #971). \
+             Fix (WU-B2): add `sig.mark_superseded();` after `suppress_outbound_bye()` \
+             and before `sig.stop()`.",
+        );
+        let stop_pos = hook_region
+            .find("sig.stop()")
+            .expect("hook must call sig.stop()");
+
+        assert!(
+            suppress_pos < superseded_pos && superseded_pos < stop_pos,
+            "SC-HO-2b FAIL: `mark_superseded()` (offset {superseded_pos}) must appear AFTER \
+             `suppress_outbound_bye()` (offset {suppress_pos}) and BEFORE `sig.stop()` \
+             (offset {stop_pos}), so the re-started gen-G comes up already-superseded."
         );
     }
 }

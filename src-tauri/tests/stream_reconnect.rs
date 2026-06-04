@@ -549,6 +549,9 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ev_rx, stop_flag, channel, st, p, ack_t, rebuild_t, hooks,
+                        // Media-arrival watchdog disabled — this V2 rebuild-hook
+                        // bridge does not exercise the post-rebuild watchdog.
+                        None,
                     );
                 })
                 .expect("spawn stream drain");
@@ -734,6 +737,8 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        // Media-arrival watchdog disabled for this drain.
+                        None,
                     );
                 })
                 .expect("spawn");
@@ -1044,6 +1049,9 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                             t,
                             t,
                             hooks,
+                            // Media-arrival watchdog disabled — this generation-chain
+                            // test does not exercise the post-rebuild watchdog.
+                            None,
                         );
                     })
                     .expect("spawn drain");
@@ -1312,6 +1320,8 @@ fn rebuild_releases_udp_port_before_rebind() {
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        // Media-arrival watchdog disabled for this drain.
+                        None,
                     );
                 })
                 .expect("spawn stream drain");
@@ -1473,6 +1483,8 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        // Media-arrival watchdog disabled for this drain.
+                        None,
                     );
                 })
                 .expect("spawn");

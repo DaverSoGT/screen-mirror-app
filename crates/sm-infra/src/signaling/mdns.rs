@@ -48,6 +48,7 @@ use sm_domain::signaling::{
 use sm_domain::supervisor::SupervisorSignal;
 
 use crate::signaling::wire::{MAX_FRAME_BYTES, SignalingFrame, write_frame};
+use crate::transport::{NIC_RETRY_ATTEMPTS, NIC_RETRY_INTERVAL, resolve_ipv4_with_retry};
 
 /// Write timeout for `publish_reconnect_request` / `publish_reconnect_ack`.
 ///
@@ -73,6 +74,24 @@ const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read timeout for the TCP frame loop — allows periodic stop-flag checks.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Process-global monotonic counter assigning a unique id to each signaling
+/// connection (one per `run_frame_loop` invocation).
+///
+/// D6 instrumentation (design #963): during a dual-reconnect, the sender may have
+/// two overlapping listeners on port 7889 (the reset listener and the rebuild
+/// listener bound via SO_REUSEADDR). The receiver connects to exactly one of them.
+/// Tagging each connection with a stable instance id lets the HW operator correlate
+/// — across the `connection up`, `accept`, and `Bye` log lines — WHICH listener
+/// served the connection that carried (or failed to carry) the fresh Offer, and
+/// WHICH torn-down generation emitted the stale Bye. This settles the DEFERRED D3
+/// dual-listener question at the next HW gate without changing any behavior.
+static SIGNALING_INSTANCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Allocate the next signaling-instance id (monotonic, process-global).
+fn next_signaling_instance_id() -> u64 {
+    SIGNALING_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 // ─── Internal control messages ────────────────────────────────────────────────
 
@@ -132,6 +151,29 @@ pub struct MdnsSignaling {
     /// `None` until `set_supervisor_signal_tx` is called. When `None`, reconnect
     /// frames are silently consumed (backward-compatible — frame_to_event returns None).
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    /// When raised, the frame loop exits on the stop flag WITHOUT sending the
+    /// teardown `Bye` frame (D3 stale-Bye fix, design #967).
+    ///
+    /// Default `false` — genuine shutdown still emits `Bye` so the receiver's
+    /// `PeerBye` eager-wake fast-path is preserved. It is set to `true` ONLY on a
+    /// generation that is being superseded by a fast rebuild, so the old
+    /// generation's eventual teardown does not emit a spurious `Bye` on a
+    /// connection the receiver may still be using (see `suppress_outbound_bye`).
+    suppress_bye: Arc<AtomicBool>,
+    /// When raised, the sender accept loop stops accepting NEW TCP connections
+    /// (listener-handover accept-gate, design #971 §B option iii-a).
+    ///
+    /// Default `false`. Set to `true` ONLY on a generation that is being
+    /// superseded by a fast rebuild, BEFORE the reset hook re-`start()`s it, so the
+    /// re-started gen-G comes up already-superseded and never competes for the
+    /// receiver's reconnect — only the offer-bearing gen-(G+1) accepts. This closes
+    /// the dual-listener RST race (HW gate v4, #970): an offer-less gen-G socket
+    /// must not steal and then RST the receiver's rebuilt connection.
+    ///
+    /// CRITICAL: this flag governs ONLY the pre-accept poll loop. It is NOT
+    /// threaded into `run_frame_loop`, so raising it never closes an
+    /// already-accepted live connection (SC-HO-1b). Sibling seam to `suppress_bye`.
+    superseded: Arc<AtomicBool>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -143,6 +185,8 @@ impl Signaling for MdnsSignaling {
             inbox: Arc::new(Mutex::new(Vec::new())),
             handle: None,
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
+            suppress_bye: Arc::new(AtomicBool::new(false)),
+            superseded: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -159,11 +203,21 @@ impl Signaling for MdnsSignaling {
         let stop = Arc::clone(&self.stop);
         let inbox = Arc::clone(&self.inbox);
         let supervisor_signal_tx = Arc::clone(&self.supervisor_signal_tx);
+        let suppress_bye = Arc::clone(&self.suppress_bye);
+        let superseded = Arc::clone(&self.superseded);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
             .spawn(move || {
-                run_signaling_thread(config, stop, inbox, event_tx, supervisor_signal_tx);
+                run_signaling_thread(
+                    config,
+                    stop,
+                    inbox,
+                    event_tx,
+                    supervisor_signal_tx,
+                    suppress_bye,
+                    superseded,
+                );
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
 
@@ -226,6 +280,89 @@ impl MdnsSignaling {
     /// `start()` is safe but may miss frames that arrive before the channel is set.
     pub fn set_supervisor_signal_tx(&self, tx: SyncSender<SupervisorSignal>) {
         *self.supervisor_signal_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Suppress the teardown `Bye` frame for this signaling instance (D3 stale-Bye
+    /// fix, design #967).
+    ///
+    /// Once set, the frame loop exits on the stop flag WITHOUT writing a `Bye`.
+    /// Call this on a generation that is being superseded by a fast rebuild so its
+    /// eventual teardown does not emit a spurious `Bye` on a connection the receiver
+    /// may still be using. Genuine shutdown leaves this unset and still emits `Bye`,
+    /// preserving the receiver's `PeerBye` eager-wake fast-path.
+    ///
+    /// Ordering: stores with `Release` to pair with the frame loop's `Acquire` load
+    /// at the stop-flag Bye gate.
+    pub fn suppress_outbound_bye(&self) {
+        self.suppress_bye.store(true, Ordering::Release);
+    }
+
+    /// Read-only observer for the suppress-Bye flag (D3, design #967).
+    ///
+    /// Diagnostic accessor (sibling to the D6 instance-id instrumentation): lets the
+    /// sender-coordinator reset-hook test (SC-D3-3) assert that the superseded
+    /// generation had its teardown Bye muted. Loads with `Acquire`.
+    pub fn is_bye_suppressed(&self) -> bool {
+        self.suppress_bye.load(Ordering::Acquire)
+    }
+
+    /// Mark this signaling generation as superseded by a fast rebuild
+    /// (listener-handover accept-gate, design #971 §B option iii-a).
+    ///
+    /// Once set, the sender accept loop stops accepting NEW TCP connections so only
+    /// the offer-bearing gen-(G+1) answers the receiver's reconnect — closing the
+    /// dual-listener RST race (#970). Call this in the `InitiateMdnsReset` hook
+    /// right after `suppress_outbound_bye()` and BEFORE the reset's re-`start()`, so
+    /// the re-started gen-G comes up already-superseded. The flag persists across
+    /// the `stop()` + `start()` reuse cycle (it is cloned into the freshly-spawned
+    /// accept thread), so the re-started listener never accepts.
+    ///
+    /// Does NOT close any already-accepted connection — the flag is never threaded
+    /// into `run_frame_loop` (SC-HO-1b). Sibling seam to `suppress_outbound_bye`.
+    ///
+    /// Ordering: stores with `Release` to pair with the accept loop's `Acquire`
+    /// load at the top-of-loop gate.
+    pub fn mark_superseded(&self) {
+        self.superseded.store(true, Ordering::Release);
+    }
+
+    /// Read-only observer for the superseded accept-gate flag (B, design #971).
+    ///
+    /// Diagnostic accessor (sibling to `is_bye_suppressed`): lets the
+    /// sender-coordinator reset-hook test (SC-HO-2) assert that the superseded
+    /// generation had its accept gate raised. Loads with `Acquire`.
+    pub fn is_superseded(&self) -> bool {
+        self.superseded.load(Ordering::Acquire)
+    }
+
+    /// Remove any queued `ReconnectRequest` frames from the outbound inbox,
+    /// returning how many were dropped (D3 stale-Bye fix, design #967 §3).
+    ///
+    /// `InitiateMdnsReset` reuses the SAME inbox `Arc` across `stop()` + `start()`.
+    /// A `ReconnectRequest` queued for the OLD connection but not yet drained would
+    /// otherwise re-flush onto the NEW connection, keeping the superseded generation
+    /// competing as an offer-less listener. This clear is TARGETED: only
+    /// `ReconnectRequest` entries are removed; `Offer` / `Answer` / `Candidate` /
+    /// `ReconnectAck` stay queued so no legitimately-needed frame is lost.
+    ///
+    /// MUST be called while no frame-loop thread is draining the inbox (i.e. between
+    /// `stop()` — which joins the old thread — and the next `start()`), so the retain
+    /// is race-free.
+    pub fn drain_stale_reconnect_requests(&self) -> usize {
+        let mut inbox = self.inbox.lock().unwrap();
+        let before = inbox.len();
+        inbox.retain(|msg| !matches!(msg, MdnsControl::ReconnectRequest { .. }));
+        before - inbox.len()
+    }
+
+    /// Test-only accessor for the outbound inbox (D3, design #967).
+    ///
+    /// Lets `SC-D3-4` seed and inspect inbox contents to verify
+    /// `drain_stale_reconnect_requests` is targeted. Kept module-private (matching
+    /// `MdnsControl`'s visibility) and only reachable from the in-module test child.
+    #[cfg(test)]
+    fn inbox_for_test(&self) -> &Arc<Mutex<Vec<MdnsControl>>> {
+        &self.inbox
     }
 
     /// Queue a `ReconnectRequest` frame to be written on the TCP channel.
@@ -341,14 +478,19 @@ pub(crate) fn frame_to_event(
         }
         SignalingFrame::ReconnectRequest {
             attempt,
-            requester_role: _,
+            requester_role,
             session_nonce,
         } => {
             // Route to supervisor channel; do NOT produce a SignalingEvent.
-            // `session_nonce` from the peer acts as the peer's nonce for tie-breaking.
+            // `session_nonce` from the peer acts as the peer's nonce for the
+            // role-equal tie-break fallback. `requester_role` is forwarded as
+            // `peer_role` so the supervisor's role-aware tie-break (design #963 D1)
+            // can elect the offerer (Sender) as the active reconnector — previously
+            // this field was discarded (#962), making the tie-break role-blind.
             if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
                 let _ = tx.try_send(SupervisorSignal::PeerRequest {
                     peer_nonce: session_nonce,
+                    peer_role: requester_role,
                     attempt,
                 });
             }
@@ -379,14 +521,29 @@ fn run_signaling_thread(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
+    superseded: Arc<AtomicBool>,
 ) {
     match config.role {
-        SignalingRole::Sender => {
-            run_sender_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
-        }
-        SignalingRole::Receiver => {
-            run_receiver_thread(config, stop, inbox, event_tx, supervisor_signal_tx)
-        }
+        // `superseded` gates ONLY the sender accept loop (listener handover, B).
+        // The receiver is a TCP client and never accepts, so it does not need it.
+        SignalingRole::Sender => run_sender_thread(
+            config,
+            stop,
+            inbox,
+            event_tx,
+            supervisor_signal_tx,
+            suppress_bye,
+            superseded,
+        ),
+        SignalingRole::Receiver => run_receiver_thread(
+            config,
+            stop,
+            inbox,
+            event_tx,
+            supervisor_signal_tx,
+            suppress_bye,
+        ),
     }
 }
 
@@ -411,12 +568,77 @@ fn bind_tcp_listener_reusable(addr: SocketAddr) -> io::Result<TcpListener> {
 
 // ─── Sender thread ────────────────────────────────────────────────────────────
 
+/// Outcome of the gated accept poll loop.
+///
+/// Distinguishes a real accepted connection from a clean gate-driven exit (stop or
+/// superseded) and from an I/O error, so the caller can run the right cleanup
+/// (mDNS shutdown) on each path.
+enum AcceptOutcome {
+    /// A peer connected and was accepted; carries the stream.
+    Accepted(std::net::TcpStream),
+    /// The loop exited cleanly because `stop` or `superseded` was raised — no
+    /// connection was accepted.
+    Gated,
+    /// `accept()` returned a hard I/O error (already emitted to `event_tx`).
+    Errored,
+}
+
+/// Poll `listener.accept()` non-blocking, gated by `stop` and `superseded`.
+///
+/// Returns:
+/// - [`AcceptOutcome::Accepted`] with the stream + emits `PeerFound`, on a real connect.
+/// - [`AcceptOutcome::Gated`] when `stop` OR `superseded` is raised before a connect —
+///   the superseded gate (design #971 §B) is what makes a re-started, offer-less
+///   gen-G NOT compete for the receiver's reconnect.
+/// - [`AcceptOutcome::Errored`] on a hard `accept()` error (already emitted).
+///
+/// The listener MUST already be in non-blocking mode. Both flags are loaded with
+/// `Acquire` to pair with the `Release` stores in `stop()` / `mark_superseded()`.
+fn accept_one_with_gate(
+    listener: &std::net::TcpListener,
+    stop: &Arc<AtomicBool>,
+    superseded: &Arc<AtomicBool>,
+    event_tx: &SyncSender<SignalingEvent>,
+) -> AcceptOutcome {
+    loop {
+        // Gate at the TOP of the loop, alongside the stop check. A superseded
+        // generation stops accepting NEW connections so only the offer-bearing
+        // gen-(G+1) answers (listener handover, B). It does NOT touch any
+        // already-accepted connection — that lives in `run_frame_loop`.
+        if stop.load(Ordering::Acquire) || superseded.load(Ordering::Acquire) {
+            return AcceptOutcome::Gated;
+        }
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                let _ = emit(
+                    event_tx,
+                    SignalingEvent::PeerFound {
+                        host: addr.ip().to_string(),
+                        port: addr.port(),
+                    },
+                );
+                return AcceptOutcome::Accepted(stream);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                emit_error(event_tx, SignalingError::Io(e.to_string()));
+                return AcceptOutcome::Errored;
+            }
+        }
+    }
+}
+
 fn run_sender_thread(
     config: SignalingConfig,
     stop: Arc<AtomicBool>,
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
+    superseded: Arc<AtomicBool>,
 ) {
     let port = config.control_port;
 
@@ -438,14 +660,55 @@ fn run_sender_thread(
         return;
     }
 
-    // Enumerate IPv4 addresses for mDNS registration.
-    let ip_list = collect_ipv4_addrs();
+    // Enumerate IPv4 addresses for mDNS registration, retrying across a NIC-down
+    // window (e.g. Wi-Fi flap). `resolve_ipv4_with_retry` polls up to
+    // NIC_RETRY_ATTEMPTS times with NIC_RETRY_INTERVAL between probes — a budget
+    // of ~20s, comfortably under DISCOVER_TIMEOUT (30s). If the NIC returns
+    // within that window, the bind proceeds; if not, we still terminate cleanly.
+    //
+    // C1 fix: pass the thread's stop flag as `should_stop` so that when
+    // `MdnsSignaling::stop()` sets the flag, the retry loop breaks at the top of
+    // the next iteration rather than sleeping through the full ~20s budget.
+    // Teardown latency is now bounded to at most one NIC_RETRY_INTERVAL (500ms).
+    let attempts_before_success = std::cell::Cell::new(0u32);
+    let ip_list = resolve_ipv4_with_retry(
+        || {
+            attempts_before_success.set(attempts_before_success.get() + 1);
+            collect_ipv4_addrs()
+        },
+        NIC_RETRY_ATTEMPTS,
+        std::thread::sleep,
+        || stop.load(Ordering::Acquire),
+    );
     if ip_list.is_empty() {
+        // All NIC_RETRY_ATTEMPTS probes exhausted and NIC did not return — the
+        // sender is genuinely offline. Log loudly so HW-gate logs show the budget
+        // was honoured, then terminate with the standard error.
+        eprintln!(
+            "[sm-signaling] ERROR: NIC enumeration exhausted after {} attempts \
+             ({} × {}ms ≈ {}s budget) — no IPv4 interfaces found; \
+             sender signaling thread terminating",
+            NIC_RETRY_ATTEMPTS,
+            NIC_RETRY_ATTEMPTS,
+            NIC_RETRY_INTERVAL.as_millis(),
+            NIC_RETRY_INTERVAL.as_millis() * u128::from(NIC_RETRY_ATTEMPTS - 1) / 1000,
+        );
         emit_error(
             &event_tx,
             SignalingError::Io("no IPv4 network interfaces found".to_string()),
         );
         return;
+    }
+    // NIC returned — log recovery if it took more than one probe.
+    let probes = attempts_before_success.get();
+    if probes > 1 {
+        eprintln!(
+            "[sm-signaling] NIC recovered after {} probe(s) \
+             (~{}ms wait) — proceeding with mDNS registration on {}",
+            probes,
+            NIC_RETRY_INTERVAL.as_millis() * u128::from(probes - 1),
+            ip_list[0],
+        );
     }
 
     // Register mDNS service.
@@ -480,32 +743,15 @@ fn run_sender_thread(
         return;
     }
 
-    // Accept one TCP connection (non-blocking with stop-flag polling).
-    let stream = loop {
-        if stop.load(Ordering::Acquire) {
+    // Accept one TCP connection (non-blocking with stop + superseded polling).
+    // The `superseded` accept-gate (listener handover, design #971 §B option iii-a)
+    // makes a re-started, offer-less gen-G stop accepting NEW connections so only
+    // the offer-bearing gen-(G+1) answers the receiver's reconnect.
+    let stream = match accept_one_with_gate(&listener, &stop, &superseded, &event_tx) {
+        AcceptOutcome::Accepted(stream) => stream,
+        AcceptOutcome::Gated | AcceptOutcome::Errored => {
             let _ = mdns.shutdown();
             return;
-        }
-        match listener.accept() {
-            Ok((stream, addr)) => {
-                let _ = emit(
-                    &event_tx,
-                    SignalingEvent::PeerFound {
-                        host: addr.ip().to_string(),
-                        port: addr.port(),
-                    },
-                );
-                break stream;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            Err(e) => {
-                emit_error(&event_tx, SignalingError::Io(e.to_string()));
-                let _ = mdns.shutdown();
-                return;
-            }
         }
     };
 
@@ -513,7 +759,14 @@ fn run_sender_thread(
     // stays published throughout the entire TCP session. A reconnecting receiver can
     // still discover the sender while streaming. When run_frame_loop exits (Bye, error,
     // or stop_flag), shutdown() sends the goodbye packet to clean up the mDNS entry.
-    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    run_frame_loop(
+        stream,
+        stop,
+        inbox,
+        event_tx,
+        supervisor_signal_tx,
+        suppress_bye,
+    );
     let _ = mdns.shutdown();
 }
 
@@ -525,6 +778,7 @@ fn run_receiver_thread(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -605,7 +859,14 @@ fn run_receiver_thread(
     // stays published throughout the entire TCP session. The mDNS entry remains active
     // until the TCP session ends, ensuring a reconnecting sender can still be discovered
     // by other receivers. Shutdown sends the goodbye packet to clean up the mDNS entry.
-    run_frame_loop(stream, stop, inbox, event_tx, supervisor_signal_tx);
+    run_frame_loop(
+        stream,
+        stop,
+        inbox,
+        event_tx,
+        supervisor_signal_tx,
+        suppress_bye,
+    );
     let _ = mdns.shutdown();
 }
 
@@ -620,10 +881,19 @@ fn run_frame_loop(
     inbox: Arc<Mutex<Vec<MdnsControl>>>,
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    suppress_bye: Arc<AtomicBool>,
 ) {
+    // D6 instrumentation: assign a unique signaling-instance id to this connection
+    // so the HW operator can correlate which listener/connection served it (and,
+    // on teardown, which instance emitted a stale Bye) across overlapping
+    // dual-listener generations during a dual-reconnect.
+    let instance_id = next_signaling_instance_id();
+
     // Diagnostic: log the actual TCP endpoints so loopback/dup-connect can be
     // distinguished from cross-host. Should always be peer != local; equal
-    // would indicate the writer is feeding the reader on the same machine.
+    // would indicate the writer is feeding the reader on the same machine. The
+    // `local` endpoint identifies WHICH listener (e.g. reset vs rebuild on 7889)
+    // accepted/served this connection.
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -632,7 +902,9 @@ fn run_frame_loop(
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|e| format!("<local_addr err: {e}>"));
-    eprintln!("[sm-signaling-frame-loop] connection up: local={local} peer={peer}");
+    eprintln!(
+        "[sm-signaling-frame-loop] connection up: instance={instance_id} local={local} peer={peer}"
+    );
 
     // Set read timeout so the loop can check the stop flag and drain the inbox.
     if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
@@ -675,7 +947,27 @@ fn run_frame_loop(
 
     loop {
         if stop.load(Ordering::Acquire) {
-            eprintln!("[sm-signaling-frame-loop] EXIT: stop flag set, sending Bye");
+            // D3 stale-Bye fix (design #967): a superseded generation muting its
+            // teardown Bye exits here WITHOUT writing Bye. Acquire pairs with the
+            // Release store in `suppress_outbound_bye`. Genuine shutdown leaves the
+            // flag false and still emits Bye, preserving the receiver's PeerBye
+            // eager-wake fast-path.
+            if suppress_bye.load(Ordering::Acquire) {
+                // D6: the instance id lets the HW operator confirm the suppressed
+                // teardown came from the stale (offer-less) generation.
+                eprintln!(
+                    "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, Bye SUPPRESSED (D3)"
+                );
+                break;
+            }
+            // D6: tag the stop-flag Bye with the instance id. Per #962 this is the
+            // stale-Bye source during a dual-reconnect — a torn-down OLD generation
+            // emitting Bye on a connection the peer may still be using. The instance
+            // id lets the HW operator confirm whether the Bye came from the offer-
+            // bearing generation or a stale one.
+            eprintln!(
+                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, sending Bye"
+            );
             let _ = write_frame(&mut writer, &SignalingFrame::Bye);
             break;
         }
@@ -720,7 +1012,7 @@ fn run_frame_loop(
                     session_nonce,
                 } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
             };
-            eprintln!("[sm-signaling-frame-loop] OUT → {kind}");
+            eprintln!("[sm-signaling-frame-loop] OUT → instance={instance_id} {kind}");
             if let Err(e) = write_frame(&mut writer, &frame) {
                 eprintln!("[sm-signaling-frame-loop] write_frame error: {e}");
                 emit_error(&event_tx, SignalingError::Io(e.to_string()));
@@ -754,7 +1046,7 @@ fn run_frame_loop(
                         session_nonce,
                     } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
                 };
-                eprintln!("[sm-signaling-frame-loop] IN  ← {kind}");
+                eprintln!("[sm-signaling-frame-loop] IN  ← instance={instance_id} {kind}");
                 match frame_to_event(frame, &supervisor_signal_tx) {
                     Some(SignalingEvent::Closed) => {
                         eprintln!("[sm-signaling-frame-loop] EXIT: peer sent Bye → emit Closed");
@@ -1172,6 +1464,7 @@ mod tests {
             signal,
             SupervisorSignal::PeerRequest {
                 peer_nonce: 42_000,
+                peer_role: SignalingRole::Sender,
                 attempt: 2,
             }
         );
@@ -1207,6 +1500,48 @@ mod tests {
             signal,
             SupervisorSignal::PeerAck {
                 session_nonce: 99,
+                attempt: 1,
+            }
+        );
+    }
+
+    /// SC-DR-5 — `frame_to_event` MUST forward the wire `requester_role` into the
+    /// `SupervisorSignal::PeerRequest { peer_role }` instead of discarding it.
+    ///
+    /// Root cause #962: `mdns.rs` dropped `requester_role` (`requester_role: _`),
+    /// so the supervisor's tie-break was role-blind. Design #963 D1 plumbs the role
+    /// through. This pins the plumbing: a `Receiver`-role request must arrive as
+    /// `peer_role: Receiver` on the supervisor channel.
+    #[test]
+    fn sc_dr_5_requester_role_not_discarded() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(8);
+        let supervisor_signal_tx = std::sync::Arc::new(Mutex::new(Some(sup_tx)));
+
+        let frame = SignalingFrame::ReconnectRequest {
+            attempt: 1,
+            requester_role: SignalingRole::Receiver,
+            session_nonce: 42,
+        };
+
+        let result = frame_to_event(frame, &supervisor_signal_tx);
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must not produce a SignalingEvent"
+        );
+
+        let signal = sup_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("supervisor channel must receive PeerRequest within 100ms");
+        assert_eq!(
+            signal,
+            SupervisorSignal::PeerRequest {
+                peer_nonce: 42,
+                peer_role: SignalingRole::Receiver,
                 attempt: 1,
             }
         );
@@ -1732,5 +2067,380 @@ mod tests {
             matches!(event, Some(sm_domain::signaling::SignalingEvent::Closed)),
             "SC-S1-001b: frame_to_event(Bye) with None supervisor must return Some(Closed)"
         );
+    }
+
+    // ─── SC-D3-1 / SC-D3-2: suppress_bye gates the stop-flag teardown Bye ──────
+    //
+    // D3 stale-Bye fix (design #967): a superseded sender generation, on
+    // rebuild teardown, must NOT emit the spurious stop-flag Bye on a
+    // connection the receiver may still be using. The Bye is gated by a
+    // per-instance `suppress_bye` flag, set ONLY on the superseded generation.
+    // Genuine shutdown (default `suppress_bye=false`) MUST still emit Bye so the
+    // receiver's PeerBye eager-wake fast-path is preserved.
+    //
+    // Strategy: drive `run_frame_loop` on the server side of a real loopback TCP
+    // pair, let it send Hello, then set the stop flag and observe what the client
+    // side reads next:
+    //   - suppress_bye=true  → no Bye frame; the peer sees EOF (connection closes).
+    //   - suppress_bye=false → a Bye frame arrives before close.
+
+    /// Read the next frame from `stream` with a bounded timeout, mapping a clean
+    /// peer-close (EOF) to `Ok(None)`. Used by the SC-D3 frame-loop tests.
+    #[cfg(test)]
+    fn read_next_frame_or_eof(
+        stream: &mut std::net::TcpStream,
+    ) -> std::io::Result<Option<crate::signaling::wire::SignalingFrame>> {
+        use crate::signaling::wire::read_frame;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("set_read_timeout");
+        match read_frame(stream) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Spawn `run_frame_loop` on the accepted server side of a loopback TCP pair.
+    /// Returns the client stream, the stop flag, and the loop's thread handle.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_frame_loop_over_loopback(
+        suppress_bye: Arc<AtomicBool>,
+    ) -> (
+        std::net::TcpStream,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).expect("connect loopback client");
+        let (server, _peer) = listener.accept().expect("accept loopback server");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let suppress_loop = Arc::clone(&suppress_bye);
+        let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
+        let inbox: Arc<Mutex<Vec<super::MdnsControl>>> = Arc::new(Mutex::new(Vec::new()));
+        let supervisor: Arc<
+            Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
+        > = Arc::new(Mutex::new(None));
+
+        let handle = std::thread::spawn(move || {
+            super::run_frame_loop(
+                server,
+                stop_loop,
+                inbox,
+                event_tx,
+                supervisor,
+                suppress_loop,
+            );
+        });
+
+        (client, stop, handle)
+    }
+
+    /// SC-D3-1 — With `suppress_bye=true`, the frame loop exits on the stop flag
+    /// WITHOUT writing a Bye frame; the peer observes only Hello then EOF.
+    ///
+    /// RED: `run_frame_loop` has no `suppress_bye` parameter and the stop-flag
+    ///      branch unconditionally writes Bye, so the peer reads a Bye frame.
+    /// GREEN (WU-D3a): the Bye write is gated behind `!suppress_bye.load(Acquire)`.
+    #[test]
+    fn sc_d3_1_suppressed_frame_loop_exits_without_bye() {
+        use crate::signaling::wire::SignalingFrame;
+
+        let suppress_bye = Arc::new(AtomicBool::new(true));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        // The loop first sends Hello.
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        // Trigger teardown.
+        stop.store(true, std::sync::atomic::Ordering::Release);
+
+        // With suppression on, the next read must be EOF (clean close), NOT a Bye.
+        let next = read_next_frame_or_eof(&mut client).expect("read after stop");
+        assert!(
+            next.is_none(),
+            "SC-D3-1 FAIL: with suppress_bye=true the loop must close WITHOUT a Bye, \
+             but the peer read {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
+    }
+
+    /// SC-D3-2 — With `suppress_bye=false` (default), the frame loop STILL writes a
+    /// Bye frame on stop. Protects genuine-shutdown and the receiver PeerBye
+    /// eager-wake fast-path.
+    ///
+    /// RED: `run_frame_loop` has no `suppress_bye` parameter (compile failure).
+    /// GREEN (WU-D3a): default path remains Bye-on-stop.
+    #[test]
+    fn sc_d3_2_default_frame_loop_still_writes_bye() {
+        use crate::signaling::wire::SignalingFrame;
+
+        let suppress_bye = Arc::new(AtomicBool::new(false));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+
+        let next = read_next_frame_or_eof(&mut client)
+            .expect("read after stop")
+            .expect("SC-D3-2 FAIL: default path must emit a Bye frame on stop");
+        assert!(
+            matches!(next, SignalingFrame::Bye),
+            "SC-D3-2 FAIL: default (suppress_bye=false) must emit Bye on stop, got {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
+    }
+
+    // ─── SC-D3-4: reset must NOT re-flush a stale ReconnectRequest (D3c, #967) ──
+    //
+    // The InitiateMdnsReset hook reuses the SAME inbox Arc across stop()+start().
+    // A ReconnectRequest queued for the OLD connection but not yet drained must be
+    // cleared before re-start, or it re-flushes onto the NEW connection — keeping
+    // the superseded gen-G competing as an offer-less listener (design #967 §3).
+    // The clear MUST be targeted: only ReconnectRequest entries are removed; any
+    // legitimately-queued Offer / Answer / Candidate / ReconnectAck is preserved.
+
+    /// SC-D3-4 — `drain_stale_reconnect_requests()` removes ONLY queued
+    /// `ReconnectRequest` entries from the inbox, leaving every other variant intact.
+    ///
+    /// RED: the method does not exist yet (compile failure).
+    /// GREEN (WU-D3c): targeted retain that drops only `ReconnectRequest`.
+    #[test]
+    fn sc_d3_4_drain_stale_reconnect_requests_is_targeted() {
+        use super::MdnsControl;
+        use sm_domain::signaling::{SdpOffer, SignalingConfig, SignalingRole};
+
+        let sig = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Receiver,
+            ..Default::default()
+        })
+        .expect("new signaling");
+
+        // Seed the reused inbox with a stale ReconnectRequest plus benign frames
+        // that MUST survive the targeted drain.
+        {
+            let mut inbox = sig.inbox_for_test().lock().unwrap();
+            inbox.push(MdnsControl::Offer(SdpOffer("v=0".into())));
+            inbox.push(MdnsControl::ReconnectRequest {
+                attempt: 1,
+                requester_role: SignalingRole::Sender,
+                session_nonce: 42,
+            });
+            inbox.push(MdnsControl::ReconnectAck {
+                attempt: 1,
+                session_nonce: 42,
+            });
+        }
+
+        let removed = sig.drain_stale_reconnect_requests();
+        assert_eq!(
+            removed, 1,
+            "SC-D3-4 FAIL: exactly one stale ReconnectRequest must be drained, got {removed}"
+        );
+
+        let kinds: Vec<&'static str> = sig
+            .inbox_for_test()
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| match m {
+                MdnsControl::Offer(_) => "Offer",
+                MdnsControl::Answer(_) => "Answer",
+                MdnsControl::Candidate(_) => "Candidate",
+                MdnsControl::ReconnectRequest { .. } => "ReconnectRequest",
+                MdnsControl::ReconnectAck { .. } => "ReconnectAck",
+            })
+            .collect();
+
+        assert!(
+            !kinds.contains(&"ReconnectRequest"),
+            "SC-D3-4 FAIL: stale ReconnectRequest must be removed; inbox still has {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"Offer") && kinds.contains(&"ReconnectAck"),
+            "SC-D3-4 FAIL: non-ReconnectRequest frames must be preserved; inbox has {kinds:?}"
+        );
+    }
+
+    // ─── SC-HO-1 / SC-HO-1b: superseded accept-gate (listener handover, B) ────
+    //
+    // Listener handover (design #971 §B, option iii-a): on the dual-reconnect /
+    // severance path the reset hook re-`start()`s gen-G, which re-binds :7889 and
+    // accepts AGAIN — but gen-G has no Offer (its inbox was drained, D3c). The
+    // receiver's rebuilt connection can then land on the offer-less gen-G socket
+    // and RST (HW gate v4, #970). The fix: a per-instance `superseded` accept-gate
+    // that, once raised, stops gen-G from accepting NEW connections so only the
+    // offer-bearing gen-(G+1) answers. CRITICAL: the flag must NOT close an
+    // already-accepted live connection — it gates ONLY the pre-accept loop, never
+    // `run_frame_loop`.
+
+    /// Spawn just the accept-gate poll loop (`accept_one_with_gate`) over a
+    /// loopback `TcpListener`. Returns the bound port, the stop + superseded flags,
+    /// the event receiver, and the loop's join handle. This exercises the accept
+    /// gate in isolation WITHOUT mDNS registration (no multicast needed).
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_accept_gate_over_loopback(
+        superseded: Arc<AtomicBool>,
+    ) -> (
+        u16,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        std::sync::mpsc::Receiver<SignalingEvent>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::net::TcpListener;
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind loopback accept-gate listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking on accept-gate listener");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let superseded_loop = Arc::clone(&superseded);
+        let (event_tx, event_rx) = sync_channel::<SignalingEvent>(16);
+
+        let handle = std::thread::spawn(move || {
+            // The gate returns Some(stream) on accept, None on stop/superseded exit.
+            let _ = super::accept_one_with_gate(&listener, &stop_loop, &superseded_loop, &event_tx);
+        });
+
+        (port, stop, superseded, event_rx, handle)
+    }
+
+    /// SC-HO-1 — With `superseded=false` the accept gate accepts a new TCP
+    /// connection and emits `PeerFound`; with `superseded=true` it does NOT accept
+    /// (no `PeerFound` within 200 ms) and exits cleanly on stop.
+    ///
+    /// RED: `accept_one_with_gate` does not exist yet (compile failure).
+    /// GREEN (WU-B1): the gate checks `superseded` at the TOP of the poll loop,
+    ///      alongside `stop`, and returns without accepting when raised.
+    #[test]
+    fn sc_ho_1_superseded_flag_stops_accept() {
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        // ── Case A: not superseded → connection IS accepted (PeerFound). ──
+        let superseded_off = Arc::new(AtomicBool::new(false));
+        let (port, stop, _sup, event_rx, handle) = spawn_accept_gate_over_loopback(superseded_off);
+
+        let _client = TcpStream::connect(("127.0.0.1", port)).expect("connect to accept gate");
+        let ev = event_rx.recv_timeout(Duration::from_millis(500));
+        assert!(
+            matches!(ev, Ok(SignalingEvent::PeerFound { .. })),
+            "SC-HO-1 FAIL: with superseded=false the gate MUST accept and emit PeerFound, got {ev:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        handle
+            .join()
+            .expect("accept-gate thread (case A) must join");
+
+        // ── Case B: superseded → connection is NOT accepted (no PeerFound). ──
+        let superseded_on = Arc::new(AtomicBool::new(true));
+        let (port_b, stop_b, _sup_b, event_rx_b, handle_b) =
+            spawn_accept_gate_over_loopback(superseded_on);
+
+        // The kernel SYN backlog still completes the TCP handshake, but the gate
+        // must NOT call accept() → no PeerFound is emitted.
+        let _client_b = TcpStream::connect(("127.0.0.1", port_b));
+        let ev_b = event_rx_b.recv_timeout(Duration::from_millis(200));
+        assert!(
+            ev_b.is_err(),
+            "SC-HO-1 FAIL: with superseded=true the gate MUST NOT accept (no PeerFound), got {ev_b:?}"
+        );
+        stop_b.store(true, std::sync::atomic::Ordering::Release);
+        handle_b
+            .join()
+            .expect("accept-gate thread (case B) must join");
+    }
+
+    /// SC-HO-1b — Raising `superseded` does NOT close an already-accepted
+    /// connection: the live `run_frame_loop` is structurally independent of the
+    /// accept gate (the flag is NOT threaded into `run_frame_loop`). With
+    /// `suppress_bye=false`, the live frame loop STILL emits its Bye only on the
+    /// stop flag — proving `superseded` neither tears down the connection nor
+    /// suppresses its Bye.
+    ///
+    /// RED: shares the SC-HO-1 compile failure (`accept_one_with_gate` missing);
+    ///      this test compiles only once the gate exists and the frame loop is
+    ///      left untouched by the gate.
+    /// GREEN (WU-B1): `superseded` governs ONLY the pre-accept loop.
+    #[test]
+    fn sc_ho_1b_superseded_does_not_kill_existing_frame_loop() {
+        use crate::signaling::wire::SignalingFrame;
+
+        // suppress_bye=false so a genuine stop still emits Bye; superseded must
+        // have NO bearing on the already-accepted frame loop.
+        let suppress_bye = Arc::new(AtomicBool::new(false));
+        let (mut client, stop, handle) = spawn_frame_loop_over_loopback(suppress_bye);
+
+        // The frame loop first sends Hello on the already-accepted connection.
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive on the live connection");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "first frame must be Hello, got {hello:?}"
+        );
+
+        // Raise a SEPARATE superseded flag. Because `run_frame_loop` does NOT take
+        // `superseded`, this must NOT close the connection nor inject a Bye. The
+        // live frame loop keeps running; the connection stays open.
+        let superseded = Arc::new(AtomicBool::new(true));
+        superseded.store(true, std::sync::atomic::Ordering::Release);
+
+        // The connection must STILL be alive: no spurious Bye, no EOF yet. A short
+        // read must time out (WouldBlock) rather than return a frame or EOF.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 1];
+        let read_res = std::io::Read::read(&mut client, &mut buf);
+        match read_res {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            other => panic!(
+                "SC-HO-1b FAIL: raising superseded must NOT disturb the live frame loop \
+                 (expected the connection to stay open with no Bye/EOF), got {other:?}"
+            ),
+        }
+
+        // Now a genuine stop with suppress_bye=false MUST still emit a Bye —
+        // proving the live connection was untouched by superseded.
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let next = read_next_frame_or_eof(&mut client)
+            .expect("read after stop")
+            .expect("SC-HO-1b FAIL: default path must still emit a Bye on stop");
+        assert!(
+            matches!(next, SignalingFrame::Bye),
+            "SC-HO-1b FAIL: live frame loop must emit Bye on stop (superseded irrelevant), got {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
     }
 }
