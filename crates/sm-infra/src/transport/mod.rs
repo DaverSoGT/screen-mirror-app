@@ -107,8 +107,7 @@ pub const CANDIDATE_RETRY_ATTEMPTS: u32 = 15;
 
 /// Sleep between probe attempts in [`resolve_candidate_with_retry`].
 /// 15 attempts × 100ms ≈ 1.5s total budget (no sleep after the final attempt).
-pub const CANDIDATE_RETRY_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(100);
+pub const CANDIDATE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Probe for a usable host candidate, retrying up to `attempts` times with a
 /// caller-supplied delay between tries.
@@ -165,8 +164,7 @@ pub const NIC_RETRY_ATTEMPTS: u32 = 40;
 
 /// Sleep between probe attempts in [`resolve_ipv4_with_retry`].
 /// 40 attempts × 500ms ≈ 20s total budget (no sleep after the final attempt).
-pub const NIC_RETRY_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(500);
+pub const NIC_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Probe for at least one non-loopback IPv4 address, retrying up to `attempts`
 /// times with a caller-supplied delay between tries.
@@ -227,7 +225,7 @@ where
 
 #[cfg(test)]
 mod resolve_ipv4_with_retry_tests {
-    use super::{resolve_ipv4_with_retry, NIC_RETRY_ATTEMPTS};
+    use super::{NIC_RETRY_ATTEMPTS, resolve_ipv4_with_retry};
     use std::cell::Cell;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -256,7 +254,11 @@ mod resolve_ipv4_with_retry_tests {
         let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, || false);
 
         assert_eq!(resolved, vec![ip()], "must return addrs once NIC returns");
-        assert_eq!(calls.get(), 4, "probe exactly until the first non-empty result");
+        assert_eq!(
+            calls.get(),
+            4,
+            "probe exactly until the first non-empty result"
+        );
         assert_eq!(
             delays.get(),
             3,
@@ -280,7 +282,10 @@ mod resolve_ipv4_with_retry_tests {
 
         let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, || false);
 
-        assert!(resolved.is_empty(), "exhausted budget → empty (caller logs error)");
+        assert!(
+            resolved.is_empty(),
+            "exhausted budget → empty (caller logs error)"
+        );
         assert_eq!(
             calls.get(),
             NIC_RETRY_ATTEMPTS,
@@ -338,8 +343,7 @@ mod resolve_ipv4_with_retry_tests {
         // exactly STOP_AFTER probes execute before the break.
         let should_stop = || calls.get() >= STOP_AFTER;
 
-        let resolved =
-            resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, should_stop);
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, should_stop);
 
         assert!(
             resolved.is_empty(),
@@ -387,7 +391,7 @@ pub fn publish_host_candidate(
 
 #[cfg(test)]
 mod resolve_candidate_with_retry_tests {
-    use super::{resolve_candidate_with_retry, CANDIDATE_RETRY_ATTEMPTS};
+    use super::{CANDIDATE_RETRY_ATTEMPTS, resolve_candidate_with_retry};
     use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;

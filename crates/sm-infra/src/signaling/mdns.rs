@@ -1529,7 +1529,10 @@ mod tests {
         };
 
         let result = frame_to_event(frame, &supervisor_signal_tx);
-        assert!(result.is_none(), "ReconnectRequest must not produce a SignalingEvent");
+        assert!(
+            result.is_none(),
+            "ReconnectRequest must not produce a SignalingEvent"
+        );
 
         let signal = sup_rx
             .recv_timeout(Duration::from_millis(100))
@@ -2309,7 +2312,8 @@ mod tests {
     ) {
         use std::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback accept-gate listener");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind loopback accept-gate listener");
         let port = listener.local_addr().expect("local_addr").port();
         listener
             .set_nonblocking(true)
@@ -2351,7 +2355,9 @@ mod tests {
             "SC-HO-1 FAIL: with superseded=false the gate MUST accept and emit PeerFound, got {ev:?}"
         );
         stop.store(true, std::sync::atomic::Ordering::Release);
-        handle.join().expect("accept-gate thread (case A) must join");
+        handle
+            .join()
+            .expect("accept-gate thread (case A) must join");
 
         // ── Case B: superseded → connection is NOT accepted (no PeerFound). ──
         let superseded_on = Arc::new(AtomicBool::new(true));
@@ -2367,7 +2373,9 @@ mod tests {
             "SC-HO-1 FAIL: with superseded=true the gate MUST NOT accept (no PeerFound), got {ev_b:?}"
         );
         stop_b.store(true, std::sync::atomic::Ordering::Release);
-        handle_b.join().expect("accept-gate thread (case B) must join");
+        handle_b
+            .join()
+            .expect("accept-gate thread (case B) must join");
     }
 
     /// SC-HO-1b — Raising `superseded` does NOT close an already-accepted

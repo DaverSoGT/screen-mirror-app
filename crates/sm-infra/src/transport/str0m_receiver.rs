@@ -667,7 +667,10 @@ fn handle_receiver_event(
         Event::MediaAdded(added) => {
             // Instrumentation (HW gate, log #4 — HIGHEST VALUE): proves whether
             // MediaAdded ever fires on the rebuilt Rtc post-reconnect.
-            eprintln!("[sm-receiver] MediaAdded mid={:?} on rebuilt Rtc", added.mid);
+            eprintln!(
+                "[sm-receiver] MediaAdded mid={:?} on rebuilt Rtc",
+                added.mid
+            );
             // Capture the mid so we can send PLI later.
             *mid_slot = Some(added.mid);
         }

@@ -1648,8 +1648,8 @@ fn build_production_sender_bundle(
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{
-        publish_host_candidate, resolve_candidate_with_retry, Str0mVideoSender,
-        CANDIDATE_RETRY_ATTEMPTS,
+        CANDIDATE_RETRY_ATTEMPTS, Str0mVideoSender, publish_host_candidate,
+        resolve_candidate_with_retry,
     };
     use std::sync::mpsc::sync_channel;
 
@@ -3151,8 +3151,7 @@ mod tests {
     fn sc_d3_3b_production_reset_hook_suppresses_before_stop() {
         let manifest_dir =
             std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
-        let source_path =
-            std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
         // Normalize line endings so the structural bound is CRLF/LF-agnostic.
         let source = std::fs::read_to_string(&source_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
@@ -3255,8 +3254,7 @@ mod tests {
     fn sc_ho_2b_production_reset_hook_marks_superseded_before_stop() {
         let manifest_dir =
             std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by Cargo");
-        let source_path =
-            std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
+        let source_path = std::path::PathBuf::from(&manifest_dir).join("src/commands/sender.rs");
         let source = std::fs::read_to_string(&source_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()))
             .replace("\r\n", "\n");
