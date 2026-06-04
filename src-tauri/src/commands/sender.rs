@@ -1961,7 +1961,9 @@ fn build_production_sender_bundle(
             std::thread::Builder::new()
                 .name("sm-sender-signaling-drain-reset".into())
                 .spawn(move || {
-                    run_sender_signaling_drain(sig_ev_rx, ops_clone, stop_clone, chan_clone, sup_clone);
+                    run_sender_signaling_drain(
+                        sig_ev_rx, ops_clone, stop_clone, chan_clone, sup_clone,
+                    );
                 })
                 .map_err(|e| {
                     eprintln!("[sm-sender-coord] failed to spawn reset signaling drain: {e}");
@@ -1981,7 +1983,13 @@ fn build_production_sender_bundle(
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(sig_ev_rx, sender_ops, sig_stop, sig_channel, sup_tx_for_sig);
+            run_sender_signaling_drain(
+                sig_ev_rx,
+                sender_ops,
+                sig_stop,
+                sig_channel,
+                sup_tx_for_sig,
+            );
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
@@ -3402,7 +3410,9 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
-        let slot = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<SupervisorSignal>>));
+        let slot = Arc::new(Mutex::new(
+            None::<std::sync::mpsc::SyncSender<SupervisorSignal>>,
+        ));
         let stop = Arc::new(AtomicBool::new(false));
 
         let stop_for_thread = stop.clone();
