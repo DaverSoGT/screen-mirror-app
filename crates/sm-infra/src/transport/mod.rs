@@ -239,7 +239,7 @@ mod resolve_ipv4_with_retry_tests {
             delays.set(delays.get() + 1);
         };
 
-        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, || false);
 
         assert_eq!(resolved, vec![ip()], "must return addrs once NIC returns");
         assert_eq!(calls.get(), 4, "probe exactly until the first non-empty result");
@@ -264,7 +264,7 @@ mod resolve_ipv4_with_retry_tests {
             delays.set(delays.get() + 1);
         };
 
-        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, || false);
 
         assert!(resolved.is_empty(), "exhausted budget → empty (caller logs error)");
         assert_eq!(
@@ -293,11 +293,53 @@ mod resolve_ipv4_with_retry_tests {
             delays.set(delays.get() + 1);
         };
 
-        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, || false);
 
         assert_eq!(resolved, vec![ip()]);
         assert_eq!(calls.get(), 1, "first non-empty result short-circuits");
         assert_eq!(delays.get(), 0, "no delay when the first probe succeeds");
+    }
+
+    /// SC-NIC-4: `should_stop` returns true after K iterations → loop breaks early,
+    /// returns empty, and does NOT run all `NIC_RETRY_ATTEMPTS` probes.
+    ///
+    /// Verifies the cancellable-retry fix for C1 (stop-flag not observed, blocking
+    /// `MdnsSignaling::stop()` / `Drop` for up to ~20s). With this fix, teardown
+    /// latency is bounded to one `NIC_RETRY_INTERVAL` (500ms) rather than the full
+    /// retry budget (~20s).
+    #[test]
+    fn returns_early_when_should_stop_set() {
+        const STOP_AFTER: u32 = 3; // stop flag trips after this many iterations
+        let calls = Cell::new(0u32);
+        let delays = Cell::new(0u32);
+
+        let probe = || {
+            calls.set(calls.get() + 1);
+            vec![] // NIC never returns — without early-stop this runs 40 times
+        };
+        let delay = |_: Duration| {
+            delays.set(delays.get() + 1);
+        };
+        // should_stop fires at the TOP of the (STOP_AFTER+1)-th iteration, so
+        // exactly STOP_AFTER probes execute before the break.
+        let should_stop = || calls.get() >= STOP_AFTER;
+
+        let resolved =
+            resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay, should_stop);
+
+        assert!(
+            resolved.is_empty(),
+            "stopped early → result must be empty (no NIC found)"
+        );
+        assert_eq!(
+            calls.get(),
+            STOP_AFTER,
+            "loop must break after exactly STOP_AFTER probes, not run all NIC_RETRY_ATTEMPTS"
+        );
+        assert!(
+            calls.get() < NIC_RETRY_ATTEMPTS,
+            "must not exhaust the full attempt budget when stop flag is set"
+        );
     }
 }
 
