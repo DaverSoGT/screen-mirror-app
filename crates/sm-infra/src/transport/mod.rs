@@ -152,6 +152,112 @@ where
     None
 }
 
+// ─── resolve_ipv4_with_retry helper ──────────────────────────────────────────
+
+/// Number of times [`resolve_ipv4_with_retry`] probes for non-empty IPv4
+/// addresses before giving up.
+///
+/// Budget: 40 × 500ms = 20s total (no sleep after the final attempt), which is
+/// 10s under the receiver's 30s `DISCOVER_TIMEOUT`. A real Wi-Fi re-enable
+/// (adapter up + DHCP) typically completes in 5-15s, so this window is
+/// sufficient while remaining bounded.
+pub const NIC_RETRY_ATTEMPTS: u32 = 40;
+
+/// Sleep between probe attempts in [`resolve_ipv4_with_retry`].
+/// 40 attempts × 500ms ≈ 20s total budget (no sleep after the final attempt).
+pub const NIC_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+#[cfg(test)]
+mod resolve_ipv4_with_retry_tests {
+    use super::{resolve_ipv4_with_retry, NIC_RETRY_ATTEMPTS};
+    use std::cell::Cell;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    fn ip() -> Ipv4Addr {
+        Ipv4Addr::new(192, 168, 1, 42)
+    }
+
+    /// SC-NIC-1: probe returns empty for the first K calls then non-empty →
+    /// helper must keep probing and return the addresses once the NIC returns.
+    /// A one-shot probe would fail; this asserts probe AND delay counts.
+    #[test]
+    fn returns_addrs_after_nic_returns_midway() {
+        let calls = Cell::new(0u32);
+        let delays = Cell::new(0u32);
+        let probe = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            // Empty for the first 3 calls (NIC down), non-empty afterwards.
+            if n < 3 { vec![] } else { vec![ip()] }
+        };
+        let delay = |_: Duration| {
+            delays.set(delays.get() + 1);
+        };
+
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+
+        assert_eq!(resolved, vec![ip()], "must return addrs once NIC returns");
+        assert_eq!(calls.get(), 4, "probe exactly until the first non-empty result");
+        assert_eq!(
+            delays.get(),
+            3,
+            "delay fires only BETWEEN attempts (once per empty probe)"
+        );
+    }
+
+    /// SC-NIC-2: probe always returns empty → helper returns empty after EXACTLY
+    /// `attempts` probes, never more. No real sleep (no-op delay closure).
+    #[test]
+    fn returns_empty_when_nic_never_returns_within_budget() {
+        let calls = Cell::new(0u32);
+        let delays = Cell::new(0u32);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            vec![]
+        };
+        let delay = |_: Duration| {
+            delays.set(delays.get() + 1);
+        };
+
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+
+        assert!(resolved.is_empty(), "exhausted budget → empty (caller logs error)");
+        assert_eq!(
+            calls.get(),
+            NIC_RETRY_ATTEMPTS,
+            "must probe exactly the attempt budget, never more"
+        );
+        assert_eq!(
+            delays.get(),
+            NIC_RETRY_ATTEMPTS - 1,
+            "no delay after the final attempt"
+        );
+    }
+
+    /// SC-NIC-3: first call already returns non-empty → short-circuits immediately,
+    /// zero delays fired.
+    #[test]
+    fn returns_immediately_on_first_success() {
+        let calls = Cell::new(0u32);
+        let delays = Cell::new(0u32);
+        let probe = || {
+            calls.set(calls.get() + 1);
+            vec![ip()]
+        };
+        let delay = |_: Duration| {
+            delays.set(delays.get() + 1);
+        };
+
+        let resolved = resolve_ipv4_with_retry(probe, NIC_RETRY_ATTEMPTS, delay);
+
+        assert_eq!(resolved, vec![ip()]);
+        assert_eq!(calls.get(), 1, "first non-empty result short-circuits");
+        assert_eq!(delays.get(), 0, "no delay when the first probe succeeds");
+    }
+}
+
 // ─── publish_host_candidate helper ───────────────────────────────────────────
 
 /// Publish a trickle-ICE host candidate for `addr` on the given signaling channel.
