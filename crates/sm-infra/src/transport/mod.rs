@@ -185,20 +185,34 @@ pub const NIC_RETRY_INTERVAL: std::time::Duration =
 /// - `delay` is invoked BETWEEN attempts only (never after the last one), so a
 ///   test can pass a no-op closure and run instantly while production passes
 ///   `std::thread::sleep`.
+/// - `should_stop` is checked at the TOP of each attempt iteration before the
+///   probe runs. If it returns `true` the loop breaks immediately and an empty
+///   `Vec` is returned. This keeps teardown latency bounded to at most one
+///   `NIC_RETRY_INTERVAL` (500ms) rather than the full retry budget (~20s) —
+///   fixing C1 where `MdnsSignaling::stop()` / `Drop` could block ~20s while
+///   the thread slept through retries with the NIC down.
+///   Tests pass `|| false`; production passes `|| stop.load(Ordering::Acquire)`.
 ///
 /// Returns the first non-empty `Vec<Ipv4Addr>` found, or an empty `Vec` if
-/// every attempt within the budget returns empty. Never exceeds `attempts`
-/// probe calls.
-pub fn resolve_ipv4_with_retry<P, D>(
+/// every attempt within the budget returns empty or `should_stop` fires.
+/// Never exceeds `attempts` probe calls.
+pub fn resolve_ipv4_with_retry<P, D, S>(
     mut probe: P,
     attempts: u32,
     mut delay: D,
+    mut should_stop: S,
 ) -> Vec<std::net::Ipv4Addr>
 where
     P: FnMut() -> Vec<std::net::Ipv4Addr>,
     D: FnMut(std::time::Duration),
+    S: FnMut() -> bool,
 {
     for attempt in 0..attempts {
+        // Check the stop flag BEFORE the probe so teardown is immediately
+        // responsive — at most one NIC_RETRY_INTERVAL of latency.
+        if should_stop() {
+            break;
+        }
         let addrs = probe();
         if !addrs.is_empty() {
             return addrs;

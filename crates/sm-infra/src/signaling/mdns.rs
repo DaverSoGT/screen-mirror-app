@@ -665,6 +665,11 @@ fn run_sender_thread(
     // NIC_RETRY_ATTEMPTS times with NIC_RETRY_INTERVAL between probes — a budget
     // of ~20s, comfortably under DISCOVER_TIMEOUT (30s). If the NIC returns
     // within that window, the bind proceeds; if not, we still terminate cleanly.
+    //
+    // C1 fix: pass the thread's stop flag as `should_stop` so that when
+    // `MdnsSignaling::stop()` sets the flag, the retry loop breaks at the top of
+    // the next iteration rather than sleeping through the full ~20s budget.
+    // Teardown latency is now bounded to at most one NIC_RETRY_INTERVAL (500ms).
     let attempts_before_success = std::cell::Cell::new(0u32);
     let ip_list = resolve_ipv4_with_retry(
         || {
@@ -673,6 +678,7 @@ fn run_sender_thread(
         },
         NIC_RETRY_ATTEMPTS,
         std::thread::sleep,
+        || stop.load(Ordering::Acquire),
     );
     if ip_list.is_empty() {
         // All NIC_RETRY_ATTEMPTS probes exhausted and NIC did not return — the
