@@ -599,8 +599,11 @@ fn signaling_drain_peer_found_logs_and_emits_connecting() {
     let ch_clone = ch.clone();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone, none_slot);
     });
 
     ev_tx
@@ -630,8 +633,11 @@ fn signaling_drain_answer_received_calls_apply_remote_answer() {
     let ch = FakeJsonChannel::new();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
     });
 
     ev_tx
@@ -660,8 +666,11 @@ fn signaling_drain_candidate_received_calls_add_remote_candidate() {
     let ch = FakeJsonChannel::new();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
     });
 
     ev_tx
@@ -689,8 +698,11 @@ fn signaling_drain_offer_received_is_silently_ignored() {
     let ch = FakeJsonChannel::new();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch);
+        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
     });
 
     ev_tx
@@ -719,8 +731,11 @@ fn signaling_drain_closed_emits_peer_lost_and_exits() {
     let ch_clone = ch.clone();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone);
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone, none_slot);
     });
 
     ev_tx.send(SignalingEvent::Closed).unwrap();
@@ -740,8 +755,11 @@ fn signaling_drain_disconnected_rx_exits_cleanly() {
     let ch = FakeJsonChannel::new();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch, none_slot);
     });
 
     drop(ev_tx); // disconnect
@@ -763,8 +781,11 @@ fn signaling_drain_stop_flag_exits_loop() {
     let ch = FakeJsonChannel::new();
     let stop_clone = stop_flag.clone();
 
+    let none_slot = Arc::new(Mutex::new(
+        None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
+    ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch);
+        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch, none_slot);
     });
 
     stop_flag.store(true, Ordering::Relaxed);

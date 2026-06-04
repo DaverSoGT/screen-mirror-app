@@ -559,6 +559,8 @@ pub fn run_sender_signaling_drain(
     sender: Arc<dyn SignalingSenderOps>,
     stop_flag: Arc<AtomicBool>,
     channel: Arc<dyn ChannelLike>,
+    // NEW (REQ-RFE-1): escalate signaling Error to supervisor during rebuild phase
+    signal_slot: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -595,6 +597,12 @@ pub fn run_sender_signaling_drain(
                 }
                 SignalingEvent::Error(e) => {
                     eprintln!("[sm-sender-signaling-drain] signaling error: {e}");
+                    // Escalate a rebuild-phase signaling death back to the supervisor so it
+                    // advances to the next attempt-with-backoff instead of committing a dead
+                    // generation. None slot (pre-arm/post-stop) or full/closed channel = safe no-op.
+                    if let Some(tx) = signal_slot.lock().unwrap().as_ref() {
+                        let _ = tx.try_send(SupervisorSignal::RebuildFailed);
+                    }
                 }
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1827,6 +1835,8 @@ fn build_production_sender_bundle(
     let sender_ops_for_reset = sender_ops.clone();
     let stop_flag_for_reset = _stop_flag.clone();
     let channel_for_reset = _channel.clone();
+    // REQ-RFE-4: clone supervisor signal slot for the reset drain (same slot as primary).
+    let sup_tx_for_reset = bridge_supervisor_signal_tx.clone();
 
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
@@ -1944,10 +1954,11 @@ fn build_production_sender_bundle(
             let ops_clone = sender_ops_for_reset.clone();
             let stop_clone = stop_flag_for_reset.clone();
             let chan_clone = channel_for_reset.clone();
+            let sup_clone = sup_tx_for_reset.clone();
             std::thread::Builder::new()
                 .name("sm-sender-signaling-drain-reset".into())
                 .spawn(move || {
-                    run_sender_signaling_drain(sig_ev_rx, ops_clone, stop_clone, chan_clone);
+                    run_sender_signaling_drain(sig_ev_rx, ops_clone, stop_clone, chan_clone, sup_clone);
                 })
                 .map_err(|e| {
                     eprintln!("[sm-sender-coord] failed to spawn reset signaling drain: {e}");
@@ -1963,10 +1974,11 @@ fn build_production_sender_bundle(
     let sig_stop = stop_flag.clone();
     let tr_stop = stop_flag.clone();
 
+    let sup_tx_for_sig = bridge_supervisor_signal_tx.clone();
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(sig_ev_rx, sender_ops, sig_stop, sig_channel);
+            run_sender_signaling_drain(sig_ev_rx, sender_ops, sig_stop, sig_channel, sup_tx_for_sig);
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
@@ -3286,5 +3298,135 @@ mod tests {
              `suppress_outbound_bye()` (offset {suppress_pos}) and BEFORE `sig.stop()` \
              (offset {stop_pos}), so the re-started gen-G comes up already-superseded."
         );
+    }
+
+    // ─── SC-RFE-1 / SC-RFE-2: signaling drain Error escalation (REQ-RFE-1, REQ-RFE-2) ──
+    //
+    // WU-2 RED anchor: the test below was written against the FUTURE signature of
+    // `run_sender_signaling_drain` (5th param `signal_slot`). Before WU-3 added the
+    // param, this test would fail to compile. WU-3 turned it GREEN by adding the param
+    // and the guarded `try_send` in the Error arm. Both tests (WU-2 + WU-3) ship in
+    // the same commit per work-unit-commits: test and code travel together.
+
+    /// Minimal no-op implementation of `SignalingSenderOps` for drain unit tests.
+    struct NoopOps;
+    impl super::SignalingSenderOps for NoopOps {
+        fn apply_remote_answer(
+            &self,
+            _ans: sm_domain::signaling::SdpAnswer,
+        ) -> Result<(), sm_domain::transport::TransportError> {
+            Ok(())
+        }
+        fn add_remote_candidate(
+            &self,
+            _c: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), sm_domain::transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal `ChannelLike` for drain unit tests — discards all sends.
+    struct NoopCh;
+    impl super::ChannelLike for NoopCh {
+        fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// SC-RFE-1 drain half — `SignalingEvent::Error` with an armed slot sends
+    /// `SupervisorSignal::RebuildFailed` on the supervisor channel.
+    ///
+    /// GIVEN: `run_sender_signaling_drain` holds a `signal_slot` with `Some(tx)`.
+    /// WHEN:  `SignalingEvent::Error(SignalingError::Io("nic down".into()))` is sent.
+    /// THEN:  `RebuildFailed` is received on the paired `rx` within 300 ms.
+    #[test]
+    fn signaling_drain_error_with_armed_slot_sends_rebuild_failed() {
+        use sm_domain::signaling::{SignalingError, SignalingEvent};
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(4);
+        let slot = Arc::new(Mutex::new(Some(sup_tx)));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_for_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("test-rfe1-drain".into())
+            .spawn(move || {
+                super::run_sender_signaling_drain(
+                    sig_ev_rx,
+                    Arc::new(NoopOps),
+                    stop_for_thread,
+                    Arc::new(NoopCh),
+                    slot,
+                );
+            })
+            .unwrap();
+
+        sig_ev_tx
+            .send(SignalingEvent::Error(SignalingError::Io("nic down".into())))
+            .unwrap();
+
+        let received = sup_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("RebuildFailed must arrive within 300 ms after Error event");
+        assert_eq!(
+            received,
+            SupervisorSignal::RebuildFailed,
+            "drain must send RebuildFailed on signaling Error (REQ-RFE-1)"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        drop(sig_ev_tx);
+        let _ = thread.join();
+    }
+
+    /// SC-RFE-2 — `SignalingEvent::Error` with a `None` slot is a no-op and does not panic.
+    ///
+    /// GIVEN: `run_sender_signaling_drain` holds a `signal_slot` with `None`.
+    /// WHEN:  `SignalingEvent::Error` is sent, then `SignalingEvent::Closed` to exit cleanly.
+    /// THEN:  The drain thread joins without panic (no `RebuildFailed` is sent).
+    #[test]
+    fn signaling_drain_error_with_none_slot_is_noop() {
+        use sm_domain::signaling::{SignalingError, SignalingEvent};
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let slot = Arc::new(Mutex::new(None::<std::sync::mpsc::SyncSender<SupervisorSignal>>));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_for_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("test-rfe2-drain".into())
+            .spawn(move || {
+                super::run_sender_signaling_drain(
+                    sig_ev_rx,
+                    Arc::new(NoopOps),
+                    stop_for_thread,
+                    Arc::new(NoopCh),
+                    slot,
+                );
+            })
+            .unwrap();
+
+        sig_ev_tx
+            .send(SignalingEvent::Error(SignalingError::Io("nic down".into())))
+            .unwrap();
+        // Send Closed so the drain exits cleanly (no spin on stop_flag needed).
+        sig_ev_tx.send(SignalingEvent::Closed).unwrap();
+
+        // Drain thread must join without panic — that is the single invariant here.
+        thread
+            .join()
+            .expect("drain thread must not panic when slot is None (REQ-RFE-2)");
+
+        stop.store(true, Ordering::SeqCst);
     }
 }
