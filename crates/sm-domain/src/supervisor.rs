@@ -1631,4 +1631,99 @@ mod tests {
         h.send(SupervisorSignal::Stop);
         h.join();
     }
+
+    // ─── SC-T22-RETRY-2 / REQ-RFE-7: rebuild-failed-escalation regression guard ─
+
+    // REGRESSION GUARD (SC-T22-RETRY-2 / REQ-RFE-7): do not delete or weaken.
+    //
+    // This test locks the existing supervisor backoff/budget/emit behavior that the
+    // `rebuild-failed-escalation` change (GitHub #57) sends `RebuildFailed` into.
+    // The supervisor state machine MUST be unchanged — only sender.rs wiring changes.
+    // If this test turns RED after any future diff, the SC-T22-sensitive Rebuilding arm
+    // was modified; treat it as a merge blocker.
+
+    /// SC-T22-RETRY-2 — `RebuildFailed` in `Rebuilding(attempt 1)` advances to
+    ///                   `Reconnecting { attempt: 2, max: 3 }` with correct backoff.
+    ///
+    /// GIVEN: A supervisor in `Rebuilding { attempt: 1, .. }` (driven via
+    ///        `LocalFailure → PeerAck`).
+    /// WHEN:  `RebuildFailed` is sent.
+    /// THEN:
+    ///   1. Next outcome is `StateChanged(Reconnecting { attempt: 2, max: 3 })`.
+    ///   2. Followed by `PublishReconnectRequest { attempt: 2 }`.
+    ///   3. `ReconnectPolicy::v1_default().delay_for_attempt(2) == 3 s` (schedule intact).
+    #[test]
+    fn rebuild_failed_during_rebuilding_advances_to_attempt_2_with_backoff() {
+        let nonce: u64 = 57;
+        let h = SupervisorHandle::spawn(fast_policy(), nonce);
+
+        // Drive: LocalFailure → consume StateChanged(Reconnecting{1}) + PublishReconnectRequest{1}
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let state1 = h.recv_outcome();
+        assert_eq!(
+            state1,
+            SupervisorOutcome::StateChanged(SessionState::Reconnecting {
+                attempt: std::num::NonZeroU8::new(1).unwrap(),
+                max: std::num::NonZeroU8::new(3).unwrap(),
+            }),
+            "Expected Reconnecting{{1,3}} after LocalFailure, got {state1:?}"
+        );
+        let _req1 = h.recv_outcome(); // PublishReconnectRequest{1}
+
+        // Drive: PeerAck → consume InitiateRebuild
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 1,
+        });
+        let _rebuild = h.recv_outcome(); // InitiateRebuild
+
+        // Drive: RebuildFailed
+        h.send(SupervisorSignal::RebuildFailed);
+
+        // Assert: next outcome is StateChanged(Reconnecting{2, 3})
+        let state2 = h.recv_outcome();
+        assert_eq!(
+            state2,
+            SupervisorOutcome::StateChanged(SessionState::Reconnecting {
+                attempt: std::num::NonZeroU8::new(2).unwrap(),
+                max: std::num::NonZeroU8::new(3).unwrap(),
+            }),
+            "Expected Reconnecting{{2,3}} after RebuildFailed, got {state2:?}"
+        );
+
+        // Assert: next outcome is PublishReconnectRequest{2}
+        let req2 = h.recv_outcome();
+        assert_eq!(
+            req2,
+            SupervisorOutcome::PublishReconnectRequest {
+                attempt: 2,
+                session_nonce: nonce,
+            },
+            "Expected PublishReconnectRequest{{2}} after RebuildFailed, got {req2:?}"
+        );
+
+        // Assert: v1_default backoff schedule is unchanged — 3s/9s/27s ladder intact.
+        // Formula: base_ms=3000, factor=3 ⇒ attempt 1=3s, 2=9s, 3=27s.
+        let v1 = crate::session::ReconnectPolicy::v1_default();
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(1).unwrap()),
+            Duration::from_secs(3),
+            "v1_default delay_for_attempt(1) must equal 3s (backoff schedule locked)"
+        );
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(2).unwrap()),
+            Duration::from_secs(9),
+            "v1_default delay_for_attempt(2) must equal 9s (backoff schedule locked)"
+        );
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(3).unwrap()),
+            Duration::from_secs(27),
+            "v1_default delay_for_attempt(3) must equal 27s (backoff schedule locked)"
+        );
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
 }
