@@ -131,6 +131,23 @@ function cancelSilentRecovery() {
   overlayRevealed = false; // reset sentinel so a new loss episode can arm the timer (D-SSR-6)
 }
 
+// ── dismissReconnectOverlayOnRecovery ────────────────────────────────────────
+// Called from the <video> "playing" event to dismiss the Stage-2 reconnecting
+// overlay when the video resumes playback via the FRAME_INIT self-arm path
+// (D-IR-4, onInitFrame Guard 1). That path calls setUpMse() directly without
+// sending a handleStatus("streaming") frame, so the overlay-hide in case
+// "streaming" is never triggered — the overlay stays visible over the
+// now-playing video. This is the additive dismissal seam (SC-SSR-OVL-RECOVERY).
+//
+// Gate: if (!overlayRevealed) return — no-op during normal playback or Stage 1
+// so spurious "playing" events (startup, seek) do not touch overlay state.
+// Idempotent: repeated calls are safe (cancelSilentRecovery is idempotent).
+function dismissReconnectOverlayOnRecovery() {
+  if (!overlayRevealed) return;
+  if (reconnectingOverlay) reconnectingOverlay.hidden = true;
+  cancelSilentRecovery(); // resets overlayRevealed = false + clears any pending timer
+}
+
 // ── revealReconnectingOverlay ────────────────────────────────────────────────
 // Timer callback: fires SILENT_RECOVERY_THRESHOLD_MS after the first
 // reconnecting frame. Transitions from Stage 1 (silent) to Stage 2 (visible).
@@ -777,6 +794,11 @@ async function main() {
       );
     });
   });
+  // Additive: dismiss the Stage-2 reconnecting overlay when the video actually
+  // resumes playback, gated on overlayRevealed so it only fires during an active
+  // Stage-2 reconnect (no effect on normal playback). Handles the FRAME_INIT
+  // self-arm recovery path (D-IR-4) that bypasses handleStatus("streaming").
+  VIDEO_EL.addEventListener("playing", dismissReconnectOverlayOnRecovery);
   // Heartbeat: report buffered ranges + currentTime every 2 s while a SB exists.
   // Reads from mseState (updated by tearDownMse / setUpMse / onInitFrame).
   setInterval(() => {
