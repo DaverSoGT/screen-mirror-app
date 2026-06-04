@@ -599,7 +599,10 @@ pub fn run_sender_signaling_drain(
                     eprintln!("[sm-sender-signaling-drain] signaling error: {e}");
                     // Escalate a rebuild-phase signaling death back to the supervisor so it
                     // advances to the next attempt-with-backoff instead of committing a dead
-                    // generation. None slot (pre-arm/post-stop) or full/closed channel = safe no-op.
+                    // generation. None slot (pre-arm/post-stop) = genuine no-op (supervisor
+                    // not armed or already stopped). Disconnected = supervisor gone, also
+                    // a genuine no-op. Full (16-cap FIFO): RebuildFailed is dropped and
+                    // escalation falls back to the supervisor's rebuild_timeout backstop.
                     if let Some(tx) = signal_slot.lock().unwrap().as_ref() {
                         let _ = tx.try_send(SupervisorSignal::RebuildFailed);
                     }
