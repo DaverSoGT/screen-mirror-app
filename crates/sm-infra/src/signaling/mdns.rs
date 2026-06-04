@@ -48,6 +48,7 @@ use sm_domain::signaling::{
 use sm_domain::supervisor::SupervisorSignal;
 
 use crate::signaling::wire::{MAX_FRAME_BYTES, SignalingFrame, write_frame};
+use crate::transport::{NIC_RETRY_ATTEMPTS, NIC_RETRY_INTERVAL, resolve_ipv4_with_retry};
 
 /// Write timeout for `publish_reconnect_request` / `publish_reconnect_ack`.
 ///
@@ -659,14 +660,49 @@ fn run_sender_thread(
         return;
     }
 
-    // Enumerate IPv4 addresses for mDNS registration.
-    let ip_list = collect_ipv4_addrs();
+    // Enumerate IPv4 addresses for mDNS registration, retrying across a NIC-down
+    // window (e.g. Wi-Fi flap). `resolve_ipv4_with_retry` polls up to
+    // NIC_RETRY_ATTEMPTS times with NIC_RETRY_INTERVAL between probes — a budget
+    // of ~20s, comfortably under DISCOVER_TIMEOUT (30s). If the NIC returns
+    // within that window, the bind proceeds; if not, we still terminate cleanly.
+    let attempts_before_success = std::cell::Cell::new(0u32);
+    let ip_list = resolve_ipv4_with_retry(
+        || {
+            attempts_before_success.set(attempts_before_success.get() + 1);
+            collect_ipv4_addrs()
+        },
+        NIC_RETRY_ATTEMPTS,
+        std::thread::sleep,
+    );
     if ip_list.is_empty() {
+        // All NIC_RETRY_ATTEMPTS probes exhausted and NIC did not return — the
+        // sender is genuinely offline. Log loudly so HW-gate logs show the budget
+        // was honoured, then terminate with the standard error.
+        eprintln!(
+            "[sm-signaling] ERROR: NIC enumeration exhausted after {} attempts \
+             ({} × {}ms ≈ {}s budget) — no IPv4 interfaces found; \
+             sender signaling thread terminating",
+            NIC_RETRY_ATTEMPTS,
+            NIC_RETRY_ATTEMPTS,
+            NIC_RETRY_INTERVAL.as_millis(),
+            NIC_RETRY_INTERVAL.as_millis() * u128::from(NIC_RETRY_ATTEMPTS - 1) / 1000,
+        );
         emit_error(
             &event_tx,
             SignalingError::Io("no IPv4 network interfaces found".to_string()),
         );
         return;
+    }
+    // NIC returned — log recovery if it took more than one probe.
+    let probes = attempts_before_success.get();
+    if probes > 1 {
+        eprintln!(
+            "[sm-signaling] NIC recovered after {} probe(s) \
+             (~{}ms wait) — proceeding with mDNS registration on {}",
+            probes,
+            NIC_RETRY_INTERVAL.as_millis() * u128::from(probes - 1),
+            ip_list[0],
+        );
     }
 
     // Register mDNS service.

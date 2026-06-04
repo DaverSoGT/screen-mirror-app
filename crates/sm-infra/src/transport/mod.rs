@@ -168,6 +168,49 @@ pub const NIC_RETRY_ATTEMPTS: u32 = 40;
 pub const NIC_RETRY_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(500);
 
+/// Probe for at least one non-loopback IPv4 address, retrying up to `attempts`
+/// times with a caller-supplied delay between tries.
+///
+/// Motivation: when the sender's NIC drops and returns (Wi-Fi flap), the mDNS
+/// signaling bind in `run_sender_thread` calls `collect_ipv4_addrs()` which
+/// returns an empty list while the NIC is still recovering. Without a retry the
+/// thread emits `SignalingError::Io("no IPv4 network interfaces found")` and
+/// returns, killing the signaling thread — and nothing re-enumerates when the
+/// NIC comes back. This helper mirrors `resolve_candidate_with_retry` for the
+/// bind enumeration path so the sender can wait out the NIC-down window.
+///
+/// Pure and side-effect-injected for testability:
+/// - `probe` is called once per attempt; the first non-empty `Vec` short-circuits
+///   and is returned immediately.
+/// - `delay` is invoked BETWEEN attempts only (never after the last one), so a
+///   test can pass a no-op closure and run instantly while production passes
+///   `std::thread::sleep`.
+///
+/// Returns the first non-empty `Vec<Ipv4Addr>` found, or an empty `Vec` if
+/// every attempt within the budget returns empty. Never exceeds `attempts`
+/// probe calls.
+pub fn resolve_ipv4_with_retry<P, D>(
+    mut probe: P,
+    attempts: u32,
+    mut delay: D,
+) -> Vec<std::net::Ipv4Addr>
+where
+    P: FnMut() -> Vec<std::net::Ipv4Addr>,
+    D: FnMut(std::time::Duration),
+{
+    for attempt in 0..attempts {
+        let addrs = probe();
+        if !addrs.is_empty() {
+            return addrs;
+        }
+        // Delay only BETWEEN attempts — never after the final probe.
+        if attempt + 1 < attempts {
+            delay(NIC_RETRY_INTERVAL);
+        }
+    }
+    vec![]
+}
+
 #[cfg(test)]
 mod resolve_ipv4_with_retry_tests {
     use super::{resolve_ipv4_with_retry, NIC_RETRY_ATTEMPTS};
