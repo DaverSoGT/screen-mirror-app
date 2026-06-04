@@ -7284,6 +7284,12 @@ mod tests {
     ///
     /// RED: shares SC-WD-1's compile failure (missing parameter).
     /// GREEN (WU-D2): MediaData disarms the post-rebuild watchdog.
+    ///
+    /// Determinism fix: instead of a single timed MediaData (which races against the
+    /// wall-clock moment the supervisor reaches Connected on slow CI), we spawn a
+    /// continuous sender that fires every 35ms. The watchdog arms at some point after
+    /// Connected; within at most ~35ms of arming a MediaData arrives and disarms it —
+    /// well within N=400ms on any runner.
     #[test]
     fn sc_wd_2_media_in_n_no_rearm() {
         use sm_domain::transport::TransportEvent;
@@ -7310,13 +7316,27 @@ mod tests {
         });
 
         ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-        // Give the supervisor time to reach Connected and arm the watchdog, then
-        // deliver MediaData WELL within N (400ms) to disarm it.
-        std::thread::sleep(Duration::from_millis(150));
-        ev_tx.try_send(TransportEvent::MediaData).unwrap();
 
-        // Wait past the original deadline to prove no re-arm fired.
+        // Continuous MediaData sender: models real media flow so the watchdog is
+        // guaranteed to see a MediaData within ~35ms of arming (whenever Connected
+        // happens on any runner speed). try_send ignores Err(Full) so a
+        // transiently-full channel can't panic the sender thread.
+        let media_stop = Arc::new(AtomicBool::new(false));
+        let media_stop_clone = media_stop.clone();
+        let ev_tx_media = ev_tx.clone();
+        let media_sender = std::thread::spawn(move || {
+            while !media_stop_clone.load(Ordering::Relaxed) {
+                let _ = ev_tx_media.try_send(TransportEvent::MediaData);
+                std::thread::sleep(Duration::from_millis(35));
+            }
+        });
+
+        // Wait past the original watchdog deadline to prove no re-arm fired.
         std::thread::sleep(Duration::from_millis(600));
+
+        // Stop the MediaData sender, then stop the drain.
+        media_stop.store(true, Ordering::Relaxed);
+        let _ = media_sender.join();
         stop_flag.store(true, Ordering::Relaxed);
         let _ = handle.join();
 
@@ -7334,6 +7354,10 @@ mod tests {
     ///
     /// RED: shares SC-WD-1's compile failure.
     /// GREEN (WU-D2): SC-T22 shape sees zero behavioral change from the watchdog.
+    ///
+    /// Determinism fix: same continuous-sender pattern as SC-WD-2 — fires every 35ms
+    /// so the watchdog is guaranteed to be disarmed regardless of when Connected
+    /// lands on any runner speed (eliminates macOS CI wall-clock flake).
     #[test]
     fn sc_wd_3_sc_t22_shape_unaffected() {
         use sm_domain::transport::TransportEvent;
@@ -7359,11 +7383,28 @@ mod tests {
             );
         });
 
-        // Single-side restart shape: one IceFailed → rebuild succeeds → media flows.
+        // Single-side restart shape: IceFailed → rebuild succeeds → continuous media.
+        // The continuous sender guarantees the watchdog sees a MediaData within ~35ms
+        // of arming on any runner, preventing the wall-clock race that caused macOS CI
+        // flakes (single MediaData sent before Connected could race the arm point).
         ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-        std::thread::sleep(Duration::from_millis(120));
-        ev_tx.try_send(TransportEvent::MediaData).unwrap();
-        std::thread::sleep(Duration::from_millis(550));
+
+        let media_stop = Arc::new(AtomicBool::new(false));
+        let media_stop_clone = media_stop.clone();
+        let ev_tx_media = ev_tx.clone();
+        let media_sender = std::thread::spawn(move || {
+            while !media_stop_clone.load(Ordering::Relaxed) {
+                let _ = ev_tx_media.try_send(TransportEvent::MediaData);
+                std::thread::sleep(Duration::from_millis(35));
+            }
+        });
+
+        // Run long enough to prove no re-arm (watchdog N=400ms, total >550ms).
+        std::thread::sleep(Duration::from_millis(600));
+
+        // Stop the MediaData sender, then stop the drain.
+        media_stop.store(true, Ordering::Relaxed);
+        let _ = media_sender.join();
         stop_flag.store(true, Ordering::Relaxed);
         let _ = handle.join();
 
