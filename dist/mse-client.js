@@ -104,6 +104,13 @@ let pendingInit = null;
 // progress (D-IR-5). Reset to false by both the sourceopen and error handlers.
 let setUpInFlight = false;
 
+// Generation counter for MSE lifecycle sessions (SC-IR-9: stale-sourceopen guard).
+// Incremented each time setUpMse() creates a new MediaSource. The sourceopen and
+// error handlers capture their generation at construction time and exit early if
+// the current counter no longer matches — a superseded MS's late sourceopen must
+// not corrupt the live session's state (the stale-callback wedge).
+let mseGeneration = 0;
+
 // ── cancelAutoRetry ──────────────────────────────────────────────────────────
 // Cancels any pending auto-retry timer. Idempotent — safe to call when no
 // timer is armed. MUST be called on every Dead-state exit (PQ-3 invariant,
@@ -291,6 +298,10 @@ function tearDownMse() {
 function setUpMse() {
   setUpInFlight = true; // D-IR-5: mark in-flight before construction
   const ms = new MediaSource();
+  // SC-IR-9: capture this session's generation tag immediately after construction.
+  // If tearDownMse supersedes this MS before its sourceopen fires, the orphaned
+  // callback will see a stale myGen and exit without touching global state.
+  const myGen = ++mseGeneration;
   mseState.ms = ms;
   const url = URL.createObjectURL(ms);
   mseState.objectUrl = url;
@@ -302,6 +313,15 @@ function setUpMse() {
 
   return new Promise((resolve, reject) => {
     ms.addEventListener("sourceopen", () => {
+      // SC-IR-9: stale-sourceopen guard. A superseded MS's late sourceopen must
+      // not corrupt the live session's state. If this generation tag no longer
+      // matches the current counter, or mseState.ms has moved on to a different
+      // instance, this callback belongs to an orphaned MS — resolve and return
+      // without mutating any global state.
+      if (mseGeneration !== myGen || mseState.ms !== ms) {
+        resolve();
+        return;
+      }
       setUpInFlight = false; // D-IR-5: clear flag — MS is now open
       mseState.active = true;
       setStatus("MSE ready (reconnect) — awaiting fresh init segment…");
@@ -315,6 +335,11 @@ function setUpMse() {
       resolve();
     }, { once: true });
     ms.addEventListener("error", (e) => {
+      // SC-IR-9: same stale-generation guard for the error path.
+      if (mseGeneration !== myGen || mseState.ms !== ms) {
+        reject(e);
+        return;
+      }
       setUpInFlight = false; // D-IR-5: clear flag on error too
       reject(e);
     }, { once: true });
@@ -666,7 +691,19 @@ function applyInit(ms, data, frameBytes) {
     sb.addEventListener("updateend", seekToLiveEdge);
     mseState.sb = sb; // write into module-level state (heartbeat + tearDownMse)
   } catch (e) {
+    // Primary warn (keep existing): visible in operator console.
     setStatus("addSourceBuffer failed: " + e);
+    // Secondary hardening (SC-IR-9 defense-in-depth): reset broken state so the
+    // pipeline can self-heal. Without this reset, mseState.sb stays null and
+    // mseState.initReceived stays false after a throw (e.g. InvalidStateError on a
+    // CLOSED MS), but mseState.active may already be true from a prior stale
+    // sourceopen — the pipeline wedges permanently. Re-queuing into pendingInit
+    // gives a later/current sourceopen drain the chance to re-apply the init.
+    mseState.sb = null;
+    mseState.initReceived = false;
+    // Re-queue this init so the next sourceopen drain can re-apply it.
+    // { data, frameBytes } are in scope as applyInit parameters.
+    pendingInit = { data, frameBytes };
     return;
   }
   // Surface SourceBuffer error and updateend events so MSE failures are visible.
@@ -709,12 +746,43 @@ function applyInit(ms, data, frameBytes) {
 // - Guard 3 (sb !== null, same session): same-session duplicate init; ignored as
 //   before (tearDownMse always nulls sb for a new session).
 function onInitFrame(data, frameBytes) {
-  // Guard 3: already have a SourceBuffer for this session — same-session
-  // duplicate init not supported in v1; ignore. A genuinely new session always
-  // went through tearDownMse (which nulls sb), so sb!==null here means duplicate.
+  // Guard 3: already have a SourceBuffer — but distinguish a true same-session
+  // duplicate from a recovery init that raced ahead during a reconnect.
+  //
+  // Original invariant: "a genuinely new session always went through tearDownMse
+  // (which nulls sb), so sb!==null here means duplicate." This breaks during the
+  // deferred-teardown reconnect window: handleStatus("reconnecting") deliberately
+  // does NOT call tearDownMse so the last frozen frame stays visible (REQ-SSR-4).
+  // The Rust mux emits FRAME_INIT from its own keyframe-driven thread, which can
+  // race AHEAD of the "streaming" status frame. The recovery init then hits this
+  // guard with sb!==null while we are still in Stage 1 of the silent-reconnect
+  // window, causing it to be dropped and permanently wedging the pipeline.
+  //
+  // Fix: keep the ignore path ONLY for a genuine duplicate on a healthy session
+  // (MS open AND no reconnect in progress). Otherwise call tearDownMse() and fall
+  // through so Guard 1 self-arms setUpMse and queues the init via pendingInit —
+  // the proven recovery path (D-IR-4).
   if (mseState.sb !== null) {
-    console.warn("[mse] additional init segment ignored");
-    return;
+    const msOpen = !!(mseState.ms && mseState.ms.readyState === "open");
+    // Detect a reconnect in progress via module-scoped signals:
+    //   silentRecoveryTimerId !== null → Stage 1 silent window is active (timer armed
+    //   by handleStatus("reconnecting"), not yet fired, overlay not yet shown).
+    //   overlayRevealed && !msOpen → Stage 2 was entered (revealReconnectingOverlay
+    //   called tearDownMse + set overlayRevealed), but self-arm has not yet re-opened
+    //   the MS. Once self-arm completes and sb is set again, msOpen is true and
+    //   overlayRevealed is still true until cancelSilentRecovery fires — but that
+    //   re-entry case means we're in a healthy new session, not in a reconnect race.
+    // Together these two conditions cover the races without false-positives on the
+    // "second FRAME_INIT after self-arm recovery" case (SC-IR-3 invariant).
+    const reconnecting = silentRecoveryTimerId !== null || (overlayRevealed && !msOpen);
+    if (msOpen && !reconnecting) {
+      // True same-session duplicate on a healthy, non-reconnecting session — ignore.
+      console.warn("[mse] additional init segment ignored");
+      return;
+    }
+    // Recovery init during a reconnect window (or stale MS): tear down the stale
+    // session and fall through to Guard 1 to self-arm a fresh setUpMse.
+    tearDownMse();
   }
 
   const ms = mseState.ms;
