@@ -48,6 +48,9 @@ describe('mse-client — init-segment recovery (SC-IR-1..8)', () => {
     vi.stubGlobal('MediaSource', MockMediaSourceCtor);
     MockMediaSourceCtor._lastInstance = null;
     MockMediaSourceCtor._deferOpenNext = false;
+    // Expose mseState for SC-IR-9 (and any future tests that need it). The seam
+    // is a no-op in production (the `if` short-circuits when the key is absent).
+    globalThis.__SCREEN_MIRROR_TEST_EXPORTS__ = {};
     vi.useFakeTimers();
     vi.resetModules();
     await import('../../../dist/mse-client.js');
@@ -521,5 +524,130 @@ describe('mse-client — init-segment recovery (SC-IR-1..8)', () => {
 
     // appendBuffer must have been called a second time (init + segment).
     expect(ms2._sb.appendBuffer).toHaveBeenCalledTimes(2);
+  });
+
+  // ── SC-IR-9 ───────────────────────────────────────────────────────────────────
+  // Multi-cycle reconnect: stale-sourceopen wedge under a long outage.
+  //
+  // Bug (RCA-confirmed): setUpMse's sourceopen handler mutates module-global
+  // mseState.active and setUpInFlight with NO generation/identity guard. When a
+  // self-armed MS is superseded by tearDownMse before its async sourceopen fires,
+  // the orphaned MS's late sourceopen blindly sets mseState.active = true even
+  // though mseState.ms is now a DIFFERENT (or null) MS. The pipeline then takes
+  // the applyInit happy path on a CLOSED MS → addSourceBuffer throws
+  // InvalidStateError → the catch is a dead-end (no reset, no re-queue) →
+  // initReceived stays false → every FRAME_SEGMENT hits "segment arrived before
+  // init — discarding" → permanent wedge requiring full app relaunch.
+  //
+  // Fix: generation-tag each setUpMse call. The sourceopen/error handlers only
+  // mutate global state when their captured generation tag matches the current
+  // module-global generation counter AND mseState.ms is still themselves.
+  //
+  // Scenario (multi-cycle, Stage-2 path):
+  //   1. Prime healthy session (beforeEach).
+  //   2. Dispatch reconnecting → advance 10 s → Stage-2 reveal → tearDownMse
+  //      (ms=null). Stream is still alive (__sm_streamActive=true).
+  //   3. Deferred-open; dispatch FRAME_INIT → self-arm builds deferred MS#2
+  //      (sourceopen NOT yet fired). Capture ms2.
+  //   4. Deferred-open; dispatch streaming → tearDownMse supersedes MS#2 +
+  //      setUpMse builds deferred MS#3. Capture ms3 (ms3 !== ms2).
+  //   5. THE RACE: fire MS#2's orphan sourceopen late.
+  //      RED (current code): mseState.active === true (corrupted) because the
+  //        orphaned handler runs setUpInFlight=false; mseState.active=true
+  //        unconditionally.
+  //      GREEN (after fix): mseState.active === false (stale callback exits early).
+  //   6. Dispatch a fresh FRAME_INIT to prime MS#3; fire MS#3's sourceopen; then
+  //      dispatch a FRAME_SEGMENT.
+  //   7. Convergence (RED today, GREEN after fix): mseState.initReceived===true,
+  //      mseState.sb truthy, ms3._sb.appendBuffer called twice (init + segment).
+  it('SC-IR-9: multi-cycle — orphaned MS#2 late sourceopen must not corrupt live MS#3 session', async () => {
+    const exports = globalThis.__SCREEN_MIRROR_TEST_EXPORTS__;
+
+    // ── Step 1: confirm the primed session is healthy (beforeEach did this).
+    const ms1 = MockMediaSourceCtor._lastInstance;
+    expect(ms1).not.toBeNull();
+    expect(ms1.addSourceBuffer).toHaveBeenCalledTimes(1);
+    expect(exports.mseState.active).toBe(true);
+
+    // ── Step 2: dispatch reconnecting → advance 10 s → Stage-2 teardown.
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 }).buffer);
+    await Promise.resolve();
+
+    // Advance past silent threshold → revealReconnectingOverlay fires → tearDownMse.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // After Stage-2 teardown: ms is null, active is false.
+    expect(exports.mseState.ms).toBeNull();
+    expect(exports.mseState.active).toBe(false);
+
+    // ── Step 3: deferred-open; dispatch FRAME_INIT → self-arm → MS#2 (deferred).
+    MockMediaSourceCtor._deferOpenNext = true;
+    const initFrame2 = makeInitFrame(INIT_HIGH_41);
+    ch._dispatch(initFrame2.buffer);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const ms2 = MockMediaSourceCtor._lastInstance;
+    expect(ms2).not.toBeNull();
+    expect(ms2).not.toBe(ms1);
+    // MS#2 is deferred — sourceopen has NOT fired yet.
+    expect(ms2.readyState).toBe('closed');
+    // Nothing appended yet (pending init queued, not applied).
+    expect(ms2.addSourceBuffer).not.toHaveBeenCalled();
+
+    // ── Step 4: deferred-open; dispatch streaming → tearDownMse (supersedes MS#2)
+    //    + setUpMse → MS#3 (also deferred, so we can control its open timing).
+    MockMediaSourceCtor._deferOpenNext = true;
+    ch._dispatch(makeStatusFrame({ kind: 'streaming' }).buffer);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const ms3 = MockMediaSourceCtor._lastInstance;
+    expect(ms3).not.toBeNull();
+    expect(ms3).not.toBe(ms2); // MS#3 is a different instance
+    expect(ms3.readyState).toBe('closed');  // still deferred
+
+    // ── Step 5: THE RACE — fire MS#2's orphan sourceopen late.
+    // This is the stale callback that must be ignored by the generation guard.
+    ms2._fireSourceOpen();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // RED on current code: the orphaned sourceopen handler runs unconditionally
+    //   → setUpInFlight=false; mseState.active=true (corrupting the live session's
+    //   state even though mseState.ms is now ms3, not ms2).
+    // GREEN after fix: the handler detects its generation tag is stale (or
+    //   mseState.ms !== ms2), exits without mutating global state.
+    //   mseState.active must still be false (MS#3 has not opened yet).
+    expect(exports.mseState.active).toBe(false);  // RED today, GREEN after fix
+
+    // ── Step 6: supply MS#3 with a fresh init and open it.
+    // Dispatch the recovery FRAME_INIT for MS#3's session (it will queue into
+    // pendingInit because MS#3 is still deferred-open / active===false).
+    const initFrame3 = makeInitFrame(INIT_HIGH_41);
+    ch._dispatch(initFrame3.buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now fire MS#3's sourceopen → drain should apply the queued init.
+    ms3._fireSourceOpen();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Dispatch a FRAME_SEGMENT — must be appended (no discard wedge).
+    const segFrame = makeMediaSegmentFrame();
+    ch._dispatch(segFrame.buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // ── Step 7: convergence assertions (RED today, GREEN after fix).
+    expect(exports.mseState.initReceived).toBe(true);   // init was applied
+    expect(exports.mseState.sb).toBeTruthy();            // SourceBuffer was created
+    // ms3._sb.appendBuffer called twice: once for init payload, once for segment.
+    expect(ms3._sb.appendBuffer).toHaveBeenCalledTimes(2);
   });
 });

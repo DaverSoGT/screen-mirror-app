@@ -104,6 +104,13 @@ let pendingInit = null;
 // progress (D-IR-5). Reset to false by both the sourceopen and error handlers.
 let setUpInFlight = false;
 
+// Generation counter for MSE lifecycle sessions (SC-IR-9: stale-sourceopen guard).
+// Incremented each time setUpMse() creates a new MediaSource. The sourceopen and
+// error handlers capture their generation at construction time and exit early if
+// the current counter no longer matches — a superseded MS's late sourceopen must
+// not corrupt the live session's state (the stale-callback wedge).
+let mseGeneration = 0;
+
 // ── cancelAutoRetry ──────────────────────────────────────────────────────────
 // Cancels any pending auto-retry timer. Idempotent — safe to call when no
 // timer is armed. MUST be called on every Dead-state exit (PQ-3 invariant,
@@ -291,6 +298,10 @@ function tearDownMse() {
 function setUpMse() {
   setUpInFlight = true; // D-IR-5: mark in-flight before construction
   const ms = new MediaSource();
+  // SC-IR-9: capture this session's generation tag immediately after construction.
+  // If tearDownMse supersedes this MS before its sourceopen fires, the orphaned
+  // callback will see a stale myGen and exit without touching global state.
+  const myGen = ++mseGeneration;
   mseState.ms = ms;
   const url = URL.createObjectURL(ms);
   mseState.objectUrl = url;
@@ -302,6 +313,15 @@ function setUpMse() {
 
   return new Promise((resolve, reject) => {
     ms.addEventListener("sourceopen", () => {
+      // SC-IR-9: stale-sourceopen guard. A superseded MS's late sourceopen must
+      // not corrupt the live session's state. If this generation tag no longer
+      // matches the current counter, or mseState.ms has moved on to a different
+      // instance, this callback belongs to an orphaned MS — resolve and return
+      // without mutating any global state.
+      if (mseGeneration !== myGen || mseState.ms !== ms) {
+        resolve();
+        return;
+      }
       setUpInFlight = false; // D-IR-5: clear flag — MS is now open
       mseState.active = true;
       setStatus("MSE ready (reconnect) — awaiting fresh init segment…");
@@ -315,6 +335,11 @@ function setUpMse() {
       resolve();
     }, { once: true });
     ms.addEventListener("error", (e) => {
+      // SC-IR-9: same stale-generation guard for the error path.
+      if (mseGeneration !== myGen || mseState.ms !== ms) {
+        reject(e);
+        return;
+      }
       setUpInFlight = false; // D-IR-5: clear flag on error too
       reject(e);
     }, { once: true });
@@ -666,7 +691,19 @@ function applyInit(ms, data, frameBytes) {
     sb.addEventListener("updateend", seekToLiveEdge);
     mseState.sb = sb; // write into module-level state (heartbeat + tearDownMse)
   } catch (e) {
+    // Primary warn (keep existing): visible in operator console.
     setStatus("addSourceBuffer failed: " + e);
+    // Secondary hardening (SC-IR-9 defense-in-depth): reset broken state so the
+    // pipeline can self-heal. Without this reset, mseState.sb stays null and
+    // mseState.initReceived stays false after a throw (e.g. InvalidStateError on a
+    // CLOSED MS), but mseState.active may already be true from a prior stale
+    // sourceopen — the pipeline wedges permanently. Re-queuing into pendingInit
+    // gives a later/current sourceopen drain the chance to re-apply the init.
+    mseState.sb = null;
+    mseState.initReceived = false;
+    // Re-queue this init so the next sourceopen drain can re-apply it.
+    // { data, frameBytes } are in scope as applyInit parameters.
+    pendingInit = { data, frameBytes };
     return;
   }
   // Surface SourceBuffer error and updateend events so MSE failures are visible.
