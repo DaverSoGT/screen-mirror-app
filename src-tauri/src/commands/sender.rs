@@ -1632,6 +1632,33 @@ fn capture_backend_and_erase(
     (arc, name)
 }
 
+// ─── Candidate decision helper ────────────────────────────────────────────────
+
+/// Map an `Option<SocketAddr>` from `resolve_candidate_with_retry` to a `Result`.
+///
+/// Returns `Ok(addr)` when a non-loopback candidate was found, or
+/// `Err(BundleError::NoLocalNic)` when the retry budget was exhausted.
+///
+/// # Accepted trade (Option 1, GitHub #57)
+///
+/// `NoLocalNic` fires on ANY NIC outage that lasts longer than the candidate
+/// retry window (~1.5 s = `CANDIDATE_RETRY_ATTEMPTS × 100 ms`). There is no
+/// STUN/TURN/srflx/relay fallback — this sender uses host-only candidates.
+/// Returning `Err` here is the INTENTIONAL trade: the supervisor escalates with
+/// exponential back-off (`3 s / 9 s / 27 s`) instead of committing a dead
+/// generation with no usable ICE candidate. The trade is bounded because
+/// 1.5 s ≪ the 15 s `rebuild_timeout`, so a NIC that recovers within the window
+/// still succeeds on a later rebuild attempt.
+///
+/// Do NOT add STUN/TURN logic here without a design review; this function is
+/// intentionally minimal and synchronous.
+#[cfg(any(target_os = "windows", test))]
+fn decide_candidate_or_nic_error(
+    candidate: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, BundleError> {
+    candidate.ok_or(BundleError::NoLocalNic)
+}
+
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
 
 /// Build the production sender bundle.
@@ -1768,30 +1795,31 @@ fn build_production_sender_bundle(
     // `resolve_candidate_with_retry` polls across the NIC-down window (15×100ms
     // ≈ 1.5s, comfortably under the 15s rebuild_timeout) so the publish recovers
     // once the interface returns.
-    match resolve_candidate_with_retry(
+    let candidate_raw = resolve_candidate_with_retry(
         || sender.candidate_addr(),
         CANDIDATE_RETRY_ATTEMPTS,
         std::thread::sleep,
-    ) {
-        Some(addr) => {
+    );
+    // decide_candidate_or_nic_error maps None → Err(NoLocalNic) (REQ-HWF-1).
+    // See the function's doc comment for the accepted Option-1 trade-off.
+    match decide_candidate_or_nic_error(candidate_raw) {
+        Ok(addr) => {
             // WU-3 log #3: positive branch — proves THIS generation published.
             eprintln!("[sm-sender-bundle] published host candidate addr={addr}");
             publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
                 eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
             });
         }
-        None => {
+        Err(e) => {
             // Budget exhausted: NIC never returned in the retry window.
-            // There is no srflx/relay fallback — this sender uses host-only
-            // candidates. Returning Err here causes the rebuild worker
-            // (sender.rs:1435-1438) to send RebuildFailed while the supervisor
-            // is still in Rebuilding, so it escalates with backoff instead of
-            // committing a dead generation. (REQ-HWF-1, GitHub #57 Option 1)
+            // decide_candidate_or_nic_error returned Err(NoLocalNic); the rebuild
+            // worker (sender.rs rebuild hook) will forward this as RebuildFailed so
+            // the supervisor escalates with backoff. (REQ-HWF-1, GitHub #57 Option 1)
             eprintln!(
                 "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
                  aborting bundle build — supervisor will escalate with backoff"
             );
-            return Err(BundleError::NoLocalNic);
+            return Err(e);
         }
     }
 
@@ -3341,18 +3369,21 @@ mod tests {
     //   - `None` arm at sender.rs ~1782 returns `Err(BundleError::NoLocalNic)`
     //   - Builder returns `Err` → worker sends `RebuildFailed` → assertion passes → GREEN.
 
-    /// SC-HWF-1 — no-NIC at rebuild time: builder returns `NoLocalNic` error →
-    ///             worker sends `RebuildFailed` while supervisor is still in `Rebuilding`.
+    /// SC-HWF-1 — wiring test: when a builder returns `Err(NoLocalNic)`, the rebuild
+    ///             worker sends `RebuildFailed` while the supervisor is in `Rebuilding`.
     ///
-    /// GIVEN: A fake builder that simulates `resolve_candidate_with_retry` exhaustion
-    ///        by calling it with a probe that always returns `None`, then returning
-    ///        `Err(BundleError::NoLocalNic)`.
+    /// GIVEN: A fake `SenderBuilderFn` (4-param) that returns `Err(BundleError::NoLocalNic)`.
     /// WHEN:  `make_sender_rebuild_hook` fires the rebuild worker.
     /// THEN:  `SupervisorSignal::RebuildFailed` is received within 500ms.
     ///
-    /// This test guards the HW-gate-F scenario: no-NIC-at-rebuild → escalate,
-    /// NOT silently stop. It exercises the path that the two-PC gate caught in
-    /// PR #59 (B2 fix was insufficient because the builder returned Ok on no-NIC).
+    /// Coverage scope: the `Err(_) → try_send(RebuildFailed)` wiring inside
+    /// `make_sender_rebuild_hook` (drain→RebuildFailed path). The fake builder
+    /// re-implements the `resolve_candidate_with_retry`→None decision rather than
+    /// calling the production function, so this test does NOT cover the real
+    /// `#[cfg(windows)]` None-arm decision in `build_production_sender_bundle`.
+    /// The production None-arm decision is covered by SC-HWF-1B (below), which calls
+    /// `decide_candidate_or_nic_error` directly. True end-to-end HW coverage (real
+    /// NIC absence on Windows hardware) requires manual HW gate — Procedure F.
     #[test]
     fn sc_hwf_1_no_nic_at_rebuild_builder_returns_no_local_nic_and_worker_sends_rebuild_failed() {
         use sm_domain::supervisor::SupervisorSignal;
@@ -3419,6 +3450,46 @@ mod tests {
             matches!(signal, SupervisorSignal::RebuildFailed),
             "SC-HWF-1: expected RebuildFailed from no-NIC builder, got {signal:?} — \
              guards HW-gate-F: no-NIC at rebuild MUST escalate, not produce a dead generation"
+        );
+    }
+
+    // ─── SC-HWF-1B: pure-function unit test for decide_candidate_or_nic_error ────
+    //
+    // RED anchor: this test calls `super::decide_candidate_or_nic_error`, which does
+    // not yet exist. It will fail to compile (RED) until the function is extracted from
+    // the None-arm in `build_production_sender_bundle` (GREEN step).
+    //
+    // This test is the TRUE coverage for REQ-HWF-1's production decision: it calls the
+    // REAL extracted function, not a re-implementation. SC-HWF-1 (above) guards the
+    // drain→RebuildFailed wiring and is a separate, complementary concern.
+
+    /// SC-HWF-1B — unit test for `decide_candidate_or_nic_error` (REQ-HWF-1).
+    ///
+    /// Calls the REAL extracted pure function directly with:
+    ///   - `None`         → must return `Err(BundleError::NoLocalNic)`
+    ///   - `Some(addr)`   → must return `Ok(addr)` (pass-through)
+    ///
+    /// This test is the genuine coverage gate for the production None-arm's decision.
+    /// It does NOT re-implement the logic — it calls the production function.
+    #[test]
+    fn sc_hwf_1b_decide_candidate_or_nic_error_none_returns_no_local_nic_some_returns_ok() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // None → Err(NoLocalNic)
+        let result = super::decide_candidate_or_nic_error(None);
+        assert!(
+            matches!(result, Err(super::BundleError::NoLocalNic)),
+            "SC-HWF-1B: decide_candidate_or_nic_error(None) must return \
+             Err(BundleError::NoLocalNic); got {result:?}"
+        );
+
+        // Some(addr) → Ok(addr)
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        let result = super::decide_candidate_or_nic_error(Some(addr));
+        assert!(
+            matches!(result, Ok(a) if a == addr),
+            "SC-HWF-1B: decide_candidate_or_nic_error(Some(addr)) must return \
+             Ok(addr); got {result:?}"
         );
     }
 
