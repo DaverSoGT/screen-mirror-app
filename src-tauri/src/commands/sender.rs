@@ -1211,6 +1211,7 @@ pub fn start_sender_inner(
     )
     .map_err(|e| match e {
         BundleError::PortInUse(port) => StartSenderError::PortInUse { port },
+        BundleError::NoLocalNic => StartSenderError::BundleBuildFailed(e.to_string()),
         BundleError::Other(s) => StartSenderError::BundleBuildFailed(s),
     })?;
 
@@ -1780,12 +1781,17 @@ fn build_production_sender_bundle(
             });
         }
         None => {
-            // Budget exhausted: NIC never returned in the retry window. LOUD log
-            // so the HW gate shows this generation published NO candidate.
+            // Budget exhausted: NIC never returned in the retry window.
+            // There is no srflx/relay fallback — this sender uses host-only
+            // candidates. Returning Err here causes the rebuild worker
+            // (sender.rs:1435-1438) to send RebuildFailed while the supervisor
+            // is still in Rebuilding, so it escalates with backoff instead of
+            // committing a dead generation. (REQ-HWF-1, GitHub #57 Option 1)
             eprintln!(
                 "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
-                 skipping candidate publish — this WebRTC generation will have NO local host candidate"
+                 aborting bundle build — supervisor will escalate with backoff"
             );
+            return Err(BundleError::NoLocalNic);
         }
     }
 
@@ -3308,6 +3314,111 @@ mod tests {
             "SC-HO-2b FAIL: `mark_superseded()` (offset {superseded_pos}) must appear AFTER \
              `suppress_outbound_bye()` (offset {suppress_pos}) and BEFORE `sig.stop()` \
              (offset {stop_pos}), so the re-started gen-G comes up already-superseded."
+        );
+    }
+
+    // ─── SC-HWF-1: HW-gate F guard — no-NIC at rebuild time escalates, not silently stops ─
+    //
+    // REQ-HWF-1 (GitHub #57 Option 1): when `build_production_sender_bundle` exhausts
+    // `resolve_candidate_with_retry` (all attempts return None == no non-loopback NIC),
+    // the builder MUST return `Err(BundleError::NoLocalNic)`. The rebuild worker's
+    // existing `Err(_) => try_send(RebuildFailed)` arm (sender.rs:1435-1438) then fires
+    // while the supervisor is still in `Rebuilding`, so the supervisor escalates to
+    // `AwaitingAck{attempt:2}` instead of the previous silent `supervisor stopped` path.
+    //
+    // WHY THIS IS THE REAL PATH (not supervisor-in-isolation):
+    // Prior tests (SC-T22, WU-7, WU-8) tested the supervisor's *RebuildFailed handler*
+    // in isolation, which did not catch the bug: on the two-PC HW gate, the builder
+    // returned `Ok` (no-NIC → log-and-continue), so `RebuildFailed` was NEVER sent.
+    // This test closes the gap by injecting the exact failure condition (no-NIC probe →
+    // NoLocalNic error) through `make_sender_rebuild_hook`, exercising the
+    // no-NIC→Err→RebuildFailed→supervisor-escalation chain end-to-end at the unit level.
+    //
+    // RED state (before Option 1 fix): `BundleError::NoLocalNic` does not exist →
+    //   compile error on `BundleError::NoLocalNic` → RED.
+    // GREEN state (after Option 1 fix):
+    //   - `BundleError::NoLocalNic` variant added to `stream.rs`
+    //   - `None` arm at sender.rs ~1782 returns `Err(BundleError::NoLocalNic)`
+    //   - Builder returns `Err` → worker sends `RebuildFailed` → assertion passes → GREEN.
+
+    /// SC-HWF-1 — no-NIC at rebuild time: builder returns `NoLocalNic` error →
+    ///             worker sends `RebuildFailed` while supervisor is still in `Rebuilding`.
+    ///
+    /// GIVEN: A fake builder that simulates `resolve_candidate_with_retry` exhaustion
+    ///        by calling it with a probe that always returns `None`, then returning
+    ///        `Err(BundleError::NoLocalNic)`.
+    /// WHEN:  `make_sender_rebuild_hook` fires the rebuild worker.
+    /// THEN:  `SupervisorSignal::RebuildFailed` is received within 500ms.
+    ///
+    /// This test guards the HW-gate-F scenario: no-NIC-at-rebuild → escalate,
+    /// NOT silently stop. It exercises the path that the two-PC gate caught in
+    /// PR #59 (B2 fix was insufficient because the builder returned Ok on no-NIC).
+    #[test]
+    fn sc_hwf_1_no_nic_at_rebuild_builder_returns_no_local_nic_and_worker_sends_rebuild_failed() {
+        use sm_domain::supervisor::SupervisorSignal;
+        use sm_infra::transport::{CANDIDATE_RETRY_ATTEMPTS, resolve_candidate_with_retry};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Fake builder: simulates the production None-arm by calling
+        // `resolve_candidate_with_retry` with a probe that always returns `None`
+        // (no non-loopback NIC), then returning `Err(BundleError::NoLocalNic)`.
+        // No-op delay so the test runs instantly (does not sleep).
+        let builder: super::SenderBuilderFn = Arc::new(|_, _, _, _| {
+            let result = resolve_candidate_with_retry(
+                || None, // probe: NIC never returns
+                CANDIDATE_RETRY_ATTEMPTS,
+                |_| {}, // no-op delay
+            );
+            match result {
+                Some(_) => unreachable!("probe always returns None in this test"),
+                None => Err(super::BundleError::NoLocalNic),
+            }
+        });
+
+        // Supervisor signal channel — the worker delivers RebuildFailed on this.
+        let (sig_tx, sig_rx) = sync_channel::<SupervisorSignal>(4);
+
+        // Minimal bridge state: non-None cache so the worker doesn't abort at cache-gate.
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = super::RestartCache {
+            udp_port: 0,
+            service_name: "test-sc-hwf-1".to_string(),
+            channel: Arc::new(FakeCh) as Arc<dyn super::ChannelLike>,
+            session_nonce: 0,
+        };
+        let bridge_cache = Arc::new(Mutex::new(Some(cache)));
+        let bridge_session = Arc::new(Mutex::new(None::<super::SenderSession>));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Build and fire the hook (simulates the coordinator calling initiate_rebuild).
+        let hook = super::make_sender_rebuild_hook(
+            builder,
+            bridge_cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+        );
+        (hook)(sig_tx);
+
+        // ASSERT: RebuildFailed must arrive within 500ms.
+        // RED: `BundleError::NoLocalNic` does not compile yet → RED.
+        // GREEN: builder returns Err(NoLocalNic) → worker sends RebuildFailed.
+        let signal = sig_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-HWF-1: RebuildFailed must arrive within 500ms — \
+                 no-NIC builder must escalate, not silently stop (HW-gate-F guard, #57)",
+        );
+        assert!(
+            matches!(signal, SupervisorSignal::RebuildFailed),
+            "SC-HWF-1: expected RebuildFailed from no-NIC builder, got {signal:?} — \
+             guards HW-gate-F: no-NIC at rebuild MUST escalate, not produce a dead generation"
         );
     }
 
