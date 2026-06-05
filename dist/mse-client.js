@@ -709,12 +709,43 @@ function applyInit(ms, data, frameBytes) {
 // - Guard 3 (sb !== null, same session): same-session duplicate init; ignored as
 //   before (tearDownMse always nulls sb for a new session).
 function onInitFrame(data, frameBytes) {
-  // Guard 3: already have a SourceBuffer for this session — same-session
-  // duplicate init not supported in v1; ignore. A genuinely new session always
-  // went through tearDownMse (which nulls sb), so sb!==null here means duplicate.
+  // Guard 3: already have a SourceBuffer — but distinguish a true same-session
+  // duplicate from a recovery init that raced ahead during a reconnect.
+  //
+  // Original invariant: "a genuinely new session always went through tearDownMse
+  // (which nulls sb), so sb!==null here means duplicate." This breaks during the
+  // deferred-teardown reconnect window: handleStatus("reconnecting") deliberately
+  // does NOT call tearDownMse so the last frozen frame stays visible (REQ-SSR-4).
+  // The Rust mux emits FRAME_INIT from its own keyframe-driven thread, which can
+  // race AHEAD of the "streaming" status frame. The recovery init then hits this
+  // guard with sb!==null while we are still in Stage 1 of the silent-reconnect
+  // window, causing it to be dropped and permanently wedging the pipeline.
+  //
+  // Fix: keep the ignore path ONLY for a genuine duplicate on a healthy session
+  // (MS open AND no reconnect in progress). Otherwise call tearDownMse() and fall
+  // through so Guard 1 self-arms setUpMse and queues the init via pendingInit —
+  // the proven recovery path (D-IR-4).
   if (mseState.sb !== null) {
-    console.warn("[mse] additional init segment ignored");
-    return;
+    const msOpen = !!(mseState.ms && mseState.ms.readyState === "open");
+    // Detect a reconnect in progress via module-scoped signals:
+    //   silentRecoveryTimerId !== null → Stage 1 silent window is active (timer armed
+    //   by handleStatus("reconnecting"), not yet fired, overlay not yet shown).
+    //   overlayRevealed && !msOpen → Stage 2 was entered (revealReconnectingOverlay
+    //   called tearDownMse + set overlayRevealed), but self-arm has not yet re-opened
+    //   the MS. Once self-arm completes and sb is set again, msOpen is true and
+    //   overlayRevealed is still true until cancelSilentRecovery fires — but that
+    //   re-entry case means we're in a healthy new session, not in a reconnect race.
+    // Together these two conditions cover the races without false-positives on the
+    // "second FRAME_INIT after self-arm recovery" case (SC-IR-3 invariant).
+    const reconnecting = silentRecoveryTimerId !== null || (overlayRevealed && !msOpen);
+    if (msOpen && !reconnecting) {
+      // True same-session duplicate on a healthy, non-reconnecting session — ignore.
+      console.warn("[mse] additional init segment ignored");
+      return;
+    }
+    // Recovery init during a reconnect window (or stale MS): tear down the stale
+    // session and fall through to Guard 1 to self-arm a fresh setUpMse.
+    tearDownMse();
   }
 
   const ms = mseState.ms;

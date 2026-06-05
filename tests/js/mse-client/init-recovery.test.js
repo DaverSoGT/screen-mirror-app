@@ -1,4 +1,4 @@
-// init-recovery.test.js — SC-IR-1..6 (init-segment recovery fix)
+// init-recovery.test.js — SC-IR-1..8 (init-segment recovery fix)
 //
 // These tests are RED against the current dist/mse-client.js because onInitFrame
 // drops a FRAME_INIT that arrives before the MediaSource reaches readyState='open'
@@ -15,13 +15,18 @@
 // SC-IR-4: two pre-open inits → only latest applied (single-slot queue)
 // SC-IR-5: REQ-SSR-4 frozen-frame preserved (reconnecting alone does NOT teardown)
 // SC-IR-6: stale pendingInit discarded on teardown (session A init can't leak to B)
+// SC-IR-7: recovery init arrives before streaming during Stage 1 → tears down stale
+//          session, self-arms, segment appended (Guard 3 fix)
+// SC-IR-8: Stage-2 teardown invariant — revealReconnectingOverlay MUST call
+//          tearDownMse so a recovery FRAME_INIT after Stage 2 enters the self-arm
+//          path on a clean slate (no wedge)
 
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { installDom, removeDom } from '../mocks/dom.js';
 import { installTauriMock, resetTauriMock } from '../mocks/tauri.js';
 import { MockMediaSourceCtor } from '../mocks/media-source.js';
 import { INIT_HIGH_41, INIT_BASELINE_30 } from '../fixtures/init-segments.js';
-import { makeInitFrame } from '../fixtures/media-segments.js';
+import { makeInitFrame, makeMediaSegmentFrame } from '../fixtures/media-segments.js';
 
 // Build a 0x02 status frame: [0x02, ...UTF-8 JSON bytes]
 function makeStatusFrame(obj) {
@@ -33,7 +38,7 @@ function makeStatusFrame(obj) {
   return frame;
 }
 
-describe('mse-client — init-segment recovery (SC-IR-1..6)', () => {
+describe('mse-client — init-segment recovery (SC-IR-1..8)', () => {
   let tauri;
   let ch;
 
@@ -363,5 +368,158 @@ describe('mse-client — init-segment recovery (SC-IR-1..6)', () => {
     expect(msB._lastCodec).toBe('video/mp4; codecs="avc1.42E01E"');
     // Session A still untouched.
     expect(msA.addSourceBuffer).not.toHaveBeenCalled();
+  });
+
+  // ── SC-IR-7 ───────────────────────────────────────────────────────────────────
+  // Bug: recovery FRAME_INIT arrives BEFORE the "streaming" status during Stage 1
+  // of the silent-reconnect window. Guard 3 in onInitFrame sees sb!==null and logs
+  // "additional init segment ignored", dropping the ONLY recovery init. Every later
+  // FRAME_SEGMENT is silently discarded (mseState.initReceived stays true on a dead
+  // MediaSource but mseState.active flips false on sourceended/sourceclose), causing
+  // permanent video freeze. No self-recovery without a full app relaunch.
+  //
+  // Fix: Guard 3 must distinguish a true same-session duplicate (MS open, not
+  // reconnecting) from a reconnect-window recovery init (sb!==null but we are in
+  // Stage 1 OR the MS is no longer "open"). When in doubt, call tearDownMse() and
+  // fall through to Guard 1 self-arm so the proven recovery path handles the init.
+  //
+  // RED on current code: Guard 3 logs "additional init segment ignored" and returns;
+  // no new MediaSource is constructed; subsequent FRAME_SEGMENT is never appended.
+  it('SC-IR-7: recovery init arrives before streaming during Stage 1 → tears down stale session, self-arms, segment appended', async () => {
+    // ── Step 1: verify the initial primed session is healthy (beforeEach already did this).
+    const ms1 = MockMediaSourceCtor._lastInstance;
+    expect(ms1).not.toBeNull();
+    // sb was created during priming.
+    expect(ms1.addSourceBuffer).toHaveBeenCalledTimes(1);
+    expect(ms1._sb.appendBuffer).toHaveBeenCalledTimes(1); // init payload appended
+
+    const endOfStreamBefore = ms1.endOfStream.mock.calls.length;
+
+    // ── Step 2: dispatch reconnecting (attempt 1/3) — Stage 1 silent window opens.
+    // REQ-SSR-4: tearDownMse must NOT fire; sb stays non-null; MS stays open.
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 }).buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Confirm Stage 1: no teardown yet.
+    expect(ms1.endOfStream.mock.calls.length).toBe(endOfStreamBefore);
+    // The silent-recovery timer is armed (silentRecoveryTimerId !== null) — that is
+    // the reconnect signal Guard 3 must check. We do not inspect it directly here
+    // (module-private), but we know it is set because no 10 s have elapsed and
+    // cancelSilentRecovery has not been called.
+
+    // ── Step 3: dispatch a recovery FRAME_INIT while sb !== null AND before streaming.
+    // This is the RACE condition: Rust emits FRAME_INIT from its keyframe thread
+    // before the reconnect supervisor emits the "streaming" status frame.
+    const recoveryInitFrame = makeInitFrame(INIT_HIGH_41);
+    ch._dispatch(recoveryInitFrame.buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve(); // extra tick for setUpMse promise + sourceopen microtask
+
+    // ── Step 4: assert a NEW MediaSource was constructed (self-arm fired).
+    const ms2 = MockMediaSourceCtor._lastInstance;
+    expect(ms2).not.toBe(ms1);
+    expect(ms2).not.toBeNull();
+
+    // The recovery init must have been applied to the new MS (addSourceBuffer called).
+    expect(ms2.addSourceBuffer).toHaveBeenCalledTimes(1);
+    // The init payload bytes must have been appended to the new SourceBuffer.
+    expect(ms2._sb.appendBuffer).toHaveBeenCalledTimes(1);
+    const appended = ms2._sb._lastAppend;
+    expect(appended).not.toBeNull();
+    expect(appended.length).toBe(INIT_HIGH_41.length);
+
+    // ── Step 5: dispatch a FRAME_SEGMENT and confirm it is appended (no discard loop).
+    const segFrame = makeMediaSegmentFrame();
+    ch._dispatch(segFrame.buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // appendBuffer must have been called a second time (once for init, once for segment).
+    expect(ms2._sb.appendBuffer).toHaveBeenCalledTimes(2);
+  });
+
+  // ── SC-IR-8 ───────────────────────────────────────────────────────────────────
+  // Stage-2 teardown invariant: revealReconnectingOverlay MUST call tearDownMse().
+  //
+  // The Guard 3 fix (SC-IR-7) is only safe because revealReconnectingOverlay sets
+  // overlayRevealed=true AND immediately calls tearDownMse() (nulling mseState.sb).
+  // If a future refactor separated those two operations, Guard 3's
+  // (overlayRevealed && !msOpen) branch would not be reached for Stage 2 — the stale
+  // sb would still be non-null and the recovery init would be silently dropped again.
+  //
+  // This test locks that invariant:
+  //   1. Prime a healthy active session (sb !== null, MS open).
+  //   2. Dispatch reconnecting (Stage 1) — no teardown must happen.
+  //   3. Advance fake timers PAST SILENT_RECOVERY_THRESHOLD_MS so
+  //      revealReconnectingOverlay fires (Stage 2 entered).
+  //   4. Assert the old MS was torn down (endOfStream called) — Stage 2 fired teardown.
+  //   5. Dispatch a recovery FRAME_INIT — self-arm must construct a NEW MediaSource,
+  //      apply the init (addSourceBuffer called), and a subsequent segment must append.
+  //      This confirms NO WEDGE in the Stage-2 recovery path.
+  //
+  // FAILURE MODE when tearDownMse is removed from revealReconnectingOverlay:
+  //   Step 4 passes (endOfStream not called → expected fail on that assert).
+  //   Step 5: onInitFrame sees sb!==null; Guard 3 checks msOpen (still "open" since
+  //   MS was never torn down) + reconnecting (overlayRevealed=true but msOpen is still
+  //   true, so the (overlayRevealed && !msOpen) branch is false; silentRecoveryTimerId
+  //   is null because it already fired). Both reconnect signals are false → takes the
+  //   "ignore duplicate" path → recovery init dropped → segment never appended.
+  it('SC-IR-8: Stage-2 reveal MUST tear down the stale session so recovery FRAME_INIT enters self-arm path (no wedge)', async () => {
+    // ── Step 1: verify the initial primed session is healthy.
+    const ms1 = MockMediaSourceCtor._lastInstance;
+    expect(ms1).not.toBeNull();
+    expect(ms1.addSourceBuffer).toHaveBeenCalledTimes(1);
+
+    const endOfStreamBefore = ms1.endOfStream.mock.calls.length;
+
+    // ── Step 2: dispatch reconnecting — Stage 1 silent window opens, no teardown.
+    ch._dispatch(makeStatusFrame({ kind: 'reconnecting', attempt: 1, max: 3 }).buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Confirm Stage 1: no teardown yet.
+    expect(ms1.endOfStream.mock.calls.length).toBe(endOfStreamBefore);
+
+    // ── Step 3: advance timers past the threshold — revealReconnectingOverlay fires.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // ── Step 4: assert Stage 2 tore down the stale session.
+    // revealReconnectingOverlay must have called tearDownMse → endOfStream called on ms1.
+    expect(ms1.endOfStream.mock.calls.length).toBeGreaterThan(endOfStreamBefore);
+
+    // ── Step 5: dispatch recovery FRAME_INIT — must NOT be wedged.
+    // With the teardown done, mseState.sb === null. Guard 3 does not fire.
+    // Guard 1 (ms === null) self-arms setUpMse → constructs a new MS.
+    const recoveryInitFrame = makeInitFrame(INIT_HIGH_41);
+    ch._dispatch(recoveryInitFrame.buffer);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve(); // extra tick for setUpMse sourceopen microtask
+
+    // A NEW MediaSource must have been constructed (self-arm).
+    const ms2 = MockMediaSourceCtor._lastInstance;
+    expect(ms2).not.toBe(ms1);
+    expect(ms2).not.toBeNull();
+
+    // The recovery init must have been applied to the new MS.
+    expect(ms2.addSourceBuffer).toHaveBeenCalledTimes(1);
+    expect(ms2._sb.appendBuffer).toHaveBeenCalledTimes(1);
+    const appended = ms2._sb._lastAppend;
+    expect(appended).not.toBeNull();
+    expect(appended.length).toBe(INIT_HIGH_41.length);
+
+    // ── Step 6: dispatch a FRAME_SEGMENT — must be appended (no discard loop).
+    const segFrame = makeMediaSegmentFrame();
+    ch._dispatch(segFrame.buffer);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // appendBuffer must have been called a second time (init + segment).
+    expect(ms2._sb.appendBuffer).toHaveBeenCalledTimes(2);
   });
 });
