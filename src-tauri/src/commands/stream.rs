@@ -283,6 +283,14 @@ pub enum BundleError {
     #[error("UDP port {0} already in use")]
     PortInUse(u16),
 
+    /// Candidate-retry budget exhausted: no non-loopback NIC was available at
+    /// rebuild time. There is no srflx/relay fallback (sender uses host-only
+    /// candidates), so this generation would have no usable ICE candidate —
+    /// failing here is safe and causes the supervisor to escalate with backoff
+    /// instead of committing a dead generation.
+    #[error("no local NIC available after candidate-retry budget exhausted")]
+    NoLocalNic,
+
     #[error("bundle build failed: {0}")]
     Other(String),
 }
@@ -2034,7 +2042,7 @@ pub fn make_stream_rebuild_hook(
                                 ));
                                 result = do_probe(cache.udp_port);
                             }
-                            Err(BundleError::Other(_)) => break, // non-retriable
+                            Err(BundleError::Other(_) | BundleError::NoLocalNic) => break, // non-retriable
                         }
                     }
                     match result {
@@ -2246,6 +2254,7 @@ pub fn start_stream_inner(
     // Mutex during a syscall.
     let socket = bind_probe(resolved_port).map_err(|e| match e {
         BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
+        BundleError::NoLocalNic => StartStreamError::BundleBuildFailed(e.to_string()),
         BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
     })?;
 
@@ -2304,6 +2313,7 @@ pub fn start_stream_inner(
     )
     .map_err(|e| match e {
         BundleError::PortInUse(port) => StartStreamError::PortInUse { port },
+        BundleError::NoLocalNic => StartStreamError::BundleBuildFailed(e.to_string()),
         BundleError::Other(s) => StartStreamError::BundleBuildFailed(s),
     })?;
 
@@ -5335,6 +5345,11 @@ mod tests {
         let result = bind_probe(1);
         match result {
             Err(BundleError::Other(_)) => {}
+            Err(BundleError::NoLocalNic) => {
+                // bind_probe only returns NoLocalNic for candidate exhaustion (sender path).
+                // It cannot occur here — panic so any unexpected routing is visible.
+                panic!("bind_probe returned NoLocalNic — unexpected on receiver bind path")
+            }
             Err(BundleError::PortInUse(_)) => {
                 panic!("port 1 returned PortInUse instead of Other — unexpected")
             }

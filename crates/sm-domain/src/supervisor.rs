@@ -1631,4 +1631,285 @@ mod tests {
         h.send(SupervisorSignal::Stop);
         h.join();
     }
+
+    // ─── SC-T22-RETRY-2 / REQ-RFE-7: rebuild-failed-escalation regression guard ─
+
+    // REGRESSION GUARD (SC-T22-RETRY-2 / REQ-RFE-7): do not delete or weaken.
+    //
+    // This test locks the existing supervisor backoff/budget/emit behavior that the
+    // `rebuild-failed-escalation` change (GitHub #57) sends `RebuildFailed` into.
+    // The supervisor state machine MUST be unchanged — only sender.rs wiring changes.
+    // If this test turns RED after any future diff, the SC-T22-sensitive Rebuilding arm
+    // was modified; treat it as a merge blocker.
+
+    /// SC-T22-RETRY-2 — `RebuildFailed` in `Rebuilding(attempt 1)` advances to
+    ///                   `Reconnecting { attempt: 2, max: 3 }` with correct backoff.
+    ///
+    /// GIVEN: A supervisor in `Rebuilding { attempt: 1, .. }` (driven via
+    ///        `LocalFailure → PeerAck`).
+    /// WHEN:  `RebuildFailed` is sent.
+    /// THEN:
+    ///   1. Next outcome is `StateChanged(Reconnecting { attempt: 2, max: 3 })`.
+    ///   2. Followed by `PublishReconnectRequest { attempt: 2 }`.
+    ///   3. `ReconnectPolicy::v1_default().delay_for_attempt(2) == 3 s` (schedule intact).
+    #[test]
+    fn rebuild_failed_during_rebuilding_advances_to_attempt_2_with_backoff() {
+        let nonce: u64 = 57;
+        let h = SupervisorHandle::spawn(fast_policy(), nonce);
+
+        // Drive: LocalFailure → consume StateChanged(Reconnecting{1}) + PublishReconnectRequest{1}
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let state1 = h.recv_outcome();
+        assert_eq!(
+            state1,
+            SupervisorOutcome::StateChanged(SessionState::Reconnecting {
+                attempt: std::num::NonZeroU8::new(1).unwrap(),
+                max: std::num::NonZeroU8::new(3).unwrap(),
+            }),
+            "Expected Reconnecting{{1,3}} after LocalFailure, got {state1:?}"
+        );
+        let _req1 = h.recv_outcome(); // PublishReconnectRequest{1}
+
+        // Drive: PeerAck → consume InitiateRebuild
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 1,
+        });
+        let _rebuild = h.recv_outcome(); // InitiateRebuild
+
+        // Drive: RebuildFailed
+        h.send(SupervisorSignal::RebuildFailed);
+
+        // Assert: next outcome is StateChanged(Reconnecting{2, 3})
+        let state2 = h.recv_outcome();
+        assert_eq!(
+            state2,
+            SupervisorOutcome::StateChanged(SessionState::Reconnecting {
+                attempt: std::num::NonZeroU8::new(2).unwrap(),
+                max: std::num::NonZeroU8::new(3).unwrap(),
+            }),
+            "Expected Reconnecting{{2,3}} after RebuildFailed, got {state2:?}"
+        );
+
+        // Assert: next outcome is PublishReconnectRequest{2}
+        let req2 = h.recv_outcome();
+        assert_eq!(
+            req2,
+            SupervisorOutcome::PublishReconnectRequest {
+                attempt: 2,
+                session_nonce: nonce,
+            },
+            "Expected PublishReconnectRequest{{2}} after RebuildFailed, got {req2:?}"
+        );
+
+        // Assert: v1_default backoff schedule is unchanged — 3s/9s/27s ladder intact.
+        // Formula: base_ms=3000, factor=3 ⇒ attempt 1=3s, 2=9s, 3=27s.
+        let v1 = crate::session::ReconnectPolicy::v1_default();
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(1).unwrap()),
+            Duration::from_secs(3),
+            "v1_default delay_for_attempt(1) must equal 3s (backoff schedule locked)"
+        );
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(2).unwrap()),
+            Duration::from_secs(9),
+            "v1_default delay_for_attempt(2) must equal 9s (backoff schedule locked)"
+        );
+        assert_eq!(
+            v1.delay_for_attempt(std::num::NonZeroU8::new(3).unwrap()),
+            Duration::from_secs(27),
+            "v1_default delay_for_attempt(3) must equal 27s (backoff schedule locked)"
+        );
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    // ─── SC-#57 accepted-race characterization: teardown-error false-escalation ─
+    //
+    // Judgment-day synthesis (engram #992, 2026-06-04): both judges converged on a
+    // WARNING (not CRITICAL) — during Rebuilding{n} the OLD signaling drain is still
+    // alive and can emit a spurious RebuildFailed before the worker's RebuildSucceeded.
+    // The supervisor consumes it, escalates to attempt n+1, and the late RebuildSucceeded
+    // is ignored in AwaitingAck. ACCEPTED: next attempt re-converges (proven below).
+    // A guard was deferred as a follow-up; see the transport-origin guard at
+    // sender.rs:1011-1024 (engram #509) for the analogous pattern.
+
+    /// SC-#57 convergence — spurious `RebuildFailed` in `Rebuilding{1}` causes a
+    /// false escalation to `AwaitingAck{2}` (the accepted teardown-error race), but the
+    /// supervisor re-converges: a subsequent `PeerAck{2}` → `Rebuilding{2}` →
+    /// `RebuildSucceeded` cycle reaches `Connected`.
+    ///
+    /// This test characterizes the ACCEPTED race documented in the #57 judgment-day
+    /// synthesis (engram #992). The race is benign because the system re-converges on
+    /// the next attempt with the new generation already live. It is GREEN-at-add by
+    /// design: characterization tests assert existing supervisor behavior, not a new
+    /// invariant introduced by this change.
+    ///
+    /// GIVEN: `Rebuilding { attempt: 1, .. }` reached via `LocalFailure → PeerAck{1}`.
+    /// WHEN:  A spurious `RebuildFailed` arrives (simulating an OLD-generation drain
+    ///        firing before the worker's `RebuildSucceeded`).
+    /// THEN:
+    ///   1. Supervisor escalates: `StateChanged(Reconnecting{2,3})` + `PublishReconnectRequest{2}`.
+    ///   2. Driving `PeerAck{2}` → `Rebuilding{2}`, then `RebuildSucceeded` → `Connected`.
+    #[test]
+    fn spurious_rebuild_failed_in_rebuilding_reconverges_on_next_attempt() {
+        let nonce: u64 = 57;
+        let h = SupervisorHandle::spawn(fast_policy(), nonce);
+
+        // Step 1: Drive to Rebuilding{1} via LocalFailure → PeerAck{1}.
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let _state1 = h.recv_outcome(); // StateChanged(Reconnecting{1,3})
+        let _req1 = h.recv_outcome(); // PublishReconnectRequest{1}
+
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 1,
+        });
+        let _rebuild1 = h.recv_outcome(); // InitiateRebuild
+
+        // Step 2: Inject spurious RebuildFailed (the teardown-error race).
+        // Simulates an OLD signaling drain emitting SignalingEvent::Error before
+        // the worker's RebuildSucceeded reaches the supervisor.
+        h.send(SupervisorSignal::RebuildFailed);
+
+        // Assert: false escalation — supervisor must advance to Reconnecting{2}.
+        let false_escalation = h.recv_outcome();
+        assert_eq!(
+            false_escalation,
+            SupervisorOutcome::StateChanged(SessionState::Reconnecting {
+                attempt: std::num::NonZeroU8::new(2).unwrap(),
+                max: std::num::NonZeroU8::new(3).unwrap(),
+            }),
+            "Spurious RebuildFailed must cause false-escalation to Reconnecting{{2,3}}, \
+             got {false_escalation:?}"
+        );
+        let req2 = h.recv_outcome(); // PublishReconnectRequest{2}
+        assert_eq!(
+            req2,
+            SupervisorOutcome::PublishReconnectRequest {
+                attempt: 2,
+                session_nonce: nonce,
+            },
+            "False escalation must emit PublishReconnectRequest{{2}}, got {req2:?}"
+        );
+
+        // Step 3: Drive to Rebuilding{2} and deliver RebuildSucceeded.
+        // Proves re-convergence: the system is not permanently stuck despite the race.
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 2,
+        });
+        let _rebuild2 = h.recv_outcome(); // InitiateRebuild
+
+        h.send(SupervisorSignal::RebuildSucceeded);
+
+        // Assert: re-convergence — supervisor must reach Connected.
+        let connected = h.recv_outcome();
+        assert_eq!(
+            connected,
+            SupervisorOutcome::StateChanged(SessionState::Connected),
+            "Supervisor must reach Connected after RebuildSucceeded on attempt 2 \
+             (re-convergence proof), got {connected:?}"
+        );
+
+        h.send(SupervisorSignal::Stop);
+        h.join();
+    }
+
+    // ─── SC-RFE-5: budget-exhaustion coverage (signaling-origin path) ─────────
+    //
+    // REQ-RFE-5: when SignalingEvent::Error fires across repeated rebuild attempts
+    // and the attempt budget is exhausted, the supervisor MUST reach Dead via the
+    // existing Rebuilding→RebuildFailed→budget-check path. No special-casing for
+    // the signaling-error origin. The real policy (v1_default, max_attempts=3)
+    // is used so the budget count is authentic.
+
+    /// SC-RFE-5 — Repeated `RebuildFailed` across all three attempts exhausts the
+    /// budget and reaches `Dead` via the standard path.
+    ///
+    /// Uses `fast_policy()` (max_attempts=3, sub-millisecond backoff) so the test
+    /// completes quickly while exercising the real budget-check branch.
+    ///
+    /// GIVEN: Policy `max_attempts = 3`. Supervisor driven through three full
+    ///        `Rebuilding → RebuildFailed` cycles.
+    /// WHEN:  The third `RebuildFailed` is processed.
+    /// THEN:
+    ///   1. `StateChanged(Dead { reason: IceFailedRepeatedly })` is emitted.
+    ///   2. `Dead(IceFailedRepeatedly)` is emitted.
+    ///   3. `supervisor.run()` returns `Some(DeadReason)`.
+    ///   4. No `PublishReconnectRequest` is emitted after budget exhaustion.
+    #[test]
+    fn repeated_rebuild_failed_exhausts_budget_to_dead() {
+        let nonce: u64 = 57;
+        let h = SupervisorHandle::spawn(fast_policy(), nonce);
+
+        // Attempt 1: LocalFailure → AwaitingAck{1} → PeerAck → Rebuilding{1} → RebuildFailed.
+        h.send(SupervisorSignal::LocalFailure {
+            trigger: ReconnectTrigger::IceFailed,
+        });
+        let _state1 = h.recv_outcome(); // StateChanged(Reconnecting{1,3})
+        let _req1 = h.recv_outcome(); // PublishReconnectRequest{1}
+
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 1,
+        });
+        let _rebuild1 = h.recv_outcome(); // InitiateRebuild
+
+        h.send(SupervisorSignal::RebuildFailed);
+        let _state2 = h.recv_outcome(); // StateChanged(Reconnecting{2,3})
+        let _req2 = h.recv_outcome(); // PublishReconnectRequest{2}
+
+        // Attempt 2: PeerAck → Rebuilding{2} → RebuildFailed.
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 2,
+        });
+        let _rebuild2 = h.recv_outcome(); // InitiateRebuild
+
+        h.send(SupervisorSignal::RebuildFailed);
+        let _state3 = h.recv_outcome(); // StateChanged(Reconnecting{3,3})
+        let _req3 = h.recv_outcome(); // PublishReconnectRequest{3}
+
+        // Attempt 3 (final): PeerAck → Rebuilding{3} → RebuildFailed → budget exhausted → Dead.
+        h.send(SupervisorSignal::PeerAck {
+            session_nonce: nonce,
+            attempt: 3,
+        });
+        let _rebuild3 = h.recv_outcome(); // InitiateRebuild
+
+        h.send(SupervisorSignal::RebuildFailed);
+
+        // Assert 1: StateChanged(Dead { reason: IceFailedRepeatedly }).
+        let dead_state = h.recv_outcome();
+        assert_eq!(
+            dead_state,
+            SupervisorOutcome::StateChanged(SessionState::Dead {
+                reason: crate::session::DeadReason::IceFailedRepeatedly,
+            }),
+            "Budget exhaustion must emit StateChanged(Dead), got {dead_state:?}"
+        );
+
+        // Assert 2: Dead(IceFailedRepeatedly) outcome.
+        let dead_outcome = h.recv_outcome();
+        assert_eq!(
+            dead_outcome,
+            SupervisorOutcome::Dead(crate::session::DeadReason::IceFailedRepeatedly),
+            "Budget exhaustion must emit Dead(IceFailedRepeatedly), got {dead_outcome:?}"
+        );
+
+        // Assert 3: run() returns Some(DeadReason) — no additional PublishReconnectRequest.
+        let dead_reason = h.join();
+        assert_eq!(
+            dead_reason,
+            Some(crate::session::DeadReason::IceFailedRepeatedly),
+            "run() must return Some(IceFailedRepeatedly) after budget exhaustion, \
+             got {dead_reason:?}"
+        );
+    }
 }

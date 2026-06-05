@@ -559,6 +559,8 @@ pub fn run_sender_signaling_drain(
     sender: Arc<dyn SignalingSenderOps>,
     stop_flag: Arc<AtomicBool>,
     channel: Arc<dyn ChannelLike>,
+    // NEW (REQ-RFE-1): escalate signaling Error to supervisor during rebuild phase
+    signal_slot: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -595,6 +597,15 @@ pub fn run_sender_signaling_drain(
                 }
                 SignalingEvent::Error(e) => {
                     eprintln!("[sm-sender-signaling-drain] signaling error: {e}");
+                    // Escalate a rebuild-phase signaling death back to the supervisor so it
+                    // advances to the next attempt-with-backoff instead of committing a dead
+                    // generation. None slot (pre-arm/post-stop) = genuine no-op (supervisor
+                    // not armed or already stopped). Disconnected = supervisor gone, also
+                    // a genuine no-op. Full (16-cap FIFO): RebuildFailed is dropped and
+                    // escalation falls back to the supervisor's rebuild_timeout backstop.
+                    if let Some(tx) = signal_slot.lock().unwrap().as_ref() {
+                        let _ = tx.try_send(SupervisorSignal::RebuildFailed);
+                    }
                 }
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1200,6 +1211,7 @@ pub fn start_sender_inner(
     )
     .map_err(|e| match e {
         BundleError::PortInUse(port) => StartSenderError::PortInUse { port },
+        BundleError::NoLocalNic => StartSenderError::BundleBuildFailed(e.to_string()),
         BundleError::Other(s) => StartSenderError::BundleBuildFailed(s),
     })?;
 
@@ -1620,6 +1632,33 @@ fn capture_backend_and_erase(
     (arc, name)
 }
 
+// ─── Candidate decision helper ────────────────────────────────────────────────
+
+/// Map an `Option<SocketAddr>` from `resolve_candidate_with_retry` to a `Result`.
+///
+/// Returns `Ok(addr)` when a non-loopback candidate was found, or
+/// `Err(BundleError::NoLocalNic)` when the retry budget was exhausted.
+///
+/// # Accepted trade (Option 1, GitHub #57)
+///
+/// `NoLocalNic` fires on ANY NIC outage that lasts longer than the candidate
+/// retry window (~1.5 s = `CANDIDATE_RETRY_ATTEMPTS × 100 ms`). There is no
+/// STUN/TURN/srflx/relay fallback — this sender uses host-only candidates.
+/// Returning `Err` here is the INTENTIONAL trade: the supervisor escalates with
+/// exponential back-off (`3 s / 9 s / 27 s`) instead of committing a dead
+/// generation with no usable ICE candidate. The trade is bounded because
+/// 1.5 s ≪ the 15 s `rebuild_timeout`, so a NIC that recovers within the window
+/// still succeeds on a later rebuild attempt.
+///
+/// Do NOT add STUN/TURN logic here without a design review; this function is
+/// intentionally minimal and synchronous.
+#[cfg(any(target_os = "windows", test))]
+fn decide_candidate_or_nic_error(
+    candidate: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, BundleError> {
+    candidate.ok_or(BundleError::NoLocalNic)
+}
+
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
 
 /// Build the production sender bundle.
@@ -1756,25 +1795,31 @@ fn build_production_sender_bundle(
     // `resolve_candidate_with_retry` polls across the NIC-down window (15×100ms
     // ≈ 1.5s, comfortably under the 15s rebuild_timeout) so the publish recovers
     // once the interface returns.
-    match resolve_candidate_with_retry(
+    let candidate_raw = resolve_candidate_with_retry(
         || sender.candidate_addr(),
         CANDIDATE_RETRY_ATTEMPTS,
         std::thread::sleep,
-    ) {
-        Some(addr) => {
+    );
+    // decide_candidate_or_nic_error maps None → Err(NoLocalNic) (REQ-HWF-1).
+    // See the function's doc comment for the accepted Option-1 trade-off.
+    match decide_candidate_or_nic_error(candidate_raw) {
+        Ok(addr) => {
             // WU-3 log #3: positive branch — proves THIS generation published.
             eprintln!("[sm-sender-bundle] published host candidate addr={addr}");
             publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
                 eprintln!("[sm-sender-bundle] publish_host_candidate failed: {e}");
             });
         }
-        None => {
-            // Budget exhausted: NIC never returned in the retry window. LOUD log
-            // so the HW gate shows this generation published NO candidate.
+        Err(e) => {
+            // Budget exhausted: NIC never returned in the retry window.
+            // decide_candidate_or_nic_error returned Err(NoLocalNic); the rebuild
+            // worker (sender.rs rebuild hook) will forward this as RebuildFailed so
+            // the supervisor escalates with backoff. (REQ-HWF-1, GitHub #57 Option 1)
             eprintln!(
                 "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
-                 skipping candidate publish — this WebRTC generation will have NO local host candidate"
+                 aborting bundle build — supervisor will escalate with backoff"
             );
+            return Err(e);
         }
     }
 
@@ -1827,6 +1872,8 @@ fn build_production_sender_bundle(
     let sender_ops_for_reset = sender_ops.clone();
     let stop_flag_for_reset = _stop_flag.clone();
     let channel_for_reset = _channel.clone();
+    // REQ-RFE-4: clone supervisor signal slot for the reset drain (same slot as primary).
+    let sup_tx_for_reset = bridge_supervisor_signal_tx.clone();
 
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
@@ -1944,10 +1991,13 @@ fn build_production_sender_bundle(
             let ops_clone = sender_ops_for_reset.clone();
             let stop_clone = stop_flag_for_reset.clone();
             let chan_clone = channel_for_reset.clone();
+            let sup_clone = sup_tx_for_reset.clone();
             std::thread::Builder::new()
                 .name("sm-sender-signaling-drain-reset".into())
                 .spawn(move || {
-                    run_sender_signaling_drain(sig_ev_rx, ops_clone, stop_clone, chan_clone);
+                    run_sender_signaling_drain(
+                        sig_ev_rx, ops_clone, stop_clone, chan_clone, sup_clone,
+                    );
                 })
                 .map_err(|e| {
                     eprintln!("[sm-sender-coord] failed to spawn reset signaling drain: {e}");
@@ -1963,10 +2013,17 @@ fn build_production_sender_bundle(
     let sig_stop = stop_flag.clone();
     let tr_stop = stop_flag.clone();
 
+    let sup_tx_for_sig = bridge_supervisor_signal_tx.clone();
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(sig_ev_rx, sender_ops, sig_stop, sig_channel);
+            run_sender_signaling_drain(
+                sig_ev_rx,
+                sender_ops,
+                sig_stop,
+                sig_channel,
+                sup_tx_for_sig,
+            );
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
 
@@ -3286,5 +3343,285 @@ mod tests {
              `suppress_outbound_bye()` (offset {suppress_pos}) and BEFORE `sig.stop()` \
              (offset {stop_pos}), so the re-started gen-G comes up already-superseded."
         );
+    }
+
+    // ─── SC-HWF-1: HW-gate F guard — no-NIC at rebuild time escalates, not silently stops ─
+    //
+    // REQ-HWF-1 (GitHub #57 Option 1): when `build_production_sender_bundle` exhausts
+    // `resolve_candidate_with_retry` (all attempts return None == no non-loopback NIC),
+    // the builder MUST return `Err(BundleError::NoLocalNic)`. The rebuild worker's
+    // existing `Err(_) => try_send(RebuildFailed)` arm (sender.rs:1435-1438) then fires
+    // while the supervisor is still in `Rebuilding`, so the supervisor escalates to
+    // `AwaitingAck{attempt:2}` instead of the previous silent `supervisor stopped` path.
+    //
+    // WHY THIS IS THE REAL PATH (not supervisor-in-isolation):
+    // Prior tests (SC-T22, WU-7, WU-8) tested the supervisor's *RebuildFailed handler*
+    // in isolation, which did not catch the bug: on the two-PC HW gate, the builder
+    // returned `Ok` (no-NIC → log-and-continue), so `RebuildFailed` was NEVER sent.
+    // This test closes the gap by injecting the exact failure condition (no-NIC probe →
+    // NoLocalNic error) through `make_sender_rebuild_hook`, exercising the
+    // no-NIC→Err→RebuildFailed→supervisor-escalation chain end-to-end at the unit level.
+    //
+    // RED state (before Option 1 fix): `BundleError::NoLocalNic` does not exist →
+    //   compile error on `BundleError::NoLocalNic` → RED.
+    // GREEN state (after Option 1 fix):
+    //   - `BundleError::NoLocalNic` variant added to `stream.rs`
+    //   - `None` arm at sender.rs ~1782 returns `Err(BundleError::NoLocalNic)`
+    //   - Builder returns `Err` → worker sends `RebuildFailed` → assertion passes → GREEN.
+
+    /// SC-HWF-1 — wiring test: when a builder returns `Err(NoLocalNic)`, the rebuild
+    ///             worker sends `RebuildFailed` while the supervisor is in `Rebuilding`.
+    ///
+    /// GIVEN: A fake `SenderBuilderFn` (4-param) that returns `Err(BundleError::NoLocalNic)`.
+    /// WHEN:  `make_sender_rebuild_hook` fires the rebuild worker.
+    /// THEN:  `SupervisorSignal::RebuildFailed` is received within 500ms.
+    ///
+    /// Coverage scope: the `Err(_) → try_send(RebuildFailed)` wiring inside
+    /// `make_sender_rebuild_hook` (drain→RebuildFailed path). The fake builder
+    /// re-implements the `resolve_candidate_with_retry`→None decision rather than
+    /// calling the production function, so this test does NOT cover the real
+    /// `#[cfg(windows)]` None-arm decision in `build_production_sender_bundle`.
+    /// The production None-arm decision is covered by SC-HWF-1B (below), which calls
+    /// `decide_candidate_or_nic_error` directly. True end-to-end HW coverage (real
+    /// NIC absence on Windows hardware) requires manual HW gate — Procedure F.
+    #[test]
+    fn sc_hwf_1_no_nic_at_rebuild_builder_returns_no_local_nic_and_worker_sends_rebuild_failed() {
+        use sm_domain::supervisor::SupervisorSignal;
+        use sm_infra::transport::{CANDIDATE_RETRY_ATTEMPTS, resolve_candidate_with_retry};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Fake builder: simulates the production None-arm by calling
+        // `resolve_candidate_with_retry` with a probe that always returns `None`
+        // (no non-loopback NIC), then returning `Err(BundleError::NoLocalNic)`.
+        // No-op delay so the test runs instantly (does not sleep).
+        let builder: super::SenderBuilderFn = Arc::new(|_, _, _, _| {
+            let result = resolve_candidate_with_retry(
+                || None, // probe: NIC never returns
+                CANDIDATE_RETRY_ATTEMPTS,
+                |_| {}, // no-op delay
+            );
+            match result {
+                Some(_) => unreachable!("probe always returns None in this test"),
+                None => Err(super::BundleError::NoLocalNic),
+            }
+        });
+
+        // Supervisor signal channel — the worker delivers RebuildFailed on this.
+        let (sig_tx, sig_rx) = sync_channel::<SupervisorSignal>(4);
+
+        // Minimal bridge state: non-None cache so the worker doesn't abort at cache-gate.
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = super::RestartCache {
+            udp_port: 0,
+            service_name: "test-sc-hwf-1".to_string(),
+            channel: Arc::new(FakeCh) as Arc<dyn super::ChannelLike>,
+            session_nonce: 0,
+        };
+        let bridge_cache = Arc::new(Mutex::new(Some(cache)));
+        let bridge_session = Arc::new(Mutex::new(None::<super::SenderSession>));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Build and fire the hook (simulates the coordinator calling initiate_rebuild).
+        let hook = super::make_sender_rebuild_hook(
+            builder,
+            bridge_cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+        );
+        (hook)(sig_tx);
+
+        // ASSERT: RebuildFailed must arrive within 500ms.
+        // RED: `BundleError::NoLocalNic` does not compile yet → RED.
+        // GREEN: builder returns Err(NoLocalNic) → worker sends RebuildFailed.
+        let signal = sig_rx.recv_timeout(Duration::from_millis(500)).expect(
+            "SC-HWF-1: RebuildFailed must arrive within 500ms — \
+                 no-NIC builder must escalate, not silently stop (HW-gate-F guard, #57)",
+        );
+        assert!(
+            matches!(signal, SupervisorSignal::RebuildFailed),
+            "SC-HWF-1: expected RebuildFailed from no-NIC builder, got {signal:?} — \
+             guards HW-gate-F: no-NIC at rebuild MUST escalate, not produce a dead generation"
+        );
+    }
+
+    // ─── SC-HWF-1B: pure-function unit test for decide_candidate_or_nic_error ────
+    //
+    // RED anchor: this test calls `super::decide_candidate_or_nic_error`, which does
+    // not yet exist. It will fail to compile (RED) until the function is extracted from
+    // the None-arm in `build_production_sender_bundle` (GREEN step).
+    //
+    // This test is the TRUE coverage for REQ-HWF-1's production decision: it calls the
+    // REAL extracted function, not a re-implementation. SC-HWF-1 (above) guards the
+    // drain→RebuildFailed wiring and is a separate, complementary concern.
+
+    /// SC-HWF-1B — unit test for `decide_candidate_or_nic_error` (REQ-HWF-1).
+    ///
+    /// Calls the REAL extracted pure function directly with:
+    ///   - `None`         → must return `Err(BundleError::NoLocalNic)`
+    ///   - `Some(addr)`   → must return `Ok(addr)` (pass-through)
+    ///
+    /// This test is the genuine coverage gate for the production None-arm's decision.
+    /// It does NOT re-implement the logic — it calls the production function.
+    #[test]
+    fn sc_hwf_1b_decide_candidate_or_nic_error_none_returns_no_local_nic_some_returns_ok() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // None → Err(NoLocalNic)
+        let result = super::decide_candidate_or_nic_error(None);
+        assert!(
+            matches!(result, Err(super::BundleError::NoLocalNic)),
+            "SC-HWF-1B: decide_candidate_or_nic_error(None) must return \
+             Err(BundleError::NoLocalNic); got {result:?}"
+        );
+
+        // Some(addr) → Ok(addr)
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5000);
+        let result = super::decide_candidate_or_nic_error(Some(addr));
+        assert!(
+            matches!(result, Ok(a) if a == addr),
+            "SC-HWF-1B: decide_candidate_or_nic_error(Some(addr)) must return \
+             Ok(addr); got {result:?}"
+        );
+    }
+
+    // ─── SC-RFE-1 / SC-RFE-2: signaling drain Error escalation (REQ-RFE-1, REQ-RFE-2) ──
+    //
+    // WU-2 RED anchor: the test below was written against the FUTURE signature of
+    // `run_sender_signaling_drain` (5th param `signal_slot`). Before WU-3 added the
+    // param, this test would fail to compile. WU-3 turned it GREEN by adding the param
+    // and the guarded `try_send` in the Error arm. Both tests (WU-2 + WU-3) ship in
+    // the same commit per work-unit-commits: test and code travel together.
+
+    /// Minimal no-op implementation of `SignalingSenderOps` for drain unit tests.
+    struct NoopOps;
+    impl super::SignalingSenderOps for NoopOps {
+        fn apply_remote_answer(
+            &self,
+            _ans: sm_domain::signaling::SdpAnswer,
+        ) -> Result<(), sm_domain::transport::TransportError> {
+            Ok(())
+        }
+        fn add_remote_candidate(
+            &self,
+            _c: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), sm_domain::transport::TransportError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal `ChannelLike` for drain unit tests — discards all sends.
+    struct NoopCh;
+    impl super::ChannelLike for NoopCh {
+        fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// SC-RFE-1 drain half — `SignalingEvent::Error` with an armed slot sends
+    /// `SupervisorSignal::RebuildFailed` on the supervisor channel.
+    ///
+    /// GIVEN: `run_sender_signaling_drain` holds a `signal_slot` with `Some(tx)`.
+    /// WHEN:  `SignalingEvent::Error(SignalingError::Io("nic down".into()))` is sent.
+    /// THEN:  `RebuildFailed` is received on the paired `rx` within 300 ms.
+    #[test]
+    fn signaling_drain_error_with_armed_slot_sends_rebuild_failed() {
+        use sm_domain::signaling::{SignalingError, SignalingEvent};
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(4);
+        let slot = Arc::new(Mutex::new(Some(sup_tx)));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_for_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("test-rfe1-drain".into())
+            .spawn(move || {
+                super::run_sender_signaling_drain(
+                    sig_ev_rx,
+                    Arc::new(NoopOps),
+                    stop_for_thread,
+                    Arc::new(NoopCh),
+                    slot,
+                );
+            })
+            .unwrap();
+
+        sig_ev_tx
+            .send(SignalingEvent::Error(SignalingError::Io("nic down".into())))
+            .unwrap();
+
+        let received = sup_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("RebuildFailed must arrive within 300 ms after Error event");
+        assert_eq!(
+            received,
+            SupervisorSignal::RebuildFailed,
+            "drain must send RebuildFailed on signaling Error (REQ-RFE-1)"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        drop(sig_ev_tx);
+        let _ = thread.join();
+    }
+
+    /// SC-RFE-2 — `SignalingEvent::Error` with a `None` slot is a no-op and does not panic.
+    ///
+    /// GIVEN: `run_sender_signaling_drain` holds a `signal_slot` with `None`.
+    /// WHEN:  `SignalingEvent::Error` is sent, then `SignalingEvent::Closed` to exit cleanly.
+    /// THEN:  The drain thread joins without panic (no `RebuildFailed` is sent).
+    #[test]
+    fn signaling_drain_error_with_none_slot_is_noop() {
+        use sm_domain::signaling::{SignalingError, SignalingEvent};
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let slot = Arc::new(Mutex::new(
+            None::<std::sync::mpsc::SyncSender<SupervisorSignal>>,
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_for_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("test-rfe2-drain".into())
+            .spawn(move || {
+                super::run_sender_signaling_drain(
+                    sig_ev_rx,
+                    Arc::new(NoopOps),
+                    stop_for_thread,
+                    Arc::new(NoopCh),
+                    slot,
+                );
+            })
+            .unwrap();
+
+        sig_ev_tx
+            .send(SignalingEvent::Error(SignalingError::Io("nic down".into())))
+            .unwrap();
+        // Send Closed so the drain exits cleanly (no spin on stop_flag needed).
+        sig_ev_tx.send(SignalingEvent::Closed).unwrap();
+
+        // Drain thread must join without panic — that is the single invariant here.
+        thread
+            .join()
+            .expect("drain thread must not panic when slot is None (REQ-RFE-2)");
+
+        stop.store(true, Ordering::SeqCst);
     }
 }
