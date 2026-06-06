@@ -1691,6 +1691,30 @@ fn decide_candidate_or_nic_error(
     candidate.ok_or(BundleError::NoLocalNic)
 }
 
+// ─── Offer wire-stamp seam (REQ-GE-1 / REQ-GE-2) ──────────────────────────────
+
+/// Stamp the live SDP generation `attempt` onto the published `Offer`.
+///
+/// This is the single production wire-stamp boundary: the value the receiver's
+/// `expected_attempt` guard compares against (`offer_attempt >= expected`) is the
+/// `attempt` passed here. Extracted as a seam so the value-reaching-the-wire
+/// contract is testable without real NIC/capture/encoder hardware: a `Signaling`
+/// capture mock asserts the exact `attempt` forwarded to `publish_local_offer`.
+///
+/// `build_production_sender_bundle` (Windows-only) and the test contract both call
+/// this so the production path and the assertion cannot diverge (verify SUGGESTION-1).
+#[cfg(any(target_os = "windows", test))]
+fn stamp_and_publish_offer(
+    signaling: &dyn sm_domain::signaling::Signaling,
+    offer: sm_domain::signaling::SdpOffer,
+    attempt: u8,
+) -> Result<(), sm_domain::signaling::SignalingError> {
+    // BUG (RED): the live `attempt` is discarded and `1` is hardcoded, mirroring
+    // the production defect at the publish_local_offer call. C1 replaces `1` with
+    // `attempt` so every rebuild Offer carries its real generation epoch.
+    signaling.publish_local_offer(offer, 1)
+}
+
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
 
 /// Build the production sender bundle.
@@ -3776,6 +3800,103 @@ mod tests {
             sender_attempt.load(Ordering::Acquire),
             3,
             "T1.8 FAIL: sender_attempt Arc was mutated unexpectedly"
+        );
+    }
+
+    // ─── C2 RED — production wire-stamp contract (value reaches publish_local_offer) ─
+    //
+    // The seam test above (sc_ge_sender_stamps_live_attempt_on_published_offer)
+    // only guards the hook→builder hand-off; it passes even while production
+    // hardcodes attempt=1 at the publish_local_offer call. This test guards the
+    // PRODUCTION boundary: it drives `stamp_and_publish_offer` — the single
+    // production wire-stamp seam that `build_production_sender_bundle` calls — with
+    // a `Signaling` capture mock and asserts the exact attempt forwarded to
+    // `publish_local_offer`. No NIC/capture/encoder hardware required.
+    //
+    // RED against pre-C1 code: `stamp_and_publish_offer` discards `attempt` and
+    // hardcodes 1, so the mock captures 1 — the assertion `captured == 2` fails.
+    // GREEN after C1: the seam forwards the real `attempt`, mock captures 2.
+
+    /// C2 / REQ-GE-2 — the live generation `attempt` reaches `publish_local_offer`.
+    ///
+    /// GIVEN: A `Signaling` capture mock recording every `(offer, attempt)` it
+    ///        receives via `publish_local_offer`.
+    /// WHEN:  `stamp_and_publish_offer` (the production wire-stamp seam) is invoked
+    ///        for a generation-2 rebuild (`attempt = 2`).
+    /// THEN:  The mock captured `attempt == 2` (NOT the hardcoded 1).
+    #[test]
+    fn sc_ge_published_offer_carries_live_attempt_at_wire_boundary() {
+        use sm_domain::signaling::{
+            IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError,
+            SignalingEvent,
+        };
+        use std::sync::mpsc::SyncSender;
+        use std::sync::{Arc, Mutex};
+
+        // Capture mock: records the `attempt` passed to publish_local_offer.
+        struct CaptureSignaling {
+            captured: Arc<Mutex<Option<u8>>>,
+        }
+
+        impl Signaling for CaptureSignaling {
+            fn new(_config: SignalingConfig) -> Result<Self, SignalingError>
+            where
+                Self: Sized,
+            {
+                Ok(Self {
+                    captured: Arc::new(Mutex::new(None)),
+                })
+            }
+
+            fn start(
+                &mut self,
+                _event_tx: SyncSender<SignalingEvent>,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_offer(
+                &self,
+                _offer: SdpOffer,
+                attempt: u8,
+            ) -> Result<(), SignalingError> {
+                *self.captured.lock().unwrap() = Some(attempt);
+                Ok(())
+            }
+
+            fn publish_local_answer(&self, _answer: SdpAnswer) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_candidate(&self, _cand: IceCandidate) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn stop(&mut self) -> Result<(), SignalingError> {
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let signaling = CaptureSignaling {
+            captured: captured.clone(),
+        };
+
+        // Generation-2 rebuild: the receiver's expected_attempt has advanced to 2,
+        // so a gen-2 Offer must be stamped attempt=2 to satisfy `2 >= 2` (ACCEPT).
+        const GEN2_ATTEMPT: u8 = 2;
+        let offer = SdpOffer("v=0\r\no=- gen2 test\r\n".to_string());
+
+        super::stamp_and_publish_offer(&signaling, offer, GEN2_ATTEMPT)
+            .expect("stamp_and_publish_offer must succeed with the capture mock");
+
+        let got = *captured.lock().unwrap();
+        assert_eq!(
+            got,
+            Some(GEN2_ATTEMPT),
+            "C2 FAIL (REQ-GE-2): published Offer carried attempt={got:?}, expected Some(2). \
+             A hardcoded 1 here means the receiver drops every legitimate gen-2+ Offer \
+             (offer_attempt < expected_attempt) and reconnection breaks."
         );
     }
 }
