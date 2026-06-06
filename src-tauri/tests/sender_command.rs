@@ -706,9 +706,10 @@ fn signaling_drain_offer_received_is_silently_ignored() {
     });
 
     ev_tx
-        .send(SignalingEvent::OfferReceived(SdpOffer(
-            "test-offer".to_string(),
-        )))
+        .send(SignalingEvent::OfferReceived(
+            SdpOffer("test-offer".to_string()),
+            1,
+        ))
         .unwrap();
 
     thread::sleep(Duration::from_millis(50));

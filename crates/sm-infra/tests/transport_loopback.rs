@@ -175,12 +175,12 @@ fn transport_loopback_signaling_exchange_completes() {
 
     // Step 2: Sender publishes offer via loopback signaling.
     sender_sig
-        .publish_local_offer(offer.clone())
+        .publish_local_offer(offer.clone(), 1)
         .expect("publish_local_offer must succeed");
 
     // Step 3: Receiver side receives OfferReceived.
     let offer_received = match receiver_sig_event_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(SignalingEvent::OfferReceived(o)) => o,
+        Ok(SignalingEvent::OfferReceived(o, _attempt)) => o,
         Ok(other) => panic!("expected OfferReceived, got {other:?}"),
         Err(e) => panic!("recv_timeout for OfferReceived: {e}"),
     };
@@ -496,12 +496,12 @@ fn transport_loopback_full_wire_up_no_error() {
     // Publish offer/answer through signaling for observability (not strictly needed
     // since we applied them directly, but exercises the signaling path).
     sender_sig
-        .publish_local_offer(offer)
+        .publish_local_offer(offer, 1)
         .expect("publish_local_offer");
 
     // Drain the OfferReceived from receiver_sig.
     match receiver_sig_event_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(SignalingEvent::OfferReceived(_)) => {}
+        Ok(SignalingEvent::OfferReceived(_, _)) => {}
         Ok(other) => panic!("expected OfferReceived; got {other:?}"),
         Err(e) => panic!("recv_timeout: {e}"),
     }

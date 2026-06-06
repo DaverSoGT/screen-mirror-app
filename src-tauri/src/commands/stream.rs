@@ -935,8 +935,10 @@ fn run_signaling_drain(
                 SignalingEvent::PeerFound { host, port } => {
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
-                SignalingEvent::OfferReceived(offer) => {
+                SignalingEvent::OfferReceived(offer, _offer_attempt) => {
                     // D-RBF-2: race-window guard. The outer stop_flag check (line 892) fires
+                    // NOTE: `_offer_attempt` is a placeholder binding; the stale-guard using
+                    // `expected_attempt: Arc<AtomicU8>` will be wired in T1.11.
                     // ONCE per recv_timeout iteration; an offer pulled before the OLD session
                     // teardown started can still race into this arm. The OLD receiver's str0m
                     // Rtc has m-line state that conflicts with a fresh sender Rtc, so we drop
@@ -3611,7 +3613,7 @@ mod tests {
         // Send an OfferReceived event.
         let test_offer = SdpOffer("v=0\r\noffer".to_string());
         ev_tx
-            .send(SignalingEvent::OfferReceived(test_offer.clone()))
+            .send(SignalingEvent::OfferReceived(test_offer.clone(), 1))
             .unwrap();
 
         // Give the drain a moment to process.
@@ -5620,6 +5622,7 @@ mod tests {
             fn publish_local_offer(
                 &self,
                 _offer: sm_domain::signaling::SdpOffer,
+                _attempt: u8,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
@@ -5713,8 +5716,10 @@ mod tests {
         // ── Send an offer on the new sig_ev_tx ──
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
         // With the broken code (_sig_ev_rx dropped) try_send would return Disconnected.
-        let offer_event =
-            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset".to_string()));
+        let offer_event = SignalingEvent::OfferReceived(
+            SdpOffer("v=0\r\noffer-post-reset".to_string()),
+            1,
+        );
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel is live (not orphaned) ──
@@ -5817,6 +5822,7 @@ mod tests {
             fn publish_local_offer(
                 &self,
                 _offer: SdpOffer,
+                _attempt: u8,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
@@ -5919,8 +5925,10 @@ mod tests {
         // ── Inject an OfferReceived event on the new channel ──
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
         // With the broken pre-fix code (_sig_ev_rx dropped) → Disconnected.
-        let offer_event =
-            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset-f002".to_string()));
+        let offer_event = SignalingEvent::OfferReceived(
+            SdpOffer("v=0\r\noffer-post-reset-f002".to_string()),
+            1,
+        );
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel not orphaned ──
@@ -6660,7 +6668,7 @@ mod tests {
         // Pre-load the offer. drain grabs it immediately (no 500ms recv_timeout wait).
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\n".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("SC-MLO-1: pre-load OfferReceived");
 
         let stop_clone = stop_flag.clone();
@@ -6753,7 +6761,7 @@ mod tests {
         // Inject OfferReceived with stop_flag=false — must go through to apply_remote_offer.
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\n".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("SC-MLO-2: send OfferReceived");
 
         // Drop the sender to close the channel, causing the drain to exit on Disconnected.
@@ -7088,7 +7096,7 @@ mod tests {
         // Inject an offer — with ResetSignalingOnly the drain must log-and-skip it.
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-1".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("sc_rdf_1: send OfferReceived");
 
         // Drop sender to close the channel, letting the drain exit on Disconnected.
@@ -7157,7 +7165,7 @@ mod tests {
         // Inject an offer first — must be ignored (not break the drain).
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-2".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("sc_rdf_2: send OfferReceived");
 
         // Small sleep so the drain can process the offer before we send Closed.

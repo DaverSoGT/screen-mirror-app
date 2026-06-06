@@ -588,7 +588,7 @@ pub fn run_sender_signaling_drain(
                         eprintln!("[sm-sender-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
-                SignalingEvent::OfferReceived(_) => {
+                SignalingEvent::OfferReceived(_, _) => {
                     // Sender role: ignore incoming offers.
                 }
                 SignalingEvent::Closed => {
@@ -1779,8 +1779,10 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Publish offer immediately (Amendment B — buffers in inbox; written on connect).
+    // Cold-start attempt is 1 (matches supervisor.rs:268 seed and receiver expected_attempt seed).
+    // T1.13 will replace this literal with the live sender_attempt Arc read when that task lands.
     signaling
-        .publish_local_offer(offer)
+        .publish_local_offer(offer, 1)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
