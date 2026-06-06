@@ -31,7 +31,7 @@
 //! `stop_sender_session` sends `SupervisorSignal::Stop` via `supervisor_signal_tx`
 //! before joining drain threads, interrupting any in-flight backoff sleep (AC-13).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -99,6 +99,11 @@ pub struct SenderCoordinatorHooks {
     /// Called when supervisor emits `InitiateMdnsReset`.
     /// Must tear down the current `MdnsSignaling` and re-start discovery.
     pub initiate_mdns_reset: Arc<dyn Fn() + Send + Sync>,
+    /// T1.10: SDP generation epoch counter — written by coordinator on
+    /// `StateChanged(Reconnecting{attempt})` so `make_sender_rebuild_hook` can stamp
+    /// the Offer with the current attempt at builder-call time (REQ-GE-1).
+    /// Default (noop): `Arc::new(AtomicU8::new(1))`.
+    pub sender_attempt: Arc<AtomicU8>,
 }
 
 impl SenderCoordinatorHooks {
@@ -113,6 +118,7 @@ impl SenderCoordinatorHooks {
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
             }),
             initiate_mdns_reset: Arc::new(|| {}),
+            sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch
         }
     }
 }
@@ -127,8 +133,17 @@ impl SenderCoordinatorHooks {
 ///
 /// Production: wraps `build_production_sender_bundle` (Windows-only).
 /// Tests inject a closure returning a fake bundle with cross-platform fake adapters.
+/// Builder closure that constructs a `SenderBundle`.
+///
+/// Parameters (in order):
+/// 1. `udp_port: u16` — local UDP port for the WebRTC transport.
+/// 2. `service_name: String` — mDNS service name to advertise.
+/// 3. `stop_flag: Arc<AtomicBool>` — shared stop signal; builder should honour it.
+/// 4. `channel: Arc<dyn ChannelLike>` — Tauri IPC channel for status frames.
+/// 5. `attempt: u8` — SDP generation epoch (T1.13, REQ-GE-1). The builder stamps
+///    this value onto the Offer wire frame so the receiver can reject stale offers.
 pub type SenderBuilderFn = Arc<
-    dyn Fn(u16, String, Arc<AtomicBool>, Arc<dyn ChannelLike>) -> Result<SenderBundle, BundleError>
+    dyn Fn(u16, String, Arc<AtomicBool>, Arc<dyn ChannelLike>, u8) -> Result<SenderBundle, BundleError>
         + Send
         + Sync,
 >;
@@ -303,7 +318,9 @@ impl SenderBridge {
         let sup_tx_for_builder = supervisor_signal_tx_arc.clone(); // D-RBF-1 (REQ-RBL-1)
         Self {
             session: session_arc,
-            builder: Arc::new(move |udp_port, service_name, stop_flag, channel| {
+            builder: Arc::new(move |udp_port, service_name, stop_flag, channel, _attempt| {
+                // T1.13: `_attempt` is the epoch; cold-start uses literal 1 in
+                // build_production_sender_bundle (T1.13 TODO for full wiring).
                 build_production_sender_bundle(
                     udp_port,
                     service_name,
@@ -1049,6 +1066,9 @@ fn handle_supervisor_outcome(
 ) {
     match outcome {
         SupervisorOutcome::StateChanged(SessionState::Reconnecting { attempt, max }) => {
+            // T1.10: store current attempt epoch so make_sender_rebuild_hook can stamp
+            // the Offer with the correct generation when it calls the builder (REQ-GE-1).
+            hooks.sender_attempt.store(attempt.get(), Ordering::Release);
             emit_event(
                 channel,
                 &SenderStatusEvent::Reconnecting {
@@ -1203,11 +1223,13 @@ pub fn start_sender_inner(
     *bridge.supervisor_signal_tx.lock().unwrap() = None;
 
     // Step 7 — invoke builder (no lock held).
+    // T1.13: cold-start uses attempt=1 (supervisor's first generation).
     let bundle = (builder)(
         resolved_port,
         resolved_name.clone(),
         stop_flag.clone(),
         channel.clone(),
+        1u8, // T1.13: cold-start epoch = 1
     )
     .map_err(|e| match e {
         BundleError::PortInUse(port) => StartSenderError::PortInUse { port },
@@ -1359,6 +1381,9 @@ pub fn make_sender_rebuild_hook(
     bridge_session: Arc<Mutex<Option<SenderSession>>>,
     old_stop_flag: Arc<std::sync::atomic::AtomicBool>,
     attempt: u32,
+    // T1.10/T1.13: epoch counter written by coordinator on Reconnecting; read here
+    // at builder-call time so the Offer is stamped with the current generation attempt.
+    sender_attempt: Arc<AtomicU8>,
 ) -> Arc<dyn Fn(SyncSender<SupervisorSignal>) + Send + Sync> {
     Arc::new(move |signal_tx: SyncSender<SupervisorSignal>| {
         let builder = builder.clone();
@@ -1366,6 +1391,10 @@ pub fn make_sender_rebuild_hook(
         let bridge_session = bridge_session.clone();
         let old_stop_flag = old_stop_flag.clone();
         let signal_tx_for_err = signal_tx.clone();
+        // T1.13: read current epoch just before spawning the worker so the Offer is
+        // stamped with the attempt that fired this rebuild cycle (Acquire for HB with
+        // the coordinator's Release store on StateChanged(Reconnecting)).
+        let current_attempt = sender_attempt.load(std::sync::atomic::Ordering::Acquire);
 
         let spawn_result = std::thread::Builder::new()
             .name(format!("sm-rebuild-worker-sender-{attempt}"))
@@ -1425,12 +1454,15 @@ pub fn make_sender_rebuild_hook(
                 }
 
                 // Step 9: invoke cached builder with a fresh stop_flag.
+                // T1.13: pass current_attempt so the builder can stamp the Offer with
+                // the current SDP generation epoch (REQ-GE-1).
                 let fresh_stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let new_bundle = match (builder)(
                     cache.udp_port,
                     cache.service_name.clone(),
                     fresh_stop_flag.clone(),
                     cache.channel.clone(),
+                    current_attempt, // T1.13: epoch stamp (REQ-GE-1)
                 ) {
                     Ok(b) => b,
                     Err(_) => {
@@ -1877,6 +1909,11 @@ fn build_production_sender_bundle(
     // REQ-RFE-4: clone supervisor signal slot for the reset drain (same slot as primary).
     let sup_tx_for_reset = bridge_supervisor_signal_tx.clone();
 
+    // T1.10: epoch counter — written by coordinator on StateChanged(Reconnecting),
+    // read by make_sender_rebuild_hook at builder-call time to stamp the Offer (REQ-GE-1).
+    // Seed = 1 matches the supervisor's first attempt (supervisor.rs:268).
+    let sender_attempt_arc = Arc::new(AtomicU8::new(1));
+
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
             let sig = sig_for_req.lock().unwrap();
@@ -1912,7 +1949,10 @@ fn build_production_sender_bundle(
                 let session_for_inner = _bridge_session.clone();
                 let cache_for_inner = _bridge_cache.clone();
                 let sup_tx_for_inner = bridge_supervisor_signal_tx.clone(); // D-RBF-1
-                Arc::new(move |udp_port, service_name, stop_flag, channel| {
+                Arc::new(move |udp_port, service_name, stop_flag, channel, _attempt| {
+                    // T1.13: `_attempt` is the epoch passed by make_sender_rebuild_hook;
+                    // build_production_sender_bundle will pass it to publish_local_offer
+                    // via the cold-start path in start_sender_inner (T1.13 TODO).
                     build_production_sender_bundle(
                         udp_port,
                         service_name,
@@ -1928,6 +1968,7 @@ fn build_production_sender_bundle(
             _bridge_session.clone(),
             _stop_flag.clone(),
             1, // attempt — supervisor attempt counter; 1 as the default for production hook
+            sender_attempt_arc.clone(), // T1.10/T1.13: epoch read at builder-call time
         ),
         initiate_mdns_reset: Arc::new(move || {
             // MdnsSignaling::reset() consumes self. Since we hold an Arc<Mutex<>>,
@@ -2006,6 +2047,7 @@ fn build_production_sender_bundle(
                 })
                 .ok();
         }),
+        sender_attempt: sender_attempt_arc, // T1.10: coordinator writes epoch on Reconnecting
     };
 
     // ── 6. Spawn drain threads ────────────────────────────────────────────────
@@ -2324,7 +2366,7 @@ mod tests {
 
         // new_with_builder_and_sup_tx accepts a pre-populated Some(sup_tx) — supports S-1.
         let bridge = super::SenderBridge::new_with_builder_and_sup_tx(
-            Arc::new(|_, _, _, _| Err(super::BundleError::Other("test-only".to_string()))),
+            Arc::new(|_, _, _, _, _| Err(super::BundleError::Other("test-only".to_string()))),
             sup_tx_arc.clone(),
         );
 
@@ -2439,7 +2481,7 @@ mod tests {
         // Wrap Receiver in Mutex<Option<_>> so it can be moved into Arc<dyn Fn + Sync>.
         let sup_rx_cell: Arc<Mutex<Option<std::sync::mpsc::Receiver<SupervisorSignal>>>> =
             Arc::new(Mutex::new(Some(sup_rx)));
-        let builder: super::SenderBuilderFn = Arc::new(move |_, _, sf, _ch| {
+        let builder: super::SenderBuilderFn = Arc::new(move |_, _, sf, _ch, _attempt| {
             // Correct pattern (post-WU-7): write into the passed-in bridge Arc.
             *probe_for_builder.lock().unwrap() = Some(sup_tx_for_builder.clone());
 
@@ -2537,7 +2579,7 @@ mod tests {
     fn sc_rbl_2_enter_supervisor_mode_calls_signaling_refresh_after_bridge_write() {
         use sm_domain::supervisor::SupervisorSignal;
         use sm_domain::transport::TransportEvent;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
         use std::sync::mpsc::{SyncSender, sync_channel};
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
@@ -2586,6 +2628,7 @@ mod tests {
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
             }),
             initiate_mdns_reset: Arc::new(|| {}),
+            sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
         };
 
         // Spawn the drain.
@@ -2683,7 +2726,7 @@ mod tests {
         let stop_received = Arc::new(AtomicBool::new(false));
         let stop_received_for_cell = stop_received.clone();
 
-        let builder: super::SenderBuilderFn = Arc::new(move |_, _, _, _| {
+        let builder: super::SenderBuilderFn = Arc::new(move |_, _, _, _, _| {
             // Wire supervisor_signal_tx into the probe Arc (simulates WU-8 GREEN behavior).
             *probe_for_builder.lock().unwrap() = Some(sup_tx_for_builder.clone());
 
@@ -2790,7 +2833,7 @@ mod tests {
         use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
         use sm_domain::supervisor::SupervisorSignal;
         use sm_domain::transport::TransportEvent;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
         use std::sync::mpsc::sync_channel;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
@@ -2826,6 +2869,7 @@ mod tests {
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
             }),
             initiate_mdns_reset: Arc::new(|| {}),
+            sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
         };
 
         // Fast policy so the supervisor cycles without waiting production delays.
@@ -2959,7 +3003,7 @@ mod tests {
         use sm_domain::supervisor::SupervisorSignal;
         use sm_domain::transport::TransportEvent;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
         use std::sync::mpsc::sync_channel;
         use std::time::Duration;
 
@@ -3040,6 +3084,7 @@ mod tests {
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
             }),
             initiate_mdns_reset: fixed_reset_hook,
+            sender_attempt: std::sync::Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
         };
 
         let stop_for_main = stop_flag.clone();
@@ -3217,16 +3262,16 @@ mod tests {
             .replace("\r\n", "\n");
 
         // Scope the search to the production initiate_mdns_reset hook body ONLY.
-        // The closure is the LAST field of the production SenderCoordinatorHooks
-        // literal, terminated by `}),` followed by the struct's closing `};`. Bound
-        // the region there so the gate cannot match the string in this test's own
-        // source further down the file.
+        // The closure is followed by `sender_attempt` as the last field of the
+        // production SenderCoordinatorHooks literal. Bound the region at `}),`
+        // followed by `sender_attempt:` so the gate cannot match the string in
+        // this test's own source further down the file.
         let hook_start = source
             .find("initiate_mdns_reset: Arc::new(move || {")
             .expect("production initiate_mdns_reset hook must exist");
         let hook_rel_end = source[hook_start..]
-            .find("\n        }),\n    };")
-            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+            .find("\n        }),\n        sender_attempt:")
+            .expect("production initiate_mdns_reset closure must be followed by sender_attempt field");
         let hook_region = &source[hook_start..hook_start + hook_rel_end];
 
         let suppress_pos = hook_region.find("suppress_outbound_bye()").expect(
@@ -3322,8 +3367,8 @@ mod tests {
             .find("initiate_mdns_reset: Arc::new(move || {")
             .expect("production initiate_mdns_reset hook must exist");
         let hook_rel_end = source[hook_start..]
-            .find("\n        }),\n    };")
-            .expect("production initiate_mdns_reset closure must terminate with `}),` then `};`");
+            .find("\n        }),\n        sender_attempt:")
+            .expect("production initiate_mdns_reset closure must be followed by sender_attempt field");
         let hook_region = &source[hook_start..hook_start + hook_rel_end];
 
         let suppress_pos = hook_region
@@ -3390,7 +3435,7 @@ mod tests {
     fn sc_hwf_1_no_nic_at_rebuild_builder_returns_no_local_nic_and_worker_sends_rebuild_failed() {
         use sm_domain::supervisor::SupervisorSignal;
         use sm_infra::transport::{CANDIDATE_RETRY_ATTEMPTS, resolve_candidate_with_retry};
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
         use std::sync::mpsc::sync_channel;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
@@ -3399,7 +3444,7 @@ mod tests {
         // `resolve_candidate_with_retry` with a probe that always returns `None`
         // (no non-loopback NIC), then returning `Err(BundleError::NoLocalNic)`.
         // No-op delay so the test runs instantly (does not sleep).
-        let builder: super::SenderBuilderFn = Arc::new(|_, _, _, _| {
+        let builder: super::SenderBuilderFn = Arc::new(|_, _, _, _, _| {
             let result = resolve_candidate_with_retry(
                 || None, // probe: NIC never returns
                 CANDIDATE_RETRY_ATTEMPTS,
@@ -3438,6 +3483,7 @@ mod tests {
             bridge_session,
             old_stop_flag,
             1,
+            Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
         );
         (hook)(sig_tx);
 
@@ -3632,18 +3678,20 @@ mod tests {
     // RED until T1.10 adds Arc<AtomicU8> sender_attempt and T1.13 widens
     // SenderBuilderFn to receive attempt:u8 and passes it to publish_local_offer.
 
-    /// T1.8 / REQ-GE-2 — sender stamps the live attempt on the published Offer.
+    /// T1.8 / REQ-GE-2 — `make_sender_rebuild_hook` stamps the live attempt on the
+    /// builder call.
     ///
-    /// GIVEN:  A spy SenderBuilderFn that records the attempt it receives.
-    /// WHEN:   StateChanged(Reconnecting{attempt: 1}) triggers InitiateRebuild.
-    /// THEN:   The spy builder captures attempt == 1.
+    /// GIVEN:  A spy SenderBuilderFn (5-arg) that records the attempt it receives.
+    ///         A `sender_attempt` Arc seeded with `attempt = 3`.
+    /// WHEN:   The hook returned by `make_sender_rebuild_hook` is fired.
+    /// THEN:   The spy builder captures attempt == 3 (the value read from the Arc).
     ///
     /// RED: SenderBuilderFn is currently 4-arg (u16, String, Arc<AtomicBool>,
     /// Arc<dyn ChannelLike>). T1.13 widens it to 5-arg by adding `attempt: u8`.
     /// This test uses the 5-arg type — compile fails = RED until T1.13.
     #[test]
     fn sc_ge_sender_stamps_live_attempt_on_published_offer() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
         use std::sync::mpsc::sync_channel;
         use std::sync::{Arc, Mutex};
 
@@ -3652,17 +3700,7 @@ mod tests {
         let spy_for_builder = spy_attempt.clone();
 
         // Widened SenderBuilderFn (5-arg) — compile fails until T1.13 changes the type.
-        let builder: Arc<
-            dyn Fn(
-                    u16,
-                    String,
-                    Arc<AtomicBool>,
-                    Arc<dyn super::ChannelLike>,
-                    u8, // T1.13: attempt param — does not exist yet in SenderBuilderFn
-                ) -> Result<super::SenderBundle, super::BundleError>
-                + Send
-                + Sync,
-        > = Arc::new(move |_, _, sf, _ch, attempt| {
+        let builder: super::SenderBuilderFn = Arc::new(move |_, _, sf, _ch, attempt| {
             *spy_for_builder.lock().unwrap() = Some(attempt);
             let stop_for_drain = sf.clone();
             let drain = std::thread::Builder::new()
@@ -3680,49 +3718,64 @@ mod tests {
             })
         });
 
-        // new_with_builder accepts the widened type once T1.13 is done.
-        let bridge = super::SenderBridge::new_with_builder(builder);
-
         struct FakeCh;
         impl super::ChannelLike for FakeCh {
             fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
                 Ok(())
             }
         }
-        let channel: Arc<dyn super::ChannelLike> = Arc::new(FakeCh);
 
-        // Cold-start.
-        super::start_sender_inner(&bridge, channel, None, None).expect("start must succeed");
+        // Seed attempt = 3 to distinguish from the default 1.
+        let sender_attempt = Arc::new(AtomicU8::new(3));
 
-        // Inject IceFailed → supervisor transitions to Reconnecting{1} → InitiateRebuild.
-        let sig_tx = bridge
-            .supervisor_signal_tx
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("supervisor_signal_tx must be set after start");
-        sig_tx
-            .send(sm_domain::supervisor::SupervisorSignal::LocalFailure {
-                trigger: sm_domain::session::ReconnectTrigger::IceFailed,
-            })
-            .ok();
+        let cache = super::RestartCache {
+            udp_port: 0,
+            service_name: "t1-8".to_string(),
+            channel: Arc::new(FakeCh) as Arc<dyn super::ChannelLike>,
+            session_nonce: 0,
+        };
+        let bridge_cache = Arc::new(Mutex::new(Some(cache)));
+        let bridge_session = Arc::new(Mutex::new(None::<super::SenderSession>));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
 
-        // Wait for the rebuild to complete.
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (sig_tx, sig_rx) = sync_channel::<sm_domain::supervisor::SupervisorSignal>(4);
 
-        // Assert spy captured attempt == 1 (first reconnect).
+        // Build and fire the hook — make_sender_rebuild_hook reads sender_attempt.load()
+        // and passes it as the 5th arg to the builder.
+        let hook = super::make_sender_rebuild_hook(
+            builder,
+            bridge_cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+            sender_attempt.clone(),
+        );
+        (hook)(sig_tx);
+
+        // Wait briefly for the worker thread to call the builder and return.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Drain signal channel — the spy builder succeeds so RebuildSucceeded arrives.
+        let _ = sig_rx.recv_timeout(std::time::Duration::from_millis(200));
+
+        // Assert spy captured attempt == 3 (value read from sender_attempt Arc).
         let captured = *spy_attempt.lock().unwrap();
         assert!(
             captured.is_some(),
-            "T1.8 FAIL: builder was not called — rebuild did not fire"
+            "T1.8 FAIL: builder was not called"
         );
         assert_eq!(
             captured.unwrap(),
-            1,
-            "T1.8 FAIL: builder received attempt={:?}, expected 1",
+            3,
+            "T1.8 FAIL: builder received attempt={:?}, expected 3 (REQ-GE-2)",
             captured
         );
 
-        super::stop_sender_session(&bridge);
+        // Verify sender_attempt Arc is still intact.
+        assert_eq!(
+            sender_attempt.load(Ordering::Acquire),
+            3,
+            "T1.8 FAIL: sender_attempt Arc was mutated unexpectedly"
+        );
     }
 }

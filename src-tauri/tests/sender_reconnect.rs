@@ -8,7 +8,7 @@
 //
 // All tests are cross-platform — no real adapters or Windows-only code.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -107,7 +107,7 @@ fn make_supervised_bridge_with_policy(
     let sup_tx_for_drain = sup_tx.clone();
 
     let bridge = SenderBridge::new_with_builder_and_sup_tx(
-        Arc::new(move |_, _, stop_flag, channel| {
+        Arc::new(move |_, _, stop_flag, channel, _attempt| {
             let ev_rx = ev_rx_slot_clone
                 .lock()
                 .unwrap()
@@ -156,7 +156,7 @@ fn make_supervised_bridge() -> (
 #[test]
 fn t6_1_restart_cache_populated_after_start() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(
@@ -180,7 +180,7 @@ fn t6_1_restart_cache_populated_after_start() {
 #[test]
 fn t6_1_restart_cache_cleared_after_stop() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
@@ -201,7 +201,7 @@ fn t6_1_restart_cache_cleared_after_stop() {
 #[test]
 fn t6_1_session_nonce_is_stable_during_session() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     start_sender_inner(&bridge, ch as Arc<dyn ChannelLike>, None, None)
@@ -433,7 +433,7 @@ fn t6_2_stop_during_reconnect_cancels_supervisor_cleanly() {
 #[test]
 fn t11_1_retry_session_no_cache_returns_err() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     let result = retry_session_inner(&bridge, ch as Arc<dyn ChannelLike>);
@@ -453,7 +453,7 @@ fn t11_1_retry_session_no_cache_returns_err() {
 #[test]
 fn t11_1_retry_session_while_live_stops_and_restarts() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     // Start a session (still alive — test stub has no real drain).
@@ -485,7 +485,7 @@ fn t11_1_retry_session_while_live_stops_and_restarts() {
 #[test]
 fn t11_1_retry_session_after_dead_emits_connecting() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch1 = FakeJsonChannel::new();
 
     // First session: start, then simulate Dead (no real supervisor — just stop the session
@@ -541,7 +541,7 @@ fn t11_1_retry_session_after_dead_emits_connecting() {
 #[test]
 fn t11_1_retry_session_populates_restart_cache_with_new_nonce() {
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch1 = FakeJsonChannel::new();
 
     start_sender_inner(&bridge, ch1.clone() as Arc<dyn ChannelLike>, None, None)
@@ -595,7 +595,7 @@ fn stop_sender_session_internal_leaves_restart_cache_intact() {
     use screen_mirror_lib::commands::sender::stop_sender_session_internal;
 
     let bridge =
-        SenderBridge::new_with_builder(Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())));
+        SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
     let ch = FakeJsonChannel::new();
 
     // Populate current_args and restart_cache via a real start.
@@ -688,7 +688,7 @@ fn make_supervised_bridge_with_rebuild_hook(
     let cache_for_builder = restart_cache_arc.clone();
 
     let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
-        Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+        Arc::new(move |_udp_port, _service_name, stop_flag, channel, _attempt| {
             let ev_rx = ev_rx_slot_clone
                 .lock()
                 .unwrap()
@@ -702,11 +702,12 @@ fn make_supervised_bridge_with_rebuild_hook(
             // Construct the V2 rebuild hook using the shared session and cache arcs.
             // The hook's builder returns test_stub() — no real pipeline.
             let rebuild_hook = make_sender_rebuild_hook(
-                Arc::new(|_, _, _, _| Ok(SenderBundle::test_stub())),
+                Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())),
                 cache_for_builder.clone(),
                 session_for_builder.clone(),
                 stop_flag.clone(),
                 1, // attempt — fixed at 1 for this helper
+                Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             );
 
             let hooks = SenderCoordinatorHooks {
@@ -714,6 +715,7 @@ fn make_supervised_bridge_with_rebuild_hook(
                 publish_reconnect_ack: Arc::new(|_, _| {}),
                 initiate_rebuild: rebuild_hook,
                 initiate_mdns_reset: Arc::new(|| {}),
+                sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             };
 
             let h = thread::Builder::new()
@@ -869,7 +871,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
     let ack_timeout = Duration::from_millis(500);
 
     let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
-        Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+        Arc::new(move |_udp_port, _service_name, stop_flag, channel, _attempt| {
             let ev_rx = ev_rx_slot_clone
                 .lock()
                 .unwrap()
@@ -882,7 +884,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
 
             // Builder that counts calls and always fails.
             let failing_builder: screen_mirror_lib::commands::sender::SenderBuilderFn =
-                Arc::new(move |_, _, _, _| {
+                Arc::new(move |_, _, _, _, _| {
                     cnt.fetch_add(1, Ordering::Relaxed);
                     Err(screen_mirror_lib::commands::sender::BundleError::Other(
                         "injected failure".to_string(),
@@ -895,6 +897,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 session_clone.clone(),
                 stop_flag.clone(),
                 1,
+                Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             );
 
             let hooks = SenderCoordinatorHooks {
@@ -902,6 +905,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 publish_reconnect_ack: Arc::new(|_, _| {}),
                 initiate_rebuild: rebuild_hook,
                 initiate_mdns_reset: Arc::new(|| {}),
+                sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             };
 
             let h = thread::Builder::new()
@@ -1175,7 +1179,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
         let ack_timeout = Duration::from_millis(500);
 
         let the_builder: SenderBuilderFn =
-            Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+            Arc::new(move |_udp_port, _service_name, stop_flag, channel, _attempt| {
                 let generation = build_count_b.fetch_add(1, Ordering::Relaxed);
 
                 let ev_rx = match generation {
@@ -1221,6 +1225,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                     hook_session,
                     stop_flag.clone(),
                     generation + 1,
+                    Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
                 );
 
                 let hooks = SenderCoordinatorHooks {
@@ -1228,6 +1233,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                     publish_reconnect_ack: Arc::new(|_, _| {}),
                     initiate_rebuild: rebuild_hook,
                     initiate_mdns_reset: Arc::new(|| {}),
+                    sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
                 };
 
                 let p = policy.clone();
@@ -1464,7 +1470,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
     // Blocking builder: waits for the release channel before returning the bundle.
     // This keeps the rebuild worker in flight long enough for stop to arrive.
     let blocking_builder: screen_mirror_lib::commands::sender::SenderBuilderFn =
-        Arc::new(move |_, _, _, _| {
+        Arc::new(move |_, _, _, _, _| {
             // Wait for the test to release us (or timeout after 1s to avoid hanging).
             if let Some(rx) = release_rx_clone.lock().unwrap().take() {
                 let _ = rx.recv_timeout(Duration::from_millis(1000));
@@ -1477,7 +1483,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
         });
 
     let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder_and_arcs(
-        Arc::new(move |_udp_port, _service_name, stop_flag, channel| {
+        Arc::new(move |_udp_port, _service_name, stop_flag, channel, _attempt| {
             let ev_rx = ev_rx_slot_clone
                 .lock()
                 .unwrap()
@@ -1493,6 +1499,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                 session_for_builder.clone(),
                 stop_flag.clone(),
                 1,
+                Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             );
 
             let hooks = SenderCoordinatorHooks {
@@ -1500,6 +1507,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                 publish_reconnect_ack: Arc::new(|_, _| {}),
                 initiate_rebuild: rebuild_hook,
                 initiate_mdns_reset: Arc::new(|| {}),
+                sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             };
 
             let h = thread::Builder::new()
