@@ -925,6 +925,7 @@ fn run_signaling_drain(
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
     role: DrainRole,                                                        // D-RDF-1
+    expected_attempt: Arc<AtomicU8>, // T1.9: stale-Offer guard (REQ-GE-1, SC-GE-3..6)
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -935,10 +936,8 @@ fn run_signaling_drain(
                 SignalingEvent::PeerFound { host, port } => {
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
-                SignalingEvent::OfferReceived(offer, _offer_attempt) => {
+                SignalingEvent::OfferReceived(offer, offer_attempt) => {
                     // D-RBF-2: race-window guard. The outer stop_flag check (line 892) fires
-                    // NOTE: `_offer_attempt` is a placeholder binding; the stale-guard using
-                    // `expected_attempt: Arc<AtomicU8>` will be wired in T1.11.
                     // ONCE per recv_timeout iteration; an offer pulled before the OLD session
                     // teardown started can still race into this arm. The OLD receiver's str0m
                     // Rtc has m-line state that conflicts with a fresh sender Rtc, so we drop
@@ -960,6 +959,19 @@ fn run_signaling_drain(
                     if role == DrainRole::ResetSignalingOnly {
                         eprintln!(
                             "[sm-signaling-drain-reset] OfferReceived ignored (signaling-only, D-RDF-2)"
+                        );
+                        continue;
+                    }
+                    // T1.11: stale-generation Offer guard (REQ-GE-1, SC-GE-3..6).
+                    // Monotonic >= rule: accept offer_attempt >= expected_attempt so a
+                    // drain that runs slightly ahead of the coordinator store cannot
+                    // false-reject a valid current-generation Offer.
+                    // Use `continue` (NOT `break`) — drain stays alive for subsequent events.
+                    let expected = expected_attempt.load(Ordering::Acquire);
+                    if offer_attempt < expected {
+                        eprintln!(
+                            "[sm-signaling-drain] stale Offer attempt={offer_attempt} expected={expected}; \
+                             dropping (REQ-GE-1)"
                         );
                         continue;
                     }
@@ -1064,6 +1076,9 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
         // Legacy variant: media-arrival watchdog disabled (None). The production
         // path uses the `_and_hooks` variant directly with `Some(6s)`.
         None,
+        // T1.9: no epoch tracking needed for this no-hooks variant (tests that use
+        // it don't drive the signaling drain). Supply a default Arc.
+        Arc::new(AtomicU8::new(1)),
     );
 }
 
@@ -1087,6 +1102,9 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
     // drain arms this deadline; the first `TransportEvent::MediaData` disarms it,
     // and expiry re-injects `IceFailed` for a fresh supervisor cycle.
     media_watchdog_timeout: Option<Duration>,
+    // T1.9: shared epoch counter; written by coordinator on Reconnecting, read by
+    // signaling drain to reject stale-generation Offers (REQ-GE-1, SC-GE-3..6).
+    expected_attempt: Arc<AtomicU8>,
 ) {
     let session_nonce: u64 = rand::random();
 
@@ -1115,6 +1133,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         rebuild_timeout,
                         hooks,
                         media_watchdog_timeout,
+                        expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
                 }
@@ -1134,6 +1153,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         rebuild_timeout,
                         hooks,
                         media_watchdog_timeout,
+                        expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
                 }
@@ -1199,6 +1219,7 @@ fn enter_stream_supervisor_mode(
     rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
     media_watchdog_timeout: Option<Duration>,
+    expected_attempt: Arc<AtomicU8>, // T1.9: updated on Reconnecting → signals drain
 ) {
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
     let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
@@ -1265,7 +1286,7 @@ fn enter_stream_supervisor_mode(
                             );
                         }
                     }
-                    handle_stream_supervisor_outcome(&outcome, channel, &signal_tx, &hooks);
+                    handle_stream_supervisor_outcome(&outcome, channel, &signal_tx, &hooks, &expected_attempt);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1357,9 +1378,13 @@ fn handle_stream_supervisor_outcome(
     channel: &Arc<dyn ChannelLike>,
     signal_tx: &SyncSender<SupervisorSignal>,
     hooks: &StreamCoordinatorHooks,
+    expected_attempt: &Arc<AtomicU8>, // T1.9: updated on Reconnecting so drain rejects stale Offers
 ) {
     match outcome {
         SupervisorOutcome::StateChanged(SessionState::Reconnecting { attempt, max }) => {
+            // T1.9: store the current attempt epoch so the signaling drain can reject
+            // Offers from a previous generation (SC-GE-3..6, REQ-GE-1).
+            expected_attempt.store(attempt.get(), Ordering::Release);
             emit_stream_status(
                 channel,
                 &StreamStatusEvent::Reconnecting {
@@ -1642,6 +1667,9 @@ where
                     stop_clone,
                     sup_tx_clone,
                     DrainRole::ResetSignalingOnly,
+                    // T1.9: reset drain is signaling-only (D-RDF-2) — it never applies
+                    // Offers, so the epoch is not needed. Supply a default Arc.
+                    Arc::new(AtomicU8::new(1)),
                 );
             })
         {
@@ -1831,6 +1859,13 @@ fn build_production_bundle(
     // drain (step 5) and the reset hook (already cloned above) can share the same Arc.
     let sup_tx_for_sig_drain = supervisor_signal_tx.clone(); // D-3: pre-clone for sig drain
     let stop_flag_t = stop_flag.clone();
+    // T1.9: epoch counter shared between coordinator (writer) and signaling drain (reader).
+    // Seed = 1 — matches the supervisor's first Reconnecting attempt (supervisor.rs:268).
+    // The coordinator stores the new attempt on every StateChanged(Reconnecting{attempt})
+    // outcome so the drain can reject Offers from the previous generation (REQ-GE-1).
+    let expected_attempt = Arc::new(AtomicU8::new(1));
+    let expected_attempt_for_transport = expected_attempt.clone();
+    let expected_attempt_for_sig_drain = expected_attempt; // moved into sig drain
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
         .spawn(move || {
@@ -1848,6 +1883,7 @@ fn build_production_bundle(
                 // > first-GOP budget, < the 9s second-backoff so a re-arm still
                 // fits the 3/9/27 attempt budget.
                 Some(Duration::from_secs(6)),
+                expected_attempt_for_transport, // T1.9: coordinator writes epoch on Reconnecting
             );
         })?;
 
@@ -1864,8 +1900,9 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain,   // D-3 REQ-A
-                DrainRole::Primary, // D-RDF-1: primary drain owns offer application
+                sup_tx_for_drain,            // D-3 REQ-A
+                DrainRole::Primary,          // D-RDF-1: primary drain owns offer application
+                expected_attempt_for_sig_drain, // T1.9: reads epoch to reject stale-gen Offers
             );
         })?;
 
@@ -3607,6 +3644,7 @@ mod tests {
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
                 DrainRole::Primary,
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -3699,6 +3737,7 @@ mod tests {
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
                 DrainRole::Primary,
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -6047,6 +6086,7 @@ mod tests {
                     stop_clone,
                     supervisor_signal_tx, // 5th param — added in T09
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("spawn drain thread");
@@ -6151,6 +6191,7 @@ mod tests {
                     stop_clone,
                     sup_tx_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("spawn drain");
@@ -6683,6 +6724,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-1: spawn drain thread");
@@ -6754,6 +6796,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-2: spawn drain thread");
@@ -6831,6 +6874,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-3: spawn drain thread");
@@ -7089,6 +7133,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::ResetSignalingOnly,
+                    Arc::new(AtomicU8::new(1)), // T1.9: reset drain ignores epoch (D-RDF-2)
                 );
             })
             .expect("sc_rdf_1: spawn drain thread");
@@ -7158,6 +7203,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::ResetSignalingOnly,
+                    Arc::new(AtomicU8::new(1)), // T1.9: reset drain ignores epoch (D-RDF-2)
                 );
             })
             .expect("sc_rdf_2: spawn drain thread");
@@ -7282,6 +7328,7 @@ mod tests {
                 Duration::from_millis(100), // rebuild_timeout
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(200)), // media watchdog N — fast for test
+                Arc::new(AtomicU8::new(1)),        // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -7335,6 +7382,7 @@ mod tests {
                 Duration::from_millis(100),
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(400)), // watchdog N
+                Arc::new(AtomicU8::new(1)),        // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -7403,6 +7451,7 @@ mod tests {
                 Duration::from_millis(100),
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(400)),
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 

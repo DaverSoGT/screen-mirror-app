@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use screen_mirror_lib::commands::sender::ChannelLike;
 use screen_mirror_lib::commands::stream::{
@@ -552,6 +552,7 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                         // Media-arrival watchdog disabled — this V2 rebuild-hook
                         // bridge does not exercise the post-rebuild watchdog.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn stream drain");
@@ -739,6 +740,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn");
@@ -1052,6 +1054,7 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                             // Media-arrival watchdog disabled — this generation-chain
                             // test does not exercise the post-rebuild watchdog.
                             None,
+                            Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                         );
                     })
                     .expect("spawn drain");
@@ -1322,6 +1325,7 @@ fn rebuild_releases_udp_port_before_rebind() {
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn stream drain");
@@ -1485,6 +1489,7 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                         ev_rx, stop_flag, channel, st, p, t, t, hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn");

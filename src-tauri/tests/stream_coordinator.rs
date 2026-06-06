@@ -5,7 +5,7 @@
 //
 // TDD cycle (Strict TDD Mode): tests written FIRST (RED), then implementation.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -202,6 +202,7 @@ fn make_stream_bridge_with_counting_hooks() -> (
                         // Media-arrival watchdog disabled — this coordinator test
                         // does not exercise the post-rebuild watchdog.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn drain");
