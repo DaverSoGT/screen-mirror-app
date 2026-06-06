@@ -3626,4 +3626,103 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
     }
+
+    // ─── T1.8 RED — sender stamps live attempt on published Offer ─────────────
+    //
+    // RED until T1.10 adds Arc<AtomicU8> sender_attempt and T1.13 widens
+    // SenderBuilderFn to receive attempt:u8 and passes it to publish_local_offer.
+
+    /// T1.8 / REQ-GE-2 — sender stamps the live attempt on the published Offer.
+    ///
+    /// GIVEN:  A spy SenderBuilderFn that records the attempt it receives.
+    /// WHEN:   StateChanged(Reconnecting{attempt: 1}) triggers InitiateRebuild.
+    /// THEN:   The spy builder captures attempt == 1.
+    ///
+    /// RED: SenderBuilderFn is currently 4-arg (u16, String, Arc<AtomicBool>,
+    /// Arc<dyn ChannelLike>). T1.13 widens it to 5-arg by adding `attempt: u8`.
+    /// This test uses the 5-arg type — compile fails = RED until T1.13.
+    #[test]
+    fn sc_ge_sender_stamps_live_attempt_on_published_offer() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+
+        // Spy: captures the attempt argument passed to the widened SenderBuilderFn.
+        let spy_attempt: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
+        let spy_for_builder = spy_attempt.clone();
+
+        // Widened SenderBuilderFn (5-arg) — compile fails until T1.13 changes the type.
+        let builder: Arc<
+            dyn Fn(
+                    u16,
+                    String,
+                    Arc<AtomicBool>,
+                    Arc<dyn super::ChannelLike>,
+                    u8, // T1.13: attempt param — does not exist yet in SenderBuilderFn
+                ) -> Result<super::SenderBundle, super::BundleError>
+                + Send
+                + Sync,
+        > = Arc::new(move |_, _, sf, _ch, attempt| {
+            *spy_for_builder.lock().unwrap() = Some(attempt);
+            let stop_for_drain = sf.clone();
+            let drain = std::thread::Builder::new()
+                .name("t1-8-spy-drain".into())
+                .spawn(move || {
+                    while !stop_for_drain.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                })
+                .unwrap();
+            Ok(super::SenderBundle {
+                drain_handles: vec![drain],
+                shutdown: None,
+                backend_name: "spy".to_string(),
+            })
+        });
+
+        // new_with_builder accepts the widened type once T1.13 is done.
+        let bridge = super::SenderBridge::new_with_builder(builder);
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let channel: Arc<dyn super::ChannelLike> = Arc::new(FakeCh);
+
+        // Cold-start.
+        super::start_sender_inner(&bridge, channel, None, None).expect("start must succeed");
+
+        // Inject IceFailed → supervisor transitions to Reconnecting{1} → InitiateRebuild.
+        let sig_tx = bridge
+            .supervisor_signal_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("supervisor_signal_tx must be set after start");
+        sig_tx
+            .send(sm_domain::supervisor::SupervisorSignal::LocalFailure {
+                trigger: sm_domain::session::ReconnectTrigger::IceFailed,
+            })
+            .ok();
+
+        // Wait for the rebuild to complete.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // Assert spy captured attempt == 1 (first reconnect).
+        let captured = *spy_attempt.lock().unwrap();
+        assert!(
+            captured.is_some(),
+            "T1.8 FAIL: builder was not called — rebuild did not fire"
+        );
+        assert_eq!(
+            captured.unwrap(),
+            1,
+            "T1.8 FAIL: builder received attempt={:?}, expected 1",
+            captured
+        );
+
+        super::stop_sender_session(&bridge);
+    }
 }

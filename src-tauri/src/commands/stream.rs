@@ -35,7 +35,7 @@
 //! - Small payloads (< 1024 B, e.g. init segment) take the `webview.eval` fast path.
 //! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -7443,5 +7443,326 @@ mod tests {
             "SC-WD-3 FAIL: the build-OK Streaming emit (SC-T22-proven path) must still \
              fire, got {streaming} streaming frames"
         );
+    }
+
+    // ─── SC-GE-3 / SC-GE-4 / SC-GE-5 / SC-GE-6 — stale-Offer guard ─────────
+    //
+    // These tests drive `run_signaling_drain` with a preset `Arc<AtomicU8>
+    // expected_attempt` and verify the drain's stale-offer rejection logic.
+    //
+    // RED until T1.9 adds the `expected_attempt` parameter to `run_signaling_drain`
+    // and T1.11 implements the stale guard.
+
+    /// Shared helper: counting receiver ops for SC-GE tests.
+    struct GeCountingReceiver {
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl GeCountingReceiver {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (Self { call_count: counter.clone() }, counter)
+        }
+    }
+    impl SignalingReceiverOps for GeCountingReceiver {
+        fn apply_remote_offer(
+            &self,
+            _offer: sm_domain::signaling::SdpOffer,
+        ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(TransportError::NotRunning)
+        }
+        fn add_remote_candidate(
+            &self,
+            _cand: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// No-op publish ops for SC-GE tests.
+    struct GeNoOpPublish;
+    impl SignalingPublishOps for GeNoOpPublish {
+        fn publish_local_answer(
+            &self,
+            _answer: sm_domain::signaling::SdpAnswer,
+        ) -> Result<(), sm_domain::signaling::SignalingError> {
+            Ok(())
+        }
+        fn publish_local_candidate(
+            &self,
+            _cand: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), sm_domain::signaling::SignalingError> {
+            Ok(())
+        }
+    }
+
+    /// SC-GE-3 — Stale Offer (attempt < expected) MUST NOT call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 2, drain receives OfferReceived(offer, attempt=1).
+    /// THEN:  apply_remote_offer NOT called; drain stays alive.
+    ///
+    /// RED until T1.9 adds expected_attempt param + T1.11 implements guard.
+    #[test]
+    fn sc_ge_3_stale_offer_rejected_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-3-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone, // T1.9: new expected_attempt parameter
+                );
+            })
+            .expect("sc_ge_3: spawn drain thread");
+
+        // Inject stale Offer (attempt=1 < expected=2).
+        let stale_offer = SdpOffer("v=0\r\nstale".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(stale_offer, 1))
+            .expect("sc_ge_3: send stale OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer NOT called (call count == 0).
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "SC-GE-3 FAIL: apply_remote_offer called for stale Offer (attempt=1, expected=2)"
+        );
+
+        // Verify drain is still alive (operational — no panic, no early exit).
+        assert!(
+            !drain_handle.is_finished(),
+            "SC-GE-3 FAIL: drain exited prematurely after stale Offer (must stay alive)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-4 — Matching attempt Offer MUST call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 2, drain receives OfferReceived(offer, attempt=2).
+    /// THEN:  apply_remote_offer called exactly once.
+    ///
+    /// RED until T1.9 + T1.11.
+    #[test]
+    fn sc_ge_4_matching_offer_accepted_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-4-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_4: spawn drain thread");
+
+        // Inject matching Offer (attempt=2 == expected=2).
+        let matching_offer = SdpOffer("v=0\r\nmatching".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(matching_offer, 2))
+            .expect("sc_ge_4: send matching OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer called exactly once.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-4 FAIL: apply_remote_offer not called for matching Offer (attempt=2, expected=2)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-5 — Newer attempt Offer MUST call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 1, drain receives OfferReceived(offer, attempt=2).
+    /// THEN:  apply_remote_offer called exactly once (newer is accepted by >= rule).
+    ///
+    /// RED until T1.9 + T1.11.
+    #[test]
+    fn sc_ge_5_newer_offer_accepted_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(1)); // expected is 1
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-5-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_5: spawn drain thread");
+
+        // Inject newer Offer (attempt=2 > expected=1).
+        let newer_offer = SdpOffer("v=0\r\nnewer".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(newer_offer, 2))
+            .expect("sc_ge_5: send newer OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer called exactly once.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-5 FAIL: apply_remote_offer not called for newer Offer (attempt=2, expected=1)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-6 — expected_attempt advances on Reconnecting state change.
+    ///
+    /// GIVEN: expected_attempt Arc starts at 1.
+    /// WHEN: Arc is written to 2 externally (simulating coordinator store on Reconnecting{2}).
+    /// THEN: OfferReceived(offer, 1) is rejected; OfferReceived(offer, 2) is accepted.
+    ///
+    /// RED until T1.9 + T1.11 (Arc threaded, store + guard implemented).
+    #[test]
+    fn sc_ge_6_expected_attempt_advances_on_reconnecting_state_change() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        // Coordinator writes this Arc on StateChanged(Reconnecting{attempt}).
+        let expected_attempt = Arc::new(AtomicU8::new(1));
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(8);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-6-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_6: spawn drain thread");
+
+        // Simulate coordinator: StateChanged(Reconnecting{attempt: 2}) → store(2).
+        expected_attempt.store(2, Ordering::Release);
+
+        // Inject stale Offer (attempt=1 < new expected=2) → must be rejected.
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\nstale-ge6".to_string()),
+                1,
+            ))
+            .expect("sc_ge_6: send stale offer");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "SC-GE-6 FAIL: stale Offer (attempt=1, expected=2) must be rejected"
+        );
+
+        // Inject matching Offer (attempt=2 == expected=2) → must be accepted.
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\nmatching-ge6".to_string()),
+                2,
+            ))
+            .expect("sc_ge_6: send matching offer");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-6 FAIL: matching Offer (attempt=2, expected=2) must be accepted"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
     }
 }
