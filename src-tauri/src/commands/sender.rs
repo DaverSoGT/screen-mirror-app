@@ -318,14 +318,16 @@ impl SenderBridge {
         let sup_tx_for_builder = supervisor_signal_tx_arc.clone(); // D-RBF-1 (REQ-RBL-1)
         Self {
             session: session_arc,
-            builder: Arc::new(move |udp_port, service_name, stop_flag, channel, _attempt| {
-                // T1.13: `_attempt` is the epoch; cold-start uses literal 1 in
-                // build_production_sender_bundle (T1.13 TODO for full wiring).
+            builder: Arc::new(move |udp_port, service_name, stop_flag, channel, attempt| {
+                // C1 (REQ-GE-1/2): forward the live epoch `attempt` so the production
+                // bundle stamps it onto the published Offer. Cold start flows 1 here;
+                // a rebuild flows the supervisor attempt read by make_sender_rebuild_hook.
                 build_production_sender_bundle(
                     udp_port,
                     service_name,
                     stop_flag,
                     channel,
+                    attempt,
                     session_for_builder.clone(),
                     cache_for_builder.clone(),
                     sup_tx_for_builder.clone(), // D-RBF-1 (REQ-RBL-1)
@@ -1709,10 +1711,11 @@ fn stamp_and_publish_offer(
     offer: sm_domain::signaling::SdpOffer,
     attempt: u8,
 ) -> Result<(), sm_domain::signaling::SignalingError> {
-    // BUG (RED): the live `attempt` is discarded and `1` is hardcoded, mirroring
-    // the production defect at the publish_local_offer call. C1 replaces `1` with
-    // `attempt` so every rebuild Offer carries its real generation epoch.
-    signaling.publish_local_offer(offer, 1)
+    // C1: stamp the LIVE generation `attempt` (cold-start = 1; each rebuild carries
+    // the supervisor attempt that fired it) so the receiver's `offer_attempt >=
+    // expected_attempt` guard accepts the current generation and only drops strictly
+    // older ones (REQ-GE-1, REQ-GE-2).
+    signaling.publish_local_offer(offer, attempt)
 }
 
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
@@ -1726,11 +1729,16 @@ fn stamp_and_publish_offer(
 /// Running sender + receiver on the same machine will collide on TCP 7889.
 /// UDP is ephemeral (port 0) so no UDP collision (Amendment A).
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)] // C1: +attempt epoch param on the bundle-builder seam
 fn build_production_sender_bundle(
     udp_port: u16,
     service_name: String,
     _stop_flag: Arc<AtomicBool>,
     _channel: Arc<dyn ChannelLike>,
+    // C1 (REQ-GE-1/2): SDP generation epoch in force when this bundle is built.
+    // Cold start = 1; each rebuild carries the supervisor attempt that fired it.
+    // Stamped onto the published Offer so the receiver accepts the live generation.
+    attempt: u8,
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
     bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1 (REQ-RBL-1)
@@ -1835,10 +1843,10 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Publish offer immediately (Amendment B — buffers in inbox; written on connect).
-    // Cold-start attempt is 1 (matches supervisor.rs:268 seed and receiver expected_attempt seed).
-    // T1.13 will replace this literal with the live sender_attempt Arc read when that task lands.
-    signaling
-        .publish_local_offer(offer, 1)
+    // C1: stamp the LIVE generation `attempt` (cold-start = 1, matches supervisor.rs:268
+    // seed and receiver expected_attempt seed; rebuilds carry the supervisor attempt that
+    // fired them) via the wire-stamp seam so the receiver accepts the current generation.
+    stamp_and_publish_offer(&signaling, offer, attempt)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
@@ -1973,15 +1981,17 @@ fn build_production_sender_bundle(
                 let session_for_inner = _bridge_session.clone();
                 let cache_for_inner = _bridge_cache.clone();
                 let sup_tx_for_inner = bridge_supervisor_signal_tx.clone(); // D-RBF-1
-                Arc::new(move |udp_port, service_name, stop_flag, channel, _attempt| {
-                    // T1.13: `_attempt` is the epoch passed by make_sender_rebuild_hook;
-                    // build_production_sender_bundle will pass it to publish_local_offer
-                    // via the cold-start path in start_sender_inner (T1.13 TODO).
+                Arc::new(move |udp_port, service_name, stop_flag, channel, attempt| {
+                    // C1 (REQ-GE-1/2): `attempt` is the live epoch read by
+                    // make_sender_rebuild_hook (sender_attempt.load(Acquire)) before the
+                    // worker spawn; forward it so build_production_sender_bundle stamps the
+                    // rebuilt-generation Offer with the attempt that fired this rebuild.
                     build_production_sender_bundle(
                         udp_port,
                         service_name,
                         stop_flag,
                         channel,
+                        attempt,
                         session_for_inner.clone(),
                         cache_for_inner.clone(),
                         sup_tx_for_inner.clone(), // D-RBF-1 (REQ-RBL-1)
@@ -2135,11 +2145,13 @@ fn build_production_sender_bundle(
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(clippy::too_many_arguments)] // C1: +attempt epoch param on the bundle-builder seam
 fn build_production_sender_bundle(
     _udp_port: u16,
     _service_name: String,
     _stop_flag: Arc<AtomicBool>,
     _channel: Arc<dyn ChannelLike>,
+    _attempt: u8, // C1 (REQ-GE-1/2): SDP generation epoch — unused on non-Windows (no pipeline).
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
     _bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1
