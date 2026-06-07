@@ -4032,21 +4032,27 @@ mod tests {
         );
     }
 
-    // ─── SC-WD-S1/S2/S3/S4: sender media-arrival watchdog ────────────────────
+    // ─── SC-WD-S1..S5: sender media-arrival watchdog (CAP-2-v2, relocated) ────
     //
-    // Mirrors the receiver watchdog tests (SC-WD-1/2/3 in stream.rs ~7246).
-    // The sender coordinator loop must arm a one-shot deadline on
-    // `StateChanged(Connected)` after a rebuild (RebuildSucceeded → Connected),
-    // disarm it on `TransportEvent::IceConnected`, and re-inject
-    // `LocalFailure{IceFailed}` on expiry.
+    // CAP-2-v2 (design #1021, RCA #1020): the watchdog is RELOCATED out of the
+    // transient reconnect coordinator (`enter_supervisor_mode`) and into the
+    // long-lived steady-state drain
+    // (`run_sender_transport_event_drain_with_supervisor_custom_and_hooks`). The
+    // arm event is DRAIN ENTRY (REQ-WD-1), not `StateChanged(Connected)`. The drain
+    // arms a one-shot deadline at entry, disarms it on `TransportEvent::IceConnected`
+    // (REQ-WD-2), and on expiry re-injects `IceFailed` via `enter_supervisor_mode`
+    // (REQ-WD-3) — exactly like a real transport IceFailed.
     //
-    // Observable behavior: when the watchdog fires the supervisor re-enters
-    // `Reconnecting`, emitting a JSON event with `"kind":"reconnecting"`. We count
-    // those frames on a capturing channel — mirrors the receiver pattern exactly.
+    // Observable behavior: when the watchdog fires the supervisor enters
+    // `Reconnecting`, emitting a JSON event containing `"reconnecting"`. We count
+    // those frames on a capturing channel.
     //
-    // RED (before T2.4): `run_sender_transport_event_drain_with_supervisor_custom_and_hooks`
-    //   does NOT accept `media_watchdog_timeout` — all four tests fail to compile.
-    // GREEN (after T2.4): parameter added; watchdog arms, disarms, and fires correctly.
+    // FALSIFIABILITY (the whole point — SC-WD-S5): the fixture's `initiate_rebuild`
+    // hook now sends `RebuildSucceeded` IMMEDIATELY FOLLOWED BY `Stop` (the
+    // production kill sequence, sender.rs:1637→1652). Against the OLD coordinator-
+    // armed watchdog the coordinator dies on the Stop microseconds after arming, so
+    // its deadline can NEVER elapse (RCA #1020). Only a watchdog living in the
+    // independent steady-state drain survives the Stop and can fire.
 
     /// Capturing channel for sender watchdog tests: collects raw `send_raw` payloads.
     #[cfg(test)]
@@ -4120,9 +4126,18 @@ mod tests {
         let hooks = super::SenderCoordinatorHooks {
             publish_reconnect_request: Arc::new(|_, _| {}),
             publish_reconnect_ack: Arc::new(|_, _| {}),
-            // Report RebuildSucceeded so the internal supervisor reaches Connected.
+            // PRODUCTION KILL SEQUENCE (SC-WD-S5 falsifiability gate): mirror the
+            // real rebuild worker (sender.rs:1637 RebuildSucceeded → 1652 Stop). The
+            // worker reports success and IMMEDIATELY stops the OLD coordinator. The
+            // previous fixture sent ONLY RebuildSucceeded with NO following Stop, which
+            // is exactly why the coordinator-armed watchdog appeared to fire in tests
+            // while being inert in production (RCA #1020). With this Stop the OLD
+            // coordinator dies within microseconds of arming, so a coordinator-armed
+            // watchdog can NEVER reach its deadline — only a watchdog that lives in the
+            // (independent) steady-state drain survives the Stop and can fire.
             initiate_rebuild: Arc::new(|sig_tx| {
                 let _ = sig_tx.try_send(SupervisorSignal::RebuildSucceeded);
+                let _ = sig_tx.try_send(SupervisorSignal::Stop);
             }),
             initiate_mdns_reset: Arc::new(|| {}),
             sender_attempt: Arc::new(AtomicU8::new(1)),
@@ -4152,51 +4167,100 @@ mod tests {
         (channel, ev_tx, stop_flag, join)
     }
 
-    /// SC-WD-S1 — Sender watchdog FIRES `LocalFailure{IceFailed}` when no
-    /// `TransportEvent::IceConnected` arrives before the deadline.
+    /// SC-WD-S5 (NEW — falsifiability gate; catches the no-op) — the watchdog STILL
+    /// fires after the PRODUCTION kill sequence (RebuildSucceeded → Stop).
     ///
-    /// Strategy: IceFailed → rebuild succeeds → `StateChanged(Connected)` →
-    /// watchdog armed with short 200ms deadline. NO IceConnected delivered.
-    /// Observable: supervisor re-enters Reconnecting → ≥2 "reconnecting" JSON events.
+    /// This is THE test the original `sc_wd_*` suite should have had. The fixture's
+    /// `initiate_rebuild` hook now sends `RebuildSucceeded` IMMEDIATELY FOLLOWED BY
+    /// `Stop` (mirroring sender.rs:1637→1652). Against the OLD coordinator-armed
+    /// watchdog the coordinator receives the Stop microseconds after arming and breaks
+    /// before its deadline can elapse → 0 fires → RED. The watchdog only fires when it
+    /// lives in the steady-state drain (which is NOT torn down by the coordinator's
+    /// Stop) and arms at drain entry.
     ///
-    /// RED (before T2.4): compile failure (missing media_watchdog_timeout param).
-    /// GREEN (after T2.4): watchdog arms on Connected, fires on expiry.
+    /// Strategy: the drain arms at entry with a short injectable deadline. NO
+    /// `IceConnected` is delivered. On expiry the drain re-injects `IceFailed` via
+    /// `enter_supervisor_mode`, the supervisor re-enters `Reconnecting` (emitting a
+    /// `"reconnecting"` frame), runs `InitiateRebuild` → the hook reports
+    /// `RebuildSucceeded` then `Stop` (the production kill sequence), and the
+    /// coordinator exits cleanly.
+    ///
+    /// RED (before relocation): drain entry does NOT arm a watchdog → 0 reconnecting.
+    /// GREEN (after relocation): drain-entry arm fires → ≥1 reconnecting.
     #[test]
-    fn sc_wd_s1_no_ice_connected_fires_local_failure() {
-        use sm_domain::transport::TransportEvent;
+    fn sc_wd_prod_kill_sequence_still_fires() {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
+        // NO IceFailed and NO IceConnected are delivered. The relocated watchdog must
+        // arm at drain entry and fire purely on the deadline. The hook's Stop (sent
+        // right after RebuildSucceeded) proves the firing path survives the production
+        // kill sequence that makes the coordinator-armed watchdog a no-op.
         let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(200)));
+            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
 
-        // Arm the supervisor: IceFailed → rebuild succeeds → Connected → watchdog armed.
-        // NO IceConnected is injected — the watchdog must fire.
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-
-        // Allow: first cycle + 200ms watchdog + second Reconnecting cycle.
+        // Allow: drain-entry arm (150ms) → fire → Reconnecting cycle (~110ms).
         std::thread::sleep(Duration::from_millis(900));
         stop_flag.store(true, Ordering::Relaxed);
         drop(ev_tx);
         let _ = join.join();
 
-        // The watchdog fired → supervisor re-entered Reconnecting → ≥2 events.
         let reconnecting = channel.count_json_containing("reconnecting");
         assert!(
-            reconnecting >= 2,
-            "SC-WD-S1 FAIL: with no IceConnected the watchdog must re-arm a fresh \
-             supervisor cycle (≥2 reconnecting events), got {reconnecting}"
+            reconnecting >= 1,
+            "SC-WD-S5 FAIL (falsifiability gate): with NO IceConnected the drain-entry \
+             watchdog MUST fire and drive a fresh Reconnecting cycle EVEN THOUGH the \
+             rebuild hook sends Stop right after RebuildSucceeded (the production kill \
+             sequence). Expected ≥1 reconnecting event, got {reconnecting}. A value of \
+             0 means the watchdog is armed on the dying coordinator (RCA #1020) instead \
+             of the steady-state drain."
         );
     }
 
-    /// SC-WD-S2 — Sender watchdog DISARMS when `TransportEvent::IceConnected`
-    /// arrives before the deadline.
+    /// SC-WD-S1 (re-based) — Sender watchdog FIRES `LocalFailure{IceFailed}` when no
+    /// `TransportEvent::IceConnected` arrives before the drain-entry deadline.
     ///
-    /// Observable: IceConnected before 60s deadline → watchdog does NOT fire →
-    /// exactly ONE `reconnecting` event (from the initial IceFailed cycle only).
+    /// Arm event is now DRAIN ENTRY (REQ-WD-1), not `StateChanged(Connected)` in the
+    /// transient coordinator. The drain arms a short deadline at entry; no IceConnected
+    /// is delivered; the watchdog fires exactly once (the drain breaks into the
+    /// supervisor after firing), producing exactly one `"reconnecting"` cycle.
     ///
-    /// RED (before T2.4): compile failure.
-    /// GREEN (after T2.4): IceConnected disarms the watchdog; no second cycle.
+    /// RED (before relocation): no drain-entry watchdog → 0 reconnecting.
+    /// GREEN (after relocation): exactly 1 reconnecting.
+    #[test]
+    fn sc_wd_s1_no_ice_connected_fires_local_failure() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (channel, ev_tx, stop_flag, join) =
+            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+
+        // NO IceConnected — the drain-entry watchdog must fire.
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        let _ = join.join();
+
+        // The watchdog fires once at drain entry → the drain enters the supervisor and
+        // breaks → exactly one Reconnecting cycle.
+        let reconnecting = channel.count_json_containing("reconnecting");
+        assert_eq!(
+            reconnecting, 1,
+            "SC-WD-S1 FAIL: with no IceConnected the drain-entry watchdog must inject \
+             exactly one IceFailed (one Reconnecting cycle), got {reconnecting}"
+        );
+    }
+
+    /// SC-WD-S2 (fixed — was tautological) — Sender watchdog DISARMS when
+    /// `TransportEvent::IceConnected` arrives BEFORE a SHORT deadline.
+    ///
+    /// The original SC-WD-S2 used a 60s deadline that never expired in the test, making
+    /// the assertion trivially true regardless of disarm correctness (#1019). This
+    /// version uses a SHORT injectable deadline, delivers IceConnected before it, and
+    /// observes PAST the deadline. An `if false` mutation on the disarm branch MUST flip
+    /// this RED (the watchdog would fire → count becomes 1).
+    ///
+    /// Observable: IceConnected disarms → watchdog never fires → exactly 0 reconnecting.
     #[test]
     fn sc_wd_s2_ice_connected_disarms_watchdog() {
         use sm_domain::transport::TransportEvent;
@@ -4204,18 +4268,14 @@ mod tests {
         use std::time::Duration;
 
         let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_secs(60)));
+            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
 
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-
-        // Allow first cycle to reach Connected and arm the watchdog.
-        std::thread::sleep(Duration::from_millis(300));
-
-        // Deliver IceConnected to disarm the watchdog BEFORE the 60s deadline.
+        // Deliver IceConnected promptly — BEFORE the 150ms deadline — to disarm.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
 
-        // Observe for 300ms — no second Reconnecting cycle expected.
-        std::thread::sleep(Duration::from_millis(300));
+        // Observe well PAST the short deadline (≈6× the injectable timeout). A correctly
+        // disarmed watchdog produces zero fires across this window.
+        std::thread::sleep(Duration::from_millis(900));
 
         stop_flag.store(true, Ordering::Relaxed);
         drop(ev_tx);
@@ -4223,51 +4283,67 @@ mod tests {
 
         let reconnecting = channel.count_json_containing("reconnecting");
         assert_eq!(
-            reconnecting, 1,
-            "SC-WD-S2 FAIL: IceConnected must disarm the watchdog — expected exactly \
-             1 reconnecting event (the initial IceFailed cycle), got {reconnecting}"
+            reconnecting, 0,
+            "SC-WD-S2 FAIL: IceConnected before the (short) deadline must disarm the \
+             watchdog — expected 0 reconnecting events observed past the deadline, got \
+             {reconnecting}. (An `if false` on the disarm branch MUST flip this to 1.)"
         );
     }
 
-    /// SC-WD-S3 — Sender watchdog is ONE-SHOT per `Connected` epoch.
+    /// SC-WD-S3 (fixed — upper bound now exact) — Sender watchdog is ONE-SHOT per DRAIN
+    /// GENERATION.
     ///
-    /// Two cycles: each Connected entry arms the watchdog; each expiry fires and
-    /// triggers another Reconnecting cycle. Expects ≥2 reconnecting events.
+    /// Each drain instance is one generation; each arms a one-shot deadline at entry and
+    /// fires at most once. Two independent drain generations, each driven to expiry with
+    /// no IceConnected, MUST produce EXACTLY 2 reconnecting cycles total — not 0, not 1,
+    /// not 3+. The exact count proves (a) no double-fire within a generation, and (b)
+    /// exactly-once re-arm per generation (the structural per-generation property of
+    /// REQ-WD-4). `>= 2` is insufficient as the spec's upper bound.
     ///
-    /// RED (before T2.4): compile failure.
-    /// GREEN (after T2.4): watchdog re-arms on each Connected entry.
+    /// RED (before relocation): no drain-entry watchdog → 0.
+    /// GREEN (after relocation): exactly 2.
     #[test]
-    fn sc_wd_s3_one_shot_per_connected_epoch() {
-        use sm_domain::transport::TransportEvent;
+    fn sc_wd_s3_one_shot_per_drain_generation() {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
+        // Generation 1: a fresh drain arms at entry, fires once, breaks.
+        let (channel_a, ev_tx_a, stop_flag_a, join_a) =
             spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_a.store(true, Ordering::Relaxed);
+        drop(ev_tx_a);
+        let _ = join_a.join();
+        let gen1 = channel_a.count_json_containing("reconnecting");
 
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
+        // Generation 2: a second fresh drain (a new generation) arms a new one-shot
+        // deadline at its own entry and fires once.
+        let (channel_b, ev_tx_b, stop_flag_b, join_b) =
+            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_b.store(true, Ordering::Relaxed);
+        drop(ev_tx_b);
+        let _ = join_b.join();
+        let gen2 = channel_b.count_json_containing("reconnecting");
 
-        // Allow two full watchdog cycles:
-        // cycle-1: watchdog fires (150ms) → Reconnecting → rebuild → Connected.
-        // cycle-2: watchdog fires again (150ms) → second Reconnecting.
-        // Budget: 2 × (150ms watchdog + ~110ms supervisor) ≈ 520ms; pad to 1500ms.
-        std::thread::sleep(Duration::from_millis(1500));
-        stop_flag.store(true, Ordering::Relaxed);
-        drop(ev_tx);
-        let _ = join.join();
-
-        let reconnecting = channel.count_json_containing("reconnecting");
-        assert!(
-            reconnecting >= 2,
-            "SC-WD-S3 FAIL: watchdog must fire once per Connected epoch; expected \
-             ≥2 reconnecting events over two cycles, got {reconnecting}"
+        assert_eq!(
+            gen1 + gen2,
+            2,
+            "SC-WD-S3 FAIL: the watchdog must fire EXACTLY once per drain generation — \
+             expected exactly 2 reconnecting events across two generations (gen1={gen1}, \
+             gen2={gen2}), got {}",
+            gen1 + gen2
         );
     }
 
-    /// SC-WD-S4 — Happy-path regression: watchdog does NOT cause an extra cycle
-    /// when `IceConnected` arrives quickly (normal clean rebuild).
+    /// SC-WD-S4 (fixed — was tautological) — Cold-connect happy path: the drain-entry
+    /// watchdog does NOT fire when `IceConnected` arrives in time.
     ///
-    /// GREEN after T2.4 — the disarm logic covers this naturally.
+    /// Equivalent to SC-WD-S2 but explicitly covers the COLD-connect entry (the drain
+    /// starts without any preceding rebuild). Short deadline + IceConnected before it +
+    /// observation past the deadline + exact count 0 ensures an `if false` removal of
+    /// the disarm logic is caught (it would flip the count to 1). The original SC-WD-S4
+    /// used a 60s deadline that never expired, making the assertion trivially true.
     #[test]
     fn sc_wd_s4_no_extra_cycle_on_clean_ice_connected() {
         use sm_domain::transport::TransportEvent;
@@ -4275,26 +4351,23 @@ mod tests {
         use std::time::Duration;
 
         let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_secs(60)));
+            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
 
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-
-        // Allow first cycle to reach Connected.
-        std::thread::sleep(Duration::from_millis(300));
-        // Deliver IceConnected — disarms the watchdog.
+        // Cold connect: deliver IceConnected before the short deadline — disarms.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
 
-        // Observe 300ms — no second cycle expected.
-        std::thread::sleep(Duration::from_millis(300));
+        // Observe well past the short deadline — no fire expected.
+        std::thread::sleep(Duration::from_millis(900));
         stop_flag.store(true, Ordering::Relaxed);
         drop(ev_tx);
         let _ = join.join();
 
         let reconnecting = channel.count_json_containing("reconnecting");
         assert_eq!(
-            reconnecting, 1,
-            "SC-WD-S4 FAIL: clean IceConnected must not trigger a second cycle \
-             (expected 1 reconnecting event, got {reconnecting})"
+            reconnecting, 0,
+            "SC-WD-S4 FAIL: a clean cold-connect IceConnected before the (short) \
+             deadline must not trigger any cycle — expected 0 reconnecting events, got \
+             {reconnecting}. (An `if false` on the disarm branch MUST flip this to 1.)"
         );
     }
 }
