@@ -883,7 +883,7 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     // correct backstop (REQ-WD-4). Production deadline = 6s; tests inject a short one.
     let mut watchdog_deadline: Option<std::time::Instant> =
         media_watchdog_timeout.map(|t| std::time::Instant::now() + t);
-    if media_watchdog_timeout.is_some() {
+    if watchdog_deadline.is_some() {
         eprintln!(
             "[sm-sender-media-watchdog n={session_nonce}] armed at drain entry — \
              expecting IceConnected within {media_watchdog_timeout:?} (no ICE → IceFailed)"
@@ -897,12 +897,10 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
 
         // REQ-WD-3: FIRE the watchdog if its deadline elapsed with no IceConnected.
         // Re-inject IceFailed via `enter_supervisor_mode` — exactly like a real
-        // `TransportEvent::IceFailed` (this is the production re-entry path). One-shot:
-        // the deadline is cleared and the drain breaks into the supervisor.
+        // `TransportEvent::IceFailed` (this is the production re-entry path). One-shot
+        // per generation: the immediate `break 'drain` below makes it fire at most once.
         if let Some(deadline) = watchdog_deadline {
             if std::time::Instant::now() >= deadline {
-                // One-shot: the drain breaks into the supervisor immediately below, so
-                // this generation's deadline never fires twice (no manual clear needed).
                 eprintln!(
                     "[sm-sender-media-watchdog n={session_nonce}] fired — NO IceConnected \
                      within deadline; injecting IceFailed to drive a fresh supervisor cycle"
@@ -2231,9 +2229,10 @@ fn build_production_sender_bundle(
                 Duration::from_secs(15),
                 coordinator_hooks,
                 signaling_refresh, // D-RBF-1 (REQ-RBL-2)
-                // REQ-WD-1..6 (CAP-2): 6s sender media-arrival watchdog — mirrors the
-                // receiver's production watchdog (stream.rs:1881). Armed on Connected,
-                // disarmed on IceConnected, fires IceFailed on expiry.
+                // REQ-WD-1..6 (CAP-2-v2): 6s sender media-arrival watchdog. Armed at
+                // drain entry — NOT on Connected: RCA #1020 proved the old coordinator-
+                // armed timer died on the rebuild worker's Stop before it could elapse.
+                // Disarmed on IceConnected; fires IceFailed on expiry.
                 Some(Duration::from_secs(6)),
             );
         })
