@@ -1885,10 +1885,12 @@ fn build_production_bundle(
                 Duration::from_secs(2),
                 Duration::from_secs(15),
                 coordinator_hooks,
-                // Media-arrival watchdog (design #971 §D4/O4): N=6s production
-                // default — between ack_timeout (2s) and rebuild_timeout (15s),
-                // > first-GOP budget, < the 9s second-backoff so a re-arm still
-                // fits the 3/9/27 attempt budget.
+                // REQ-WD-1..6 (CAP-2-v2): 6s receiver media-arrival watchdog. Armed at
+                // drain entry — NOT on Connected: RCA #1020 proved the old coordinator-
+                // armed timer died on the rebuild worker's Stop before it could elapse.
+                // Disarmed on MediaData; fires IceFailed on expiry. N=6s sits between
+                // ack_timeout (2s) and the 9s second-backoff so a re-arm still fits the
+                // 3/9/27 attempt budget.
                 Some(Duration::from_secs(6)),
                 expected_attempt_for_transport, // T1.9: coordinator writes epoch on Reconnecting
             );
@@ -7257,7 +7259,7 @@ mod tests {
     // asserted against the OLD coordinator-armed watchdog (RCA #1020): those tests
     // sent an initial `IceFailed` to drive the drain INTO `enter_stream_supervisor_mode`
     // and a `rebuild_succeeds_hooks` that emitted ONLY `RebuildSucceeded` with NO
-    // following `Stop`. That hid the no-op — production (stream.rs:2179→2193) sends
+    // following `Stop`. That hid the no-op — the production rebuild worker sends
     // `RebuildSucceeded` THEN `Stop` back-to-back, so the transient coordinator dies
     // in microseconds and a deadline armed there could never elapse.
     //
@@ -7265,7 +7267,7 @@ mod tests {
     // (`run_stream_transport_event_drain_with_supervisor_custom_and_hooks`), which
     // owns the NEW-generation `ev_rx` and is NOT torn down by the rebuild worker's
     // `Stop`. The disarm trigger on the receiver is `TransportEvent::MediaData`
-    // (str0m_receiver.rs:132 emits it once per generation on first media).
+    // (sm-infra str0m_receiver emits it once per generation on first media).
     //
     // Observable: each supervisor cycle emits a `reconnecting` 0x02 status frame.
     // A watchdog fire drives one Reconnecting cycle → one `reconnecting` frame.
@@ -7303,7 +7305,7 @@ mod tests {
     ///
     /// The `initiate_rebuild` hook reproduces the PRODUCTION KILL SEQUENCE
     /// (SC-WD-S5 falsifiability gate): it sends `RebuildSucceeded` IMMEDIATELY
-    /// FOLLOWED BY `Stop`, mirroring the real rebuild worker at stream.rs:2179→2193.
+    /// FOLLOWED BY `Stop`, mirroring the real rebuild worker's success path.
     /// The previous `rebuild_succeeds_hooks` sent ONLY `RebuildSucceeded` with NO
     /// following `Stop`, which is exactly why the coordinator-armed watchdog appeared
     /// to fire in tests while being inert in production (RCA #1020). With this `Stop`
@@ -7329,7 +7331,7 @@ mod tests {
         let hooks = StreamCoordinatorHooks {
             publish_reconnect_request: Arc::new(|_, _| {}),
             publish_reconnect_ack: Arc::new(|_, _| {}),
-            // PRODUCTION KILL SEQUENCE (mirrors stream.rs:2179→2193).
+            // PRODUCTION KILL SEQUENCE (mirrors the real rebuild worker: RebuildSucceeded → Stop).
             initiate_rebuild: Arc::new(|signal_tx| {
                 let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
                 let _ = signal_tx.try_send(SupervisorSignal::Stop);
