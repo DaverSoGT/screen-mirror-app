@@ -934,10 +934,17 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     //
     // `Some(deadline)` while armed; `None` once disarmed or fired. The drain-entry
     // arm also covers the cold connect: on the happy path `IceConnected` disarms it
-    // well within 6s; if a generation never produces media, firing IceFailed is the
-    // correct backstop (REQ-WD-4). Production deadline = 6s; tests inject a short one.
-    let mut watchdog_deadline: Option<std::time::Instant> =
-        media_watchdog_timeout.map(|t| std::time::Instant::now() + t);
+    // CAP-2-v3 (REQ-WD-1 / M1): arm ONLY when `arm_media_watchdog` is true — i.e. for
+    // post-rebuild generations, which are genuinely expected to produce media. The
+    // cold-connect generation passes `false` (cold first-media was measured at +5312ms
+    // = 88% of the 6s window; arming risks a spurious fire with no outage). On the happy
+    // path `IceConnected` disarms it well within 6s; if a post-rebuild generation never
+    // connects, firing IceFailed is the correct backstop (REQ-WD-4).
+    let mut watchdog_deadline: Option<std::time::Instant> = if arm_media_watchdog {
+        media_watchdog_timeout.map(|t| std::time::Instant::now() + t)
+    } else {
+        None
+    };
     if watchdog_deadline.is_some() {
         eprintln!(
             "[sm-sender-media-watchdog n={session_nonce}] armed at drain entry — \
@@ -950,15 +957,39 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
             break;
         }
 
-        // REQ-WD-3: FIRE the watchdog if its deadline elapsed with no IceConnected.
-        // Re-inject IceFailed via `enter_supervisor_mode` — exactly like a real
-        // `TransportEvent::IceFailed` (this is the production re-entry path). One-shot
-        // per generation: the immediate `break 'drain` below makes it fire at most once.
+        // FIRE the watchdog if its deadline elapsed with no IceConnected.
+        //
+        // CAP-2-v3 fire-block (REQ-WD-3/7/8, R-A rule — mirror of stream.rs):
+        //   1. Increment the cross-generation counter FIRST (this fire is counted).
+        //   2. Cap-check FIRST, BEFORE any `enter_supervisor_mode` call: at the cap emit
+        //      a terminal `Dead { peer_unreachable }` and `break 'drain` WITHOUT
+        //      re-entering the supervisor — one Dead by construction (R-A §2.2).
+        //   3. Below the cap: re-inject IceFailed exactly as before (REQ-WD-3).
+        // A genuine RebuildFailed-Dead on the below-cap path terminates the supervisor
+        // and spawns NO successor drain, so the counter is never read again (R-A §2.1).
         if let Some(deadline) = watchdog_deadline {
             if std::time::Instant::now() >= deadline {
+                let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(cap) = media_watchdog_max_fires {
+                    if n >= cap {
+                        eprintln!(
+                            "[sm-sender-media-watchdog n={session_nonce}] fired {n}/{cap} \
+                             (CAP reached) — peer unreachable; emitting terminal Dead and \
+                             stopping (no supervisor re-entry)"
+                        );
+                        emit_event(
+                            &channel,
+                            &SenderStatusEvent::Dead {
+                                reason: "peer_unreachable".to_string(),
+                            },
+                        );
+                        break 'drain;
+                    }
+                }
                 eprintln!(
-                    "[sm-sender-media-watchdog n={session_nonce}] fired — NO IceConnected \
-                     within deadline; injecting IceFailed to drive a fresh supervisor cycle"
+                    "[sm-sender-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
+                     IceConnected within deadline; injecting IceFailed to drive a fresh \
+                     supervisor cycle"
                 );
                 enter_supervisor_mode(
                     ReconnectTrigger::IceFailed,
@@ -1003,6 +1034,10 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                              IceConnected arrived before deadline"
                         );
                     }
+                    // CAP-2-v3 (REQ-WD-4 / R-C): IceConnected proves the peer is present,
+                    // so the consecutive-absent-fire streak is broken — reset the
+                    // cross-generation counter to 0 (fresh ≈60s budget on a later drop).
+                    media_watchdog_fires.store(0, Ordering::Relaxed);
                     emit_event(&channel, &SenderStatusEvent::Streaming);
                     emit_event(
                         &channel,
