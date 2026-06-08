@@ -454,7 +454,11 @@ function handleStatus(payload) {
       cancelAutoRetry();
       // Capture most-recent attempt/max for the deferred overlay reveal (D-SSR-3).
       pendingReconnectAttempt = { attempt: payload.attempt, max: payload.max };
-      setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")...");
+      // CAP-2-v3 (REQ-WD-10): honest count-free copy. The bounded retry window can last
+      // up to ~60s (issue #62) and the frontend cannot distinguish the supervisor's real
+      // retry from the post-watchdog wait, so the misleading "attempt X/max" denominator
+      // is removed. The deferred Stage-2 silent-recovery overlay keeps its own counter.
+      setStatus("Reconnecting… waiting for the other device");
       // DO NOT call tearDownMse() here — deferred to Stage 2 reveal or streaming/dead
       // so the last frozen video frame stays visible during the silent window (REQ-SSR-4).
       // DO NOT show the overlay yet — Stage 1 is silent (REQ-SSR-3).
