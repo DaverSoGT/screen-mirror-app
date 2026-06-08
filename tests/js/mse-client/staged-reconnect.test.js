@@ -99,9 +99,10 @@ describe('mse-client — staged silent reconnect timer gate (SC-SSR-1..10)', () 
 
     // Overlay must now be visible.
     expect(overlay.hidden).toBe(false);
-    // Text must include attempt counter.
-    expect(overlay.textContent).toMatch(/1/);
-    expect(overlay.textContent).toMatch(/3/);
+    // CAP-2-v3 FIX-1: the overlay no longer renders a misleading "attempt X/N"
+    // counter — it carries the honest count-free waiting copy instead.
+    expect(overlay.textContent).not.toMatch(/\/\s*\d/);
+    expect(overlay.textContent.toLowerCase()).toContain('waiting for the other device');
   });
 
   // ── SC-SSR-3 ─────────────────────────────────────────────────────────────────
@@ -161,8 +162,9 @@ describe('mse-client — staged silent reconnect timer gate (SC-SSR-1..10)', () 
   });
 
   // ── SC-SSR-5 ─────────────────────────────────────────────────────────────────
-  // REQ-SSR-6: overlay shows most-recent attempt counter when timer fires.
-  it('SC-SSR-5: overlay shows most-recent attempt/max when timer fires', async () => {
+  // REQ-SSR-6 + CAP-2-v3 FIX-1: overlay reveals on timer fire with the honest
+  // count-free copy (no "/N") regardless of the most-recent attempt payload.
+  it('SC-SSR-5: overlay reveals with honest count-free copy when timer fires', async () => {
     const overlay = document.getElementById('reconnecting-overlay');
 
     // First frame: attempt 1/3.
@@ -179,10 +181,11 @@ describe('mse-client — staged silent reconnect timer gate (SC-SSR-1..10)', () 
     await Promise.resolve();
     await Promise.resolve();
 
-    // Overlay text must reference attempt 2 (the most recent payload), not attempt 1.
+    // CAP-2-v3 FIX-1: the overlay reveals with the honest count-free copy regardless
+    // of which attempt payload (1 or 2) was most recent — no "/N" denominator is shown.
     expect(overlay.hidden).toBe(false);
-    expect(overlay.textContent).toMatch(/2/);
-    expect(overlay.textContent).toMatch(/3/);
+    expect(overlay.textContent).not.toMatch(/\/\s*\d/);
+    expect(overlay.textContent.toLowerCase()).toContain('waiting for the other device');
   });
 
   // ── SC-SSR-6 ─────────────────────────────────────────────────────────────────

@@ -2441,15 +2441,6 @@ pub fn start_stream_inner(
     let resolved_port = udp_port.unwrap_or(7889);
     let resolved_name = service_name.unwrap_or_else(|| "_screen-mirror._tcp.local.".to_string());
 
-    // CAP-2-v3 (REQ-WD-4 / R-C): reset the cross-generation media-watchdog fire counter
-    // at the start of a genuinely-new connection episode. The counter persists across
-    // rebuild generations WITHIN an episode (that is what bounds the absent-peer loop),
-    // but a fresh user-initiated start must begin with a clean ≈60s budget rather than
-    // inheriting a stale near-cap count from a prior episode.
-    bridge
-        .media_watchdog_fires
-        .store(0, Ordering::Relaxed);
-
     // Step 4 — bind_probe: speculative bind BEFORE any StreamBridge mutex (PQ-D-1, R4.2).
     //
     // This is the TOCTOU fix (start-stream-toctou-hardening). The FD is acquired
@@ -2510,6 +2501,18 @@ pub fn start_stream_inner(
 
     // Reset the bridge-level supervisor_signal_tx for this new session (AC-13).
     *bridge.supervisor_signal_tx.lock().unwrap() = None;
+
+    // CAP-2-v3 (REQ-WD-4 / R-C / FIX-2): reset the cross-generation media-watchdog fire
+    // counter at the start of a genuinely-new connection episode. The counter persists
+    // across rebuild generations WITHIN an episode (that is what bounds the absent-peer
+    // loop), but a fresh user-initiated start must begin with a clean ≈60s budget rather
+    // than inheriting a stale near-cap count from a prior episode.
+    //
+    // This reset MUST run AFTER the Step 5 AlreadyRunning guard (above): a rejected
+    // double-start is NOT a new episode, so it must NOT clear the counter. This mirrors
+    // the sender, which resets only after its own AlreadyRunning guard (sender/receiver
+    // symmetry, REQ-WD-4).
+    bridge.media_watchdog_fires.store(0, Ordering::Relaxed);
 
     // Step 7 — Invoke BuilderFn (no StreamBridge mutex held — R4.3).
     // Translate BundleError into StartStreamError.

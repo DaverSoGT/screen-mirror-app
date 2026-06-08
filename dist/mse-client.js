@@ -170,9 +170,16 @@ function revealReconnectingOverlay() {
   // reconnectingOverlay is the module-scoped variable assigned below at parse
   // time; by the time this timer callback fires it is fully initialized.
   if (reconnectingOverlay && pendingReconnectAttempt) {
+    // CAP-2-v3 FIX-1 (R-F extension to the overlay): the Stage-2 overlay is the
+    // surface the user actually stares at during the absent-peer wait, so it must
+    // NOT render the misleading "/N" denominator. The transport can keep retrying
+    // for ~60s (issue #62) and the frontend cannot distinguish the supervisor's
+    // real retry from the post-watchdog wait — the same honest, count-free copy as
+    // the reconnecting status line is used here. The presence of pendingReconnectAttempt
+    // is still the gate (deferred teardown + timer logic unchanged); only the text
+    // is count-free.
     reconnectingOverlay.textContent =
-      "Reconnecting (attempt " + pendingReconnectAttempt.attempt +
-      "/" + pendingReconnectAttempt.max + ")...";
+      "Reconnecting… waiting for the other device";
     reconnectingOverlay.hidden = false;
   }
 }

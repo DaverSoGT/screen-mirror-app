@@ -932,8 +932,8 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     // a deadline armed here can actually elapse — unlike the old coordinator-armed
     // watchdog that the rebuild worker killed within microseconds (RCA #1020).
     //
-    // `Some(deadline)` while armed; `None` once disarmed or fired. The drain-entry
-    // arm also covers the cold connect: on the happy path `IceConnected` disarms it
+    // `Some(deadline)` while armed; `None` once disarmed or fired.
+    //
     // CAP-2-v3 (REQ-WD-1 / M1): arm ONLY when `arm_media_watchdog` is true — i.e. for
     // post-rebuild generations, which are genuinely expected to produce media. The
     // cold-connect generation passes `false` (cold first-media was measured at +5312ms
