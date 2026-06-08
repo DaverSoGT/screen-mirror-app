@@ -4937,6 +4937,12 @@ mod tests {
         )
         .expect("first start must succeed");
 
+        // CAP-2-v3 (REQ-WD-4 / FIX-2): seed the cross-generation fire counter with a
+        // non-zero sentinel BEFORE the rejected double-start. A rejected start is NOT a
+        // new connection episode, so it MUST NOT reset the counter. This mirrors the
+        // sender, which resets only AFTER its AlreadyRunning guard.
+        bridge.media_watchdog_fires.store(2, Ordering::Relaxed);
+
         // Second start with the SAME args — must return AlreadyRunning.
         let err = start_stream_inner(&bridge, channel.clone(), Some(picked_port), None)
             .expect_err("second start must return AlreadyRunning, not Ok(())");
@@ -4957,6 +4963,14 @@ mod tests {
             }
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
+
+        // REQ-WD-4: the rejected double-start MUST NOT have reset the fire counter.
+        assert_eq!(
+            bridge.media_watchdog_fires.load(Ordering::Relaxed),
+            2,
+            "a rejected double-start (AlreadyRunning) must NOT reset the media-watchdog \
+             fire counter — reset belongs AFTER the guard (sender/receiver symmetry)"
+        );
     }
 
     /// B6-2 / T7.7 — Double-start with DIFFERENT args returns
