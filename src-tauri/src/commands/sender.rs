@@ -196,6 +196,16 @@ pub struct SenderBundle {
     /// the Bye for the receiver's PeerBye eager-wake, R-5). `None` for test stubs
     /// and the non-Windows stub builder.
     pub suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// D-RFG (REQ-RFG-1): rebuild-only hook that joins the OLD generation's
+    /// signaling frame-loop thread synchronously so `emit_error` can no longer
+    /// fire after this returns — closes the #58 RebuildFailed FIFO window at the
+    /// source. Bounded by READ_TIMEOUT (mdns.rs:76, ~200 ms worst case); no
+    /// unbounded blocking exists in the frame loop (stop flag checked at every
+    /// iteration top and between resilient-read retries). `stop()` is idempotent
+    /// (mdns.rs:286): the later `Drop::stop()` in the shutdown closure is a
+    /// clean no-op. MUST NOT be called by `stop_sender_session_internal` (genuine
+    /// stop uses the Drop path; R-5/D-RFG-5). `None` for test stubs.
+    pub stop_signaling_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SenderBundle {
@@ -208,6 +218,7 @@ impl SenderBundle {
             shutdown: None,
             backend_name: "sw_fake".to_string(),
             suppress_bye_on_rebuild: None,
+            stop_signaling_on_rebuild: None,
         }
     }
 }
@@ -266,6 +277,16 @@ pub struct SenderSession {
     /// Propagated from the bundle that produced this session. Rebuild step 6 calls this
     /// (if Some) BEFORE `s.shutdown.take()()`. Genuine stop does NOT call it (R-5).
     pub suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// D-RFG (REQ-RFG-1): rebuild-only hook that joins the OLD generation's
+    /// signaling frame-loop thread synchronously so `emit_error` can no longer
+    /// fire after this returns — closes the #58 RebuildFailed FIFO window at the
+    /// source. Bounded by READ_TIMEOUT (mdns.rs:76, ~200 ms worst case); no
+    /// unbounded blocking exists in the frame loop (stop flag checked at every
+    /// iteration top and between resilient-read retries). `stop()` is idempotent
+    /// (mdns.rs:286): the later `Drop::stop()` in the shutdown closure is a
+    /// clean no-op. MUST NOT be called by `stop_sender_session_internal` (genuine
+    /// stop uses the Drop path; R-5/D-RFG-5). `None` for test stubs.
+    pub stop_signaling_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Canonical backend token captured at construction time (DD2 ordering invariant).
     /// Immutable after session start — never mutated by any path (R9).
     backend_name: String,
@@ -286,6 +307,7 @@ impl SenderSession {
         shutdown: Option<Box<dyn FnOnce() + Send>>,
         backend_name: String,
         suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
+        stop_signaling_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             stop_flag,
@@ -294,6 +316,7 @@ impl SenderSession {
             counters,
             shutdown,
             suppress_bye_on_rebuild,
+            stop_signaling_on_rebuild,
             backend_name,
         }
     }
@@ -1471,6 +1494,7 @@ pub fn start_sender_inner(
         bundle.shutdown,
         bundle.backend_name,
         bundle.suppress_bye_on_rebuild,
+        bundle.stop_signaling_on_rebuild,
     );
     *bridge.session.lock().unwrap() = Some(session);
     *bridge.current_args.lock().unwrap() = Some(SenderArgs {
@@ -1737,6 +1761,10 @@ pub fn make_sender_rebuild_hook(
                         // at ITS own signaling instance; the OLD hook is on the OLD s
                         // (already consumed above in step 6).
                         new_bundle.suppress_bye_on_rebuild,
+                        // D-RFG-4 (REQ-RFG-4): propagate the NEW bundle's stop hook so
+                        // a future rebuild of THIS generation will also join ITS frame
+                        // loop. The OLD hook was consumed in step 6 above.
+                        new_bundle.stop_signaling_on_rebuild,
                     ));
                 }
 
@@ -2427,6 +2455,7 @@ fn build_production_sender_bundle(
         shutdown: Some(shutdown),
         backend_name,
         suppress_bye_on_rebuild,
+        stop_signaling_on_rebuild: None, // placeholder; T-03 (WU-2) replaces with live hook
     })
 }
 
@@ -2838,6 +2867,7 @@ mod tests {
                 shutdown: None,
                 backend_name: "test".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
             })
         });
 
@@ -3156,6 +3186,7 @@ mod tests {
                 shutdown: None,
                 backend_name: "test".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
             })
         });
 
@@ -4130,6 +4161,7 @@ mod tests {
                 shutdown: None,
                 backend_name: "spy".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
             })
         });
 
@@ -4976,6 +5008,7 @@ mod tests {
                 order_for_suppress.lock().unwrap().push("suppress");
                 suppress_clone.store(true, Ordering::Relaxed);
             })),
+            None, // stop_signaling_on_rebuild: not under test here
         );
 
         let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
@@ -5002,6 +5035,7 @@ mod tests {
                     shutdown: None,
                     backend_name: "sw_fake".to_string(),
                     suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
                 })
             }),
             cache,
@@ -5072,6 +5106,7 @@ mod tests {
             Some(Arc::new(move || {
                 hook_clone.store(true, Ordering::Relaxed);
             })),
+            None, // stop_signaling_on_rebuild: not under test here
         );
         *bridge.session.lock().unwrap() = Some(session);
 

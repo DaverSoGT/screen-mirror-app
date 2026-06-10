@@ -207,6 +207,7 @@ fn make_bridge_with_counting_hooks(
                 shutdown: None,
                 backend_name: "sw_fake".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
             })
         }),
         sup_tx,

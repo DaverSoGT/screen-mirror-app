@@ -72,6 +72,7 @@ fn blocking_session(
         })),
         "sw_fake".to_string(),
         None, // D-6: suppress_bye_on_rebuild — None for test stubs
+        None, // D-RFG: stop_signaling_on_rebuild — None for test stubs
     );
     Arc::new(Mutex::new(Some(session)))
 }
