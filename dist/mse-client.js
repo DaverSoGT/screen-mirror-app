@@ -453,6 +453,24 @@ if (deadRoleChangeEl) {
   });
 }
 
+// S-conf1 (CAP-2-v3): map terminal dead `reason` tokens to human-readable copy.
+// CAP-2-v3 introduced new machine tokens (peer_unreachable, ice_failed_repeatedly)
+// that would otherwise leak raw into the dead-modal as "Connection lost: peer_unreachable".
+// Only mapped tokens get bespoke copy; any other/absent reason keeps the existing
+// "Connection lost: <reason|unknown>" fallback (behavior unchanged). Kept symmetric
+// with dist/sender.js.
+const DEAD_REASON_COPY = {
+  peer_unreachable: "The other device is unreachable",
+  ice_failed_repeatedly: "The connection failed repeatedly",
+};
+
+function humanDeadReason(reason) {
+  if (reason && Object.prototype.hasOwnProperty.call(DEAD_REASON_COPY, reason)) {
+    return DEAD_REASON_COPY[reason];
+  }
+  return "Connection lost: " + (reason || "unknown");
+}
+
 function handleStatus(payload) {
   console.log("[mse-client] status:", payload.kind, payload);
   switch (payload.kind) {
@@ -501,8 +519,7 @@ function handleStatus(payload) {
       if (reconnectingOverlay) reconnectingOverlay.hidden = true;
       if (deadModal) {
         if (deadReasonEl) {
-          deadReasonEl.textContent =
-            "Connection lost: " + (payload.reason || "unknown");
+          deadReasonEl.textContent = humanDeadReason(payload.reason);
         }
         deadModal.hidden = false;
       }
