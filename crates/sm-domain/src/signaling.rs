@@ -105,7 +105,11 @@ pub enum SignalingEvent {
         port: u16,
     },
     /// Remote SDP offer arrived (receiver side).
-    OfferReceived(SdpOffer),
+    ///
+    /// The second field is the sender's supervisor reconnect-attempt number at the
+    /// time the Offer was published. The receiver's `run_signaling_drain` uses this
+    /// to drop stale-generation Offers (REQ-GE-4, Decision 1).
+    OfferReceived(SdpOffer, u8),
     /// Remote SDP answer arrived (sender side).
     AnswerReceived(SdpAnswer),
     /// Remote ICE candidate arrived (either side).
@@ -178,7 +182,10 @@ pub trait Signaling: Send + Sync {
     fn start(&mut self, event_tx: SyncSender<SignalingEvent>) -> Result<(), SignalingError>;
 
     /// Publish the local SDP offer to the remote peer.
-    fn publish_local_offer(&self, offer: SdpOffer) -> Result<(), SignalingError>;
+    ///
+    /// `attempt` is the supervisor reconnect-attempt number at the time of publishing
+    /// (REQ-GE-1, REQ-GE-2). Carried through to the wire `Offer` frame.
+    fn publish_local_offer(&self, offer: SdpOffer, attempt: u8) -> Result<(), SignalingError>;
 
     /// Publish the local SDP answer to the remote peer.
     fn publish_local_answer(&self, answer: SdpAnswer) -> Result<(), SignalingError>;
@@ -235,9 +242,9 @@ mod tests {
             Ok(())
         }
 
-        fn publish_local_offer(&self, offer: SdpOffer) -> Result<(), SignalingError> {
+        fn publish_local_offer(&self, offer: SdpOffer, attempt: u8) -> Result<(), SignalingError> {
             if let Some(ref tx) = self.event_tx {
-                tx.try_send(SignalingEvent::OfferReceived(offer))
+                tx.try_send(SignalingEvent::OfferReceived(offer, attempt))
                     .map_err(|_| SignalingError::Io("channel full or closed".to_string()))?;
             }
             Ok(())
@@ -294,16 +301,17 @@ mod tests {
         let (event_tx, event_rx) = sync_channel::<SignalingEvent>(4);
         sig.start(event_tx).unwrap();
         let offer = SdpOffer("v=0\r\n".to_string());
-        sig.publish_local_offer(offer.clone()).unwrap();
+        sig.publish_local_offer(offer.clone(), 1).unwrap();
         let ev = event_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("expected SignalingEvent within 1s");
         match ev {
-            SignalingEvent::OfferReceived(received_offer) => {
+            SignalingEvent::OfferReceived(received_offer, attempt) => {
                 assert_eq!(
                     received_offer, offer,
                     "OfferReceived must contain the exact offer"
                 );
+                assert_eq!(attempt, 1, "OfferReceived must carry the attempt number");
             }
             other => panic!("expected OfferReceived, got {other:?}"),
         }

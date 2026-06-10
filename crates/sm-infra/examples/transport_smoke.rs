@@ -155,9 +155,10 @@ fn run_smoke() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Publish offer via signaling and let receiver pick it up.
-    sender_sig.publish_local_offer(offer.clone())?;
+    // Cold-start attempt is 1 (matching supervisor.rs:268 seed and receiver expected_attempt seed).
+    sender_sig.publish_local_offer(offer.clone(), 1)?;
     let offer_received = match receiver_sig_event_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(SignalingEvent::OfferReceived(o)) => o,
+        Ok(SignalingEvent::OfferReceived(o, _attempt)) => o,
         Ok(other) => return Err(format!("expected OfferReceived, got {other:?}").into()),
         Err(e) => return Err(format!("OfferReceived timeout: {e}").into()),
     };

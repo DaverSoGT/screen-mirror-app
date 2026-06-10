@@ -5,7 +5,7 @@
 //
 // TDD cycle (Strict TDD Mode): tests written FIRST (RED), then implementation.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -198,10 +198,18 @@ fn make_stream_bridge_with_counting_hooks() -> (
                 .name("stream-coord-test-drain".into())
                 .spawn(move || {
                     run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                        ev_rx, stop_flag, channel, st, p, t, t, hooks,
+                        ev_rx,
+                        stop_flag,
+                        channel,
+                        st,
+                        p,
+                        t,
+                        t,
+                        hooks,
                         // Media-arrival watchdog disabled — this coordinator test
                         // does not exercise the post-rebuild watchdog.
                         None,
+                        Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
                 .expect("spawn drain");

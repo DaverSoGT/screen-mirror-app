@@ -170,7 +170,11 @@ fn make_sender_test_builder(
     probe: Arc<SenderBuilderProbe>,
 ) -> screen_mirror_lib::commands::sender::SenderBuilderFn {
     Arc::new(
-        move |port: u16, name: String, _stop: Arc<AtomicBool>, _ch: Arc<dyn ChannelLike>| {
+        move |port: u16,
+              name: String,
+              _stop: Arc<AtomicBool>,
+              _ch: Arc<dyn ChannelLike>,
+              _attempt: u8| {
             probe.calls.lock().unwrap().push((port, name));
             (probe.result)()
         },
@@ -706,9 +710,10 @@ fn signaling_drain_offer_received_is_silently_ignored() {
     });
 
     ev_tx
-        .send(SignalingEvent::OfferReceived(SdpOffer(
-            "test-offer".to_string(),
-        )))
+        .send(SignalingEvent::OfferReceived(
+            SdpOffer("test-offer".to_string()),
+            1,
+        ))
         .unwrap();
 
     thread::sleep(Duration::from_millis(50));
@@ -1007,7 +1012,7 @@ fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
 
     let dc = drop_count.clone();
     let bridge = screen_mirror_lib::commands::sender::SenderBridge::new_with_builder(Arc::new(
-        move |_, _, _, _| {
+        move |_, _, _, _, _| {
             let tracker = DropTracker(dc.clone());
             Ok(SenderBundle {
                 drain_handles: vec![],

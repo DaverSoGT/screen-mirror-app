@@ -16,7 +16,7 @@
 //
 // Naming convention: coordinator_invokes_<what>_on_<outcome>
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -148,7 +148,7 @@ fn make_bridge_with_counting_hooks(
     let policy = fast_policy();
 
     let bridge = SenderBridge::new_with_builder_and_sup_tx(
-        Arc::new(move |_, _, stop_flag, channel| {
+        Arc::new(move |_, _, stop_flag, channel, _attempt| {
             let ev_rx = ev_rx_slot_clone
                 .lock()
                 .unwrap()
@@ -178,6 +178,7 @@ fn make_bridge_with_counting_hooks(
                 initiate_mdns_reset: Arc::new(move || {
                     re.fetch_add(1, Ordering::Relaxed);
                 }),
+                sender_attempt: Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
             };
 
             let h = thread::Builder::new()

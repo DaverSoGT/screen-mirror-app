@@ -99,7 +99,8 @@ fn next_signaling_instance_id() -> u64 {
 #[derive(Debug)]
 enum MdnsControl {
     /// Offer to be forwarded to the connected peer.
-    Offer(SdpOffer),
+    /// Carries the supervisor reconnect-attempt number (REQ-GE-1).
+    Offer(SdpOffer, u8),
     /// Answer to be forwarded to the connected peer.
     Answer(SdpAnswer),
     /// ICE candidate to be forwarded to the connected peer.
@@ -227,12 +228,16 @@ impl Signaling for MdnsSignaling {
 
     /// Queue an SDP offer to be written on the TCP channel.
     ///
+    /// `attempt` is the supervisor reconnect-attempt number at publish time (REQ-GE-1).
     /// Returns `Err(NotRunning)` if `start()` has not been called or `stop()` was called.
-    fn publish_local_offer(&self, offer: SdpOffer) -> Result<(), SignalingError> {
+    fn publish_local_offer(&self, offer: SdpOffer, attempt: u8) -> Result<(), SignalingError> {
         if self.handle.is_none() {
             return Err(SignalingError::NotRunning);
         }
-        self.inbox.lock().unwrap().push(MdnsControl::Offer(offer));
+        self.inbox
+            .lock()
+            .unwrap()
+            .push(MdnsControl::Offer(offer, attempt));
         Ok(())
     }
 
@@ -458,7 +463,9 @@ pub(crate) fn frame_to_event(
 ) -> Option<SignalingEvent> {
     match frame {
         SignalingFrame::Hello { proto: _ } => None,
-        SignalingFrame::Offer { sdp } => Some(SignalingEvent::OfferReceived(SdpOffer(sdp))),
+        SignalingFrame::Offer { sdp, attempt } => {
+            Some(SignalingEvent::OfferReceived(SdpOffer(sdp), attempt))
+        }
         SignalingFrame::Answer { sdp } => Some(SignalingEvent::AnswerReceived(SdpAnswer(sdp))),
         SignalingFrame::Candidate { sdp } => {
             Some(SignalingEvent::CandidateReceived(IceCandidate(sdp)))
@@ -976,7 +983,10 @@ fn run_frame_loop(
         let pending: Vec<MdnsControl> = inbox.lock().unwrap().drain(..).collect();
         for msg in pending {
             let frame = match msg {
-                MdnsControl::Offer(o) => SignalingFrame::Offer { sdp: o.0 },
+                MdnsControl::Offer(o, att) => SignalingFrame::Offer {
+                    sdp: o.0,
+                    attempt: att,
+                },
                 MdnsControl::Answer(a) => SignalingFrame::Answer { sdp: a.0 },
                 MdnsControl::Candidate(c) => SignalingFrame::Candidate { sdp: c.0 },
                 MdnsControl::ReconnectRequest {
@@ -997,7 +1007,9 @@ fn run_frame_loop(
                 },
             };
             let kind = match &frame {
-                SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
+                SignalingFrame::Offer { sdp, attempt } => {
+                    format!("Offer (sdp={} bytes, attempt={attempt})", sdp.len())
+                }
                 SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
@@ -1030,7 +1042,9 @@ fn run_frame_loop(
             Ok(Some(frame)) => {
                 let kind = match &frame {
                     SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
-                    SignalingFrame::Offer { sdp } => format!("Offer (sdp={} bytes)", sdp.len()),
+                    SignalingFrame::Offer { sdp, attempt } => {
+                        format!("Offer (sdp={} bytes, attempt={attempt})", sdp.len())
+                    }
                     SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
                     SignalingFrame::Candidate { sdp } => {
                         format!("Candidate (sdp={} bytes)", sdp.len())
@@ -1356,7 +1370,7 @@ mod tests {
         std::sync::Arc::new(Mutex::new(None))
     }
 
-    /// S7.2 — frame_to_event maps Offer frame to OfferReceived.
+    /// S7.2 — frame_to_event maps Offer frame to OfferReceived with attempt.
     #[test]
     fn frame_to_event_offer_maps_correctly() {
         use crate::signaling::mdns::frame_to_event;
@@ -1364,11 +1378,12 @@ mod tests {
 
         let frame = SignalingFrame::Offer {
             sdp: "v=0".to_string(),
+            attempt: 1,
         };
         let event = frame_to_event(frame, &no_supervisor()).expect("Offer must produce an event");
         assert!(
-            matches!(event, SignalingEvent::OfferReceived(SdpOffer(ref s)) if s == "v=0"),
-            "Offer frame must map to OfferReceived with exact SDP"
+            matches!(event, SignalingEvent::OfferReceived(SdpOffer(ref s), 1) if s == "v=0"),
+            "Offer frame must map to OfferReceived with exact SDP and attempt"
         );
     }
 
@@ -1598,7 +1613,7 @@ mod tests {
         let sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
         let fresh = sig.reset().expect("reset must succeed");
         // Fresh instance must be in pre-start state: publish returns NotRunning.
-        let result = fresh.publish_local_offer(SdpOffer("v=0".to_string()));
+        let result = fresh.publish_local_offer(SdpOffer("v=0".to_string()), 1);
         assert!(
             matches!(result, Err(SignalingError::NotRunning)),
             "after reset(), new instance must be in pre-start state; got {result:?}"
@@ -1632,7 +1647,7 @@ mod tests {
     #[test]
     fn mdns_publish_before_start_returns_not_running() {
         let sig = MdnsSignaling::new(SignalingConfig::default()).unwrap();
-        let result = sig.publish_local_offer(SdpOffer("v=0".to_string()));
+        let result = sig.publish_local_offer(SdpOffer("v=0".to_string()), 1);
         assert!(
             matches!(result, Err(SignalingError::NotRunning)),
             "publish before start must return NotRunning, got {result:?}"
@@ -2241,7 +2256,7 @@ mod tests {
         // that MUST survive the targeted drain.
         {
             let mut inbox = sig.inbox_for_test().lock().unwrap();
-            inbox.push(MdnsControl::Offer(SdpOffer("v=0".into())));
+            inbox.push(MdnsControl::Offer(SdpOffer("v=0".into()), 1));
             inbox.push(MdnsControl::ReconnectRequest {
                 attempt: 1,
                 requester_role: SignalingRole::Sender,
@@ -2265,7 +2280,7 @@ mod tests {
             .unwrap()
             .iter()
             .map(|m| match m {
-                MdnsControl::Offer(_) => "Offer",
+                MdnsControl::Offer(_, _) => "Offer",
                 MdnsControl::Answer(_) => "Answer",
                 MdnsControl::Candidate(_) => "Candidate",
                 MdnsControl::ReconnectRequest { .. } => "ReconnectRequest",

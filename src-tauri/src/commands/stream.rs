@@ -35,7 +35,7 @@
 //! - Small payloads (< 1024 B, e.g. init segment) take the `webview.eval` fast path.
 //! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -925,6 +925,7 @@ fn run_signaling_drain(
     stop_flag: Arc<AtomicBool>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
     role: DrainRole,                                                        // D-RDF-1
+    expected_attempt: Arc<AtomicU8>, // T1.9: stale-Offer guard (REQ-GE-1, SC-GE-3..6)
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -935,7 +936,7 @@ fn run_signaling_drain(
                 SignalingEvent::PeerFound { host, port } => {
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
-                SignalingEvent::OfferReceived(offer) => {
+                SignalingEvent::OfferReceived(offer, offer_attempt) => {
                     // D-RBF-2: race-window guard. The outer stop_flag check (line 892) fires
                     // ONCE per recv_timeout iteration; an offer pulled before the OLD session
                     // teardown started can still race into this arm. The OLD receiver's str0m
@@ -958,6 +959,19 @@ fn run_signaling_drain(
                     if role == DrainRole::ResetSignalingOnly {
                         eprintln!(
                             "[sm-signaling-drain-reset] OfferReceived ignored (signaling-only, D-RDF-2)"
+                        );
+                        continue;
+                    }
+                    // T1.11: stale-generation Offer guard (REQ-GE-1, SC-GE-3..6).
+                    // Monotonic >= rule: accept offer_attempt >= expected_attempt so a
+                    // drain that runs slightly ahead of the coordinator store cannot
+                    // false-reject a valid current-generation Offer.
+                    // Use `continue` (NOT `break`) — drain stays alive for subsequent events.
+                    let expected = expected_attempt.load(Ordering::Acquire);
+                    if offer_attempt < expected {
+                        eprintln!(
+                            "[sm-signaling-drain] stale Offer attempt={offer_attempt} expected={expected}; \
+                             dropping (REQ-GE-1)"
                         );
                         continue;
                     }
@@ -1062,6 +1076,9 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom(
         // Legacy variant: media-arrival watchdog disabled (None). The production
         // path uses the `_and_hooks` variant directly with `Some(6s)`.
         None,
+        // T1.9: no epoch tracking needed for this no-hooks variant (tests that use
+        // it don't drive the signaling drain). Supply a default Arc.
+        Arc::new(AtomicU8::new(1)),
     );
 }
 
@@ -1085,6 +1102,9 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
     // drain arms this deadline; the first `TransportEvent::MediaData` disarms it,
     // and expiry re-injects `IceFailed` for a fresh supervisor cycle.
     media_watchdog_timeout: Option<Duration>,
+    // T1.9: shared epoch counter; written by coordinator on Reconnecting, read by
+    // signaling drain to reject stale-generation Offers (REQ-GE-1, SC-GE-3..6).
+    expected_attempt: Arc<AtomicU8>,
 ) {
     let session_nonce: u64 = rand::random();
 
@@ -1113,6 +1133,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         rebuild_timeout,
                         hooks,
                         media_watchdog_timeout,
+                        expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
                 }
@@ -1132,6 +1153,7 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         rebuild_timeout,
                         hooks,
                         media_watchdog_timeout,
+                        expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
                 }
@@ -1197,6 +1219,7 @@ fn enter_stream_supervisor_mode(
     rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
     media_watchdog_timeout: Option<Duration>,
+    expected_attempt: Arc<AtomicU8>, // T1.9: updated on Reconnecting → signals drain
 ) {
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
     let (outcome_tx, outcome_rx) = sync_channel::<SupervisorOutcome>(32);
@@ -1263,7 +1286,13 @@ fn enter_stream_supervisor_mode(
                             );
                         }
                     }
-                    handle_stream_supervisor_outcome(&outcome, channel, &signal_tx, &hooks);
+                    handle_stream_supervisor_outcome(
+                        &outcome,
+                        channel,
+                        &signal_tx,
+                        &hooks,
+                        &expected_attempt,
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1355,9 +1384,13 @@ fn handle_stream_supervisor_outcome(
     channel: &Arc<dyn ChannelLike>,
     signal_tx: &SyncSender<SupervisorSignal>,
     hooks: &StreamCoordinatorHooks,
+    expected_attempt: &Arc<AtomicU8>, // T1.9: updated on Reconnecting so drain rejects stale Offers
 ) {
     match outcome {
         SupervisorOutcome::StateChanged(SessionState::Reconnecting { attempt, max }) => {
+            // T1.9: store the current attempt epoch so the signaling drain can reject
+            // Offers from a previous generation (SC-GE-3..6, REQ-GE-1).
+            expected_attempt.store(attempt.get(), Ordering::Release);
             emit_stream_status(
                 channel,
                 &StreamStatusEvent::Reconnecting {
@@ -1640,6 +1673,9 @@ where
                     stop_clone,
                     sup_tx_clone,
                     DrainRole::ResetSignalingOnly,
+                    // T1.9: reset drain is signaling-only (D-RDF-2) — it never applies
+                    // Offers, so the epoch is not needed. Supply a default Arc.
+                    Arc::new(AtomicU8::new(1)),
                 );
             })
         {
@@ -1829,6 +1865,13 @@ fn build_production_bundle(
     // drain (step 5) and the reset hook (already cloned above) can share the same Arc.
     let sup_tx_for_sig_drain = supervisor_signal_tx.clone(); // D-3: pre-clone for sig drain
     let stop_flag_t = stop_flag.clone();
+    // T1.9: epoch counter shared between coordinator (writer) and signaling drain (reader).
+    // Seed = 1 — matches the supervisor's first Reconnecting attempt (supervisor.rs:268).
+    // The coordinator stores the new attempt on every StateChanged(Reconnecting{attempt})
+    // outcome so the drain can reject Offers from the previous generation (REQ-GE-1).
+    let expected_attempt = Arc::new(AtomicU8::new(1));
+    let expected_attempt_for_transport = expected_attempt.clone();
+    let expected_attempt_for_sig_drain = expected_attempt; // moved into sig drain
     let transport_drain = thread::Builder::new()
         .name("sm-transport-event-drain".into())
         .spawn(move || {
@@ -1846,6 +1889,7 @@ fn build_production_bundle(
                 // > first-GOP budget, < the 9s second-backoff so a re-arm still
                 // fits the 3/9/27 attempt budget.
                 Some(Duration::from_secs(6)),
+                expected_attempt_for_transport, // T1.9: coordinator writes epoch on Reconnecting
             );
         })?;
 
@@ -1862,8 +1906,9 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain,   // D-3 REQ-A
-                DrainRole::Primary, // D-RDF-1: primary drain owns offer application
+                sup_tx_for_drain,               // D-3 REQ-A
+                DrainRole::Primary,             // D-RDF-1: primary drain owns offer application
+                expected_attempt_for_sig_drain, // T1.9: reads epoch to reject stale-gen Offers
             );
         })?;
 
@@ -3605,13 +3650,14 @@ mod tests {
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
                 DrainRole::Primary,
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
         // Send an OfferReceived event.
         let test_offer = SdpOffer("v=0\r\noffer".to_string());
         ev_tx
-            .send(SignalingEvent::OfferReceived(test_offer.clone()))
+            .send(SignalingEvent::OfferReceived(test_offer.clone(), 1))
             .unwrap();
 
         // Give the drain a moment to process.
@@ -3697,6 +3743,7 @@ mod tests {
                 stop_clone,
                 Arc::new(Mutex::new(None)), // D-3: no supervisor in this unit test
                 DrainRole::Primary,
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -5620,6 +5667,7 @@ mod tests {
             fn publish_local_offer(
                 &self,
                 _offer: sm_domain::signaling::SdpOffer,
+                _attempt: u8,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
@@ -5714,7 +5762,7 @@ mod tests {
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
         // With the broken code (_sig_ev_rx dropped) try_send would return Disconnected.
         let offer_event =
-            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset".to_string()));
+            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset".to_string()), 1);
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel is live (not orphaned) ──
@@ -5817,6 +5865,7 @@ mod tests {
             fn publish_local_offer(
                 &self,
                 _offer: SdpOffer,
+                _attempt: u8,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 Ok(())
             }
@@ -5920,7 +5969,7 @@ mod tests {
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
         // With the broken pre-fix code (_sig_ev_rx dropped) → Disconnected.
         let offer_event =
-            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset-f002".to_string()));
+            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset-f002".to_string()), 1);
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel not orphaned ──
@@ -6039,6 +6088,7 @@ mod tests {
                     stop_clone,
                     supervisor_signal_tx, // 5th param — added in T09
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("spawn drain thread");
@@ -6143,6 +6193,7 @@ mod tests {
                     stop_clone,
                     sup_tx_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("spawn drain");
@@ -6660,7 +6711,7 @@ mod tests {
         // Pre-load the offer. drain grabs it immediately (no 500ms recv_timeout wait).
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\n".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("SC-MLO-1: pre-load OfferReceived");
 
         let stop_clone = stop_flag.clone();
@@ -6675,6 +6726,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-1: spawn drain thread");
@@ -6746,6 +6798,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-2: spawn drain thread");
@@ -6753,7 +6806,7 @@ mod tests {
         // Inject OfferReceived with stop_flag=false — must go through to apply_remote_offer.
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\n".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("SC-MLO-2: send OfferReceived");
 
         // Drop the sender to close the channel, causing the drain to exit on Disconnected.
@@ -6823,6 +6876,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                 );
             })
             .expect("SC-MLO-3: spawn drain thread");
@@ -7081,6 +7135,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::ResetSignalingOnly,
+                    Arc::new(AtomicU8::new(1)), // T1.9: reset drain ignores epoch (D-RDF-2)
                 );
             })
             .expect("sc_rdf_1: spawn drain thread");
@@ -7088,7 +7143,7 @@ mod tests {
         // Inject an offer — with ResetSignalingOnly the drain must log-and-skip it.
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-1".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("sc_rdf_1: send OfferReceived");
 
         // Drop sender to close the channel, letting the drain exit on Disconnected.
@@ -7150,6 +7205,7 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::ResetSignalingOnly,
+                    Arc::new(AtomicU8::new(1)), // T1.9: reset drain ignores epoch (D-RDF-2)
                 );
             })
             .expect("sc_rdf_2: spawn drain thread");
@@ -7157,7 +7213,7 @@ mod tests {
         // Inject an offer first — must be ignored (not break the drain).
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\nfake-rdf-2".to_string());
         sig_ev_tx
-            .send(SignalingEvent::OfferReceived(fake_offer))
+            .send(SignalingEvent::OfferReceived(fake_offer, 1))
             .expect("sc_rdf_2: send OfferReceived");
 
         // Small sleep so the drain can process the offer before we send Closed.
@@ -7274,6 +7330,7 @@ mod tests {
                 Duration::from_millis(100), // rebuild_timeout
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(200)), // media watchdog N — fast for test
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -7327,6 +7384,7 @@ mod tests {
                 Duration::from_millis(100),
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(400)), // watchdog N
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -7395,6 +7453,7 @@ mod tests {
                 Duration::from_millis(100),
                 rebuild_succeeds_hooks(),
                 Some(Duration::from_millis(400)),
+                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
             );
         });
 
@@ -7435,5 +7494,327 @@ mod tests {
             "SC-WD-3 FAIL: the build-OK Streaming emit (SC-T22-proven path) must still \
              fire, got {streaming} streaming frames"
         );
+    }
+
+    // ─── SC-GE-3 / SC-GE-4 / SC-GE-5 / SC-GE-6 — stale-Offer guard ─────────
+    //
+    // These tests drive `run_signaling_drain` with a preset `Arc<AtomicU8>
+    // expected_attempt` and verify the drain's stale-offer rejection logic.
+    //
+    // RED until T1.9 adds the `expected_attempt` parameter to `run_signaling_drain`
+    // and T1.11 implements the stale guard.
+
+    /// Shared helper: counting receiver ops for SC-GE tests.
+    struct GeCountingReceiver {
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl GeCountingReceiver {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    call_count: counter.clone(),
+                },
+                counter,
+            )
+        }
+    }
+    impl SignalingReceiverOps for GeCountingReceiver {
+        fn apply_remote_offer(
+            &self,
+            _offer: sm_domain::signaling::SdpOffer,
+        ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(TransportError::NotRunning)
+        }
+        fn add_remote_candidate(
+            &self,
+            _cand: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    /// No-op publish ops for SC-GE tests.
+    struct GeNoOpPublish;
+    impl SignalingPublishOps for GeNoOpPublish {
+        fn publish_local_answer(
+            &self,
+            _answer: sm_domain::signaling::SdpAnswer,
+        ) -> Result<(), sm_domain::signaling::SignalingError> {
+            Ok(())
+        }
+        fn publish_local_candidate(
+            &self,
+            _cand: sm_domain::signaling::IceCandidate,
+        ) -> Result<(), sm_domain::signaling::SignalingError> {
+            Ok(())
+        }
+    }
+
+    /// SC-GE-3 — Stale Offer (attempt < expected) MUST NOT call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 2, drain receives OfferReceived(offer, attempt=1).
+    /// THEN:  apply_remote_offer NOT called; drain stays alive.
+    ///
+    /// RED until T1.9 adds expected_attempt param + T1.11 implements guard.
+    #[test]
+    fn sc_ge_3_stale_offer_rejected_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-3-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone, // T1.9: new expected_attempt parameter
+                );
+            })
+            .expect("sc_ge_3: spawn drain thread");
+
+        // Inject stale Offer (attempt=1 < expected=2).
+        let stale_offer = SdpOffer("v=0\r\nstale".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(stale_offer, 1))
+            .expect("sc_ge_3: send stale OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer NOT called (call count == 0).
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "SC-GE-3 FAIL: apply_remote_offer called for stale Offer (attempt=1, expected=2)"
+        );
+
+        // Verify drain is still alive (operational — no panic, no early exit).
+        assert!(
+            !drain_handle.is_finished(),
+            "SC-GE-3 FAIL: drain exited prematurely after stale Offer (must stay alive)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-4 — Matching attempt Offer MUST call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 2, drain receives OfferReceived(offer, attempt=2).
+    /// THEN:  apply_remote_offer called exactly once.
+    ///
+    /// RED until T1.9 + T1.11.
+    #[test]
+    fn sc_ge_4_matching_offer_accepted_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-4-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_4: spawn drain thread");
+
+        // Inject matching Offer (attempt=2 == expected=2).
+        let matching_offer = SdpOffer("v=0\r\nmatching".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(matching_offer, 2))
+            .expect("sc_ge_4: send matching OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer called exactly once.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-4 FAIL: apply_remote_offer not called for matching Offer (attempt=2, expected=2)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-5 — Newer attempt Offer MUST call apply_remote_offer.
+    ///
+    /// GIVEN: expected_attempt = 1, drain receives OfferReceived(offer, attempt=2).
+    /// THEN:  apply_remote_offer called exactly once (newer is accepted by >= rule).
+    ///
+    /// RED until T1.9 + T1.11.
+    #[test]
+    fn sc_ge_5_newer_offer_accepted_by_drain() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        let expected_attempt = Arc::new(AtomicU8::new(1)); // expected is 1
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-5-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_5: spawn drain thread");
+
+        // Inject newer Offer (attempt=2 > expected=1).
+        let newer_offer = SdpOffer("v=0\r\nnewer".to_string());
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(newer_offer, 2))
+            .expect("sc_ge_5: send newer OfferReceived");
+
+        // Let drain process.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Verify: apply_remote_offer called exactly once.
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-5 FAIL: apply_remote_offer not called for newer Offer (attempt=2, expected=1)"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
+    }
+
+    /// SC-GE-6 — expected_attempt advances on Reconnecting state change.
+    ///
+    /// GIVEN: expected_attempt Arc starts at 1.
+    /// WHEN: Arc is written to 2 externally (simulating coordinator store on Reconnecting{2}).
+    /// THEN: OfferReceived(offer, 1) is rejected; OfferReceived(offer, 2) is accepted.
+    ///
+    /// RED until T1.9 + T1.11 (Arc threaded, store + guard implemented).
+    #[test]
+    fn sc_ge_6_expected_attempt_advances_on_reconnecting_state_change() {
+        use sm_domain::signaling::{SdpOffer, SignalingEvent};
+        use std::sync::mpsc::sync_channel;
+
+        // Coordinator writes this Arc on StateChanged(Reconnecting{attempt}).
+        let expected_attempt = Arc::new(AtomicU8::new(1));
+        let (counting_recv, call_count) = GeCountingReceiver::new();
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
+        let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+
+        let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(8);
+        let stop_clone = stop_flag.clone();
+        let sup_clone = sup_tx.clone();
+        let ea_clone = expected_attempt.clone();
+
+        let drain_handle = std::thread::Builder::new()
+            .name("sc-ge-6-drain".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    sig_ev_rx,
+                    recv_ops,
+                    pub_ops,
+                    stop_clone,
+                    sup_clone,
+                    DrainRole::Primary,
+                    ea_clone,
+                );
+            })
+            .expect("sc_ge_6: spawn drain thread");
+
+        // Simulate coordinator: StateChanged(Reconnecting{attempt: 2}) → store(2).
+        expected_attempt.store(2, Ordering::Release);
+
+        // Inject stale Offer (attempt=1 < new expected=2) → must be rejected.
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\nstale-ge6".to_string()),
+                1,
+            ))
+            .expect("sc_ge_6: send stale offer");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "SC-GE-6 FAIL: stale Offer (attempt=1, expected=2) must be rejected"
+        );
+
+        // Inject matching Offer (attempt=2 == expected=2) → must be accepted.
+        sig_ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\nmatching-ge6".to_string()),
+                2,
+            ))
+            .expect("sc_ge_6: send matching offer");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SC-GE-6 FAIL: matching Offer (attempt=2, expected=2) must be accepted"
+        );
+
+        // Cleanup.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(sig_ev_tx);
+        let _ = drain_handle.join();
     }
 }

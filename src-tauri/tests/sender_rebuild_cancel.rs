@@ -15,7 +15,7 @@
 //   - Set old_stop_flag at the exact point under test, then release the block.
 //   - Assert the signal_tx receives RebuildFailed (not RebuildSucceeded).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -88,7 +88,7 @@ fn cancel_gate_a_stop_before_hook_fires_rebuild_failed() {
     let bridge_cache = make_cache(ch.clone());
 
     // Builder must NOT be called — it panics if called.
-    let builder = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+    let builder = Arc::new(move |_, _, _, _, _| -> Result<SenderBundle, BundleError> {
         panic!("Gate A: builder must not be called when stop_flag is already set");
     });
 
@@ -98,6 +98,7 @@ fn cancel_gate_a_stop_before_hook_fires_rebuild_failed() {
         bridge_session,
         old_stop_flag.clone(),
         1,
+        Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
     );
 
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(4);
@@ -141,7 +142,7 @@ fn cancel_gate_b_stop_during_teardown_fires_rebuild_failed() {
 
     let builder_called = Arc::new(AtomicBool::new(false));
     let builder_called_for_check = builder_called.clone();
-    let builder = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+    let builder = Arc::new(move |_, _, _, _, _| -> Result<SenderBundle, BundleError> {
         builder_called_for_check.store(true, Ordering::Relaxed);
         Ok(SenderBundle::test_stub())
     });
@@ -152,6 +153,7 @@ fn cancel_gate_b_stop_during_teardown_fires_rebuild_failed() {
         bridge_session,
         old_stop_flag.clone(),
         1,
+        Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
     );
 
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(4);
@@ -205,7 +207,7 @@ fn cancel_gate_c_stop_during_build_fires_rebuild_failed() {
     let release_rx = Arc::new(Mutex::new(release_rx));
 
     let release_rx_for_builder = release_rx.clone();
-    let builder = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+    let builder = Arc::new(move |_, _, _, _, _| -> Result<SenderBundle, BundleError> {
         // Block until the test releases us.
         let _ = release_rx_for_builder
             .lock()
@@ -220,6 +222,7 @@ fn cancel_gate_c_stop_during_build_fires_rebuild_failed() {
         bridge_session.clone(),
         old_stop_flag.clone(),
         1,
+        Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
     );
 
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(4);
@@ -292,7 +295,7 @@ fn cancel_gate_d_stop_during_swap_fires_rebuild_failed() {
     let (release_tx, release_rx) = sync_channel::<()>(1);
     let release_rx = Arc::new(Mutex::new(release_rx));
 
-    let builder = Arc::new(move |_, _, _, _| -> Result<SenderBundle, BundleError> {
+    let builder = Arc::new(move |_, _, _, _, _| -> Result<SenderBundle, BundleError> {
         // Notify test that builder has started and is about to block.
         let _ = builder_started_tx.send(());
         // Block until test releases us.
@@ -309,6 +312,7 @@ fn cancel_gate_d_stop_during_swap_fires_rebuild_failed() {
         bridge_session.clone(),
         old_stop_flag.clone(),
         1,
+        Arc::new(AtomicU8::new(1)), // T1.10: default epoch — test doesn't drive epoch
     );
 
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(4);

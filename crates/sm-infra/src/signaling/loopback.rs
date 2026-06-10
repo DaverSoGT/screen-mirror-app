@@ -48,7 +48,8 @@ use sm_domain::signaling::{
 /// [`SignalingEvent`] on the peer's `event_tx`.
 #[derive(Debug, Clone)]
 enum LoopbackFrame {
-    Offer(SdpOffer),
+    /// Offer with associated supervisor attempt number (REQ-GE-1).
+    Offer(SdpOffer, u8),
     Answer(SdpAnswer),
     Candidate(IceCandidate),
 }
@@ -107,7 +108,7 @@ impl LoopbackRelay {
 
 fn frame_to_event(frame: LoopbackFrame) -> SignalingEvent {
     match frame {
-        LoopbackFrame::Offer(o) => SignalingEvent::OfferReceived(o),
+        LoopbackFrame::Offer(o, attempt) => SignalingEvent::OfferReceived(o, attempt),
         LoopbackFrame::Answer(a) => SignalingEvent::AnswerReceived(a),
         LoopbackFrame::Candidate(c) => SignalingEvent::CandidateReceived(c),
     }
@@ -212,12 +213,13 @@ impl Signaling for LoopbackSignaling {
 
     /// Relay the local SDP offer to the peer.
     ///
-    /// The peer receives `SignalingEvent::OfferReceived` on its `event_tx`.
-    fn publish_local_offer(&self, offer: SdpOffer) -> Result<(), SignalingError> {
+    /// The peer receives `SignalingEvent::OfferReceived(offer, attempt)` on its `event_tx`.
+    /// `attempt` is the supervisor reconnect-attempt number (REQ-GE-1).
+    fn publish_local_offer(&self, offer: SdpOffer, attempt: u8) -> Result<(), SignalingError> {
         if !self.running {
             return Err(SignalingError::NotRunning);
         }
-        self.peer_relay.relay(LoopbackFrame::Offer(offer))
+        self.peer_relay.relay(LoopbackFrame::Offer(offer, attempt))
     }
 
     /// Relay the local SDP answer to the peer.
@@ -292,18 +294,19 @@ mod tests {
         a.start(a_event_tx).unwrap();
 
         let offer = SdpOffer("v=0\r\n".to_string());
-        a.publish_local_offer(offer.clone()).unwrap();
+        a.publish_local_offer(offer.clone(), 1).unwrap();
 
         let ev = b_event_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("expected SignalingEvent::OfferReceived on side B within 1 s");
 
         match ev {
-            SignalingEvent::OfferReceived(received) => {
+            SignalingEvent::OfferReceived(received, attempt) => {
                 assert_eq!(
                     received, offer,
                     "received offer must equal the published offer"
                 );
+                assert_eq!(attempt, 1, "attempt must be relayed through loopback");
             }
             other => panic!("expected OfferReceived, got {other:?}"),
         }
@@ -394,7 +397,7 @@ mod tests {
         a.start(event_tx).unwrap();
         a.stop().unwrap();
 
-        let result = a.publish_local_offer(SdpOffer("v=0".to_string()));
+        let result = a.publish_local_offer(SdpOffer("v=0".to_string()), 1);
         assert!(
             matches!(result, Err(SignalingError::NotRunning)),
             "expected Err(NotRunning) after stop(), got {result:?}"
