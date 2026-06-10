@@ -33,7 +33,7 @@
 
 use std::io::{self, BufReader, BufWriter, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -175,6 +175,18 @@ pub struct MdnsSignaling {
     /// threaded into `run_frame_loop`, so raising it never closes an
     /// already-accepted live connection (SC-HO-1b). Sibling seam to `suppress_bye`.
     superseded: Arc<AtomicBool>,
+    /// The attempt number from the LAST `MdnsControl::Offer` drained from the inbox.
+    ///
+    /// Stamped by `run_frame_loop` on every `MdnsControl::Offer(_, att)` drain
+    /// (D-8, REQ-BYE-2). At teardown the frame loop loads this value (Acquire)
+    /// and writes `Bye { attempt }` so the peer can filter stale-generation Byes
+    /// (REQ-BYE-4). Seeded to 0 — an offer-less connection emits `Bye{attempt:0}`;
+    /// any real receiver floor is ≥1, so `0 < floor` is always true → dropped.
+    ///
+    /// On non-Windows targets the frame loop body is dead code, but this field
+    /// is read on all targets to stamp the teardown Bye. Clippy cross-target will
+    /// confirm no dead_code warning here (if it fires, add cfg_attr as in half-1).
+    last_offer_attempt: Arc<AtomicU8>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -188,6 +200,8 @@ impl Signaling for MdnsSignaling {
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
             suppress_bye: Arc::new(AtomicBool::new(false)),
             superseded: Arc::new(AtomicBool::new(false)),
+            // D-8 (REQ-BYE-2): seeded 0; set to last drained Offer attempt in run_frame_loop.
+            last_offer_attempt: Arc::new(AtomicU8::new(0)),
         })
     }
 
@@ -206,6 +220,7 @@ impl Signaling for MdnsSignaling {
         let supervisor_signal_tx = Arc::clone(&self.supervisor_signal_tx);
         let suppress_bye = Arc::clone(&self.suppress_bye);
         let superseded = Arc::clone(&self.superseded);
+        let last_offer_attempt = Arc::clone(&self.last_offer_attempt);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
@@ -218,6 +233,7 @@ impl Signaling for MdnsSignaling {
                     supervisor_signal_tx,
                     suppress_bye,
                     superseded,
+                    last_offer_attempt,
                 );
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
@@ -520,6 +536,7 @@ pub(crate) fn frame_to_event(
 // ─── Thread entry point ───────────────────────────────────────────────────────
 
 /// Dispatch to the sender or receiver thread based on role.
+#[allow(clippy::too_many_arguments)]
 fn run_signaling_thread(
     config: SignalingConfig,
     stop: Arc<AtomicBool>,
@@ -528,6 +545,7 @@ fn run_signaling_thread(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
     superseded: Arc<AtomicBool>,
+    last_offer_attempt: Arc<AtomicU8>,
 ) {
     match config.role {
         // `superseded` gates ONLY the sender accept loop (listener handover, B).
@@ -540,6 +558,7 @@ fn run_signaling_thread(
             supervisor_signal_tx,
             suppress_bye,
             superseded,
+            last_offer_attempt,
         ),
         SignalingRole::Receiver => run_receiver_thread(
             config,
@@ -548,6 +567,7 @@ fn run_signaling_thread(
             event_tx,
             supervisor_signal_tx,
             suppress_bye,
+            last_offer_attempt,
         ),
     }
 }
@@ -636,6 +656,7 @@ fn accept_one_with_gate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sender_thread(
     config: SignalingConfig,
     stop: Arc<AtomicBool>,
@@ -644,6 +665,7 @@ fn run_sender_thread(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
     superseded: Arc<AtomicBool>,
+    last_offer_attempt: Arc<AtomicU8>,
 ) {
     let port = config.control_port;
 
@@ -771,6 +793,7 @@ fn run_sender_thread(
         event_tx,
         supervisor_signal_tx,
         suppress_bye,
+        last_offer_attempt,
     );
     let _ = mdns.shutdown();
 }
@@ -784,6 +807,7 @@ fn run_receiver_thread(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
+    last_offer_attempt: Arc<AtomicU8>,
 ) {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
@@ -871,6 +895,7 @@ fn run_receiver_thread(
         event_tx,
         supervisor_signal_tx,
         suppress_bye,
+        last_offer_attempt,
     );
     let _ = mdns.shutdown();
 }
@@ -887,6 +912,7 @@ fn run_frame_loop(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
+    last_offer_attempt: Arc<AtomicU8>,
 ) {
     // D6 instrumentation: assign a unique signaling-instance id to this connection
     // so the HW operator can correlate which listener/connection served it (and,
@@ -970,12 +996,16 @@ fn run_frame_loop(
             // emitting Bye on a connection the peer may still be using. The instance
             // id lets the HW operator confirm whether the Bye came from the offer-
             // bearing generation or a stale one.
+            // D-8 (REQ-BYE-2): stamp teardown Bye with the last drained Offer attempt.
+            // Release-Acquire pairing: last_offer_attempt was stored with Release on
+            // MdnsControl::Offer drain; we load with Acquire here so the value is
+            // always at least as fresh as the last stored attempt.
+            let bye_att = last_offer_attempt.load(Ordering::Acquire);
             eprintln!(
-                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, sending Bye(attempt=0)"
+                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, \
+                 sending Bye(attempt={bye_att})"
             );
-            // D-8 (REQ-BYE-2): stamp with last_offer_attempt (set to 0 until T-06 adds the atomic).
-            // T-06 will replace the literal 0 with last_offer_attempt.load(Acquire).
-            let _ = write_frame(&mut writer, &SignalingFrame::Bye { attempt: 0 });
+            let _ = write_frame(&mut writer, &SignalingFrame::Bye { attempt: bye_att });
             break;
         }
 
@@ -983,10 +1013,16 @@ fn run_frame_loop(
         let pending: Vec<MdnsControl> = inbox.lock().unwrap().drain(..).collect();
         for msg in pending {
             let frame = match msg {
-                MdnsControl::Offer(o, att) => SignalingFrame::Offer {
-                    sdp: o.0,
-                    attempt: att,
-                },
+                MdnsControl::Offer(o, att) => {
+                    // D-8 (REQ-BYE-2): track the last-drained Offer attempt so the
+                    // teardown Bye carries the correct generation stamp.
+                    // Store with Release so the teardown load(Acquire) sees this value.
+                    last_offer_attempt.store(att, Ordering::Release);
+                    SignalingFrame::Offer {
+                        sdp: o.0,
+                        attempt: att,
+                    }
+                }
                 MdnsControl::Answer(a) => SignalingFrame::Answer { sdp: a.0 },
                 MdnsControl::Candidate(c) => SignalingFrame::Candidate { sdp: c.0 },
                 MdnsControl::ReconnectRequest {
@@ -1701,7 +1737,7 @@ mod tests {
 
     use std::io::{self, Read};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use crate::signaling::mdns::read_frame_or_pending;
     use crate::signaling::wire::{SignalingFrame, write_frame};
@@ -2156,7 +2192,8 @@ mod tests {
     }
 
     /// Spawn `run_frame_loop` on the accepted server side of a loopback TCP pair.
-    /// Returns the client stream, the stop flag, and the loop's thread handle.
+    /// Returns the client stream, the stop flag, the loop's thread handle, and the
+    /// `last_offer_attempt` atomic (so tests can inspect / pre-seed it).
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     fn spawn_frame_loop_over_loopback(
@@ -2165,6 +2202,24 @@ mod tests {
         std::net::TcpStream,
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
+    ) {
+        let (client, stop, handle, _last_offer_attempt) =
+            spawn_frame_loop_over_loopback_with_attempt(suppress_bye, Arc::new(AtomicU8::new(0)));
+        (client, stop, handle)
+    }
+
+    /// Extended variant of `spawn_frame_loop_over_loopback` that exposes `last_offer_attempt`.
+    /// Used by T-06 tests.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_frame_loop_over_loopback_with_attempt(
+        suppress_bye: Arc<AtomicBool>,
+        last_offer_attempt: Arc<AtomicU8>,
+    ) -> (
+        std::net::TcpStream,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        Arc<AtomicU8>,
     ) {
         use std::net::{TcpListener, TcpStream};
 
@@ -2176,6 +2231,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_loop = Arc::clone(&stop);
         let suppress_loop = Arc::clone(&suppress_bye);
+        let last_offer_loop = Arc::clone(&last_offer_attempt);
         let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
         let inbox: Arc<Mutex<Vec<super::MdnsControl>>> = Arc::new(Mutex::new(Vec::new()));
         let supervisor: Arc<
@@ -2190,10 +2246,116 @@ mod tests {
                 event_tx,
                 supervisor,
                 suppress_loop,
+                last_offer_loop,
             );
         });
 
-        (client, stop, handle)
+        (client, stop, handle, last_offer_attempt)
+    }
+
+    // ─── T-06 / D-8: last_offer_attempt stored on Offer drain; teardown Bye carries it ──
+
+    /// T-06 / D-8 — last_offer_attempt is stored when MdnsControl::Offer is drained.
+    ///
+    /// GIVEN: a frame loop with inbox pre-loaded with MdnsControl::Offer(sdp, 3).
+    /// WHEN:  the inbox is drained in the frame loop's outbound pass.
+    /// THEN:  last_offer_attempt == 3 (REQ-BYE-2, SC-CONV-2-1 stamp source).
+    ///
+    /// Mechanism: we inject the Offer into the inbox BEFORE unblocking the loop,
+    /// stop the loop immediately, then check last_offer_attempt before joining.
+    #[test]
+    fn last_offer_attempt_stored_on_offer_drain() {
+        use super::MdnsControl;
+        use sm_domain::signaling::SdpOffer;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let _client = TcpStream::connect(addr).expect("connect client");
+        let (server, _peer) = listener.accept().expect("accept server");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let suppress_bye = Arc::new(AtomicBool::new(true)); // suppress to avoid Bye write complexity
+        let suppress_loop = Arc::clone(&suppress_bye);
+        let last_offer_attempt = Arc::new(AtomicU8::new(0));
+        let last_offer_loop = Arc::clone(&last_offer_attempt);
+
+        // Pre-seed the inbox with an Offer(sdp, 3) so the first drain iteration stores att=3.
+        let inbox: Arc<Mutex<Vec<MdnsControl>>> = Arc::new(Mutex::new(vec![MdnsControl::Offer(
+            SdpOffer("v=0\r\n".to_string()),
+            3,
+        )]));
+        let inbox_loop = Arc::clone(&inbox);
+
+        let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
+        let supervisor: Arc<
+            Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
+        > = Arc::new(Mutex::new(None));
+
+        let handle = std::thread::spawn(move || {
+            super::run_frame_loop(
+                server,
+                stop_loop,
+                inbox_loop,
+                event_tx,
+                supervisor,
+                suppress_loop,
+                last_offer_loop,
+            );
+        });
+
+        // Give the loop time to drain the inbox (one poll cycle ≈ READ_TIMEOUT = 100ms).
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        // Assert last_offer_attempt was updated to 3.
+        let stored = last_offer_attempt.load(Ordering::Acquire);
+        assert_eq!(
+            stored, 3,
+            "T-06/D-8: last_offer_attempt must be 3 after draining Offer(sdp, 3), got {stored}"
+        );
+
+        // Stop the loop.
+        stop.store(true, Ordering::Release);
+        handle.join().expect("frame loop must join");
+    }
+
+    /// T-06 / D-8 — teardown Bye carries last_offer_attempt value (REQ-BYE-2).
+    ///
+    /// GIVEN: last_offer_attempt pre-seeded to 2.
+    /// WHEN:  stop flag is set (suppress_bye=false so the Bye is written).
+    /// THEN:  the wire frame received by the peer is `Bye { attempt: 2 }`.
+    #[test]
+    fn teardown_bye_carries_last_offer_attempt() {
+        use crate::signaling::wire::SignalingFrame;
+
+        let last_offer_attempt = Arc::new(AtomicU8::new(2));
+        let suppress_bye = Arc::new(AtomicBool::new(false));
+        let (mut client, stop, handle, _) =
+            spawn_frame_loop_over_loopback_with_attempt(suppress_bye, last_offer_attempt);
+
+        // Read Hello (sent on connection).
+        let hello = read_next_frame_or_eof(&mut client)
+            .expect("read hello")
+            .expect("hello frame must arrive");
+        assert!(
+            matches!(hello, SignalingFrame::Hello { .. }),
+            "expected Hello, got {hello:?}"
+        );
+
+        // Trigger teardown.
+        stop.store(true, Ordering::Release);
+
+        // Read the Bye frame — must carry attempt=2.
+        let next = read_next_frame_or_eof(&mut client)
+            .expect("read after stop")
+            .expect("T-06/D-8: teardown Bye must be written (suppress_bye=false)");
+        assert!(
+            matches!(next, SignalingFrame::Bye { attempt: 2 }),
+            "T-06/D-8: teardown Bye must carry attempt=2, got {next:?}"
+        );
+
+        handle.join().expect("frame loop thread must join");
     }
 
     /// SC-D3-1 — With `suppress_bye=true`, the frame loop exits on the stop flag
