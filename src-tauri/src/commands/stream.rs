@@ -72,6 +72,7 @@ pub const FRAME_STATUS: u8 = 0x02;
 /// genuinely-recoverable outages still ride out (issue #62), but finite so the
 /// success-but-absent-peer loop terminates with a single terminal
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
 
 // ─── ChannelLike — abstraction over tauri::ipc::Channel for testability ──────
