@@ -4402,13 +4402,12 @@ mod tests {
         // arm at drain entry and fire purely on the deadline. The hook's Stop (sent
         // right after RebuildSucceeded) proves the firing path survives the production
         // kill sequence that makes the coordinator-armed watchdog a no-op.
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Allow: drain-entry arm (150ms) → fire → Reconnecting cycle (~110ms).
         std::thread::sleep(Duration::from_millis(900));
@@ -4443,13 +4442,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // NO IceConnected — the drain-entry watchdog must fire.
         std::thread::sleep(Duration::from_millis(900));
@@ -4483,13 +4481,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Deliver IceConnected promptly — BEFORE the 150ms deadline — to disarm.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
@@ -4529,13 +4526,12 @@ mod tests {
         use std::time::Duration;
 
         // Generation 1: a fresh drain arms at entry, fires once, breaks.
-        let (channel_a, ev_tx_a, stop_flag_a, join_a) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel_a, ev_tx_a, stop_flag_a, join_a) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_a.store(true, Ordering::Relaxed);
         drop(ev_tx_a);
@@ -4544,13 +4540,12 @@ mod tests {
 
         // Generation 2: a second fresh drain (a new generation) arms a new one-shot
         // deadline at its own entry and fires once.
-        let (channel_b, ev_tx_b, stop_flag_b, join_b) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel_b, ev_tx_b, stop_flag_b, join_b) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_b.store(true, Ordering::Relaxed);
         drop(ev_tx_b);
@@ -4581,13 +4576,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None, // CAP-2-v3: unbounded — preserve original single-gen semantics
-                std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
-                true, // arm (post-rebuild steady-state drain)
-            );
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Cold connect: deliver IceConnected before the short deadline — disarms.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
@@ -4805,7 +4799,10 @@ mod tests {
 
         let fast_policy = ReconnectPolicy {
             max_attempts: std::num::NonZeroU8::new(3).unwrap(),
-            backoff: BackoffSchedule::Exponential { base_ms: 1, factor: 1 },
+            backoff: BackoffSchedule::Exponential {
+                base_ms: 1,
+                factor: 1,
+            },
         };
 
         let hooks = super::SenderCoordinatorHooks {

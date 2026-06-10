@@ -7539,9 +7539,9 @@ mod tests {
                     Duration::from_millis(100), // rebuild_timeout
                     hooks,
                     watchdog_timeout,
-                    max_fires, // CAP-2-v3 fire cap
-                    fires,     // CAP-2-v3 shared cross-generation counter
-                    arm,       // CAP-2-v3 arm flag (post-rebuild)
+                    max_fires,                  // CAP-2-v3 fire cap
+                    fires,                      // CAP-2-v3 shared cross-generation counter
+                    arm,                        // CAP-2-v3 arm flag (post-rebuild)
                     Arc::new(AtomicU8::new(1)), // T1.9: default epoch — these tests don't drive the stale-guard
                 );
             })
@@ -7576,13 +7576,12 @@ mod tests {
         // arm at drain entry and fire purely on the deadline. The hook's Stop (sent
         // right after RebuildSucceeded) proves the firing path survives the production
         // kill sequence that makes the coordinator-armed watchdog a no-op.
-        let (fake_ch, ev_tx, stop_flag, handle) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch, ev_tx, stop_flag, handle) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Allow: drain-entry arm (150ms) → fire → Reconnecting cycle (~110ms).
         std::thread::sleep(Duration::from_millis(900));
@@ -7614,13 +7613,12 @@ mod tests {
     /// GREEN (after relocation): exactly 1 reconnecting.
     #[test]
     fn sc_wd_s1_no_media_fires_local_failure() {
-        let (fake_ch, ev_tx, stop_flag, handle) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch, ev_tx, stop_flag, handle) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // NO MediaData — the drain-entry watchdog must fire.
         std::thread::sleep(Duration::from_millis(900));
@@ -7651,13 +7649,12 @@ mod tests {
     /// Observable: MediaData disarms → watchdog never fires → exactly 0 reconnecting.
     #[test]
     fn sc_wd_s2_media_disarms_watchdog() {
-        let (fake_ch, ev_tx, stop_flag, handle) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch, ev_tx, stop_flag, handle) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Deliver MediaData promptly — BEFORE the 150ms deadline — to disarm.
         let _ = ev_tx.try_send(TransportEvent::MediaData);
@@ -7694,13 +7691,12 @@ mod tests {
     #[test]
     fn sc_wd_s3_one_shot_per_drain_generation() {
         // Generation 1: a fresh drain arms at entry, fires once, breaks.
-        let (fake_ch_a, ev_tx_a, stop_flag_a, handle_a) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch_a, ev_tx_a, stop_flag_a, handle_a) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_a.store(true, Ordering::Relaxed);
         drop(ev_tx_a);
@@ -7709,13 +7705,12 @@ mod tests {
 
         // Generation 2: a second fresh drain (a new generation) arms a new one-shot
         // deadline at its own entry and fires once.
-        let (fake_ch_b, ev_tx_b, stop_flag_b, handle_b) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch_b, ev_tx_b, stop_flag_b, handle_b) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_b.store(true, Ordering::Relaxed);
         drop(ev_tx_b);
@@ -7743,13 +7738,12 @@ mod tests {
     /// (dying) watchdog.
     #[test]
     fn sc_wd_s4_no_extra_cycle_on_clean_media() {
-        let (fake_ch, ev_tx, stop_flag, handle) =
-            spawn_stream_watchdog_drain(
-                Some(Duration::from_millis(150)),
-                None,                       // CAP-2-v3: unbounded — preserve original single-gen semantics
-                Arc::new(AtomicU8::new(0)), // throwaway counter
-                true,                       // arm (post-rebuild steady-state drain)
-            );
+        let (fake_ch, ev_tx, stop_flag, handle) = spawn_stream_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            Arc::new(AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Cold connect: deliver MediaData before the short deadline — disarms.
         let _ = ev_tx.try_send(TransportEvent::MediaData);
