@@ -114,8 +114,15 @@ pub enum SignalingEvent {
     AnswerReceived(SdpAnswer),
     /// Remote ICE candidate arrived (either side).
     CandidateReceived(IceCandidate),
-    /// Signaling closed cleanly (both sides exchanged Bye).
-    Closed,
+    /// Signaling closed.
+    ///
+    /// - `Some(n)` — a wire `Bye { attempt: n }` arrived from the peer (D-1).
+    ///   The attempt value enables the receiver drain to filter stale-generation
+    ///   Byes (REQ-BYE-4). `n` is the emitter's last published Offer attempt.
+    /// - `None` — a transport-level close with no attempt context: TCP EOF (mdns.rs
+    ///   EOF path) or any clean-close that is not a tagged Bye. EOF is always honored
+    ///   (the socket is genuinely gone — never a stale replay).
+    Closed { attempt: Option<u8> },
     /// Fatal error; signaling thread exits after this event.
     Error(SignalingError),
 }

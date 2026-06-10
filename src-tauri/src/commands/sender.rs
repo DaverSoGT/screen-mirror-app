@@ -652,7 +652,11 @@ pub fn run_sender_signaling_drain(
                 SignalingEvent::OfferReceived(_, _) => {
                     // Sender role: ignore incoming offers.
                 }
-                SignalingEvent::Closed => {
+                SignalingEvent::Closed { .. } => {
+                    // D-7: mechanical shape update only — behavior unchanged.
+                    // The sender drain does NOT need a stale-Bye filter (D-7 justified):
+                    // this arm only emits PeerLost and breaks its OWN drain;
+                    // it does not forward LocalFailure{PeerBye} to the supervisor.
                     emit_event(&channel, &SenderStatusEvent::PeerLost);
                     break;
                 }
@@ -3473,7 +3477,7 @@ mod tests {
             );
 
         // Inject a SignalingEvent into the post-reset channel.
-        let send_result = sig_ev_tx.try_send(SignalingEvent::Closed);
+        let send_result = sig_ev_tx.try_send(SignalingEvent::Closed { attempt: None });
         assert!(
             send_result.is_ok(),
             "sc_srr_2 FAILED: sig_ev_tx send returned {:?} — channel disconnected. \
@@ -4016,7 +4020,9 @@ mod tests {
             .send(SignalingEvent::Error(SignalingError::Io("nic down".into())))
             .unwrap();
         // Send Closed so the drain exits cleanly (no spin on stop_flag needed).
-        sig_ev_tx.send(SignalingEvent::Closed).unwrap();
+        sig_ev_tx
+            .send(SignalingEvent::Closed { attempt: None })
+            .unwrap();
 
         // Drain thread must join without panic — that is the single invariant here.
         thread

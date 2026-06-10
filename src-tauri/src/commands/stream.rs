@@ -1049,9 +1049,10 @@ fn run_signaling_drain(
                         eprintln!("[sm-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
-                SignalingEvent::Closed => {
-                    // D-3 (REQ-A): forward Closed → supervisor as LocalFailure{PeerBye}.
-                    // Best-effort: if the supervisor channel is None or full, we still exit.
+                SignalingEvent::Closed { .. } => {
+                    // T-05 mechanical stub: Closed shape updated for D-1 (Option<u8> attempt).
+                    // Full D-4 filter logic (stale-Bye drop) is added in Slice B (T-08).
+                    // For Slice A: honor all Closed events unconditionally (behavior unchanged).
                     eprintln!(
                         "[sm-signaling-drain] Closed → forwarding LocalFailure{{PeerBye}} to supervisor"
                     );
@@ -6181,7 +6182,7 @@ mod tests {
         // Inject Closed after the offer to verify D-3 + D-4 work together.
         // The drain thread should still be running (stop_flag not set yet).
         sig_ev_tx
-            .send(SignalingEvent::Closed)
+            .send(SignalingEvent::Closed { attempt: Some(1) })
             .expect("SC-F-002: inject Closed after offer");
 
         let sup_signal = spy_sup_rx.recv_timeout(Duration::from_millis(500)).expect(
@@ -6281,7 +6282,7 @@ mod tests {
 
         // ── WHEN: inject Closed ────────────────────────────────────────────
         sig_ev_tx
-            .send(SignalingEvent::Closed)
+            .send(SignalingEvent::Closed { attempt: Some(1) })
             .expect("send Closed event");
 
         // ── THEN: supervisor receives LocalFailure{PeerBye} within 500ms ──
@@ -6386,7 +6387,7 @@ mod tests {
 
         // ── WHEN: inject Closed (simulates sender Bye reaching drain) ────────
         sig_ev_tx
-            .send(SignalingEvent::Closed)
+            .send(SignalingEvent::Closed { attempt: Some(1) })
             .expect("inject Closed");
 
         // ── THEN: supervisor receives LocalFailure{PeerBye} within 500ms ─────
@@ -7076,7 +7077,7 @@ mod tests {
         // outer stop_flag check, the send will fail — that is also acceptable per
         // REQ-NO-REGRESS-2 ("drain MAY exit without forward if supervisor already in
         // teardown state"). The assertion below handles both paths.
-        let send_result = sig_ev_tx.send(SignalingEvent::Closed);
+        let send_result = sig_ev_tx.send(SignalingEvent::Closed { attempt: Some(1) });
 
         drain_handle
             .join()
@@ -7407,7 +7408,7 @@ mod tests {
 
         // Now inject Closed — the drain must still forward PeerBye.
         sig_ev_tx
-            .send(SignalingEvent::Closed)
+            .send(SignalingEvent::Closed { attempt: Some(1) })
             .expect("sc_rdf_2: send Closed");
 
         drain_handle
