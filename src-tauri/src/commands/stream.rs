@@ -1035,6 +1035,12 @@ fn run_signaling_drain(
                     }
                     match receiver.apply_remote_offer(offer) {
                         Ok(answer) => {
+                            // D-5 (REQ-BYE-5): advance the stale-Bye floor to the live generation
+                            // the moment we apply its Offer. MUST be the first statement in this
+                            // arm, before publish_local_answer. Use fetch_max (AcqRel) — never
+                            // regresses the floor even if W1 races to store a lower value from
+                            // a concurrent Reconnecting outcome. See design §D-5 / §R-1 proof.
+                            let _ = expected_attempt.fetch_max(offer_attempt, Ordering::AcqRel);
                             if let Err(e) = signaling.publish_local_answer(answer) {
                                 eprintln!("[sm-signaling-drain] publish_local_answer failed: {e}");
                             }
@@ -1049,10 +1055,23 @@ fn run_signaling_drain(
                         eprintln!("[sm-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
-                SignalingEvent::Closed { .. } => {
-                    // T-05 mechanical stub: Closed shape updated for D-1 (Option<u8> attempt).
-                    // Full D-4 filter logic (stale-Bye drop) is added in Slice B (T-08).
-                    // For Slice A: honor all Closed events unconditionally (behavior unchanged).
+                SignalingEvent::Closed {
+                    attempt: bye_attempt,
+                } => {
+                    // D-4 (REQ-BYE-4): stale-Bye filter.
+                    // Drop strictly-older Byes (bye_attempt < floor) — drain stays alive.
+                    // Honor: bye_attempt >= floor (genuine current/ahead gen) OR None (EOF).
+                    if let Some(ba) = bye_attempt {
+                        let floor = expected_attempt.load(Ordering::Acquire);
+                        if ba < floor {
+                            eprintln!(
+                                "[sm-signaling-drain] stale Bye attempt={ba} floor={floor}; \
+                                 dropping, drain stays alive (REQ-BYE-4)"
+                            );
+                            continue; // DROP — drain stays alive, live session survives
+                        }
+                    }
+                    // Some(ba >= floor) or None (EOF) → genuine or current-gen close → honor.
                     eprintln!(
                         "[sm-signaling-drain] Closed → forwarding LocalFailure{{PeerBye}} to supervisor"
                     );
@@ -8371,5 +8390,427 @@ mod tests {
         stop_flag.store(true, Ordering::Relaxed);
         drop(sig_ev_tx);
         let _ = drain_handle.join();
+    }
+
+    // ─── T-08/T-09: D-4/D-5 drain-harness helpers ────────────────────────────
+
+    /// Shared harness for the D-4 stale-Bye filter and D-5 floor-tracking tests.
+    ///
+    /// Returns:
+    /// - `sig_ev_tx`: sender side of the signaling event channel (feed events here)
+    /// - `sup_rx`: receiver side of the supervisor signal channel (check for LocalFailure)
+    /// - `expected_attempt`: the AtomicU8 floor shared with the drain
+    /// - `stop_flag`: set to `true` to ask the drain to exit
+    /// - `drain_handle`: join handle for the spawned drain thread
+    #[allow(clippy::type_complexity)]
+    fn spawn_drain_harness(
+        initial_floor: u8,
+    ) -> (
+        std::sync::mpsc::SyncSender<SignalingEvent>,
+        std::sync::mpsc::Receiver<SupervisorSignal>,
+        Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use sm_domain::signaling::{SdpAnswer, SdpOffer};
+        use std::sync::mpsc::sync_channel;
+
+        struct NoopReceiver;
+        impl SignalingReceiverOps for NoopReceiver {
+            fn apply_remote_offer(&self, _: SdpOffer) -> Result<SdpAnswer, TransportError> {
+                Ok(SdpAnswer("v=0\r\nanswer".to_string()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct NoopPublish;
+        impl SignalingPublishOps for NoopPublish {
+            fn publish_local_answer(
+                &self,
+                _: SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+        }
+
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(16);
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let expected = Arc::new(AtomicU8::new(initial_floor));
+
+        let stop_clone = stop_flag.clone();
+        let expected_clone = expected.clone();
+        let sup_tx_arc = Arc::new(Mutex::new(Some(sup_tx)));
+
+        let handle = std::thread::Builder::new()
+            .name("test-drain-harness".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    ev_rx,
+                    Arc::new(NoopReceiver),
+                    Arc::new(NoopPublish),
+                    stop_clone,
+                    sup_tx_arc,
+                    DrainRole::Primary,
+                    expected_clone,
+                );
+            })
+            .expect("spawn drain harness");
+
+        (ev_tx, sup_rx, expected, stop_flag, handle)
+    }
+
+    /// SC-CONV-2-3 — Stale Bye is dropped; drain survives.
+    ///
+    /// floor=2, inject Closed{attempt:Some(1)}: drain MUST NOT emit LocalFailure
+    /// and MUST remain alive (continue processing further events).
+    #[test]
+    fn stale_bye_is_dropped_drain_stays_alive() {
+        let (ev_tx, sup_rx, _expected, stop_flag, handle) = spawn_drain_harness(2);
+
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: Some(1) })
+            .expect("send stale Bye");
+
+        // Give drain 100ms to process. A stale Bye must be dropped (continue),
+        // so the drain must still be alive and no supervisor signal must appear.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // No LocalFailure must have been sent.
+        assert!(
+            sup_rx.try_recv().is_err(),
+            "SC-CONV-2-3 FAIL: stale Bye attempt=1 floor=2 must NOT emit LocalFailure"
+        );
+
+        // Drain must still be alive: send a second event and give it time.
+        ev_tx
+            .send(SignalingEvent::PeerFound {
+                host: "test".to_string(),
+                port: 1234,
+            })
+            .expect("drain must still be alive after stale Bye drop");
+
+        // Clean up.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        handle.join().expect("drain thread panicked");
+    }
+
+    /// SC-CONV-2-4 / SC-CONV-2-7 — Equal-attempt Bye is honored.
+    ///
+    /// floor=2, inject Closed{attempt:Some(2)}: drain MUST emit LocalFailure{PeerBye}
+    /// and exit.
+    #[test]
+    fn equal_attempt_bye_is_honored() {
+        let (ev_tx, sup_rx, _expected, _stop_flag, handle) = spawn_drain_harness(2);
+
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: Some(2) })
+            .expect("send equal-attempt Bye");
+
+        handle.join().expect("drain thread panicked");
+
+        let sig = sup_rx
+            .try_recv()
+            .expect("SC-CONV-2-4 FAIL: drain must emit LocalFailure when bye_attempt == floor");
+        assert!(
+            matches!(
+                sig,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-CONV-2-4 FAIL: wrong supervisor signal: {sig:?}"
+        );
+    }
+
+    /// SC-CONV-2-8 — Higher-attempt Bye is honored.
+    ///
+    /// floor=1, inject Closed{attempt:Some(2)}: drain MUST emit LocalFailure{PeerBye}
+    /// and exit.
+    #[test]
+    fn higher_attempt_bye_is_honored() {
+        let (ev_tx, sup_rx, _expected, _stop_flag, handle) = spawn_drain_harness(1);
+
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: Some(2) })
+            .expect("send higher-attempt Bye");
+
+        handle.join().expect("drain thread panicked");
+
+        let sig = sup_rx
+            .try_recv()
+            .expect("SC-CONV-2-8 FAIL: drain must emit LocalFailure when bye_attempt > floor");
+        assert!(
+            matches!(
+                sig,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-CONV-2-8 FAIL: wrong supervisor signal: {sig:?}"
+        );
+    }
+
+    /// D-1 EOF rule — Closed{attempt:None} is always honored regardless of floor.
+    #[test]
+    fn eof_closed_none_is_always_honored() {
+        let (ev_tx, sup_rx, _expected, _stop_flag, handle) = spawn_drain_harness(5);
+
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: None })
+            .expect("send EOF Closed");
+
+        handle.join().expect("drain thread panicked");
+
+        let sig = sup_rx
+            .try_recv()
+            .expect("EOF Closed{None} must always emit LocalFailure regardless of floor");
+        assert!(
+            matches!(
+                sig,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "EOF Closed must emit LocalFailure{{PeerBye}}: {sig:?}"
+        );
+    }
+
+    // ─── T-09: D-5 floor-tracking tests ──────────────────────────────────────
+
+    /// Spawn a drain harness where apply_remote_offer tracks the applied offer attempt.
+    ///
+    /// Returns the same tuple as `spawn_drain_harness` plus `apply_call_count` Arc.
+    #[allow(clippy::type_complexity)]
+    fn spawn_drain_harness_with_apply_tracking(
+        initial_floor: u8,
+    ) -> (
+        std::sync::mpsc::SyncSender<SignalingEvent>,
+        std::sync::mpsc::Receiver<SupervisorSignal>,
+        Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        use sm_domain::signaling::{SdpAnswer, SdpOffer};
+        use std::sync::atomic::AtomicU32;
+        use std::sync::mpsc::sync_channel;
+
+        struct TrackingReceiver {
+            apply_count: Arc<AtomicU32>,
+        }
+        impl SignalingReceiverOps for TrackingReceiver {
+            fn apply_remote_offer(&self, _: SdpOffer) -> Result<SdpAnswer, TransportError> {
+                self.apply_count.fetch_add(1, Ordering::Relaxed);
+                Ok(SdpAnswer("v=0\r\nanswer".to_string()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct NoopPublish2;
+        impl SignalingPublishOps for NoopPublish2 {
+            fn publish_local_answer(
+                &self,
+                _: SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+        }
+
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(16);
+        let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let expected = Arc::new(AtomicU8::new(initial_floor));
+        let apply_count = Arc::new(AtomicU32::new(0));
+
+        let stop_clone = stop_flag.clone();
+        let expected_clone = expected.clone();
+        let sup_tx_arc = Arc::new(Mutex::new(Some(sup_tx)));
+        let count_clone = apply_count.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("test-drain-tracking".into())
+            .spawn(move || {
+                run_signaling_drain(
+                    ev_rx,
+                    Arc::new(TrackingReceiver {
+                        apply_count: count_clone,
+                    }),
+                    Arc::new(NoopPublish2),
+                    stop_clone,
+                    sup_tx_arc,
+                    DrainRole::Primary,
+                    expected_clone,
+                );
+            })
+            .expect("spawn drain harness with tracking");
+
+        (ev_tx, sup_rx, expected, stop_flag, handle, apply_count)
+    }
+
+    /// SC-CONV-2-6 — Floor advances on Offer-apply.
+    ///
+    /// Start floor=1, inject OfferReceived(offer, 2) → successful apply.
+    /// Then assert expected_attempt == 2.
+    #[test]
+    fn floor_advances_on_offer_apply() {
+        use sm_domain::signaling::SdpOffer;
+
+        let (ev_tx, _sup_rx, expected, stop_flag, handle, _count) =
+            spawn_drain_harness_with_apply_tracking(1);
+
+        ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\noffer".to_string()),
+                2,
+            ))
+            .expect("send offer");
+
+        // Wait for drain to process.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            expected.load(Ordering::Acquire),
+            2,
+            "SC-CONV-2-6 FAIL: expected_attempt must advance to 2 after OfferReceived(attempt=2)"
+        );
+
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        handle.join().expect("drain thread panicked");
+    }
+
+    /// SC-CONV-2-5 — Stale Bye{attempt=1} dropped after Offer{attempt=2} applied.
+    ///
+    /// Primary R-1 proof: floor starts at 1 (post PeerBye reset), Offer{2} advances
+    /// it to 2, then stale Bye{1} is dropped (1 < 2).
+    #[test]
+    fn stale_bye_dropped_after_offer2_applied() {
+        use sm_domain::signaling::SdpOffer;
+
+        let (ev_tx, sup_rx, _expected, stop_flag, handle, _count) =
+            spawn_drain_harness_with_apply_tracking(1);
+
+        // Step 1: Apply Offer{attempt=2} → floor advances to 2.
+        ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\noffer".to_string()),
+                2,
+            ))
+            .expect("send offer");
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Step 2: Inject stale Bye{attempt=1} → must be dropped.
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: Some(1) })
+            .expect("send stale Bye");
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // No LocalFailure must appear.
+        assert!(
+            sup_rx.try_recv().is_err(),
+            "SC-CONV-2-5 FAIL: stale Bye attempt=1 must be dropped after floor advanced to 2 (R-1 proof)"
+        );
+
+        // Drain must still be alive.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        handle.join().expect("drain thread panicked");
+    }
+
+    /// SC-CONV-2-6 negative — Stale Offer is still rejected after floor advances.
+    ///
+    /// After floor advances to 2, Offer{attempt=1} must be rejected by the guard.
+    #[test]
+    fn stale_offer_still_rejected_after_floor_advances() {
+        use sm_domain::signaling::SdpOffer;
+
+        let (ev_tx, _sup_rx, expected, stop_flag, handle, apply_count) =
+            spawn_drain_harness_with_apply_tracking(1);
+
+        // Advance floor to 2 by applying Offer{2}.
+        ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\noffer2".to_string()),
+                2,
+            ))
+            .expect("send offer2");
+
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(expected.load(Ordering::Acquire), 2, "floor must be 2 now");
+        assert_eq!(apply_count.load(Ordering::Relaxed), 1, "first apply done");
+
+        // Now send a stale Offer{attempt=1} — must be rejected by the guard.
+        ev_tx
+            .send(SignalingEvent::OfferReceived(
+                SdpOffer("v=0\r\noffer1".to_string()),
+                1,
+            ))
+            .expect("send stale offer");
+
+        std::thread::sleep(Duration::from_millis(80));
+
+        assert_eq!(
+            apply_count.load(Ordering::Relaxed),
+            1,
+            "SC-CONV-2-6 neg FAIL: stale Offer attempt=1 must NOT be applied when floor=2"
+        );
+
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        handle.join().expect("drain thread panicked");
+    }
+
+    /// SC-CONV-2-13 — Initial session: floor=1 + Bye{attempt=1} is honored.
+    ///
+    /// Regression-guards the initial case: the floor=1 + Bye{attempt=1} combination
+    /// must honor, not drop.
+    #[test]
+    fn initial_session_bye_attempt1_floor1_honored() {
+        let (ev_tx, sup_rx, _expected, _stop_flag, handle) = spawn_drain_harness(1);
+
+        ev_tx
+            .send(SignalingEvent::Closed { attempt: Some(1) })
+            .expect("send initial-session Bye");
+
+        handle.join().expect("drain thread panicked");
+
+        let sig = sup_rx
+            .try_recv()
+            .expect("SC-CONV-2-13 FAIL: initial Bye attempt=1 floor=1 must be honored");
+        assert!(
+            matches!(
+                sig,
+                SupervisorSignal::LocalFailure {
+                    trigger: ReconnectTrigger::PeerBye
+                }
+            ),
+            "SC-CONV-2-13 FAIL: wrong signal: {sig:?}"
+        );
     }
 }

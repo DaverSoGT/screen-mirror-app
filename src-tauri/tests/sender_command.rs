@@ -353,6 +353,7 @@ fn stop_sender_fake_session_drains_handles() {
                 drain_handles: vec![h],
                 shutdown: None,
                 backend_name: "sw_fake".to_string(),
+                suppress_bye_on_rebuild: None,
             })
         }),
     });
@@ -1022,6 +1023,7 @@ fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
                     drop(tracker);
                 })),
                 backend_name: "sw_fake".to_string(),
+                suppress_bye_on_rebuild: None,
             })
         },
     ));

@@ -187,6 +187,15 @@ pub struct SenderBundle {
     /// Production: set by `capture_backend_and_erase` in the builder.
     /// Test stubs: `"sw_fake"` sentinel (matches `FakeVideoEncoder::backend_name()`).
     pub backend_name: String,
+    /// D-6 (REQ-BYE-6): rebuild-only hook to suppress the OLD generation's teardown Bye
+    /// BEFORE the shutdown closure runs. The rebuild worker (step 6) calls this hook
+    /// (if Some) before `s.shutdown.take()()`, so the OLD signaling instance has
+    /// `suppress_bye = true` before its frame loop exits and emits a Bye.
+    ///
+    /// MUST NOT be called by `stop_sender_session_internal` (genuine stop preserves
+    /// the Bye for the receiver's PeerBye eager-wake, R-5). `None` for test stubs
+    /// and the non-Windows stub builder.
+    pub suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SenderBundle {
@@ -198,6 +207,7 @@ impl SenderBundle {
             drain_handles: vec![],
             shutdown: None,
             backend_name: "sw_fake".to_string(),
+            suppress_bye_on_rebuild: None,
         }
     }
 }
@@ -252,6 +262,10 @@ pub struct SenderSession {
     pub counters: Arc<SenderCounters>,
     /// Production-only ordered teardown closure (C1 fix). See [`SenderBundle::shutdown`].
     pub shutdown: Option<Box<dyn FnOnce() + Send>>,
+    /// D-6 (REQ-BYE-6): rebuild-only hook to suppress the OLD generation's teardown Bye.
+    /// Propagated from the bundle that produced this session. Rebuild step 6 calls this
+    /// (if Some) BEFORE `s.shutdown.take()()`. Genuine stop does NOT call it (R-5).
+    pub suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Canonical backend token captured at construction time (DD2 ordering invariant).
     /// Immutable after session start — never mutated by any path (R9).
     backend_name: String,
@@ -271,6 +285,7 @@ impl SenderSession {
         counters: Arc<SenderCounters>,
         shutdown: Option<Box<dyn FnOnce() + Send>>,
         backend_name: String,
+        suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             stop_flag,
@@ -278,6 +293,7 @@ impl SenderSession {
             channel,
             counters,
             shutdown,
+            suppress_bye_on_rebuild,
             backend_name,
         }
     }
@@ -1454,6 +1470,7 @@ pub fn start_sender_inner(
         Arc::new(SenderCounters::default()),
         bundle.shutdown,
         bundle.backend_name,
+        bundle.suppress_bye_on_rebuild,
     );
     *bridge.session.lock().unwrap() = Some(session);
     *bridge.current_args.lock().unwrap() = Some(SenderArgs {
@@ -1643,6 +1660,16 @@ pub fn make_sender_rebuild_hook(
                 // The OLD drain exits naturally when it polls `stop_flag = true` (step 14).
                 let old_session = { bridge_session.lock().unwrap().take() };
                 if let Some(mut s) = old_session {
+                    // D-6 (REQ-BYE-6): suppress the OLD generation's teardown Bye BEFORE
+                    // running the shutdown closure. This sets suppress_bye=true on the OLD
+                    // MdnsSignaling instance before stop() fires, so the frame loop reads
+                    // suppress_bye=true and takes the SUPPRESSED branch (no Bye emitted).
+                    //
+                    // CRITICAL R-5 GUARD: stop_sender_session_internal does NOT call this
+                    // hook — it only runs `shutdown`. Genuine user-stop Byes are preserved.
+                    if let Some(ref hook) = s.suppress_bye_on_rebuild {
+                        hook();
+                    }
                     // Run the shutdown closure to drop production resources in order
                     // (capture → sender_arc → encoder_arc → signaling_arc). For test
                     // stubs this is a no-op (shutdown = None). The drain threads hold
@@ -1704,6 +1731,12 @@ pub fn make_sender_rebuild_hook(
                         Arc::new(SenderCounters::default()),
                         new_bundle.shutdown,
                         new_bundle.backend_name,
+                        // D-6 (REQ-BYE-6): propagate the NEW bundle's suppress hook into
+                        // the new SenderSession so a future rebuild of THIS generation
+                        // can suppress ITS Bye. Each bundle gets a fresh hook pointing
+                        // at ITS own signaling instance; the OLD hook is on the OLD s
+                        // (already consumed above in step 6).
+                        new_bundle.suppress_bye_on_rebuild,
                     ));
                 }
 
@@ -2112,6 +2145,10 @@ fn build_production_sender_bundle(
     let signaling_arc = Arc::new(Mutex::new(signaling));
     // Clone for the production coordinator hooks BEFORE moving into shutdown.
     let signaling_for_hooks = signaling_arc.clone();
+    // D-6 (REQ-BYE-6): clone for the suppress_bye_on_rebuild hook. Kept separate
+    // from signaling_for_hooks so the hook closure does not capture the entire
+    // coordinator-hooks struct.
+    let signaling_for_suppress = signaling_arc.clone();
 
     // D-RBF-1 (REQ-RBL-2): Wrap signaling_arc in the refresh adapter so
     // enter_supervisor_mode can push the live signal_tx into MdnsSignaling.
@@ -2374,10 +2411,22 @@ fn build_production_sender_bundle(
         drop(signaling_arc); // drops AFTER signaling_for_hooks clones — correct lifecycle
     });
 
+    // D-6 (REQ-BYE-6): build the rebuild-only suppress hook. Captures a clone of
+    // signaling_for_suppress (Arc<Mutex<MdnsSignaling>>). The rebuild worker calls
+    // this BEFORE the shutdown closure so suppress_bye=true is set on the OLD instance
+    // before its frame loop exits and emits a teardown Bye (ordering guaranteed by D-6).
+    let suppress_bye_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>> = Some(Arc::new(move || {
+        signaling_for_suppress
+            .lock()
+            .unwrap()
+            .suppress_outbound_bye();
+    }));
+
     Ok(SenderBundle {
         drain_handles: vec![sig_drain, tr_drain],
         shutdown: Some(shutdown),
         backend_name,
+        suppress_bye_on_rebuild,
     })
 }
 
@@ -2476,13 +2525,16 @@ mod tests {
     // ─── SC-S1-001: eager sender supervisor — Bye at t≈0 reaches supervisor ─────
     //
     // REQ-S1 / D-5: The sender supervisor MUST be created eagerly at bundle-build
-    // time. When frame_to_event(Bye) is called AND supervisor_signal_tx is Some(_),
-    // it MUST send LocalFailure{PeerBye} to the supervisor.
+    // time so supervisor_signal_tx is Some(_) before signaling starts (no None
+    // window). Per D-3 (REQ-BYE-3) the eager frame_to_event(Bye) send was removed:
+    // a peer Bye is now honored on a single route, where the drain path forwards
+    // LocalFailure{PeerBye} to the supervisor.
     //
-    // This test simulates the S-1 path directly: spawn a ReconnectSupervisor in
-    // Connected state, wire its sup_tx, send LocalFailure{PeerBye} via the wired
-    // channel (as frame_to_event Bye-arm would), assert the supervisor transitions
-    // to AwaitingAck (outcome = StateChanged(Reconnecting)) within 100ms.
+    // This test exercises the supervisor's reaction to that drain-forwarded signal:
+    // spawn a ReconnectSupervisor in Connected state, wire its sup_tx, inject
+    // LocalFailure{PeerBye} via the wired channel (standing in for the drain-path
+    // forward), assert the supervisor transitions to AwaitingAck
+    // (outcome = StateChanged(Reconnecting)) within 100ms.
     //
     // GREEN: The supervisor state machine already handles LocalFailure in Connected
     // state. This test verifies the WIRING path end-to-end (eager channel creation
@@ -2533,7 +2585,8 @@ mod tests {
             .expect("spawn supervisor");
 
         // ── WHEN: send LocalFailure{PeerBye} immediately (t≈0ms) ─────────────
-        // This simulates frame_to_event(Bye) sending to the supervisor after S-1.
+        // This stands in for the drain path forwarding LocalFailure{PeerBye} to the
+        // supervisor — the single honor-route for a peer Bye after D-3 (REQ-BYE-3).
         // SC-S1-001 verifies the supervisor channel is Some(_) and receives the signal.
         let sup_tx_guard = supervisor_signal_tx.lock().unwrap();
         assert!(
@@ -2784,6 +2837,7 @@ mod tests {
                 drain_handles: vec![drain],
                 shutdown: None,
                 backend_name: "test".to_string(),
+                suppress_bye_on_rebuild: None,
             })
         });
 
@@ -3101,6 +3155,7 @@ mod tests {
                 drain_handles: vec![drain],
                 shutdown: None,
                 backend_name: "test".to_string(),
+                suppress_bye_on_rebuild: None,
             })
         });
 
@@ -4074,6 +4129,7 @@ mod tests {
                 drain_handles: vec![drain],
                 shutdown: None,
                 backend_name: "spy".to_string(),
+                suppress_bye_on_rebuild: None,
             })
         });
 
@@ -4871,6 +4927,171 @@ mod tests {
             ice_failed, 1,
             "SC-WD-RA: the sole Dead must be the supervisor's \"ice_failed_repeatedly\", \
              got {ice_failed}"
+        );
+    }
+
+    // ─── T-10/T-11: SC-CONV-2-10/2-11 suppress_bye_on_rebuild hook tests ──────
+
+    /// SC-CONV-2-10 — rebuild step 6 calls the suppress hook BEFORE shutdown.
+    ///
+    /// Uses make_sender_rebuild_hook with a session that has both suppress_bye_on_rebuild
+    /// and shutdown set. Asserts suppress fires before shutdown.
+    #[test]
+    fn rebuild_step6_calls_suppress_hook_before_shutdown() {
+        use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
+        use sm_domain::supervisor::SupervisorSignal as SuperSig;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_for_suppress = call_order.clone();
+        let order_for_shutdown = call_order.clone();
+
+        let suppress_was_called = Arc::new(AtomicBool::new(false));
+        let suppress_clone = suppress_was_called.clone();
+
+        let shutdown_was_called = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown_was_called.clone();
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            Some(Box::new(move || {
+                order_for_shutdown.lock().unwrap().push("shutdown");
+                shutdown_clone.store(true, Ordering::Relaxed);
+            })),
+            "sw_fake".to_string(),
+            Some(Arc::new(move || {
+                order_for_suppress.lock().unwrap().push("suppress");
+                suppress_clone.store(true, Ordering::Relaxed);
+            })),
+        );
+
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
+
+        let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
+        struct FakeChForCache;
+        impl super::ChannelLike for FakeChForCache {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = Arc::new(Mutex::new(Some(super::RestartCache {
+            udp_port: 0,
+            service_name: "test".to_string(),
+            channel: Arc::new(FakeChForCache),
+            session_nonce: 0,
+        })));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let hook = make_sender_rebuild_hook(
+            Arc::new(move |_udp, _svc, _stop, _ch, _att| {
+                Ok(SenderBundle {
+                    drain_handles: vec![],
+                    shutdown: None,
+                    backend_name: "sw_fake".to_string(),
+                    suppress_bye_on_rebuild: None,
+                })
+            }),
+            cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+            Arc::new(AtomicU8::new(1)),
+        );
+
+        hook(sig_tx);
+
+        let signal = sig_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rebuild must emit RebuildSucceeded");
+        assert!(
+            matches!(signal, SuperSig::RebuildSucceeded),
+            "expected RebuildSucceeded, got {signal:?}"
+        );
+        let _ = sig_rx.recv_timeout(Duration::from_millis(200));
+
+        assert!(
+            suppress_was_called.load(Ordering::Relaxed),
+            "SC-CONV-2-10 FAIL: suppress_bye_on_rebuild hook must be called in rebuild step 6"
+        );
+        assert!(
+            shutdown_was_called.load(Ordering::Relaxed),
+            "SC-CONV-2-10 FAIL: shutdown must also be called in rebuild step 6"
+        );
+        let order = call_order.lock().unwrap().clone();
+        assert_eq!(
+            order.as_slice(),
+            &["suppress", "shutdown"],
+            "SC-CONV-2-10 FAIL: suppress MUST be called BEFORE shutdown, got {order:?}"
+        );
+    }
+
+    /// SC-CONV-2-11 / R-5 — stop_sender_session_internal does NOT call suppress hook.
+    ///
+    /// Genuine stop must NOT invoke suppress_bye_on_rebuild (R-5 guard).
+    #[test]
+    fn genuine_stop_does_not_call_suppress_hook() {
+        use super::{
+            SenderBridge, SenderBundle, SenderCounters, SenderSession, stop_sender_session_internal,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FakeCh2;
+        impl super::ChannelLike for FakeCh2 {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let hook_clone = hook_called.clone();
+
+        let bridge =
+            SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh2),
+            Arc::new(SenderCounters::default()),
+            None,
+            "sw_fake".to_string(),
+            Some(Arc::new(move || {
+                hook_clone.store(true, Ordering::Relaxed);
+            })),
+        );
+        *bridge.session.lock().unwrap() = Some(session);
+
+        stop_sender_session_internal(&bridge);
+
+        assert!(
+            !hook_called.load(Ordering::Relaxed),
+            "SC-CONV-2-11 / R-5 FAIL: stop_sender_session_internal must NOT call \
+             suppress_bye_on_rebuild"
+        );
+    }
+
+    /// SC-CONV-2-11b — test_stub() sets suppress_bye_on_rebuild to None.
+    #[test]
+    fn new_generation_suppress_is_none() {
+        use super::SenderBundle;
+        let bundle = SenderBundle::test_stub();
+        assert!(
+            bundle.suppress_bye_on_rebuild.is_none(),
+            "SC-CONV-2-11b FAIL: test_stub() must have suppress_bye_on_rebuild = None"
         );
     }
 }
