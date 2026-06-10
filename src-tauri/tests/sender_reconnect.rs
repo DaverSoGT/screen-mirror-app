@@ -733,6 +733,10 @@ fn make_supervised_bridge_with_rebuild_hook(
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                             None, // watchdog disabled in reconnect tests
+                            // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                            None,
+                            Arc::new(AtomicU8::new(0)),
+                            false,
                         );
                     })
                     .expect("spawn drain");
@@ -926,6 +930,10 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                             None, // watchdog disabled in reconnect tests
+                            // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                            None,
+                            Arc::new(AtomicU8::new(0)),
+                            false,
                         );
                     })
                     .expect("spawn");
@@ -1258,6 +1266,10 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                             None, // watchdog disabled in reconnect tests
+                            // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                            None,
+                            Arc::new(AtomicU8::new(0)),
+                            false,
                         );
                     })
                     .expect("spawn drain");
@@ -1533,6 +1545,10 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                             None, // watchdog disabled in reconnect tests
+                            // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                            None,
+                            Arc::new(AtomicU8::new(0)),
+                            false,
                         );
                     })
                     .expect("spawn drain");

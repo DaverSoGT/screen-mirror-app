@@ -75,6 +75,24 @@
     if (cancelBtn) cancelBtn.style.display = "none";
   }
 
+  // S-conf1 (CAP-2-v3): map terminal dead `reason` tokens to human-readable copy.
+  // CAP-2-v3 introduced new machine tokens (peer_unreachable, ice_failed_repeatedly)
+  // that would otherwise leak raw into the dead-modal as "Connection lost: peer_unreachable".
+  // Only mapped tokens get bespoke copy; any other/absent reason keeps the existing
+  // "Connection lost: <reason|unknown>" fallback (behavior unchanged). Kept symmetric
+  // with dist/mse-client.js.
+  const DEAD_REASON_COPY = {
+    peer_unreachable: "The other device is unreachable",
+    ice_failed_repeatedly: "The connection failed repeatedly",
+  };
+
+  function humanDeadReason(reason) {
+    if (reason && Object.prototype.hasOwnProperty.call(DEAD_REASON_COPY, reason)) {
+      return DEAD_REASON_COPY[reason];
+    }
+    return "Connection lost: " + (reason || "unknown");
+  }
+
   // ── Channel message handler ──────────────────────────────────────────────────
 
   function handleMessage(value) {
@@ -99,17 +117,18 @@
           .catch(function () {});
         break;
       case "reconnecting":
-        // Transient reconnect status — show attempt N of max (AC-2).
-        statusDiv.textContent =
-          "Reconnecting (attempt " + value.attempt + "/" + value.max + ")…";
+        // CAP-2-v3 (REQ-WD-10): honest count-free copy. The bounded retry window can
+        // last up to ~60s (issue #62); the frontend cannot distinguish the supervisor's
+        // real retry from the post-watchdog wait, so the misleading "attempt X/max"
+        // denominator is removed in favour of a clear "still waiting" message.
+        statusDiv.textContent = "Reconnecting… waiting for the viewer";
         errorDiv.textContent = "";
         hideDeadButtons();
         senderMode = "reconnecting";
         break;
       case "dead":
         // All reconnect attempts exhausted — show error + Retry/Cancel (AC-7).
-        errorDiv.textContent =
-          "Connection lost: " + (value.reason || "unknown");
+        errorDiv.textContent = humanDeadReason(value.reason);
         statusDiv.textContent = "Disconnected";
         showDeadButtons();
         senderMode = "dead";

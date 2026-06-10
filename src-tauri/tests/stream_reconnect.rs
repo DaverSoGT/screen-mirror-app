@@ -559,6 +559,10 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                         // Media-arrival watchdog disabled — this V2 rebuild-hook
                         // bridge does not exercise the post-rebuild watchdog.
                         None,
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                         Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
@@ -754,6 +758,10 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                         hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                         Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
@@ -1066,8 +1074,14 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                             t,
                             hooks,
                             // Media-arrival watchdog disabled — this generation-chain
-                            // test does not exercise the post-rebuild watchdog.
+                            // test does not exercise the post-rebuild watchdog. (The
+                            // CAP-2-v3 cross-generation cap is covered deterministically
+                            // by the in-module SC-WD-CAP tests sharing one counter Arc.)
                             None,
+                            // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                            None,
+                            Arc::new(AtomicU8::new(0)),
+                            false,
                             Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                         );
                     })
@@ -1346,6 +1360,10 @@ fn rebuild_releases_udp_port_before_rebind() {
                         hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                         Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
@@ -1517,6 +1535,10 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                         hooks,
                         // Media-arrival watchdog disabled for this drain.
                         None,
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                         Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })

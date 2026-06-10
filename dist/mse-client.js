@@ -160,7 +160,8 @@ function dismissReconnectOverlayOnRecovery() {
 // reconnecting frame. Transitions from Stage 1 (silent) to Stage 2 (visible).
 // Deferred teardown fires HERE — the last frozen frame was visible throughout
 // Stage 1; we teardown now because the overlay will cover the blanked video.
-// Uses pendingReconnectAttempt (the LATEST counter, not attempt 1) for text.
+// Uses pendingReconnectAttempt only as the reveal gate; the text is count-free
+// (CAP-2-v3 FIX-1) — no "/N" denominator, just the honest waiting copy.
 // Uses module-scoped reconnectingOverlay (assigned at parse time, always
 // available when the timer fires). D-SSR-5.
 function revealReconnectingOverlay() {
@@ -170,9 +171,16 @@ function revealReconnectingOverlay() {
   // reconnectingOverlay is the module-scoped variable assigned below at parse
   // time; by the time this timer callback fires it is fully initialized.
   if (reconnectingOverlay && pendingReconnectAttempt) {
+    // CAP-2-v3 FIX-1 (R-F extension to the overlay): the Stage-2 overlay is the
+    // surface the user actually stares at during the absent-peer wait, so it must
+    // NOT render the misleading "/N" denominator. The transport can keep retrying
+    // for ~60s (issue #62) and the frontend cannot distinguish the supervisor's
+    // real retry from the post-watchdog wait — the same honest, count-free copy as
+    // the reconnecting status line is used here. The presence of pendingReconnectAttempt
+    // is still the gate (deferred teardown + timer logic unchanged); only the text
+    // is count-free.
     reconnectingOverlay.textContent =
-      "Reconnecting (attempt " + pendingReconnectAttempt.attempt +
-      "/" + pendingReconnectAttempt.max + ")...";
+      "Reconnecting… waiting for the other device";
     reconnectingOverlay.hidden = false;
   }
 }
@@ -446,6 +454,24 @@ if (deadRoleChangeEl) {
   });
 }
 
+// S-conf1 (CAP-2-v3): map terminal dead `reason` tokens to human-readable copy.
+// CAP-2-v3 introduced new machine tokens (peer_unreachable, ice_failed_repeatedly)
+// that would otherwise leak raw into the dead-modal as "Connection lost: peer_unreachable".
+// Only mapped tokens get bespoke copy; any other/absent reason keeps the existing
+// "Connection lost: <reason|unknown>" fallback (behavior unchanged). Kept symmetric
+// with dist/sender.js.
+const DEAD_REASON_COPY = {
+  peer_unreachable: "The other device is unreachable",
+  ice_failed_repeatedly: "The connection failed repeatedly",
+};
+
+function humanDeadReason(reason) {
+  if (reason && Object.prototype.hasOwnProperty.call(DEAD_REASON_COPY, reason)) {
+    return DEAD_REASON_COPY[reason];
+  }
+  return "Connection lost: " + (reason || "unknown");
+}
+
 function handleStatus(payload) {
   console.log("[mse-client] status:", payload.kind, payload);
   switch (payload.kind) {
@@ -454,7 +480,12 @@ function handleStatus(payload) {
       cancelAutoRetry();
       // Capture most-recent attempt/max for the deferred overlay reveal (D-SSR-3).
       pendingReconnectAttempt = { attempt: payload.attempt, max: payload.max };
-      setStatus("Reconnecting (attempt " + payload.attempt + "/" + payload.max + ")...");
+      // CAP-2-v3 (REQ-WD-10): honest count-free copy. The bounded retry window can last
+      // up to ~60s (issue #62) and the frontend cannot distinguish the supervisor's real
+      // retry from the post-watchdog wait, so the misleading "attempt X/max" denominator
+      // is removed. The deferred Stage-2 silent-recovery overlay is now ALSO count-free
+      // (CAP-2-v3 FIX-1) — it renders the same honest waiting copy, no "/N" denominator.
+      setStatus("Reconnecting… waiting for the other device");
       // DO NOT call tearDownMse() here — deferred to Stage 2 reveal or streaming/dead
       // so the last frozen video frame stays visible during the silent window (REQ-SSR-4).
       // DO NOT show the overlay yet — Stage 1 is silent (REQ-SSR-3).
@@ -490,8 +521,7 @@ function handleStatus(payload) {
       if (reconnectingOverlay) reconnectingOverlay.hidden = true;
       if (deadModal) {
         if (deadReasonEl) {
-          deadReasonEl.textContent =
-            "Connection lost: " + (payload.reason || "unknown");
+          deadReasonEl.textContent = humanDeadReason(payload.reason);
         }
         deadModal.hidden = false;
       }

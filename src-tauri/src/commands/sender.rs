@@ -45,6 +45,16 @@ use tauri::ipc::InvokeResponseBody;
 
 pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 
+/// CAP-2-v3 (REQ-WD-7/9): production media-watchdog fire cap for the sender. Mirrors
+/// `stream::MEDIA_WATCHDOG_MAX_FIRES_PROD` (kept module-local for the same reason the
+/// sender mirrors `dead_reason_to_str` rather than importing it). At 6s per fire this is
+/// ≈60s of bounded absent-peer retry — wider than the supervisor's 3/9/27≈39s budget so
+/// genuinely-recoverable outages still ride out (issue #62), but finite so the
+/// success-but-absent-peer loop terminates with a single terminal
+/// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_sender_bundle); dead_code on other targets (memory #434)
+const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
+
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
 /// Seam used by `enter_supervisor_mode` to refresh the signaling layer's stored
@@ -305,6 +315,16 @@ pub struct SenderBridge {
     /// `SenderSession`) so `start_sender_inner` can provision the same Arc that the
     /// builder captures, before the session is constructed.
     pub supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+
+    /// CAP-2-v3 (REQ-WD-4): cross-generation media-watchdog consecutive-fire counter.
+    ///
+    /// Created ONCE in `new()`, captured into the builder closure (cloned into every
+    /// generation's `build_production_sender_bundle` → drain), and stored here so
+    /// `start_sender_inner` can RESET it to 0 on a genuinely-new connection episode.
+    /// Mirrors `StreamBridge::media_watchdog_fires`. Lives on the bridge (not the
+    /// session) because the session is replaced on rebuild but the absent-peer loop
+    /// spans generations. Disarm (first IceConnected) also resets it inside the drain.
+    pub(crate) media_watchdog_fires: Arc<AtomicU8>,
 }
 
 impl SenderBridge {
@@ -319,9 +339,15 @@ impl SenderBridge {
         let restart_cache_arc: Arc<Mutex<Option<RestartCache>>> = Arc::new(Mutex::new(None));
         let supervisor_signal_tx_arc: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
             Arc::new(Mutex::new(None));
+        // CAP-2-v3 (REQ-WD-4): the cross-generation fire counter is created ONCE here
+        // and shared into the builder closure so EVERY generation's drain increments the
+        // SAME counter. Cold-connect build passes `arm = false` (M1); the rebuild
+        // worker's inner closure passes `true`. Also stored on the bridge for reset.
+        let media_watchdog_fires: Arc<AtomicU8> = Arc::new(AtomicU8::new(0));
         let session_for_builder = session_arc.clone();
         let cache_for_builder = restart_cache_arc.clone();
         let sup_tx_for_builder = supervisor_signal_tx_arc.clone(); // D-RBF-1 (REQ-RBL-1)
+        let fires_for_builder = media_watchdog_fires.clone();
         Self {
             session: session_arc,
             builder: Arc::new(move |udp_port, service_name, stop_flag, channel, attempt| {
@@ -337,11 +363,16 @@ impl SenderBridge {
                     session_for_builder.clone(),
                     cache_for_builder.clone(),
                     sup_tx_for_builder.clone(), // D-RBF-1 (REQ-RBL-1)
+                    fires_for_builder.clone(),  // CAP-2-v3 shared cross-generation counter
+                    // M1 / D6: cold-connect generation does NOT arm the watchdog. The
+                    // rebuild worker's inner builder closure passes `true`.
+                    false,
                 )
             }),
             current_args: Mutex::new(None),
             restart_cache: restart_cache_arc,
             supervisor_signal_tx: supervisor_signal_tx_arc,
+            media_watchdog_fires,
         }
     }
 
@@ -353,6 +384,7 @@ impl SenderBridge {
             current_args: Mutex::new(None),
             restart_cache: Arc::new(Mutex::new(None)),
             supervisor_signal_tx: Arc::new(Mutex::new(None)),
+            media_watchdog_fires: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -383,6 +415,7 @@ impl SenderBridge {
             current_args: Mutex::new(None),
             restart_cache: Arc::new(Mutex::new(None)),
             supervisor_signal_tx,
+            media_watchdog_fires: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -421,6 +454,9 @@ impl SenderBridge {
             current_args: Mutex::new(None),
             restart_cache,
             supervisor_signal_tx,
+            // CAP-2-v3: tests using this constructor wire their own drains directly,
+            // so a fresh per-bridge counter is sufficient.
+            media_watchdog_fires: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -832,6 +868,11 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom(
         SenderCoordinatorHooks::noop(),
         Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>, // D-RBF-1
         None, // legacy wrapper — watchdog disabled
+        // CAP-2-v3: watchdog disabled here → cap/counter inert; arm = false. The
+        // production path supplies `Some(10)` + the bridge counter + the arm flag.
+        None,
+        Arc::new(AtomicU8::new(0)),
+        false,
     );
     // Note: `counters` not used in the hooks variant — kept in signature for backward compat.
     let _ = counters;
@@ -860,6 +901,21 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     // REQ-WD-6: injectable watchdog timeout (production = Some(6s); tests use
     // sub-millisecond or None). Mirrors stream.rs media_watchdog_timeout param.
     media_watchdog_timeout: Option<Duration>,
+    // CAP-2-v3 (REQ-WD-7/9): injectable fire cap. `Some(10)` in production (≈60s @ 6s);
+    // tests inject `Some(2..3)`. `None` = unbounded (back-compat for legacy/test wrappers).
+    // When the consecutive-fire counter reaches this cap the drain emits a terminal
+    // `Dead { reason: "peer_unreachable" }` instead of re-injecting IceFailed.
+    media_watchdog_max_fires: Option<u8>,
+    // CAP-2-v3 (REQ-WD-4): cross-generation consecutive-fire counter. Created ONCE in
+    // `SenderBridge::new()` and cloned into every generation's drain, so fires from
+    // multiple drain generations accumulate toward the cap (the absent-peer loop spans
+    // generations). Reset to 0 on a fresh session and on the first IceConnected (disarm).
+    media_watchdog_fires: Arc<AtomicU8>,
+    // CAP-2-v3 (REQ-WD-1 / M1): arm the watchdog only when this generation is expected
+    // to produce media — i.e. post-rebuild. Cold-connect bundle-build passes `false`
+    // (cold first-media measured at +5312ms = 88% of the 6s window; arming risks a
+    // spurious fire); the rebuild worker's builder invocation passes `true`.
+    arm_media_watchdog: bool,
 ) {
     let session_nonce: u64 = rand::random();
 
@@ -877,12 +933,19 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
     // a deadline armed here can actually elapse — unlike the old coordinator-armed
     // watchdog that the rebuild worker killed within microseconds (RCA #1020).
     //
-    // `Some(deadline)` while armed; `None` once disarmed or fired. The drain-entry
-    // arm also covers the cold connect: on the happy path `IceConnected` disarms it
-    // well within 6s; if a generation never produces media, firing IceFailed is the
-    // correct backstop (REQ-WD-4). Production deadline = 6s; tests inject a short one.
-    let mut watchdog_deadline: Option<std::time::Instant> =
-        media_watchdog_timeout.map(|t| std::time::Instant::now() + t);
+    // `Some(deadline)` while armed; `None` once disarmed or fired.
+    //
+    // CAP-2-v3 (REQ-WD-1 / M1): arm ONLY when `arm_media_watchdog` is true — i.e. for
+    // post-rebuild generations, which are genuinely expected to produce media. The
+    // cold-connect generation passes `false` (cold first-media was measured at +5312ms
+    // = 88% of the 6s window; arming risks a spurious fire with no outage). On the happy
+    // path `IceConnected` disarms it well within 6s; if a post-rebuild generation never
+    // connects, firing IceFailed is the correct backstop (REQ-WD-4).
+    let mut watchdog_deadline: Option<std::time::Instant> = if arm_media_watchdog {
+        media_watchdog_timeout.map(|t| std::time::Instant::now() + t)
+    } else {
+        None
+    };
     if watchdog_deadline.is_some() {
         eprintln!(
             "[sm-sender-media-watchdog n={session_nonce}] armed at drain entry — \
@@ -895,15 +958,39 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
             break;
         }
 
-        // REQ-WD-3: FIRE the watchdog if its deadline elapsed with no IceConnected.
-        // Re-inject IceFailed via `enter_supervisor_mode` — exactly like a real
-        // `TransportEvent::IceFailed` (this is the production re-entry path). One-shot
-        // per generation: the immediate `break 'drain` below makes it fire at most once.
+        // FIRE the watchdog if its deadline elapsed with no IceConnected.
+        //
+        // CAP-2-v3 fire-block (REQ-WD-3/7/8, R-A rule — mirror of stream.rs):
+        //   1. Increment the cross-generation counter FIRST (this fire is counted).
+        //   2. Cap-check FIRST, BEFORE any `enter_supervisor_mode` call: at the cap emit
+        //      a terminal `Dead { peer_unreachable }` and `break 'drain` WITHOUT
+        //      re-entering the supervisor — one Dead by construction (R-A §2.2).
+        //   3. Below the cap: re-inject IceFailed exactly as before (REQ-WD-3).
+        // A genuine RebuildFailed-Dead on the below-cap path terminates the supervisor
+        // and spawns NO successor drain, so the counter is never read again (R-A §2.1).
         if let Some(deadline) = watchdog_deadline {
             if std::time::Instant::now() >= deadline {
+                let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(cap) = media_watchdog_max_fires {
+                    if n >= cap {
+                        eprintln!(
+                            "[sm-sender-media-watchdog n={session_nonce}] fired {n}/{cap} \
+                             (CAP reached) — peer unreachable; emitting terminal Dead and \
+                             stopping (no supervisor re-entry)"
+                        );
+                        emit_event(
+                            &channel,
+                            &SenderStatusEvent::Dead {
+                                reason: "peer_unreachable".to_string(),
+                            },
+                        );
+                        break 'drain;
+                    }
+                }
                 eprintln!(
-                    "[sm-sender-media-watchdog n={session_nonce}] fired — NO IceConnected \
-                     within deadline; injecting IceFailed to drive a fresh supervisor cycle"
+                    "[sm-sender-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
+                     IceConnected within deadline; injecting IceFailed to drive a fresh \
+                     supervisor cycle"
                 );
                 enter_supervisor_mode(
                     ReconnectTrigger::IceFailed,
@@ -948,6 +1035,10 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
                              IceConnected arrived before deadline"
                         );
                     }
+                    // CAP-2-v3 (REQ-WD-4 / R-C): IceConnected proves the peer is present,
+                    // so the consecutive-absent-fire streak is broken — reset the
+                    // cross-generation counter to 0 (fresh ≈60s budget on a later drop).
+                    media_watchdog_fires.store(0, Ordering::Relaxed);
                     emit_event(&channel, &SenderStatusEvent::Streaming);
                     emit_event(
                         &channel,
@@ -1328,6 +1419,13 @@ pub fn start_sender_inner(
 
     // Reset the bridge-level supervisor_signal_tx for this new session.
     *bridge.supervisor_signal_tx.lock().unwrap() = None;
+
+    // CAP-2-v3 (REQ-WD-4 / R-C): reset the cross-generation media-watchdog fire counter
+    // at the start of a genuinely-new connection episode. The counter persists across
+    // rebuild generations WITHIN an episode (that is what bounds the absent-peer loop),
+    // but a fresh user-initiated start must begin with a clean ≈60s budget rather than
+    // inheriting a stale near-cap count from a prior episode.
+    bridge.media_watchdog_fires.store(0, Ordering::Relaxed);
 
     // Step 7 — invoke builder (no lock held).
     // T1.13: cold-start uses attempt=1 (supervisor's first generation).
@@ -1847,6 +1945,14 @@ fn build_production_sender_bundle(
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
     bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1 (REQ-RBL-1)
+    // CAP-2-v3 (REQ-WD-4): the bridge-owned cross-generation fire counter, cloned into
+    // this generation's drain so consecutive watchdog fires accumulate toward the cap.
+    media_watchdog_fires: Arc<AtomicU8>,
+    // CAP-2-v3 (REQ-WD-1 / M1 / D6): arm-post-rebuild provenance. The OUTER builder
+    // closure in `SenderBridge::new()` (cold connect) passes `false`; the INNER builder
+    // closure in `make_sender_rebuild_hook` (rebuild generation) passes `true`. This
+    // threads provenance WITHOUT widening `SenderBuilderFn` (both closures forward here).
+    arm_media_watchdog: bool,
 ) -> Result<SenderBundle, BundleError> {
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
@@ -2086,6 +2192,9 @@ fn build_production_sender_bundle(
                 let session_for_inner = _bridge_session.clone();
                 let cache_for_inner = _bridge_cache.clone();
                 let sup_tx_for_inner = bridge_supervisor_signal_tx.clone(); // D-RBF-1
+                // CAP-2-v3 (REQ-WD-4): forward the SAME cross-generation counter so each
+                // rebuilt generation increments the shared streak toward the cap.
+                let fires_for_inner = media_watchdog_fires.clone();
                 Arc::new(move |udp_port, service_name, stop_flag, channel, attempt| {
                     // C1 (REQ-GE-1/2): `attempt` is the live epoch read by
                     // make_sender_rebuild_hook (sender_attempt.load(Acquire)) before the
@@ -2100,6 +2209,11 @@ fn build_production_sender_bundle(
                         session_for_inner.clone(),
                         cache_for_inner.clone(),
                         sup_tx_for_inner.clone(), // D-RBF-1 (REQ-RBL-1)
+                        fires_for_inner.clone(),  // CAP-2-v3 shared counter
+                        // M1 / D6: this is the REBUILD path — every post-rebuild
+                        // generation arms the watchdog ("this generation should now
+                        // produce media" is a true expectation only post-rebuild).
+                        true,
                     )
                 })
             },
@@ -2216,6 +2330,9 @@ fn build_production_sender_bundle(
     // Both the transport drain and stop_sender_session_internal read from
     // this same Arc — supervisor lifecycle owns the slot end-to-end.
     let sup_tx_for_drain = bridge_supervisor_signal_tx.clone();
+    // CAP-2-v3 (REQ-WD-4): clone the bridge-owned cross-generation fire counter into
+    // this generation's drain so consecutive absent-peer fires accumulate toward the cap.
+    let media_watchdog_fires_for_drain = media_watchdog_fires.clone();
     let tr_drain = std::thread::Builder::new()
         .name("sm-sender-transport-drain".into())
         .spawn(move || {
@@ -2234,6 +2351,12 @@ fn build_production_sender_bundle(
                 // armed timer died on the rebuild worker's Stop before it could elapse.
                 // Disarmed on IceConnected; fires IceFailed on expiry.
                 Some(Duration::from_secs(6)),
+                // CAP-2-v3 (REQ-WD-7/9): production fire cap = 10 (≈60s @ 6s) — rides out
+                // long-but-recoverable outages (issue #62) yet guarantees termination at
+                // the absent-peer ceiling with a single terminal Dead { peer_unreachable }.
+                Some(MEDIA_WATCHDOG_MAX_FIRES_PROD),
+                media_watchdog_fires_for_drain, // CAP-2-v3 shared cross-generation counter
+                arm_media_watchdog,             // CAP-2-v3 / M1: false cold, true post-rebuild
             );
         })
         .map_err(|e| BundleError::Other(format!("spawn transport drain: {e}")))?;
@@ -2265,6 +2388,8 @@ fn build_production_sender_bundle(
     _bridge_session: Arc<Mutex<Option<SenderSession>>>,
     _bridge_cache: Arc<Mutex<Option<RestartCache>>>,
     _bridge_supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-RBF-1
+    _media_watchdog_fires: Arc<AtomicU8>, // CAP-2-v3 — unused on non-Windows (no pipeline)
+    _arm_media_watchdog: bool,            // CAP-2-v3 — unused on non-Windows (no pipeline)
 ) -> Result<SenderBundle, BundleError> {
     Err(BundleError::Other(
         "sender pipeline requires Windows".to_string(),
@@ -2689,6 +2814,69 @@ mod tests {
         super::stop_sender_session(&bridge);
     }
 
+    /// CAP-2-v3 (REQ-WD-4 / FIX-2) — Sender double-start MUST NOT reset the
+    /// cross-generation media-watchdog fire counter (sender/receiver symmetry).
+    ///
+    /// GIVEN: a started sender whose `media_watchdog_fires` was seeded non-zero.
+    /// WHEN:  a second `start_sender_inner` with the SAME args returns AlreadyRunning.
+    /// THEN:  the fire counter is UNCHANGED — a rejected double-start is NOT a new
+    ///        connection episode, so the reset (which lives AFTER the AlreadyRunning
+    ///        guard in `start_sender_inner`) MUST NOT run.
+    ///
+    /// This mirrors the receiver test
+    /// `commands::stream::tests` REQ-WD-4 double-start assertion. It is a
+    /// characterization test of ALREADY-CORRECT behavior (guard precedes reset), so
+    /// it passes GREEN immediately — its value is locking the invariant.
+    #[test]
+    fn req_wd_4_sender_double_start_does_not_reset_media_watchdog_fires() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // Minimal builder: returns a thread-free test-stub bundle so the first
+        // start succeeds without spawning production threads.
+        let builder: super::SenderBuilderFn =
+            Arc::new(|_, _, _sf, _ch, _attempt| Ok(super::SenderBundle::test_stub()));
+        let bridge = super::SenderBridge::new_with_builder(builder);
+
+        // Fake ChannelLike (no real transport).
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let ch: Arc<dyn super::ChannelLike> = Arc::new(FakeCh);
+
+        // First start — must succeed.
+        super::start_sender_inner(&bridge, ch.clone(), Some(0), None)
+            .expect("first start must succeed");
+
+        // CAP-2-v3 (REQ-WD-4 / FIX-2): seed the cross-generation fire counter with a
+        // non-zero sentinel BEFORE the rejected double-start. A rejected start is NOT a
+        // new connection episode, so it MUST NOT reset the counter. This mirrors the
+        // receiver, which resets only AFTER its AlreadyRunning guard.
+        bridge.media_watchdog_fires.store(2, Ordering::Relaxed);
+
+        // Second start with the SAME args — must return AlreadyRunning.
+        let err = super::start_sender_inner(&bridge, ch, Some(0), None)
+            .expect_err("second start must return AlreadyRunning, not Ok(())");
+        match err {
+            super::StartSenderError::AlreadyRunning { .. } => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+
+        // REQ-WD-4: the rejected double-start MUST NOT have reset the fire counter.
+        assert_eq!(
+            bridge.media_watchdog_fires.load(Ordering::Relaxed),
+            2,
+            "a rejected double-start (AlreadyRunning) must NOT reset the media-watchdog \
+             fire counter — reset belongs AFTER the guard (sender/receiver symmetry)"
+        );
+
+        // Cleanup.
+        super::stop_sender_session(&bridge);
+    }
+
     // ─── SC-RBL-2: signaling refresh — PeerBye reaches NEW supervisor after ─────
     //              enter_supervisor_mode calls set_supervisor_signal_tx
     //
@@ -2795,6 +2983,10 @@ mod tests {
                     std::sync::Arc::new(super::NoopSignalingRefresh)
                         as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
                     None, // watchdog disabled in sc-rbl-2 test
+                    // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                    false,
                 );
             })
             .unwrap();
@@ -3049,6 +3241,10 @@ mod tests {
                     std::sync::Arc::new(super::NoopSignalingRefresh)
                         as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
                     None, // watchdog disabled in sc-srr-1 test
+                    // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                    false,
                 );
             })
             .unwrap();
@@ -3254,6 +3450,10 @@ mod tests {
                     std::sync::Arc::new(super::NoopSignalingRefresh)
                         as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
                     None, // watchdog disabled in sc-srr-2 test
+                    // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                    false,
                 );
             })
             .unwrap();
@@ -4088,8 +4288,17 @@ mod tests {
     ///
     /// Returns `(channel, ev_tx, stop_flag, join)`.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     fn spawn_sender_watchdog_drain(
         watchdog_timeout: Option<std::time::Duration>,
+        // CAP-2-v3: injectable fire cap and SHARED cross-generation counter so the
+        // SC-WD-CAP/RA/RESET tests can drive the bounded-convergence path. The
+        // re-based SC-WD-S1..S5 tests pass `None` (unbounded) + a throwaway Arc to
+        // preserve their original single-generation semantics. `arm` is `true` here
+        // (these helpers model the post-rebuild steady-state drain — REQ-WD-1/M1).
+        max_fires: Option<u8>,
+        fires: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        arm: bool,
     ) -> (
         std::sync::Arc<CapturingChannel>,
         std::sync::mpsc::SyncSender<sm_domain::transport::TransportEvent>,
@@ -4155,6 +4364,9 @@ mod tests {
                     std::sync::Arc::new(super::NoopSignalingRefresh)
                         as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
                     watchdog_timeout,
+                    max_fires, // CAP-2-v3 fire cap
+                    fires,     // CAP-2-v3 shared cross-generation counter
+                    arm,       // CAP-2-v3 arm flag (post-rebuild)
                 );
             })
             .expect("spawn sc-wd-s drain");
@@ -4191,8 +4403,12 @@ mod tests {
         // arm at drain entry and fire purely on the deadline. The hook's Stop (sent
         // right after RebuildSucceeded) proves the firing path survives the production
         // kill sequence that makes the coordinator-armed watchdog a no-op.
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Allow: drain-entry arm (150ms) → fire → Reconnecting cycle (~110ms).
         std::thread::sleep(Duration::from_millis(900));
@@ -4227,8 +4443,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // NO IceConnected — the drain-entry watchdog must fire.
         std::thread::sleep(Duration::from_millis(900));
@@ -4262,8 +4482,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Deliver IceConnected promptly — BEFORE the 150ms deadline — to disarm.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
@@ -4303,8 +4527,12 @@ mod tests {
         use std::time::Duration;
 
         // Generation 1: a fresh drain arms at entry, fires once, breaks.
-        let (channel_a, ev_tx_a, stop_flag_a, join_a) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel_a, ev_tx_a, stop_flag_a, join_a) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_a.store(true, Ordering::Relaxed);
         drop(ev_tx_a);
@@ -4313,8 +4541,12 @@ mod tests {
 
         // Generation 2: a second fresh drain (a new generation) arms a new one-shot
         // deadline at its own entry and fires once.
-        let (channel_b, ev_tx_b, stop_flag_b, join_b) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel_b, ev_tx_b, stop_flag_b, join_b) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
         std::thread::sleep(Duration::from_millis(900));
         stop_flag_b.store(true, Ordering::Relaxed);
         drop(ev_tx_b);
@@ -4345,8 +4577,12 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (channel, ev_tx, stop_flag, join) =
-            spawn_sender_watchdog_drain(Some(Duration::from_millis(150)));
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            None, // CAP-2-v3: unbounded — preserve original single-gen semantics
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)), // throwaway counter
+            true, // arm (post-rebuild steady-state drain)
+        );
 
         // Cold connect: deliver IceConnected before the short deadline — disarms.
         let _ = ev_tx.try_send(TransportEvent::IceConnected);
@@ -4363,6 +4599,272 @@ mod tests {
             "SC-WD-S4 FAIL: a clean cold-connect IceConnected before the (short) \
              deadline must not trigger any cycle — expected 0 reconnecting events, got \
              {reconnecting}. (An `if false` on the disarm branch MUST flip this to 1.)"
+        );
+    }
+
+    // ─── CAP-2-v3 — bounded-honest watchdog convergence (issue #62) ─────────
+    //
+    // Sender mirrors of the receiver CAP-2-v3 tests. Disarm trigger = IceConnected;
+    // terminal frame = SenderStatusEvent::Dead { reason }. KEYSTONE = SC-WD-CAP.
+
+    /// SC-WD-CAP (KEYSTONE — RED today) — Sender: an absent peer terminates in a single
+    /// terminal `Dead { reason: "peer_unreachable" }` after exactly the cap count of
+    /// fires, with no further generation. Maps to SC-WD-S6 / REQ-WD-7.
+    ///
+    /// Drive: two drain generations SHARE one fire counter Arc; `max_fires = Some(2)`;
+    /// no `IceConnected` ever arrives. Generation 1 fires below the cap (counter 0→1) →
+    /// re-injects IceFailed → exactly 1 `reconnecting`. Generation 2 fires AT the cap
+    /// (counter 1→2 == cap) → emits exactly 1 `Dead { peer_unreachable }`, breaks, and
+    /// does NOT re-inject IceFailed.
+    ///
+    /// RED today: no cap — generation 2 ALSO re-injects IceFailed and never emits Dead.
+    #[test]
+    fn sc_wd_cap_absent_peer_terminates_in_single_dead() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::time::Duration;
+
+        let shared_fires = std::sync::Arc::new(AtomicU8::new(0));
+
+        // Generation 1 (post-rebuild): fires below the cap → re-injects IceFailed.
+        let (channel_a, ev_tx_a, stop_flag_a, join_a) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            Some(2), // cap
+            shared_fires.clone(),
+            true, // arm (post-rebuild)
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_a.store(true, Ordering::Relaxed);
+        drop(ev_tx_a);
+        let _ = join_a.join();
+
+        let gen1_reconnecting = channel_a.count_json_containing("reconnecting");
+        let gen1_dead = channel_a.count_json_containing("\"kind\":\"dead\"");
+
+        // Generation 2 (post-rebuild): SAME counter (now 1) → fires AT the cap → Dead.
+        let (channel_b, ev_tx_b, stop_flag_b, join_b) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            Some(2),
+            shared_fires.clone(),
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_b.store(true, Ordering::Relaxed);
+        drop(ev_tx_b);
+        let _ = join_b.join();
+
+        let gen2_reconnecting = channel_b.count_json_containing("reconnecting");
+        let gen2_dead = channel_b.count_json_containing("\"kind\":\"dead\"");
+        let gen2_peer_unreachable = channel_b.count_json_containing("peer_unreachable");
+
+        assert_eq!(
+            gen1_reconnecting, 1,
+            "SC-WD-CAP: gen 1 (below cap) must re-inject exactly one IceFailed \
+             (one reconnecting), got {gen1_reconnecting}"
+        );
+        assert_eq!(
+            gen1_dead, 0,
+            "SC-WD-CAP: gen 1 (below cap) must NOT emit Dead, got {gen1_dead}"
+        );
+        assert_eq!(
+            gen2_reconnecting, 0,
+            "SC-WD-CAP FAIL (RED today = infinite loop): at the cap the drain MUST NOT \
+             re-inject IceFailed — expected 0 reconnecting in the cap generation, got \
+             {gen2_reconnecting}. Today there is no cap so it loops at attempt=1 forever."
+        );
+        assert_eq!(
+            gen2_dead, 1,
+            "SC-WD-CAP FAIL (RED today = infinite loop): at the cap the drain MUST emit \
+             EXACTLY ONE terminal Dead frame — got {gen2_dead}. Today the drain never \
+             emits Dead on the absent-peer path (RCA #1031)."
+        );
+        assert_eq!(
+            gen2_peer_unreachable, 1,
+            "SC-WD-CAP: the cap-driven Dead MUST carry reason \"peer_unreachable\" \
+             (distinct from the supervisor's \"ice_failed_repeatedly\"), got \
+             {gen2_peer_unreachable} matching frames"
+        );
+    }
+
+    /// SC-WD-M1 (RED today) — Sender: a cold-connect drain (arm = false) does NOT arm
+    /// the watchdog and never fires. Maps to SC-WD-S1-R1 / REQ-WD-1.
+    #[test]
+    fn sc_wd_m1_cold_connect_does_not_arm() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::time::Duration;
+
+        let fires = std::sync::Arc::new(AtomicU8::new(0));
+        let (channel, ev_tx, stop_flag, join) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            Some(2),
+            fires,
+            false, // cold connect — MUST NOT arm
+        );
+
+        // No IceConnected; observe well past the deadline.
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        let _ = join.join();
+
+        let reconnecting = channel.count_json_containing("reconnecting");
+        assert_eq!(
+            reconnecting, 0,
+            "SC-WD-M1 FAIL (RED today): a cold-connect drain (arm = false) MUST NOT arm \
+             the watchdog — expected 0 reconnecting, got {reconnecting}. Today the drain \
+             arms unconditionally so it fires a spurious cycle with no real outage."
+        );
+    }
+
+    /// SC-WD-RESET (RED today) — Sender: the counter resets on disarm (IceConnected), so
+    /// a recovered-then-dropped stream starts a fresh streak. Maps to SC-WD-S3-Counter /
+    /// REQ-WD-4 (revised).
+    #[test]
+    fn sc_wd_reset_disarm_resets_cross_generation_counter() {
+        use sm_domain::transport::TransportEvent;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::time::Duration;
+
+        let shared_fires = std::sync::Arc::new(AtomicU8::new(0));
+        // Pre-load the counter to cap-1 to model a prior fire streak.
+        shared_fires.store(1, Ordering::Relaxed);
+
+        // Generation 1: IceConnected arrives before the deadline → disarm → reset to 0.
+        let (_channel_a, ev_tx_a, stop_flag_a, join_a) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            Some(2),
+            shared_fires.clone(),
+            true,
+        );
+        let _ = ev_tx_a.try_send(TransportEvent::IceConnected);
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_a.store(true, Ordering::Relaxed);
+        drop(ev_tx_a);
+        let _ = join_a.join();
+
+        let counter_after_disarm = shared_fires.load(Ordering::Relaxed);
+
+        // Generation 2: no media → fires. Reset ⇒ counter 0 ⇒ fire #1 (below cap) ⇒
+        // 1 reconnecting, 0 Dead. No reset ⇒ counter 1 ⇒ reaches cap ⇒ Dead.
+        let (channel_b, ev_tx_b, stop_flag_b, join_b) = spawn_sender_watchdog_drain(
+            Some(Duration::from_millis(150)),
+            Some(2),
+            shared_fires.clone(),
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_b.store(true, Ordering::Relaxed);
+        drop(ev_tx_b);
+        let _ = join_b.join();
+
+        let gen2_reconnecting = channel_b.count_json_containing("reconnecting");
+        let gen2_dead = channel_b.count_json_containing("\"kind\":\"dead\"");
+
+        assert_eq!(
+            counter_after_disarm, 0,
+            "SC-WD-RESET FAIL (RED today): IceConnected (disarm) MUST reset the \
+             cross-generation fire counter to 0 — got {counter_after_disarm}. Today the \
+             drain never writes the counter, so the pre-loaded streak persists."
+        );
+        assert_eq!(
+            gen2_reconnecting, 1,
+            "SC-WD-RESET: after a disarm-reset, the next fire is #1 (below cap) → exactly \
+             one reconnecting, got {gen2_reconnecting}"
+        );
+        assert_eq!(
+            gen2_dead, 0,
+            "SC-WD-RESET: after a disarm-reset, the next fire is below the cap → no Dead, \
+             got {gen2_dead} (a non-reset counter would reach the cap and emit Dead)"
+        );
+    }
+
+    /// SC-WD-RA (RED today) — Sender: a genuine `RebuildFailed` → supervisor-Dead
+    /// short-circuits the watchdog cap; only ONE terminal Dead is emitted, carrying the
+    /// supervisor reason, never the cap reason. Maps to SC-WD-S7 / REQ-WD-8.
+    #[test]
+    fn sc_wd_ra_rebuild_failed_dead_wins_no_double_dead() {
+        use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
+        use sm_domain::supervisor::SupervisorSignal;
+        use sm_domain::transport::TransportEvent;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let fires = Arc::new(AtomicU8::new(0));
+
+        let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let channel = CapturingChannel::new();
+        let sup_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
+            Arc::new(Mutex::new(None));
+
+        let fast_policy = ReconnectPolicy {
+            max_attempts: std::num::NonZeroU8::new(3).unwrap(),
+            backoff: BackoffSchedule::Exponential {
+                base_ms: 1,
+                factor: 1,
+            },
+        };
+
+        let hooks = super::SenderCoordinatorHooks {
+            publish_reconnect_request: Arc::new(|_, _| {}),
+            publish_reconnect_ack: Arc::new(|_, _| {}),
+            // GENUINE failure: the rebuild worker reports RebuildFailed (no success).
+            initiate_rebuild: Arc::new(|sig_tx| {
+                let _ = sig_tx.try_send(SupervisorSignal::RebuildFailed);
+            }),
+            initiate_mdns_reset: Arc::new(|| {}),
+            sender_attempt: Arc::new(AtomicU8::new(1)),
+        };
+
+        let sf = stop_flag.clone();
+        let ch: Arc<dyn super::ChannelLike> = channel.clone();
+        let join = std::thread::Builder::new()
+            .name("sc-wd-ra-sender-drain".into())
+            .spawn(move || {
+                super::run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
+                    ev_rx,
+                    sf,
+                    ch,
+                    sup_tx,
+                    fast_policy,
+                    Duration::from_millis(10),
+                    Duration::from_millis(100),
+                    hooks,
+                    Arc::new(super::NoopSignalingRefresh)
+                        as Arc<dyn super::SignalingSupervisorRefresh>,
+                    Some(Duration::from_millis(150)),
+                    Some(5), // cap is HIGH — must NOT be reached; supervisor Dead wins
+                    fires,
+                    true, // arm (post-rebuild)
+                );
+            })
+            .expect("spawn sc-wd-ra sender drain");
+
+        std::thread::sleep(Duration::from_millis(1200));
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        let _ = join.join();
+
+        let dead_total = channel.count_json_containing("\"kind\":\"dead\"");
+        let peer_unreachable = channel.count_json_containing("peer_unreachable");
+        let ice_failed = channel.count_json_containing("ice_failed_repeatedly");
+
+        assert_eq!(
+            dead_total, 1,
+            "SC-WD-RA: exactly ONE terminal Dead must be emitted per episode regardless \
+             of which authority (supervisor budget or watchdog cap) terminates first — \
+             got {dead_total}"
+        );
+        assert_eq!(
+            peer_unreachable, 0,
+            "SC-WD-RA: a genuine RebuildFailed-Dead must short-circuit the cap — the \
+             cap reason \"peer_unreachable\" MUST NOT appear, got {peer_unreachable}"
+        );
+        assert_eq!(
+            ice_failed, 1,
+            "SC-WD-RA: the sole Dead must be the supervisor's \"ice_failed_repeatedly\", \
+             got {ice_failed}"
         );
     }
 }

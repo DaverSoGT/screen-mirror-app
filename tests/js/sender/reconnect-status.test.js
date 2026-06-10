@@ -26,6 +26,7 @@ describe('sender — reconnect status messages (SC-SEND-R1 through SC-SEND-R6)',
   beforeEach(async () => {
     installDom();
     tauri = installTauriMock();
+    vi.useFakeTimers();
     vi.resetModules();
     await import('../../../dist/sender.js');
     await Promise.resolve();
@@ -45,25 +46,30 @@ describe('sender — reconnect status messages (SC-SEND-R1 through SC-SEND-R6)',
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     removeDom();
     resetTauriMock();
   });
 
-  it('SC-SEND-R1: kind="reconnecting" attempt=1 max=3 → status shows attempt info', () => {
+  it('SC-SEND-R1: kind="reconnecting" attempt=1 max=3 → honest count-free status (CAP-2-v3)', () => {
     ch._dispatch(encodeMessage({ kind: 'reconnecting', attempt: 1, max: 3 }));
 
     const statusDiv = document.getElementById('status');
-    // Status must contain "1" and "3" to indicate attempt 1/3.
-    expect(statusDiv.textContent).toContain('1');
-    expect(statusDiv.textContent).toContain('3');
+    // CAP-2-v3 (REQ-WD-10): the misleading "attempt X/max" counter is removed. The
+    // status now shows an honest "still waiting" message with no "/N" denominator.
+    expect(statusDiv.textContent).not.toContain('/3');
+    expect(statusDiv.textContent).not.toMatch(/\/\s*\d/);
+    expect(statusDiv.textContent.toLowerCase()).toContain('reconnecting');
+    expect(statusDiv.textContent.toLowerCase()).toContain('waiting for the viewer');
   });
 
-  it('SC-SEND-R2: kind="reconnecting" attempt=2 max=3 → status reflects attempt 2', () => {
+  it('SC-SEND-R2: kind="reconnecting" attempt=2 max=3 → still count-free (CAP-2-v3)', () => {
     ch._dispatch(encodeMessage({ kind: 'reconnecting', attempt: 2, max: 3 }));
 
     const statusDiv = document.getElementById('status');
-    expect(statusDiv.textContent).toContain('2');
-    expect(statusDiv.textContent).toContain('3');
+    // The denominator must not reappear for later attempts either.
+    expect(statusDiv.textContent).not.toContain('/3');
+    expect(statusDiv.textContent).not.toMatch(/\/\s*\d/);
   });
 
   it('SC-SEND-R3: kind="dead" → error div shows a message', () => {

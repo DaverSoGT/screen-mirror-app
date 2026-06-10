@@ -195,6 +195,10 @@ fn make_bridge_with_counting_hooks(
                         hooks,
                         Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
                         None, // watchdog disabled in coordinator tests
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                     );
                 })
                 .expect("spawn drain");

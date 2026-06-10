@@ -209,6 +209,10 @@ fn make_stream_bridge_with_counting_hooks() -> (
                         // Media-arrival watchdog disabled — this coordinator test
                         // does not exercise the post-rebuild watchdog.
                         None,
+                        // CAP-2-v3: watchdog inert here — no cap, throwaway counter, no arm.
+                        None,
+                        Arc::new(AtomicU8::new(0)),
+                        false,
                         Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
                     );
                 })
