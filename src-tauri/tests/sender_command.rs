@@ -743,7 +743,9 @@ fn signaling_drain_closed_emits_peer_lost_and_exits() {
         run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone, none_slot);
     });
 
-    ev_tx.send(SignalingEvent::Closed).unwrap();
+    ev_tx
+        .send(SignalingEvent::Closed { attempt: None })
+        .unwrap();
     drain.join().expect("drain must exit after Closed");
 
     let msgs = ch.messages();

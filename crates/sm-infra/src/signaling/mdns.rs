@@ -470,18 +470,16 @@ pub(crate) fn frame_to_event(
         SignalingFrame::Candidate { sdp } => {
             Some(SignalingEvent::CandidateReceived(IceCandidate(sdp)))
         }
-        SignalingFrame::Bye => {
-            // D-5 (REQ-S1): ALSO send LocalFailure{PeerBye} to the supervisor when wired.
-            // Best-effort try_send — if supervisor channel is None or full, the Closed
-            // event still flows normally via the signaling drain (defense-in-depth).
-            // This enables the S-1 eager wake: sender supervisor transitions to
-            // AwaitingAck at t≈0 on Bye, before the transport detects IceFailed.
-            if let Some(tx) = supervisor_signal_tx.lock().unwrap().as_ref() {
-                let _ = tx.try_send(SupervisorSignal::LocalFailure {
-                    trigger: sm_domain::session::ReconnectTrigger::PeerBye,
-                });
-            }
-            Some(SignalingEvent::Closed)
+        SignalingFrame::Bye { attempt } => {
+            // D-3 (REQ-BYE-3): carry the attempt on Closed so the receiver drain can
+            // apply the strict-less-than stale-Bye filter (REQ-BYE-4).
+            // The EAGER LocalFailure{PeerBye} try_send that previously lived here is
+            // REMOVED — it bypassed the drain filter entirely (R-2 bypass closed).
+            // All Bye → supervisor escalation now flows exclusively through the drain
+            // Closed arm (stream.rs), which has expected_attempt in scope.
+            Some(SignalingEvent::Closed {
+                attempt: Some(attempt),
+            })
         }
         SignalingFrame::ReconnectRequest {
             attempt,
@@ -973,9 +971,11 @@ fn run_frame_loop(
             // id lets the HW operator confirm whether the Bye came from the offer-
             // bearing generation or a stale one.
             eprintln!(
-                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, sending Bye"
+                "[sm-signaling-frame-loop] EXIT: instance={instance_id} stop flag set, sending Bye(attempt=0)"
             );
-            let _ = write_frame(&mut writer, &SignalingFrame::Bye);
+            // D-8 (REQ-BYE-2): stamp with last_offer_attempt (set to 0 until T-06 adds the atomic).
+            // T-06 will replace the literal 0 with last_offer_attempt.load(Acquire).
+            let _ = write_frame(&mut writer, &SignalingFrame::Bye { attempt: 0 });
             break;
         }
 
@@ -1013,7 +1013,7 @@ fn run_frame_loop(
                 SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
-                SignalingFrame::Bye => "Bye".to_string(),
+                SignalingFrame::Bye { attempt } => format!("Bye(attempt={attempt})"),
                 SignalingFrame::ReconnectRequest {
                     attempt,
                     session_nonce,
@@ -1049,7 +1049,7 @@ fn run_frame_loop(
                     SignalingFrame::Candidate { sdp } => {
                         format!("Candidate (sdp={} bytes)", sdp.len())
                     }
-                    SignalingFrame::Bye => "Bye".to_string(),
+                    SignalingFrame::Bye { attempt } => format!("Bye(attempt={attempt})"),
                     SignalingFrame::ReconnectRequest {
                         attempt,
                         session_nonce,
@@ -1062,9 +1062,11 @@ fn run_frame_loop(
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← instance={instance_id} {kind}");
                 match frame_to_event(frame, &supervisor_signal_tx) {
-                    Some(SignalingEvent::Closed) => {
-                        eprintln!("[sm-signaling-frame-loop] EXIT: peer sent Bye → emit Closed");
-                        let _ = emit(&event_tx, SignalingEvent::Closed);
+                    Some(SignalingEvent::Closed { attempt }) => {
+                        eprintln!(
+                            "[sm-signaling-frame-loop] EXIT: peer sent Bye(attempt={attempt:?}) → emit Closed"
+                        );
+                        let _ = emit(&event_tx, SignalingEvent::Closed { attempt });
                         break;
                     }
                     Some(ev) => {
@@ -1078,8 +1080,11 @@ fn run_frame_loop(
                 continue;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                eprintln!("[sm-signaling-frame-loop] EXIT: peer closed (EOF) → emit Closed");
-                let _ = emit(&event_tx, SignalingEvent::Closed);
+                eprintln!(
+                    "[sm-signaling-frame-loop] EXIT: peer closed (EOF) → emit Closed{{attempt:None}}"
+                );
+                // D-1: EOF has no attempt context — None signals the drain to always honor.
+                let _ = emit(&event_tx, SignalingEvent::Closed { attempt: None });
                 break;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -1432,17 +1437,55 @@ mod tests {
         );
     }
 
-    /// S7.3 — Bye frame produces Closed event.
+    /// S7.3 / T-03 — Bye frame produces Closed{attempt:Some(n)} event, no eager LocalFailure.
+    ///
+    /// GIVEN: `frame_to_event(Bye { attempt: 1 })` with no supervisor wired.
+    /// THEN:  returns `Some(Closed { attempt: Some(1) })` and does NOT send to any supervisor.
     #[test]
     fn frame_to_event_bye_returns_closed() {
         use crate::signaling::mdns::frame_to_event;
         use crate::signaling::wire::SignalingFrame;
 
-        let event =
-            frame_to_event(SignalingFrame::Bye, &no_supervisor()).expect("Bye must produce Closed");
+        let event = frame_to_event(SignalingFrame::Bye { attempt: 1 }, &no_supervisor())
+            .expect("Bye must produce Closed");
         assert!(
-            matches!(event, SignalingEvent::Closed),
-            "Bye frame must map to SignalingEvent::Closed"
+            matches!(event, SignalingEvent::Closed { attempt: Some(1) }),
+            "Bye frame must map to SignalingEvent::Closed{{attempt:Some(1)}}, got {event:?}"
+        );
+    }
+
+    /// SC-CONV-2-9 / T-03 — `frame_to_event(Bye{attempt})` returns `Closed{Some(attempt)}`
+    ///                        and DOES NOT send `LocalFailure{PeerBye}` to any supervisor.
+    ///
+    /// GIVEN: a wired supervisor_signal_tx (Some).
+    /// WHEN:  `frame_to_event(Bye { attempt: 3 })` is called.
+    /// THEN:  1. Returns `Some(Closed { attempt: Some(3) })`.
+    ///        2. NO `LocalFailure{PeerBye}` arrives in supervisor_signal_tx (D-3).
+    #[test]
+    fn frame_to_event_bye_returns_closed_with_attempt() {
+        use crate::signaling::mdns::frame_to_event;
+        use crate::signaling::wire::SignalingFrame;
+        use sm_domain::supervisor::SupervisorSignal;
+        use std::time::Duration;
+
+        let (sup_tx, sup_rx) = sc::<SupervisorSignal>(8);
+        let supervisor_signal_tx = std::sync::Arc::new(Mutex::new(Some(sup_tx)));
+
+        let event = frame_to_event(SignalingFrame::Bye { attempt: 3 }, &supervisor_signal_tx)
+            .expect("SC-CONV-2-9: Bye must produce an event");
+
+        // Assert 1: result is Closed{Some(3)}
+        assert!(
+            matches!(event, SignalingEvent::Closed { attempt: Some(3) }),
+            "SC-CONV-2-9: Bye{{attempt:3}} must map to Closed{{attempt:Some(3)}}, got {event:?}"
+        );
+
+        // Assert 2: NO LocalFailure{PeerBye} was sent to supervisor (D-3, R-2 bypass closed)
+        let no_send = sup_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            no_send.is_err(),
+            "SC-CONV-2-9: frame_to_event MUST NOT send LocalFailure{{PeerBye}} to supervisor \
+             (D-3 centralize route); got: {no_send:?}"
         );
     }
 
@@ -2008,79 +2051,75 @@ mod tests {
         );
     }
 
-    // ─── SC-S1-001 (mdns): frame_to_event(Bye) sends LocalFailure{PeerBye} ────
+    // ─── SC-S1-001 (mdns) — rewritten for D-3: frame_to_event(Bye) MUST NOT ────
+    // ─── send LocalFailure{PeerBye}; ALL Bye honoring flows through drain filter ─
     //
-    // REQ-S1 / D-5: frame_to_event(Bye) MUST send SupervisorSignal::LocalFailure
-    // { trigger: PeerBye } to supervisor_signal_tx when it is Some(_), IN ADDITION
-    // to returning Some(SignalingEvent::Closed).
+    // D-3 (REQ-BYE-3): the eager LocalFailure{PeerBye} try_send in frame_to_event
+    // was the R-2 bypass that made the drain filter ineffective. It is REMOVED.
+    // frame_to_event(Bye{att}) now ONLY returns Some(Closed{Some(att)}).
+    // All Bye → supervisor escalation flows exclusively through run_signaling_drain.
     //
-    // RED: currently `SignalingFrame::Bye => Some(SignalingEvent::Closed)` — no send.
-    // GREEN (T13): Bye-arm patched to try_send LocalFailure{PeerBye} first.
+    // Previous SC-S1-001 asserted the OPPOSITE (eager send required). That assertion
+    // is now INVERTED: the test confirms zero supervisor send from frame_to_event.
 
-    /// SC-S1-001 (mdns) — `frame_to_event(Bye)` sends `LocalFailure{PeerBye}` to
-    ///                     `supervisor_signal_tx` when `Some(_)`, AND returns `Some(Closed)`.
+    /// SC-S1-001 (mdns, D-3 rewrite) — `frame_to_event(Bye{attempt})` MUST NOT
+    ///     send `LocalFailure{PeerBye}` to `supervisor_signal_tx`, and MUST return
+    ///     `Some(Closed { attempt: Some(n) })`.
     ///
-    /// GIVEN: A `supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>`
-    ///        pre-populated with `Some(sup_tx)`.
-    /// WHEN:  `frame_to_event(SignalingFrame::Bye, &supervisor_signal_tx)` is called.
-    /// THEN:  1. Returns `Some(SignalingEvent::Closed)` (existing behavior preserved).
-    ///        2. `sup_rx` receives `SupervisorSignal::LocalFailure { trigger: PeerBye }`
-    ///           within 100ms (NEW: S-1 eager wake).
+    /// GIVEN: a wired `supervisor_signal_tx` (Some).
+    /// WHEN:  `frame_to_event(Bye { attempt: 1 })` is called.
+    /// THEN:  1. Returns `Some(Closed { attempt: Some(1) })`.
+    ///        2. supervisor_signal_tx receives NOTHING within 100ms (D-3 — eager path REMOVED).
+    ///
+    /// This is the D-3 regression guard: if the eager send is accidentally re-introduced,
+    /// this test will fail with "unexpected signal received".
     #[test]
-    fn sc_s1_001_frame_to_event_bye_sends_local_failure_peer_bye_to_supervisor() {
+    fn sc_s1_001_frame_to_event_bye_does_not_eagerly_send_local_failure() {
         use crate::signaling::mdns::frame_to_event;
         use crate::signaling::wire::SignalingFrame;
-        use sm_domain::session::ReconnectTrigger;
         use sm_domain::supervisor::SupervisorSignal;
         use std::sync::mpsc::sync_channel;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
-        // ── Wire supervisor_signal_tx with Some(sup_tx) ──────────────────────
         let (sup_tx, sup_rx) = sync_channel::<SupervisorSignal>(8);
         let supervisor_signal_tx = Arc::new(Mutex::new(Some(sup_tx)));
 
-        // ── WHEN: call frame_to_event(Bye) ───────────────────────────────────
-        // RED: currently returns Closed but does NOT send to supervisor.
-        let event = frame_to_event(SignalingFrame::Bye, &supervisor_signal_tx);
+        let event = frame_to_event(SignalingFrame::Bye { attempt: 1 }, &supervisor_signal_tx);
 
-        // ── Assertion 1: still returns Some(Closed) ─────────────────────────
-        assert!(
-            matches!(event, Some(sm_domain::signaling::SignalingEvent::Closed)),
-            "SC-S1-001: frame_to_event(Bye) must still return Some(Closed)"
-        );
-
-        // ── Assertion 2: supervisor receives LocalFailure{PeerBye} ────────────
-        // RED: this fails until mdns.rs Bye-arm is patched (T13 GREEN).
-        let signal = sup_rx.recv_timeout(Duration::from_millis(100)).expect(
-            "SC-S1-001: frame_to_event(Bye) must send LocalFailure{PeerBye} to \
-                 supervisor_signal_tx when Some(_) — RED until mdns.rs Bye-arm patched",
-        );
-
+        // Assert 1: returns Some(Closed{Some(1)})
         assert!(
             matches!(
-                signal,
-                SupervisorSignal::LocalFailure {
-                    trigger: ReconnectTrigger::PeerBye
-                }
+                event,
+                Some(sm_domain::signaling::SignalingEvent::Closed { attempt: Some(1) })
             ),
-            "SC-S1-001: expected LocalFailure{{PeerBye}} but got {signal:?}"
+            "SC-S1-001: frame_to_event(Bye{{1}}) must return Some(Closed{{Some(1)}}), got {event:?}"
+        );
+
+        // Assert 2: NO LocalFailure{PeerBye} was sent to supervisor (D-3, R-2 bypass closed)
+        let no_send = sup_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            no_send.is_err(),
+            "SC-S1-001: frame_to_event MUST NOT send LocalFailure{{PeerBye}} to supervisor \
+             after D-3 (eager path removed); got unexpected signal: {no_send:?}"
         );
     }
 
-    /// SC-S1-001b — `frame_to_event(Bye)` with `None` supervisor does NOT panic.
-    ///
-    /// When `supervisor_signal_tx` is `None`, the Bye-arm must silently skip the send.
-    /// Returns `Some(Closed)` as before.
+    /// SC-S1-001b (D-3 rewrite) — `frame_to_event(Bye{attempt})` with `None` supervisor
+    ///     returns `Some(Closed{Some(n)})` without panicking.
     #[test]
     fn sc_s1_001b_frame_to_event_bye_with_none_supervisor_returns_closed() {
         use crate::signaling::mdns::frame_to_event;
         use crate::signaling::wire::SignalingFrame;
 
-        let event = frame_to_event(SignalingFrame::Bye, &no_supervisor());
+        let event = frame_to_event(SignalingFrame::Bye { attempt: 1 }, &no_supervisor());
         assert!(
-            matches!(event, Some(sm_domain::signaling::SignalingEvent::Closed)),
-            "SC-S1-001b: frame_to_event(Bye) with None supervisor must return Some(Closed)"
+            matches!(
+                event,
+                Some(sm_domain::signaling::SignalingEvent::Closed { attempt: Some(1) })
+            ),
+            "SC-S1-001b: frame_to_event(Bye{{1}}) with None supervisor must return \
+             Some(Closed{{Some(1)}}), got {event:?}"
         );
     }
 
@@ -2220,7 +2259,7 @@ mod tests {
             .expect("read after stop")
             .expect("SC-D3-2 FAIL: default path must emit a Bye frame on stop");
         assert!(
-            matches!(next, SignalingFrame::Bye),
+            matches!(next, SignalingFrame::Bye { .. }),
             "SC-D3-2 FAIL: default (suppress_bye=false) must emit Bye on stop, got {next:?}"
         );
 
@@ -2452,7 +2491,7 @@ mod tests {
             .expect("read after stop")
             .expect("SC-HO-1b FAIL: default path must still emit a Bye on stop");
         assert!(
-            matches!(next, SignalingFrame::Bye),
+            matches!(next, SignalingFrame::Bye { .. }),
             "SC-HO-1b FAIL: live frame loop must emit Bye on stop (superseded irrelevant), got {next:?}"
         );
 

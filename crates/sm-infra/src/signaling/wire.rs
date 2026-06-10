@@ -20,7 +20,7 @@
 //! { "type": "Answer",         "sdp": "v=0 ..." }
 //! { "type": "Candidate",      "sdp": "candidate:..." }
 //! { "type": "Hello",          "proto": "v1" }
-//! { "type": "Bye" }
+//! { "type": "Bye",            "attempt": 1 }
 //! { "type": "ReconnectRequest", "attempt": 1, "requester_role": "Sender", "session_nonce": 12345678 }
 //! { "type": "ReconnectAck",     "attempt": 1, "session_nonce": 12345678 }
 //! ```
@@ -69,8 +69,19 @@ pub enum SignalingFrame {
     Answer { sdp: String },
     /// A trickled ICE candidate. `sdp` is the raw candidate attribute line.
     Candidate { sdp: String },
-    /// Graceful close — both sides stop the TCP session after this frame.
-    Bye,
+    /// Graceful close. The `attempt` MUST carry the emitter's current generation
+    /// (last published Offer attempt, or 0 if no Offer was sent). Receivers use
+    /// this to filter stale-generation Byes (REQ-BYE-4).
+    ///
+    /// `attempt` is REQUIRED — no `#[serde(default)]`, no `Option<u8>`. A JSON payload
+    /// that omits it fails deserialization by design (same-build LAN policy). Mixed-version
+    /// pairing is NOT supported (see wire-breaking note at top of enum).
+    Bye {
+        /// Generation stamp matching the last published Offer attempt (1-indexed).
+        /// Set to 0 when no Offer was sent in this generation (offer-less connection).
+        /// REQUIRED — no `#[serde(default)]`, no `Option<u8>` (REQ-BYE-1, REQ-BYE-8).
+        attempt: u8,
+    },
     /// Reconnect request from the detecting side.
     ///
     /// Published when `IceFailed` or `ConnectionLost` is detected. The
@@ -228,14 +239,54 @@ mod tests {
 
     // ─── Round-trip: Bye ──────────────────────────────────────────────────────
 
-    /// R7.3 — SignalingFrame::Bye survives round-trip.
+    /// R7.3 — SignalingFrame::Bye survives round-trip (legacy structural check).
     #[test]
     fn bye_frame_round_trip() {
-        let frame = SignalingFrame::Bye;
+        let frame = SignalingFrame::Bye { attempt: 1 };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
         let decoded = read_frame(&mut Cursor::new(buf)).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    // ─── SC-CONV-2-1: Bye round-trip with attempt field ───────────────────────
+
+    /// SC-CONV-2-1 — `SignalingFrame::Bye { attempt: 3 }` survives a full wire round-trip.
+    ///
+    /// GIVEN: `Bye { attempt: 3 }`.
+    /// WHEN:  serialized via `write_frame` and deserialized via `read_frame`.
+    /// THEN:  the result equals the original (attempt == 3).
+    #[test]
+    fn bye_frame_round_trip_with_attempt() {
+        let frame = SignalingFrame::Bye { attempt: 3 };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        let decoded = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(
+            decoded, frame,
+            "SC-CONV-2-1: Bye attempt field must survive round-trip"
+        );
+    }
+
+    // ─── SC-CONV-2-2: missing attempt on Bye fails deserialization ────────────
+
+    /// SC-CONV-2-2 — JSON `{"type":"Bye"}` (no `attempt`) MUST fail deserialization.
+    ///
+    /// Mirrors SC-GE-2 for the Offer variant. Enforces the same-build wire policy
+    /// (REQ-BYE-1, REQ-BYE-8): a receiver on the new build MUST reject the old
+    /// unit-variant Bye from a mixed-version sender.
+    ///
+    /// GIVEN: the JSON string `{"type":"Bye"}` (old on-wire format, no attempt field).
+    /// WHEN:  deserialized into `SignalingFrame`.
+    /// THEN:  returns `Err` (not `Ok`).
+    #[test]
+    fn bye_missing_attempt_fails_deserialize() {
+        let json = br#"{"type":"Bye"}"#;
+        let result = serde_json::from_slice::<SignalingFrame>(json);
+        assert!(
+            result.is_err(),
+            "SC-CONV-2-2: Bye without attempt MUST fail deserialization, got: {result:?}"
+        );
     }
 
     // ─── Serde: known JSON → frame (S7.2) ────────────────────────────────────
@@ -267,7 +318,7 @@ mod tests {
     /// The first 4 bytes of a written frame MUST equal the body length (big-endian).
     #[test]
     fn write_frame_length_prefix_equals_body_length() {
-        let frame = SignalingFrame::Bye;
+        let frame = SignalingFrame::Bye { attempt: 1 };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
         let declared_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
