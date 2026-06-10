@@ -2525,13 +2525,16 @@ mod tests {
     // ─── SC-S1-001: eager sender supervisor — Bye at t≈0 reaches supervisor ─────
     //
     // REQ-S1 / D-5: The sender supervisor MUST be created eagerly at bundle-build
-    // time. When frame_to_event(Bye) is called AND supervisor_signal_tx is Some(_),
-    // it MUST send LocalFailure{PeerBye} to the supervisor.
+    // time so supervisor_signal_tx is Some(_) before signaling starts (no None
+    // window). Per D-3 (REQ-BYE-3) the eager frame_to_event(Bye) send was removed:
+    // a peer Bye is now honored on a single route, where the drain path forwards
+    // LocalFailure{PeerBye} to the supervisor.
     //
-    // This test simulates the S-1 path directly: spawn a ReconnectSupervisor in
-    // Connected state, wire its sup_tx, send LocalFailure{PeerBye} via the wired
-    // channel (as frame_to_event Bye-arm would), assert the supervisor transitions
-    // to AwaitingAck (outcome = StateChanged(Reconnecting)) within 100ms.
+    // This test exercises the supervisor's reaction to that drain-forwarded signal:
+    // spawn a ReconnectSupervisor in Connected state, wire its sup_tx, inject
+    // LocalFailure{PeerBye} via the wired channel (standing in for the drain-path
+    // forward), assert the supervisor transitions to AwaitingAck
+    // (outcome = StateChanged(Reconnecting)) within 100ms.
     //
     // GREEN: The supervisor state machine already handles LocalFailure in Connected
     // state. This test verifies the WIRING path end-to-end (eager channel creation
@@ -2582,7 +2585,8 @@ mod tests {
             .expect("spawn supervisor");
 
         // ── WHEN: send LocalFailure{PeerBye} immediately (t≈0ms) ─────────────
-        // This simulates frame_to_event(Bye) sending to the supervisor after S-1.
+        // This stands in for the drain path forwarding LocalFailure{PeerBye} to the
+        // supervisor — the single honor-route for a peer Bye after D-3 (REQ-BYE-3).
         // SC-S1-001 verifies the supervisor channel is Some(_) and receives the signal.
         let sup_tx_guard = supervisor_signal_tx.lock().unwrap();
         assert!(

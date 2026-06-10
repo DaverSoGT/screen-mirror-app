@@ -13,7 +13,7 @@ if (-not (Test-Path $exe)) {
 
 Write-Host "SC-CONV-2-12 gate: starting screen-mirror (sender). Logs -> sender-gate.log"
 Write-Host "Key log lines to watch:"
-Write-Host "  [sm-signaling-frame-loop] Bye SUPPRESSED  (D-6: OLD-gen Bye suppressed at source)"
+Write-Host "  [sm-signaling-frame-loop] Bye SUPPRESSED (D3)  (D-6: OLD-gen Bye suppressed at source)"
 Write-Host "  [sm-sender-coord] InitiateMdnsReset / InitiateRebuild  (reconnection flow)"
 Write-Host ""
 Write-Host "Press Ctrl+C to stop."

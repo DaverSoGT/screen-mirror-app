@@ -148,7 +148,7 @@ Select-String -Path sender.log -Pattern "\[sm-sender-coord\]"
 
 **Key log lines to look for:**
 
-- `[sm-signaling-frame-loop] Bye SUPPRESSED (suppress_bye=true)`
+- `[sm-signaling-frame-loop] Bye SUPPRESSED (D3)`
   - The OLD generation's Bye was correctly suppressed at source (D-6). EXPECTED during rebuild.
 - `[sm-sender-coord] InitiateMdnsReset` / `InitiateRebuild`
   - Normal reconnection flow.
