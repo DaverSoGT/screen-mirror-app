@@ -6,10 +6,11 @@
 // from the post-watchdog wait, so the false "/3" denominator is removed in favour
 // of an honest "still trying / waiting for the other device" message.
 //
-// This asserts ONLY the inline status string (setStatus → #status), which is the
-// `reconnecting` case in dist/mse-client.js (~line 457). The deferred Stage-2
-// silent-recovery overlay (revealReconnectingOverlay) is intentionally NOT touched
-// and keeps its own counter — staged-reconnect.test.js still covers it.
+// This first describe asserts ONLY the inline status string (setStatus → #status),
+// which is the `reconnecting` case in dist/mse-client.js (~line 457). The deferred
+// Stage-2 silent-recovery overlay (revealReconnectingOverlay) is now ALSO count-free
+// (CAP-2-v3 FIX-1) — it renders the same honest waiting copy with no "/N". The 2nd
+// describe block below (and staged-reconnect.test.js) assert that overlay directly.
 //
 // RED today: the status string renders "Reconnecting (attempt 1/3)..." → contains "/3".
 

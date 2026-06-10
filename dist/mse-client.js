@@ -160,7 +160,8 @@ function dismissReconnectOverlayOnRecovery() {
 // reconnecting frame. Transitions from Stage 1 (silent) to Stage 2 (visible).
 // Deferred teardown fires HERE — the last frozen frame was visible throughout
 // Stage 1; we teardown now because the overlay will cover the blanked video.
-// Uses pendingReconnectAttempt (the LATEST counter, not attempt 1) for text.
+// Uses pendingReconnectAttempt only as the reveal gate; the text is count-free
+// (CAP-2-v3 FIX-1) — no "/N" denominator, just the honest waiting copy.
 // Uses module-scoped reconnectingOverlay (assigned at parse time, always
 // available when the timer fires). D-SSR-5.
 function revealReconnectingOverlay() {
@@ -482,7 +483,8 @@ function handleStatus(payload) {
       // CAP-2-v3 (REQ-WD-10): honest count-free copy. The bounded retry window can last
       // up to ~60s (issue #62) and the frontend cannot distinguish the supervisor's real
       // retry from the post-watchdog wait, so the misleading "attempt X/max" denominator
-      // is removed. The deferred Stage-2 silent-recovery overlay keeps its own counter.
+      // is removed. The deferred Stage-2 silent-recovery overlay is now ALSO count-free
+      // (CAP-2-v3 FIX-1) — it renders the same honest waiting copy, no "/N" denominator.
       setStatus("Reconnecting… waiting for the other device");
       // DO NOT call tearDownMse() here — deferred to Stage 2 reveal or streaming/dead
       // so the last frozen video frame stays visible during the silent window (REQ-SSR-4).

@@ -955,7 +955,7 @@ enum DrainRole {
 ///
 /// Runs on its own OS thread spawned by `build_production_bundle`.
 /// Dispatches `SignalingEvent`s:
-/// - `OfferReceived(offer)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
+/// - `OfferReceived(offer, attempt)` → `receiver.apply_remote_offer(offer)` → `signaling.publish_local_answer(answer)`
 ///   (Primary role only; ResetSignalingOnly drains log-and-skip per D-RDF-2)
 /// - `CandidateReceived(c)` → `receiver.add_remote_candidate(c)`
 /// - `PeerFound` → log
@@ -6950,7 +6950,7 @@ mod tests {
     ///
     /// GIVEN: `stop_flag=false`.
     ///        `run_signaling_drain` started on a real thread with a `CountingReceiverOps`.
-    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is sent, then the channel
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer, attempt)` is sent, then the channel
     ///        is closed to make the drain exit.
     /// THEN:  `apply_remote_offer` is called exactly once (call count == 1).
     ///
@@ -7280,7 +7280,7 @@ mod tests {
     ///
     /// GIVEN: `CountingReceiverOps` spy, no-op publish ops, `stop_flag=false`,
     ///        `DrainRole::ResetSignalingOnly` passed to `run_signaling_drain`.
-    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected, then the
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer, attempt)` is injected, then the
     ///        channel is dropped to let the drain exit.
     /// THEN:  `apply_remote_offer` call count MUST be 0 AND `publish_local_answer`
     ///        MUST NOT be called.
@@ -7349,7 +7349,7 @@ mod tests {
     /// sc_rdf_2 — `DrainRole::ResetSignalingOnly` MUST still forward `Closed` to supervisor.
     ///
     /// GIVEN: spy `supervisor_signal_tx`, `DrainRole::ResetSignalingOnly`, `stop_flag=false`.
-    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer)` is injected (must be ignored),
+    /// WHEN:  `SignalingEvent::OfferReceived(fake_offer, attempt)` is injected (must be ignored),
     ///        THEN `SignalingEvent::Closed` is injected.
     /// THEN:  `supervisor_signal_rx.recv_timeout(500ms)` returns
     ///        `Ok(SupervisorSignal::LocalFailure { trigger: ReconnectTrigger::PeerBye })`.
