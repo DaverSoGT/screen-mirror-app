@@ -2177,6 +2177,10 @@ fn build_production_sender_bundle(
     // from signaling_for_hooks so the hook closure does not capture the entire
     // coordinator-hooks struct.
     let signaling_for_suppress = signaling_arc.clone();
+    // D-RFG-2 (REQ-RFG-2): dedicated clone for the stop hook — kept separate
+    // from signaling_for_suppress so each hook closure captures exactly one Arc
+    // (mirrors the D-6 convention at the suppress clone above).
+    let signaling_for_stop = signaling_arc.clone();
 
     // D-RBF-1 (REQ-RBL-2): Wrap signaling_arc in the refresh adapter so
     // enter_supervisor_mode can push the live signal_tx into MdnsSignaling.
@@ -2450,12 +2454,22 @@ fn build_production_sender_bundle(
             .suppress_outbound_bye();
     }));
 
+    // D-RFG-2 (REQ-RFG-2): rebuild-only hook that joins the OLD frame-loop thread
+    // synchronously so emit_error can no longer fire after this returns — closes
+    // the #58 RebuildFailed FIFO window at the source. Bounded by READ_TIMEOUT
+    // (mdns.rs:76, ~200 ms worst case). stop() is idempotent (mdns.rs:286):
+    // a later Drop::stop() in the shutdown closure is a clean no-op.
+    let stop_signaling_on_rebuild: Option<Arc<dyn Fn() + Send + Sync>> =
+        Some(Arc::new(move || {
+            let _ = signaling_for_stop.lock().unwrap().stop();
+        }));
+
     Ok(SenderBundle {
         drain_handles: vec![sig_drain, tr_drain],
         shutdown: Some(shutdown),
         backend_name,
         suppress_bye_on_rebuild,
-        stop_signaling_on_rebuild: None, // placeholder; T-03 (WU-2) replaces with live hook
+        stop_signaling_on_rebuild,
     })
 }
 
