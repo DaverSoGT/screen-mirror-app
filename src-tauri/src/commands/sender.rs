@@ -5143,4 +5143,287 @@ mod tests {
             "SC-CONV-2-11b FAIL: test_stub() must have suppress_bye_on_rebuild = None"
         );
     }
+
+    // ─── T-05: SC-RFG-* stop_signaling_on_rebuild contract tests ───────────────
+
+    /// SC-RFG-1 — OLD-gen error during successful rebuild produces NO RebuildFailed.
+    ///
+    /// The stop hook flips a fake_stopped flag; an OLD-drain-equivalent fires
+    /// RebuildFailed ONLY if !fake_stopped. After make_sender_rebuild_hook runs step
+    /// 6 (which must call the stop hook before step 13), fake_stopped is true, so
+    /// the OLD-drain-equivalent is a no-op. The supervisor channel must contain
+    /// exactly one signal: RebuildSucceeded with zero RebuildFailed.
+    ///
+    /// RED until T-04 inserts the hook call in rebuild step 6.
+    #[test]
+    fn old_generation_signaling_error_during_successful_rebuild_does_not_escalate() {
+        use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
+        use sm_domain::supervisor::SupervisorSignal as SuperSig;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // Spy: when called, flip fake_stopped to true and record "stop".
+        let fake_stopped = Arc::new(AtomicBool::new(false));
+        let fake_stopped_for_hook = fake_stopped.clone();
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let call_order_for_hook = call_order.clone();
+
+        // Supervisor signal channel.
+        let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
+        let sig_tx_for_old_drain = sig_tx.clone();
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            None,
+            "sw_fake".to_string(),
+            None, // suppress_bye_on_rebuild
+            // stop hook: flip fake_stopped so the OLD-drain-equivalent becomes a no-op.
+            Some(Arc::new(move || {
+                fake_stopped_for_hook.store(true, Ordering::SeqCst);
+                call_order_for_hook.lock().unwrap().push("stop");
+            })),
+        );
+
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> =
+            Arc::new(Mutex::new(Some(session)));
+
+        struct FakeChForCache;
+        impl super::ChannelLike for FakeChForCache {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = Arc::new(Mutex::new(Some(super::RestartCache {
+            udp_port: 0,
+            service_name: "test".to_string(),
+            channel: Arc::new(FakeChForCache),
+            session_nonce: 0,
+        })));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let hook = make_sender_rebuild_hook(
+            Arc::new(move |_udp, _svc, _stop, _ch, _att| {
+                Ok(SenderBundle {
+                    drain_handles: vec![],
+                    shutdown: None,
+                    backend_name: "sw_fake".to_string(),
+                    suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                })
+            }),
+            cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+            Arc::new(AtomicU8::new(1)),
+        );
+
+        // Run the rebuild hook (drives step 6 → must call stop hook → flips fake_stopped).
+        hook(sig_tx);
+
+        // Fire the OLD-drain-equivalent AFTER the rebuild hook completes:
+        // it emits RebuildFailed only if the stop hook has NOT run yet.
+        if !fake_stopped.load(Ordering::SeqCst) {
+            let _ = sig_tx_for_old_drain.try_send(SuperSig::RebuildFailed);
+        }
+
+        // Drain the supervisor channel and assert invariants.
+        let first = sig_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SC-RFG-1: must receive at least one signal");
+        assert!(
+            matches!(first, SuperSig::RebuildSucceeded),
+            "SC-RFG-1 FAIL: first signal must be RebuildSucceeded, got {first:?}"
+        );
+        // Drain remaining signals and assert no RebuildFailed.
+        loop {
+            match sig_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(s) => {
+                    assert!(
+                        !matches!(s, SuperSig::RebuildFailed),
+                        "SC-RFG-1 FAIL: found spurious RebuildFailed after RebuildSucceeded: {s:?}"
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// SC-RFG-2 — Rebuild step 6 calls hooks in order: suppress → stop → shutdown.
+    ///
+    /// Extends the SC-CONV-2-10 harness by adding a stop spy alongside the suppress
+    /// and shutdown spies. Asserts call_order == ["suppress", "stop", "shutdown"].
+    ///
+    /// RED until T-04 inserts the stop hook call between suppress and shutdown in
+    /// rebuild step 6.
+    #[test]
+    fn rebuild_step6_calls_stop_after_suppress_before_shutdown() {
+        use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
+        use sm_domain::supervisor::SupervisorSignal as SuperSig;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_for_suppress = call_order.clone();
+        let order_for_stop = call_order.clone();
+        let order_for_shutdown = call_order.clone();
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            Some(Box::new(move || {
+                order_for_shutdown.lock().unwrap().push("shutdown");
+            })),
+            "sw_fake".to_string(),
+            Some(Arc::new(move || {
+                order_for_suppress.lock().unwrap().push("suppress");
+            })),
+            Some(Arc::new(move || {
+                order_for_stop.lock().unwrap().push("stop");
+            })),
+        );
+
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> =
+            Arc::new(Mutex::new(Some(session)));
+
+        let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
+        struct FakeChForCache;
+        impl super::ChannelLike for FakeChForCache {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = Arc::new(Mutex::new(Some(super::RestartCache {
+            udp_port: 0,
+            service_name: "test".to_string(),
+            channel: Arc::new(FakeChForCache),
+            session_nonce: 0,
+        })));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let hook = make_sender_rebuild_hook(
+            Arc::new(move |_udp, _svc, _stop, _ch, _att| {
+                Ok(SenderBundle {
+                    drain_handles: vec![],
+                    shutdown: None,
+                    backend_name: "sw_fake".to_string(),
+                    suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                })
+            }),
+            cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+            Arc::new(AtomicU8::new(1)),
+        );
+
+        hook(sig_tx);
+
+        let signal = sig_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SC-RFG-2: rebuild must emit RebuildSucceeded");
+        assert!(
+            matches!(signal, SuperSig::RebuildSucceeded),
+            "SC-RFG-2 FAIL: expected RebuildSucceeded, got {signal:?}"
+        );
+
+        let order = call_order.lock().unwrap().clone();
+        assert_eq!(
+            order.as_slice(),
+            &["suppress", "stop", "shutdown"],
+            "SC-RFG-2 FAIL: hooks must fire in order [suppress, stop, shutdown], got {order:?}"
+        );
+    }
+
+    /// SC-RFG-4 — stop_sender_session_internal does NOT call stop_signaling_on_rebuild.
+    ///
+    /// Genuine user-initiated stop must not invoke the rebuild-only stop hook.
+    /// Mirrors genuine_stop_does_not_call_suppress_hook (SC-CONV-2-11 / R-5).
+    ///
+    /// GREEN immediately: stop_sender_session_internal never touches
+    /// stop_signaling_on_rebuild (D-RFG-5 / REQ-RFG-5).
+    #[test]
+    fn genuine_stop_does_not_call_stop_signaling_on_rebuild() {
+        use super::{
+            SenderBridge, SenderBundle, SenderCounters, SenderSession,
+            stop_sender_session_internal,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let hook_clone = hook_called.clone();
+
+        let bridge = SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| {
+            Ok(SenderBundle::test_stub())
+        }));
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            None,
+            "sw_fake".to_string(),
+            None, // suppress_bye_on_rebuild
+            Some(Arc::new(move || {
+                hook_clone.store(true, Ordering::Relaxed);
+            })),
+        );
+        *bridge.session.lock().unwrap() = Some(session);
+
+        stop_sender_session_internal(&bridge);
+
+        assert!(
+            !hook_called.load(Ordering::Relaxed),
+            "SC-RFG-4 / D-RFG-5 FAIL: stop_sender_session_internal must NOT call \
+             stop_signaling_on_rebuild"
+        );
+    }
+
+    /// SC-RFG-5 — test_stub() sets stop_signaling_on_rebuild to None.
+    ///
+    /// Mirrors new_generation_suppress_is_none (SC-CONV-2-11b).
+    ///
+    /// GREEN immediately: test_stub() already sets all hooks to None.
+    #[test]
+    fn test_stub_stop_signaling_on_rebuild_is_none() {
+        use super::SenderBundle;
+        let bundle = SenderBundle::test_stub();
+        assert!(
+            bundle.stop_signaling_on_rebuild.is_none(),
+            "SC-RFG-5 FAIL: test_stub() must have stop_signaling_on_rebuild = None"
+        );
+    }
 }
