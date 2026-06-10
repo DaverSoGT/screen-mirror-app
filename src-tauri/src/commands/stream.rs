@@ -35,7 +35,7 @@
 //! - Small payloads (< 1024 B, e.g. init segment) take the `webview.eval` fast path.
 //! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -1328,7 +1328,13 @@ fn enter_stream_supervisor_mode(
         loop {
             match outcome_rx.try_recv() {
                 Ok(outcome) => {
-                    handle_stream_supervisor_outcome(&outcome, channel, &signal_tx, &hooks, &expected_attempt);
+                    handle_stream_supervisor_outcome(
+                        &outcome,
+                        channel,
+                        &signal_tx,
+                        &hooks,
+                        &expected_attempt,
+                    );
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1909,8 +1915,8 @@ fn build_production_bundle(
                 recv_ops_for_drain,
                 sig_publish_for_drain,
                 stop_flag_s,
-                sup_tx_for_drain,            // D-3 REQ-A
-                DrainRole::Primary,          // D-RDF-1: primary drain owns offer application
+                sup_tx_for_drain,               // D-3 REQ-A
+                DrainRole::Primary,             // D-RDF-1: primary drain owns offer application
                 expected_attempt_for_sig_drain, // T1.9: reads epoch to reject stale-gen Offers
             );
         })?;
@@ -5764,10 +5770,8 @@ mod tests {
         // ── Send an offer on the new sig_ev_tx ──
         // With the fixed code a drain thread holds sig_ev_rx → try_send MUST succeed.
         // With the broken code (_sig_ev_rx dropped) try_send would return Disconnected.
-        let offer_event = SignalingEvent::OfferReceived(
-            SdpOffer("v=0\r\noffer-post-reset".to_string()),
-            1,
-        );
+        let offer_event =
+            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset".to_string()), 1);
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel is live (not orphaned) ──
@@ -5973,10 +5977,8 @@ mod tests {
         // ── Inject an OfferReceived event on the new channel ──
         // With the correct D-4 fix a drain thread holds sig_ev_rx → try_send succeeds.
         // With the broken pre-fix code (_sig_ev_rx dropped) → Disconnected.
-        let offer_event = SignalingEvent::OfferReceived(
-            SdpOffer("v=0\r\noffer-post-reset-f002".to_string()),
-            1,
-        );
+        let offer_event =
+            SignalingEvent::OfferReceived(SdpOffer("v=0\r\noffer-post-reset-f002".to_string()), 1);
         let send_result = sig_ev_tx.try_send(offer_event);
 
         // ── Primary assertion: channel not orphaned ──
@@ -7349,7 +7351,7 @@ mod tests {
                     channel,
                     sup_tx,
                     fast_single_attempt_policy(),
-                    Duration::from_millis(10),  // ack_timeout — fast so supervisor cycles quickly
+                    Duration::from_millis(10), // ack_timeout — fast so supervisor cycles quickly
                     Duration::from_millis(100), // rebuild_timeout
                     hooks,
                     watchdog_timeout,
@@ -7565,7 +7567,12 @@ mod tests {
     impl GeCountingReceiver {
         fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            (Self { call_count: counter.clone() }, counter)
+            (
+                Self {
+                    call_count: counter.clone(),
+                },
+                counter,
+            )
         }
     }
     impl SignalingReceiverOps for GeCountingReceiver {
@@ -7618,8 +7625,7 @@ mod tests {
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-            Arc::new(Mutex::new(None));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
         let stop_clone = stop_flag.clone();
@@ -7685,8 +7691,7 @@ mod tests {
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-            Arc::new(Mutex::new(None));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
         let stop_clone = stop_flag.clone();
@@ -7746,8 +7751,7 @@ mod tests {
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-            Arc::new(Mutex::new(None));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
         let stop_clone = stop_flag.clone();
@@ -7809,8 +7813,7 @@ mod tests {
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(GeNoOpPublish);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
-            Arc::new(Mutex::new(None));
+        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(8);
         let stop_clone = stop_flag.clone();

@@ -4099,15 +4099,16 @@ mod tests {
         use sm_domain::session::{BackoffSchedule, ReconnectPolicy};
         use sm_domain::supervisor::SupervisorSignal;
         use sm_domain::transport::TransportEvent;
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU8};
         use std::sync::mpsc::sync_channel;
-        use std::sync::Arc;
 
         let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let channel = CapturingChannel::new();
-        let sup_tx: std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let sup_tx: std::sync::Arc<
+            std::sync::Mutex<Option<std::sync::mpsc::SyncSender<SupervisorSignal>>>,
+        > = Arc::new(std::sync::Mutex::new(None));
 
         let fast_policy = ReconnectPolicy {
             max_attempts: std::num::NonZeroU8::new(3).unwrap(),
@@ -4148,7 +4149,7 @@ mod tests {
                     ch,
                     sup_tx,
                     fast_policy,
-                    std::time::Duration::from_millis(10),  // ack_timeout — fast so supervisor cycles quickly
+                    std::time::Duration::from_millis(10), // ack_timeout — fast so supervisor cycles quickly
                     std::time::Duration::from_millis(100), // rebuild_timeout
                     hooks,
                     std::sync::Arc::new(super::NoopSignalingRefresh)
