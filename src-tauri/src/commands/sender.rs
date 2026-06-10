@@ -2813,6 +2813,69 @@ mod tests {
         super::stop_sender_session(&bridge);
     }
 
+    /// CAP-2-v3 (REQ-WD-4 / FIX-2) — Sender double-start MUST NOT reset the
+    /// cross-generation media-watchdog fire counter (sender/receiver symmetry).
+    ///
+    /// GIVEN: a started sender whose `media_watchdog_fires` was seeded non-zero.
+    /// WHEN:  a second `start_sender_inner` with the SAME args returns AlreadyRunning.
+    /// THEN:  the fire counter is UNCHANGED — a rejected double-start is NOT a new
+    ///        connection episode, so the reset (which lives AFTER the AlreadyRunning
+    ///        guard in `start_sender_inner`) MUST NOT run.
+    ///
+    /// This mirrors the receiver test
+    /// `commands::stream::tests` REQ-WD-4 double-start assertion. It is a
+    /// characterization test of ALREADY-CORRECT behavior (guard precedes reset), so
+    /// it passes GREEN immediately — its value is locking the invariant.
+    #[test]
+    fn req_wd_4_sender_double_start_does_not_reset_media_watchdog_fires() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // Minimal builder: returns a thread-free test-stub bundle so the first
+        // start succeeds without spawning production threads.
+        let builder: super::SenderBuilderFn =
+            Arc::new(|_, _, _sf, _ch, _attempt| Ok(super::SenderBundle::test_stub()));
+        let bridge = super::SenderBridge::new_with_builder(builder);
+
+        // Fake ChannelLike (no real transport).
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let ch: Arc<dyn super::ChannelLike> = Arc::new(FakeCh);
+
+        // First start — must succeed.
+        super::start_sender_inner(&bridge, ch.clone(), Some(0), None)
+            .expect("first start must succeed");
+
+        // CAP-2-v3 (REQ-WD-4 / FIX-2): seed the cross-generation fire counter with a
+        // non-zero sentinel BEFORE the rejected double-start. A rejected start is NOT a
+        // new connection episode, so it MUST NOT reset the counter. This mirrors the
+        // receiver, which resets only AFTER its AlreadyRunning guard.
+        bridge.media_watchdog_fires.store(2, Ordering::Relaxed);
+
+        // Second start with the SAME args — must return AlreadyRunning.
+        let err = super::start_sender_inner(&bridge, ch, Some(0), None)
+            .expect_err("second start must return AlreadyRunning, not Ok(())");
+        match err {
+            super::StartSenderError::AlreadyRunning { .. } => {}
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+
+        // REQ-WD-4: the rejected double-start MUST NOT have reset the fire counter.
+        assert_eq!(
+            bridge.media_watchdog_fires.load(Ordering::Relaxed),
+            2,
+            "a rejected double-start (AlreadyRunning) must NOT reset the media-watchdog \
+             fire counter — reset belongs AFTER the guard (sender/receiver symmetry)"
+        );
+
+        // Cleanup.
+        super::stop_sender_session(&bridge);
+    }
+
     // ─── SC-RBL-2: signaling refresh — PeerBye reaches NEW supervisor after ─────
     //              enter_supervisor_mode calls set_supervisor_signal_tx
     //
