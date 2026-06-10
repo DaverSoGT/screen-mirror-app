@@ -1694,6 +1694,17 @@ pub fn make_sender_rebuild_hook(
                     if let Some(ref hook) = s.suppress_bye_on_rebuild {
                         hook();
                     }
+                    // D-RFG (REQ-RFG-3): join the OLD frame-loop thread AFTER suppressing
+                    // the Bye and BEFORE running the shutdown closure. After this returns,
+                    // the OLD sm-signaling-mdns thread is dead and cannot call emit_error
+                    // again — closing the #58 RebuildFailed FIFO window. Ordering:
+                    // suppress→stop→shutdown is load-bearing (see D-RFG-3 ordering proof
+                    // in design): suppress must precede stop so the frame loop observes
+                    // suppress_bye=true before it exits; stop must precede shutdown so the
+                    // thread is joined before signaling_arc is dropped.
+                    if let Some(ref hook) = s.stop_signaling_on_rebuild {
+                        hook();
+                    }
                     // Run the shutdown closure to drop production resources in order
                     // (capture → sender_arc → encoder_arc → signaling_arc). For test
                     // stubs this is a no-op (shutdown = None). The drain threads hold
@@ -5196,8 +5207,7 @@ mod tests {
             })),
         );
 
-        let bridge_session: Arc<Mutex<Option<SenderSession>>> =
-            Arc::new(Mutex::new(Some(session)));
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
 
         struct FakeChForCache;
         impl super::ChannelLike for FakeChForCache {
@@ -5230,16 +5240,12 @@ mod tests {
             Arc::new(AtomicU8::new(1)),
         );
 
-        // Run the rebuild hook (drives step 6 → must call stop hook → flips fake_stopped).
+        // Run the rebuild hook. This spawns the worker thread — step 6 (stop hook)
+        // runs BEFORE step 13 (RebuildSucceeded) inside that thread.
         hook(sig_tx);
 
-        // Fire the OLD-drain-equivalent AFTER the rebuild hook completes:
-        // it emits RebuildFailed only if the stop hook has NOT run yet.
-        if !fake_stopped.load(Ordering::SeqCst) {
-            let _ = sig_tx_for_old_drain.try_send(SuperSig::RebuildFailed);
-        }
-
-        // Drain the supervisor channel and assert invariants.
+        // Wait for RebuildSucceeded: this proves that step 13 was reached, which
+        // means step 6 has already run and fake_stopped is now true.
         let first = sig_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("SC-RFG-1: must receive at least one signal");
@@ -5247,17 +5253,20 @@ mod tests {
             matches!(first, SuperSig::RebuildSucceeded),
             "SC-RFG-1 FAIL: first signal must be RebuildSucceeded, got {first:?}"
         );
+
+        // Now fire the OLD-drain-equivalent. Since step 6 has already run and
+        // fake_stopped is true, this should be a no-op.
+        if !fake_stopped.load(Ordering::SeqCst) {
+            // Only fires if the stop hook was NOT called — indicates a bug.
+            let _ = sig_tx_for_old_drain.try_send(SuperSig::RebuildFailed);
+        }
+
         // Drain remaining signals and assert no RebuildFailed.
-        loop {
-            match sig_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(s) => {
-                    assert!(
-                        !matches!(s, SuperSig::RebuildFailed),
-                        "SC-RFG-1 FAIL: found spurious RebuildFailed after RebuildSucceeded: {s:?}"
-                    );
-                }
-                Err(_) => break,
-            }
+        while let Ok(s) = sig_rx.recv_timeout(Duration::from_millis(100)) {
+            assert!(
+                !matches!(s, SuperSig::RebuildFailed),
+                "SC-RFG-1 FAIL: found spurious RebuildFailed after RebuildSucceeded: {s:?}"
+            );
         }
     }
 
@@ -5266,13 +5275,13 @@ mod tests {
     /// Extends the SC-CONV-2-10 harness by adding a stop spy alongside the suppress
     /// and shutdown spies. Asserts call_order == ["suppress", "stop", "shutdown"].
     ///
-    /// RED until T-04 inserts the stop hook call between suppress and shutdown in
+    /// GREEN after T-04 inserts the stop hook call between suppress and shutdown in
     /// rebuild step 6.
     #[test]
     fn rebuild_step6_calls_stop_after_suppress_before_shutdown() {
         use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
         use sm_domain::supervisor::SupervisorSignal as SuperSig;
-        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU8};
         use std::sync::mpsc::sync_channel;
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
@@ -5306,8 +5315,7 @@ mod tests {
             })),
         );
 
-        let bridge_session: Arc<Mutex<Option<SenderSession>>> =
-            Arc::new(Mutex::new(Some(session)));
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
 
         let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
         struct FakeChForCache;
@@ -5369,8 +5377,7 @@ mod tests {
     #[test]
     fn genuine_stop_does_not_call_stop_signaling_on_rebuild() {
         use super::{
-            SenderBridge, SenderBundle, SenderCounters, SenderSession,
-            stop_sender_session_internal,
+            SenderBridge, SenderBundle, SenderCounters, SenderSession, stop_sender_session_internal,
         };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -5385,9 +5392,8 @@ mod tests {
         let hook_called = Arc::new(AtomicBool::new(false));
         let hook_clone = hook_called.clone();
 
-        let bridge = SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| {
-            Ok(SenderBundle::test_stub())
-        }));
+        let bridge =
+            SenderBridge::new_with_builder(Arc::new(|_, _, _, _, _| Ok(SenderBundle::test_stub())));
 
         let session = SenderSession::new(
             Arc::new(AtomicBool::new(false)),
