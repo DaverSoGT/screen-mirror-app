@@ -170,7 +170,11 @@ fn make_sender_test_builder(
     probe: Arc<SenderBuilderProbe>,
 ) -> screen_mirror_lib::commands::sender::SenderBuilderFn {
     Arc::new(
-        move |port: u16, name: String, _stop: Arc<AtomicBool>, _ch: Arc<dyn ChannelLike>, _attempt: u8| {
+        move |port: u16,
+              name: String,
+              _stop: Arc<AtomicBool>,
+              _ch: Arc<dyn ChannelLike>,
+              _attempt: u8| {
             probe.calls.lock().unwrap().push((port, name));
             (probe.result)()
         },

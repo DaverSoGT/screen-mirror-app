@@ -31,7 +31,7 @@
 //! `stop_sender_session` sends `SupervisorSignal::Stop` via `supervisor_signal_tx`
 //! before joining drain threads, interrupting any in-flight backoff sleep (AC-13).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -143,7 +143,13 @@ impl SenderCoordinatorHooks {
 /// 5. `attempt: u8` — SDP generation epoch (T1.13, REQ-GE-1). The builder stamps
 ///    this value onto the Offer wire frame so the receiver can reject stale offers.
 pub type SenderBuilderFn = Arc<
-    dyn Fn(u16, String, Arc<AtomicBool>, Arc<dyn ChannelLike>, u8) -> Result<SenderBundle, BundleError>
+    dyn Fn(
+            u16,
+            String,
+            Arc<AtomicBool>,
+            Arc<dyn ChannelLike>,
+            u8,
+        ) -> Result<SenderBundle, BundleError>
         + Send
         + Sync,
 >;
@@ -3039,7 +3045,7 @@ mod tests {
         use sm_domain::supervisor::SupervisorSignal;
         use sm_domain::transport::TransportEvent;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
         use std::sync::mpsc::sync_channel;
         use std::time::Duration;
 
@@ -3307,7 +3313,9 @@ mod tests {
             .expect("production initiate_mdns_reset hook must exist");
         let hook_rel_end = source[hook_start..]
             .find("\n        }),\n        sender_attempt:")
-            .expect("production initiate_mdns_reset closure must be followed by sender_attempt field");
+            .expect(
+                "production initiate_mdns_reset closure must be followed by sender_attempt field",
+            );
         let hook_region = &source[hook_start..hook_start + hook_rel_end];
 
         let suppress_pos = hook_region.find("suppress_outbound_bye()").expect(
@@ -3404,7 +3412,9 @@ mod tests {
             .expect("production initiate_mdns_reset hook must exist");
         let hook_rel_end = source[hook_start..]
             .find("\n        }),\n        sender_attempt:")
-            .expect("production initiate_mdns_reset closure must be followed by sender_attempt field");
+            .expect(
+                "production initiate_mdns_reset closure must be followed by sender_attempt field",
+            );
         let hook_region = &source[hook_start..hook_start + hook_rel_end];
 
         let suppress_pos = hook_region
@@ -3796,10 +3806,7 @@ mod tests {
 
         // Assert spy captured attempt == 3 (value read from sender_attempt Arc).
         let captured = *spy_attempt.lock().unwrap();
-        assert!(
-            captured.is_some(),
-            "T1.8 FAIL: builder was not called"
-        );
+        assert!(captured.is_some(), "T1.8 FAIL: builder was not called");
         assert_eq!(
             captured.unwrap(),
             3,

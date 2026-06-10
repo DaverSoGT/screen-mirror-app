@@ -16,7 +16,7 @@
 //
 // Naming convention: coordinator_invokes_<what>_on_<outcome>
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;

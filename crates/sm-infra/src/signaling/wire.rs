@@ -187,7 +187,10 @@ mod tests {
         let decoded = read_frame(&mut Cursor::new(buf)).expect("read_frame must not fail");
         assert_eq!(decoded, frame, "Offer frame must survive a round-trip");
         // Verify inner SDP is plain text, not JSON-escaped.
-        if let SignalingFrame::Offer { sdp: decoded_sdp, .. } = decoded {
+        if let SignalingFrame::Offer {
+            sdp: decoded_sdp, ..
+        } = decoded
+        {
             assert!(
                 !decoded_sdp.contains("\\\""),
                 "inner SDP must be plain text, not JSON-escaped"
