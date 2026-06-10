@@ -732,6 +732,7 @@ fn make_supervised_bridge_with_rebuild_hook(
                             rebuild_t,
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
+                            None, // watchdog disabled in reconnect tests
                         );
                     })
                     .expect("spawn drain");
@@ -924,6 +925,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                             t,
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
+                            None, // watchdog disabled in reconnect tests
                         );
                     })
                     .expect("spawn");
@@ -1255,6 +1257,7 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                             t,
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
+                            None, // watchdog disabled in reconnect tests
                         );
                     })
                     .expect("spawn drain");
@@ -1529,6 +1532,7 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                             t,
                             hooks,
                             Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
+                            None, // watchdog disabled in reconnect tests
                         );
                     })
                     .expect("spawn drain");

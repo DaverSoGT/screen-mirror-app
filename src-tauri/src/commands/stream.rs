@@ -1096,11 +1096,11 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
     ack_timeout: Duration,
     rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
-    // Media-arrival watchdog timeout (design #971 §D4/O4). `None` disables the
-    // watchdog (legacy behavior, used by tests that don't exercise it);
-    // `Some(6s)` is the production default. After a rebuild reports success the
-    // drain arms this deadline; the first `TransportEvent::MediaData` disarms it,
-    // and expiry re-injects `IceFailed` for a fresh supervisor cycle.
+    // REQ-WD-6: injectable media-arrival watchdog timeout (production = `Some(6s)`;
+    // tests use sub-millisecond or `None`). Mirrors sender.rs `media_watchdog_timeout`.
+    // The drain arms a one-shot deadline at ENTRY (CAP-2-v2 relocation, RCA #1020);
+    // the first `TransportEvent::MediaData` disarms it, and expiry re-injects
+    // `IceFailed` for a fresh supervisor cycle.
     media_watchdog_timeout: Option<Duration>,
     // T1.9: shared epoch counter; written by coordinator on Reconnecting, read by
     // signaling drain to reject stale-generation Offers (REQ-GE-1, SC-GE-3..6).
@@ -1108,14 +1108,84 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
 ) {
     let session_nonce: u64 = rand::random();
 
+    // Media-arrival watchdog (REQ-WD-1..6 / CAP-2-v2): arm a one-shot deadline at
+    // DRAIN ENTRY. This drain is the long-lived loop that owns the NEW-generation
+    // `ev_rx` (it is spawned at bundle-build, stream.rs:1869, and is NOT torn down by
+    // the rebuild worker's `Stop`, which targets the OLD coordinator's channel). So
+    // a deadline armed here can actually elapse — unlike the old coordinator-armed
+    // watchdog that the rebuild worker killed within microseconds (RCA #1020).
+    //
+    // `Some(deadline)` while armed; `None` once disarmed or fired. The drain-entry
+    // arm also covers the cold connect: on the happy path `MediaData` disarms it
+    // well within 6s; if a generation never produces media, firing IceFailed is the
+    // correct backstop (REQ-WD-4). Production deadline = 6s; tests inject a short one.
+    let mut watchdog_deadline: Option<std::time::Instant> =
+        media_watchdog_timeout.map(|t| std::time::Instant::now() + t);
+    if watchdog_deadline.is_some() {
+        eprintln!(
+            "[sm-stream-media-watchdog n={session_nonce}] armed at drain entry — \
+             expecting MediaData within {media_watchdog_timeout:?} (no media → IceFailed)"
+        );
+    }
+
     'drain: loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        match ev_rx.recv_timeout(Duration::from_millis(500)) {
+
+        // REQ-WD-3: FIRE the watchdog if its deadline elapsed with no MediaData.
+        // Re-inject IceFailed via `enter_stream_supervisor_mode` — exactly like a real
+        // `TransportEvent::IceFailed` (this is the production re-entry path). One-shot
+        // per generation: the immediate `break 'drain` below makes it fire at most once.
+        if let Some(deadline) = watchdog_deadline {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "[sm-stream-media-watchdog n={session_nonce}] fired — NO MediaData \
+                     within deadline; injecting IceFailed to drive a fresh supervisor cycle"
+                );
+                enter_stream_supervisor_mode(
+                    ReconnectTrigger::IceFailed,
+                    session_nonce,
+                    &ev_rx,
+                    &stop_flag,
+                    &channel,
+                    &supervisor_signal_tx,
+                    policy,
+                    ack_timeout,
+                    rebuild_timeout,
+                    hooks,
+                    expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
+                );
+                break 'drain;
+            }
+        }
+
+        // Cap the recv timeout at the remaining watchdog window (when armed) so the
+        // deadline is observed promptly, clamped to [50ms, 500ms]: the 50ms floor
+        // avoids a busy-spin as the deadline approaches; the 500ms ceiling preserves
+        // the original steady-state cadence when the watchdog is disarmed or absent.
+        let wait = match watchdog_deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(500))
+                .max(Duration::from_millis(50)),
+            None => Duration::from_millis(500),
+        };
+
+        match ev_rx.recv_timeout(wait) {
             Ok(ev) => match ev {
                 TransportEvent::IceConnected => {
                     eprintln!("[sm-stream-transport-drain+sup] ICE connected");
+                }
+                TransportEvent::MediaData => {
+                    // REQ-WD-2: first real media signal — DISARM the watchdog (one-shot).
+                    let was_armed = watchdog_deadline.take().is_some();
+                    if was_armed {
+                        eprintln!(
+                            "[sm-stream-media-watchdog n={session_nonce}] disarmed — \
+                             MediaData arrived before deadline"
+                        );
+                    }
                 }
                 TransportEvent::IceFailed => {
                     eprintln!(
@@ -1132,7 +1202,6 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ack_timeout,
                         rebuild_timeout,
                         hooks,
-                        media_watchdog_timeout,
                         expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
@@ -1152,7 +1221,6 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
                         ack_timeout,
                         rebuild_timeout,
                         hooks,
-                        media_watchdog_timeout,
                         expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
                     );
                     break 'drain;
@@ -1193,19 +1261,16 @@ fn run_stream_transport_event_drain_with_supervisor(
 /// status frames instead of JSON events (receiver uses binary channel — decision #477).
 /// Production coordinator actions are dispatched via `hooks` (CRITICAL-2 wiring).
 ///
-/// ## Media-arrival watchdog (design #971 §D4/O4)
+/// ## Note: media-arrival watchdog relocated (CAP-2-v2 / RCA #1020)
 ///
-/// `media_watchdog_timeout` enables a post-rebuild first-media backstop. When the
-/// supervisor reaches `Connected` (a rebuild reported success and the build-OK
-/// `Streaming` status was emitted), this loop arms a one-shot deadline. The first
-/// `TransportEvent::MediaData` DISARMS it; if the deadline passes with NO media,
-/// the loop injects a fresh `LocalFailure { IceFailed }` into the SAME supervisor
-/// (which is parked in `Connected`) — driving a new Reconnecting cycle through the
-/// proven re-entry path. It is ONE-SHOT per generation: each fresh `Connected`
-/// re-arms a new deadline. `None` disables the watchdog (legacy behavior).
-///
-/// The watchdog feeds the EXISTING supervisor/attempt budget; it does NOT add
-/// attempts and does NOT gate the build-OK `Streaming` emit (SC-T22-RETRY-2 safe).
+/// The media-arrival watchdog (REQ-WD-1..6) is NOT armed here. This coordinator is
+/// transient — the rebuild worker sends `RebuildSucceeded` then `Stop` back-to-back
+/// (stream.rs:2179→2193), so it exits within microseconds of a successful rebuild
+/// and a deadline armed here could never elapse. The watchdog now arms at the entry
+/// of the long-lived steady-state drain
+/// (`run_stream_transport_event_drain_with_supervisor_custom_and_hooks`), which owns
+/// the NEW-generation `ev_rx` and is not torn down by this coordinator's `Stop`.
+/// The receiver disarm trigger is `TransportEvent::MediaData`.
 #[allow(clippy::too_many_arguments)]
 fn enter_stream_supervisor_mode(
     initial_trigger: ReconnectTrigger,
@@ -1218,7 +1283,6 @@ fn enter_stream_supervisor_mode(
     ack_timeout: Duration,
     rebuild_timeout: Duration,
     hooks: StreamCoordinatorHooks,
-    media_watchdog_timeout: Option<Duration>,
     expected_attempt: Arc<AtomicU8>, // T1.9: updated on Reconnecting → signals drain
 ) {
     let (signal_tx, signal_rx) = sync_channel::<SupervisorSignal>(16);
@@ -1259,33 +1323,11 @@ fn enter_stream_supervisor_mode(
     // coordinator would exit before processing StateChanged(Connected) and the
     // "streaming" 0x02 status frame would never reach the frontend.
     // Mirrors the sender's enter_supervisor_mode fix (Batch 2).
-    //
-    // Media-arrival watchdog (design #971 §D4/O4): `watchdog_deadline` is `Some`
-    // only while a post-rebuild first-media deadline is armed. It is set when the
-    // supervisor reaches `Connected`, cleared on `TransportEvent::MediaData`, and
-    // on expiry re-injects `LocalFailure { IceFailed }` into the SAME supervisor.
-    let mut watchdog_deadline: Option<std::time::Instant> = None;
     'coord: loop {
         // Drain all available outcomes BEFORE checking stop_flag.
         loop {
             match outcome_rx.try_recv() {
                 Ok(outcome) => {
-                    if matches!(
-                        outcome,
-                        SupervisorOutcome::StateChanged(SessionState::Connected)
-                    ) {
-                        // A rebuild reported success. Arm a one-shot media-arrival
-                        // deadline (if the watchdog is enabled). The build-OK
-                        // Streaming emit in `handle_stream_supervisor_outcome` is
-                        // UNTOUCHED — the watchdog is purely additive.
-                        if let Some(n) = media_watchdog_timeout {
-                            watchdog_deadline = Some(std::time::Instant::now() + n);
-                            eprintln!(
-                                "[sm-stream-media-watchdog n={session_nonce}] armed — expecting \
-                                 first media within {n:?} (no media → IceFailed re-arm)"
-                            );
-                        }
-                    }
                     handle_stream_supervisor_outcome(
                         &outcome,
                         channel,
@@ -1308,27 +1350,7 @@ fn enter_stream_supervisor_mode(
             break 'coord;
         }
 
-        // Fire the watchdog if its deadline has passed with no media. Re-inject
-        // `LocalFailure { IceFailed }` into the SAME supervisor (parked in
-        // Connected) so it runs a fresh Reconnecting cycle via the proven
-        // re-entry path. One-shot per generation: disarmed here, re-armed on the
-        // next StateChanged(Connected).
-        if let Some(deadline) = watchdog_deadline {
-            if std::time::Instant::now() >= deadline {
-                watchdog_deadline = None;
-                eprintln!(
-                    "[sm-stream-media-watchdog n={session_nonce}] fired — NO media within \
-                     deadline; injecting IceFailed to arm a fresh supervisor cycle"
-                );
-                let _ = signal_tx.try_send(SupervisorSignal::LocalFailure {
-                    trigger: ReconnectTrigger::IceFailed,
-                });
-            }
-        }
-
-        // Block on the drain channel as the loop timer. Cap the wait at the
-        // remaining watchdog window (when armed) so deadline expiry is observed
-        // promptly; otherwise use the legacy 50ms cadence.
+        // Block on the drain channel as the loop timer (50ms cadence).
         //
         // We must NOT translate OLD transport events into RebuildSucceeded/
         // RebuildFailed signals: the OLD transport keeps emitting IceFailed/
@@ -1339,26 +1361,11 @@ fn enter_stream_supervisor_mode(
         // AwaitingAck's Ignore branch. Recovery silently failed end-to-end
         // (T12.2 manual smoke FAIL post-fix-v1, engram #509). The worker is now
         // the sole reporter of rebuild outcome via signal_tx; the OLD ev_rx is
-        // consumed-and-ignored purely as a timer — EXCEPT MediaData, which
-        // disarms the post-rebuild media-arrival watchdog.
-        let wait = match watchdog_deadline {
-            Some(deadline) => deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .min(Duration::from_millis(50)),
-            None => Duration::from_millis(50),
-        };
-        match ev_rx.recv_timeout(wait) {
-            Ok(TransportEvent::MediaData) => {
-                // First media on the new generation — disarm the watchdog.
-                if watchdog_deadline.take().is_some() {
-                    eprintln!(
-                        "[sm-stream-media-watchdog n={session_nonce}] disarmed — first media \
-                         arrived on the new generation"
-                    );
-                }
-            }
-            // All other transport events (and timeouts) are consumed as a pure
-            // timer per the rationale above.
+        // consumed-and-ignored purely as a timer.
+        match ev_rx.recv_timeout(Duration::from_millis(50)) {
+            // All transport events (and timeouts) are consumed as a pure timer
+            // per the rationale above. The media-arrival watchdog now lives in the
+            // steady-state drain (CAP-2-v2), not in this transient coordinator.
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'coord,
         }
@@ -1884,10 +1891,12 @@ fn build_production_bundle(
                 Duration::from_secs(2),
                 Duration::from_secs(15),
                 coordinator_hooks,
-                // Media-arrival watchdog (design #971 §D4/O4): N=6s production
-                // default — between ack_timeout (2s) and rebuild_timeout (15s),
-                // > first-GOP budget, < the 9s second-backoff so a re-arm still
-                // fits the 3/9/27 attempt budget.
+                // REQ-WD-1..6 (CAP-2-v2): 6s receiver media-arrival watchdog. Armed at
+                // drain entry — NOT on Connected: RCA #1020 proved the old coordinator-
+                // armed timer died on the rebuild worker's Stop before it could elapse.
+                // Disarmed on MediaData; fires IceFailed on expiry. N=6s sits between
+                // ack_timeout (2s) and the 9s second-backoff so a re-arm still fits the
+                // 3/9/27 attempt budget.
                 Some(Duration::from_secs(6)),
                 expected_attempt_for_transport, // T1.9: coordinator writes epoch on Reconnecting
             );
@@ -7245,19 +7254,25 @@ mod tests {
         );
     }
 
-    // ─── SC-WD-1/2/3: media-arrival watchdog re-arm (design #971 §D4/O4) ───────
+    // ─── SC-WD-S1..S5: media-arrival watchdog RELOCATED to drain entry (CAP-2-v2) ─
     //
-    // After a rebuild reports success (RebuildSucceeded → Connected → Streaming,
-    // the build-OK fast path UNTOUCHED), the drain arms a one-shot media-arrival
-    // watchdog. If `TransportEvent::MediaData` arrives within N → disarm (media
-    // genuinely flowed). If the deadline passes with NO media → inject `IceFailed`
-    // into the SAME drain so the existing supervisor-arm path runs a fresh cycle.
-    // This backstops the premature-success/no-retry failure class (HW gate v4,
-    // #970) WITHOUT gating the Streaming emit (SC-T22-RETRY-2 safe).
+    // These tests are the RECEIVER MIRROR of the approved sender SC-WD-S1..S5 suite
+    // (PR #2a-v2, engram #1024). They supersede the old SC-WD-1/2/3 tests, which
+    // asserted against the OLD coordinator-armed watchdog (RCA #1020): those tests
+    // sent an initial `IceFailed` to drive the drain INTO `enter_stream_supervisor_mode`
+    // and a `rebuild_succeeds_hooks` that emitted ONLY `RebuildSucceeded` with NO
+    // following `Stop`. That hid the no-op — the production rebuild worker sends
+    // `RebuildSucceeded` THEN `Stop` back-to-back, so the transient coordinator dies
+    // in microseconds and a deadline armed there could never elapse.
     //
-    // Observable: each supervisor cycle emits a `Reconnecting` 0x02 status frame.
-    // A re-arm therefore produces a SECOND `reconnecting` frame; a disarmed
-    // watchdog produces exactly ONE.
+    // The watchdog now arms at the ENTRY of the long-lived NEW-generation drain
+    // (`run_stream_transport_event_drain_with_supervisor_custom_and_hooks`), which
+    // owns the NEW-generation `ev_rx` and is NOT torn down by the rebuild worker's
+    // `Stop`. The disarm trigger on the receiver is `TransportEvent::MediaData`
+    // (sm-infra str0m_receiver emits it once per generation on first media).
+    //
+    // Observable: each supervisor cycle emits a `reconnecting` 0x02 status frame.
+    // A watchdog fire drives one Reconnecting cycle → one `reconnecting` frame.
 
     /// Count captured 0x02 status frames whose JSON payload is the given kind.
     #[cfg(test)]
@@ -7274,22 +7289,8 @@ mod tests {
             .count()
     }
 
-    /// Build a stream-drain hook set whose `initiate_rebuild` immediately reports
-    /// `RebuildSucceeded` (simulating a fast, successful local rebuild).
-    #[cfg(test)]
-    fn rebuild_succeeds_hooks() -> StreamCoordinatorHooks {
-        StreamCoordinatorHooks {
-            publish_reconnect_request: Arc::new(|_, _| {}),
-            publish_reconnect_ack: Arc::new(|_, _| {}),
-            initiate_rebuild: Arc::new(|signal_tx| {
-                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
-            }),
-            initiate_mdns_reset: Arc::new(|| {}),
-        }
-    }
-
-    /// Fast policy: a single attempt, millisecond backoff — lets the supervisor
-    /// reach Connected quickly so the watchdog window dominates the test runtime.
+    /// Fast policy: 3 attempts, millisecond backoff — lets the supervisor cycle
+    /// quickly so the watchdog window dominates the test runtime.
     #[cfg(test)]
     fn fast_single_attempt_policy() -> ReconnectPolicy {
         ReconnectPolicy {
@@ -7301,198 +7302,253 @@ mod tests {
         }
     }
 
-    /// SC-WD-1 — No `MediaData` within N after RebuildSucceeded → the watchdog fires
-    /// and injects `IceFailed`, arming a SECOND supervisor cycle (≥2 `reconnecting`
-    /// status frames).
+    /// Spawn the receiver steady-state drain with a configurable injectable watchdog
+    /// timeout. Mirrors the sender's `spawn_sender_watchdog_drain` (sender.rs).
     ///
-    /// RED: `run_stream_transport_event_drain_with_supervisor_custom_and_hooks` has
-    ///      no `media_watchdog_timeout` parameter (compile failure).
-    /// GREEN (WU-D2): post-rebuild watchdog re-injects IceFailed on no-media.
-    #[test]
-    fn sc_wd_1_no_media_in_n_injects_ice_failed() {
-        use sm_domain::transport::TransportEvent;
-
+    /// The `initiate_rebuild` hook reproduces the PRODUCTION KILL SEQUENCE
+    /// (SC-WD-S5 falsifiability gate): it sends `RebuildSucceeded` IMMEDIATELY
+    /// FOLLOWED BY `Stop`, mirroring the real rebuild worker's success path.
+    /// The previous `rebuild_succeeds_hooks` sent ONLY `RebuildSucceeded` with NO
+    /// following `Stop`, which is exactly why the coordinator-armed watchdog appeared
+    /// to fire in tests while being inert in production (RCA #1020). With this `Stop`
+    /// the OLD coordinator dies within microseconds of arming, so a coordinator-armed
+    /// watchdog can NEVER reach its deadline — only a watchdog that lives in the
+    /// (independent) steady-state drain survives the `Stop` and can fire.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn spawn_stream_watchdog_drain(
+        watchdog_timeout: Option<std::time::Duration>,
+    ) -> (
+        Arc<FakeChannel>,
+        SyncSender<TransportEvent>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let fake_ch = FakeChannel::new();
         let channel: Arc<dyn ChannelLike> = fake_ch.clone();
         let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
 
+        let hooks = StreamCoordinatorHooks {
+            publish_reconnect_request: Arc::new(|_, _| {}),
+            publish_reconnect_ack: Arc::new(|_, _| {}),
+            // PRODUCTION KILL SEQUENCE (mirrors the real rebuild worker: RebuildSucceeded → Stop).
+            initiate_rebuild: Arc::new(|signal_tx| {
+                let _ = signal_tx.try_send(SupervisorSignal::RebuildSucceeded);
+                let _ = signal_tx.try_send(SupervisorSignal::Stop);
+            }),
+            initiate_mdns_reset: Arc::new(|| {}),
+        };
+
         let stop_for_drain = stop_flag.clone();
-        let handle = std::thread::spawn(move || {
-            run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                ev_rx,
-                stop_for_drain,
-                channel,
-                sup_tx,
-                fast_single_attempt_policy(),
-                Duration::from_millis(20),  // ack_timeout
-                Duration::from_millis(100), // rebuild_timeout
-                rebuild_succeeds_hooks(),
-                Some(Duration::from_millis(200)), // media watchdog N — fast for test
-                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
-            );
-        });
+        let handle = std::thread::Builder::new()
+            .name("sc-wd-s-stream-drain".into())
+            .spawn(move || {
+                run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
+                    ev_rx,
+                    stop_for_drain,
+                    channel,
+                    sup_tx,
+                    fast_single_attempt_policy(),
+                    Duration::from_millis(10), // ack_timeout — fast so supervisor cycles quickly
+                    Duration::from_millis(100), // rebuild_timeout
+                    hooks,
+                    watchdog_timeout,
+                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — these tests don't drive the stale-guard
+                );
+            })
+            .expect("spawn sc-wd-s stream drain");
 
-        // Kick the drain into supervisor mode; the hook reports RebuildSucceeded →
-        // Connected → Streaming, then the watchdog arms. NO MediaData is sent.
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
+        (fake_ch, ev_tx, stop_flag, handle)
+    }
 
-        // Allow first cycle + watchdog expiry (200ms) + second cycle to run.
+    /// SC-WD-S5 (NEW — falsifiability gate; catches the no-op) — the RECEIVER
+    /// watchdog STILL fires after the PRODUCTION kill sequence (RebuildSucceeded →
+    /// Stop). Receiver mirror of the sender keystone (engram #1024).
+    ///
+    /// The fixture's `initiate_rebuild` hook sends `RebuildSucceeded` IMMEDIATELY
+    /// FOLLOWED BY `Stop` (mirroring stream.rs:2179→2193). Against the OLD
+    /// coordinator-armed watchdog the coordinator receives the Stop microseconds
+    /// after arming and breaks before its deadline can elapse → 0 fires → RED. The
+    /// watchdog only fires when it lives in the steady-state drain (which is NOT torn
+    /// down by the coordinator's Stop) and arms at drain entry.
+    ///
+    /// Strategy: the drain arms at entry with a short injectable deadline. NO
+    /// `TransportEvent::MediaData` is delivered. On expiry the drain re-injects
+    /// `IceFailed` via `enter_stream_supervisor_mode`, the supervisor re-enters
+    /// `Reconnecting` (emitting a `reconnecting` 0x02 status frame), runs
+    /// `InitiateRebuild` → the hook reports `RebuildSucceeded` then `Stop`, and the
+    /// coordinator exits cleanly.
+    ///
+    /// RED (before relocation): drain entry does NOT arm a watchdog → 0 reconnecting.
+    /// GREEN (after relocation): drain-entry arm fires → ≥1 reconnecting.
+    #[test]
+    fn sc_wd_prod_kill_sequence_still_fires() {
+        // NO IceFailed and NO MediaData are delivered. The relocated watchdog must
+        // arm at drain entry and fire purely on the deadline. The hook's Stop (sent
+        // right after RebuildSucceeded) proves the firing path survives the production
+        // kill sequence that makes the coordinator-armed watchdog a no-op.
+        let (fake_ch, ev_tx, stop_flag, handle) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
+
+        // Allow: drain-entry arm (150ms) → fire → Reconnecting cycle (~110ms).
         std::thread::sleep(Duration::from_millis(900));
         stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
         let _ = handle.join();
 
         let reconnecting = count_status_kind(&fake_ch, "reconnecting");
         assert!(
-            reconnecting >= 2,
-            "SC-WD-1 FAIL: with NO media in N the watchdog must re-arm a fresh \
-             supervisor cycle (≥2 reconnecting frames), got {reconnecting}"
+            reconnecting >= 1,
+            "SC-WD-S5 FAIL (falsifiability gate): with NO MediaData the drain-entry \
+             watchdog MUST fire and drive a fresh Reconnecting cycle EVEN THOUGH the \
+             rebuild hook sends Stop right after RebuildSucceeded (the production kill \
+             sequence). Expected ≥1 reconnecting event, got {reconnecting}. A value of \
+             0 means the watchdog is armed on the dying coordinator (RCA #1020) instead \
+             of the steady-state drain."
         );
     }
 
-    /// SC-WD-2 — `MediaData` arrives within N after RebuildSucceeded → the watchdog
-    /// disarms; NO second supervisor cycle (exactly ONE `reconnecting` frame).
+    /// SC-WD-S1 (re-based) — Receiver watchdog FIRES `LocalFailure{IceFailed}` when no
+    /// `TransportEvent::MediaData` arrives before the drain-entry deadline.
     ///
-    /// RED: shares SC-WD-1's compile failure (missing parameter).
-    /// GREEN (WU-D2): MediaData disarms the post-rebuild watchdog.
+    /// Arm event is now DRAIN ENTRY (REQ-WD-1), not `StateChanged(Connected)` in the
+    /// transient coordinator. The drain arms a short deadline at entry; no MediaData
+    /// is delivered; the watchdog fires exactly once (the drain breaks into the
+    /// supervisor after firing), producing exactly one `reconnecting` cycle.
     ///
-    /// Determinism fix: instead of a single timed MediaData (which races against the
-    /// wall-clock moment the supervisor reaches Connected on slow CI), we spawn a
-    /// continuous sender that fires every 35ms. The watchdog arms at some point after
-    /// Connected; within at most ~35ms of arming a MediaData arrives and disarms it —
-    /// well within N=400ms on any runner.
+    /// RED (before relocation): no drain-entry watchdog → 0 reconnecting.
+    /// GREEN (after relocation): exactly 1 reconnecting.
     #[test]
-    fn sc_wd_2_media_in_n_no_rearm() {
-        use sm_domain::transport::TransportEvent;
+    fn sc_wd_s1_no_media_fires_local_failure() {
+        let (fake_ch, ev_tx, stop_flag, handle) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
 
-        let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let fake_ch = FakeChannel::new();
-        let channel: Arc<dyn ChannelLike> = fake_ch.clone();
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
-
-        let stop_for_drain = stop_flag.clone();
-        let handle = std::thread::spawn(move || {
-            run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                ev_rx,
-                stop_for_drain,
-                channel,
-                sup_tx,
-                fast_single_attempt_policy(),
-                Duration::from_millis(20),
-                Duration::from_millis(100),
-                rebuild_succeeds_hooks(),
-                Some(Duration::from_millis(400)), // watchdog N
-                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
-            );
-        });
-
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
-
-        // Continuous MediaData sender: models real media flow so the watchdog is
-        // guaranteed to see a MediaData within ~35ms of arming (whenever Connected
-        // happens on any runner speed). try_send ignores Err(Full) so a
-        // transiently-full channel can't panic the sender thread.
-        let media_stop = Arc::new(AtomicBool::new(false));
-        let media_stop_clone = media_stop.clone();
-        let ev_tx_media = ev_tx.clone();
-        let media_sender = std::thread::spawn(move || {
-            while !media_stop_clone.load(Ordering::Relaxed) {
-                let _ = ev_tx_media.try_send(TransportEvent::MediaData);
-                std::thread::sleep(Duration::from_millis(35));
-            }
-        });
-
-        // Wait past the original watchdog deadline to prove no re-arm fired.
-        std::thread::sleep(Duration::from_millis(600));
-
-        // Stop the MediaData sender, then stop the drain.
-        media_stop.store(true, Ordering::Relaxed);
-        let _ = media_sender.join();
+        // NO MediaData — the drain-entry watchdog must fire.
+        std::thread::sleep(Duration::from_millis(900));
         stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        let _ = handle.join();
+
+        // The watchdog fires once at drain entry → the drain enters the supervisor and
+        // breaks → exactly one Reconnecting cycle.
+        let reconnecting = count_status_kind(&fake_ch, "reconnecting");
+        assert_eq!(
+            reconnecting, 1,
+            "SC-WD-S1 FAIL: with no MediaData the drain-entry watchdog must inject \
+             exactly one IceFailed (one Reconnecting cycle), got {reconnecting}"
+        );
+    }
+
+    /// SC-WD-S2 (fixed — was tautological) — Receiver watchdog DISARMS when
+    /// `TransportEvent::MediaData` arrives BEFORE a SHORT deadline.
+    ///
+    /// The original SC-WD-2 used a 400ms deadline AND drove the drain through the
+    /// coordinator (initial IceFailed), so it asserted against the dying-coordinator
+    /// watchdog. This version arms at drain entry with a SHORT injectable deadline,
+    /// delivers MediaData before it, and observes PAST the deadline. An `if false`
+    /// mutation on the disarm branch MUST flip this RED (the watchdog would fire →
+    /// count becomes 1).
+    ///
+    /// Observable: MediaData disarms → watchdog never fires → exactly 0 reconnecting.
+    #[test]
+    fn sc_wd_s2_media_disarms_watchdog() {
+        let (fake_ch, ev_tx, stop_flag, handle) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
+
+        // Deliver MediaData promptly — BEFORE the 150ms deadline — to disarm.
+        let _ = ev_tx.try_send(TransportEvent::MediaData);
+
+        // Observe well PAST the short deadline (≈6× the injectable timeout). A correctly
+        // disarmed watchdog produces zero fires across this window.
+        std::thread::sleep(Duration::from_millis(900));
+
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
         let _ = handle.join();
 
         let reconnecting = count_status_kind(&fake_ch, "reconnecting");
         assert_eq!(
-            reconnecting, 1,
-            "SC-WD-2 FAIL: MediaData within N must disarm the watchdog — exactly ONE \
-             reconnecting cycle expected, got {reconnecting}"
+            reconnecting, 0,
+            "SC-WD-S2 FAIL: MediaData before the (short) deadline must disarm the \
+             watchdog — expected 0 reconnecting events observed past the deadline, got \
+             {reconnecting}. (An `if false` on the disarm branch MUST flip this to 1.)"
         );
     }
 
-    /// SC-WD-3 — SC-T22 shape: a single restart where media arrives in time. The
-    /// watchdog is present but media disarms it; the supervisor completes normally
-    /// with NO extra cycle. Proves the SC-T22-RETRY-2 path is unaffected.
+    /// SC-WD-S3 (fixed — upper bound now exact) — Receiver watchdog is ONE-SHOT per
+    /// DRAIN GENERATION.
     ///
-    /// RED: shares SC-WD-1's compile failure.
-    /// GREEN (WU-D2): SC-T22 shape sees zero behavioral change from the watchdog.
+    /// Each drain instance is one generation; each arms a one-shot deadline at entry
+    /// and fires at most once. Two independent drain generations, each driven to expiry
+    /// with no MediaData, MUST produce EXACTLY 2 reconnecting cycles total — not 0, not
+    /// 1, not 3+. The exact count proves (a) no double-fire within a generation, and
+    /// (b) exactly-once re-arm per generation (the structural per-generation property
+    /// of REQ-WD-4). `>= 2` is insufficient as the spec's upper bound.
     ///
-    /// Determinism fix: same continuous-sender pattern as SC-WD-2 — fires every 35ms
-    /// so the watchdog is guaranteed to be disarmed regardless of when Connected
-    /// lands on any runner speed (eliminates macOS CI wall-clock flake).
+    /// RED (before relocation): no drain-entry watchdog → 0.
+    /// GREEN (after relocation): exactly 2.
     #[test]
-    fn sc_wd_3_sc_t22_shape_unaffected() {
-        use sm_domain::transport::TransportEvent;
+    fn sc_wd_s3_one_shot_per_drain_generation() {
+        // Generation 1: a fresh drain arms at entry, fires once, breaks.
+        let (fake_ch_a, ev_tx_a, stop_flag_a, handle_a) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_a.store(true, Ordering::Relaxed);
+        drop(ev_tx_a);
+        let _ = handle_a.join();
+        let gen1 = count_status_kind(&fake_ch_a, "reconnecting");
 
-        let (ev_tx, ev_rx) = sync_channel::<TransportEvent>(8);
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let fake_ch = FakeChannel::new();
-        let channel: Arc<dyn ChannelLike> = fake_ch.clone();
-        let sup_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> = Arc::new(Mutex::new(None));
+        // Generation 2: a second fresh drain (a new generation) arms a new one-shot
+        // deadline at its own entry and fires once.
+        let (fake_ch_b, ev_tx_b, stop_flag_b, handle_b) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
+        std::thread::sleep(Duration::from_millis(900));
+        stop_flag_b.store(true, Ordering::Relaxed);
+        drop(ev_tx_b);
+        let _ = handle_b.join();
+        let gen2 = count_status_kind(&fake_ch_b, "reconnecting");
 
-        let stop_for_drain = stop_flag.clone();
-        let handle = std::thread::spawn(move || {
-            run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
-                ev_rx,
-                stop_for_drain,
-                channel,
-                sup_tx,
-                fast_single_attempt_policy(),
-                Duration::from_millis(20),
-                Duration::from_millis(100),
-                rebuild_succeeds_hooks(),
-                Some(Duration::from_millis(400)),
-                Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
-            );
-        });
+        assert_eq!(
+            gen1 + gen2,
+            2,
+            "SC-WD-S3 FAIL: the watchdog must fire EXACTLY once per drain generation — \
+             expected exactly 2 reconnecting events across two generations (gen1={gen1}, \
+             gen2={gen2}), got {}",
+            gen1 + gen2
+        );
+    }
 
-        // Single-side restart shape: IceFailed → rebuild succeeds → continuous media.
-        // The continuous sender guarantees the watchdog sees a MediaData within ~35ms
-        // of arming on any runner, preventing the wall-clock race that caused macOS CI
-        // flakes (single MediaData sent before Connected could race the arm point).
-        ev_tx.try_send(TransportEvent::IceFailed).unwrap();
+    /// SC-WD-S4 (fixed — was tautological) — Cold-connect happy path: the drain-entry
+    /// watchdog does NOT fire when `MediaData` arrives in time.
+    ///
+    /// Equivalent to SC-WD-S2 but explicitly covers the COLD-connect entry (the drain
+    /// starts without any preceding rebuild). Short deadline + MediaData before it +
+    /// observation past the deadline + exact count 0 ensures an `if false` removal of
+    /// the disarm logic is caught (it would flip the count to 1). The original SC-WD-3
+    /// used a 400ms deadline driven through the coordinator, asserting against the wrong
+    /// (dying) watchdog.
+    #[test]
+    fn sc_wd_s4_no_extra_cycle_on_clean_media() {
+        let (fake_ch, ev_tx, stop_flag, handle) =
+            spawn_stream_watchdog_drain(Some(Duration::from_millis(150)));
 
-        let media_stop = Arc::new(AtomicBool::new(false));
-        let media_stop_clone = media_stop.clone();
-        let ev_tx_media = ev_tx.clone();
-        let media_sender = std::thread::spawn(move || {
-            while !media_stop_clone.load(Ordering::Relaxed) {
-                let _ = ev_tx_media.try_send(TransportEvent::MediaData);
-                std::thread::sleep(Duration::from_millis(35));
-            }
-        });
+        // Cold connect: deliver MediaData before the short deadline — disarms.
+        let _ = ev_tx.try_send(TransportEvent::MediaData);
 
-        // Run long enough to prove no re-arm (watchdog N=400ms, total >550ms).
-        std::thread::sleep(Duration::from_millis(600));
-
-        // Stop the MediaData sender, then stop the drain.
-        media_stop.store(true, Ordering::Relaxed);
-        let _ = media_sender.join();
+        // Observe well past the short deadline — no fire expected.
+        std::thread::sleep(Duration::from_millis(900));
         stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
         let _ = handle.join();
 
         let reconnecting = count_status_kind(&fake_ch, "reconnecting");
-        let streaming = count_status_kind(&fake_ch, "streaming");
         assert_eq!(
-            reconnecting, 1,
-            "SC-WD-3 FAIL: SC-T22 shape must see exactly ONE reconnect cycle \
-             (watchdog adds no extra cycle when media arrives), got {reconnecting}"
-        );
-        assert!(
-            streaming >= 1,
-            "SC-WD-3 FAIL: the build-OK Streaming emit (SC-T22-proven path) must still \
-             fire, got {streaming} streaming frames"
+            reconnecting, 0,
+            "SC-WD-S4 FAIL: a clean cold-connect MediaData before the (short) deadline \
+             must not trigger any cycle — expected 0 reconnecting events, got \
+             {reconnecting}. (An `if false` on the disarm branch MUST flip this to 1.)"
         );
     }
 

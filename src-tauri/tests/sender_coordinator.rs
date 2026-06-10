@@ -194,6 +194,7 @@ fn make_bridge_with_counting_hooks(
                         t,
                         hooks,
                         Arc::new(NoopSignalingRefresh) as Arc<dyn SignalingSupervisorRefresh>,
+                        None, // watchdog disabled in coordinator tests
                     );
                 })
                 .expect("spawn drain");
