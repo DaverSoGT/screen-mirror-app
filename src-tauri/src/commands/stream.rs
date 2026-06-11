@@ -2796,15 +2796,18 @@ impl FlushTiming {
 
     /// Called when a segment flush occurs. Returns `(frames_in_segment, interval_ms_since_last_flush)`.
     ///
-    /// After return, `frames_since_flush` resets to 1 — the triggering IDR is
-    /// frame 1 of the next GOP (off-by-one invariant per D-PPT2-5).
+    /// After return, `frames_since_flush` resets to 0. The caller MUST call
+    /// `on_append()` immediately after for the triggering IDR — that IDR belongs
+    /// to the NEXT segment (fmp4_muxer::append_packet pushes the triggering IDR
+    /// into fresh pending after flushing the previous GOP). Production call order:
+    ///   append_packet(IDR) → Some(segment) → on_flush(now) → on_append() [IDR]
     fn on_flush(&mut self, now: Instant) -> (u32, Option<u64>) {
         let frames = self.frames_since_flush;
         let interval_ms = self
             .last_flush
             .map(|t| now.duration_since(t).as_millis() as u64);
         self.last_flush = Some(now);
-        self.frames_since_flush = 1;
+        self.frames_since_flush = 0;
         (frames, interval_ms)
     }
 }
@@ -2962,8 +2965,6 @@ fn mux_thread(
         }
 
         // Feed the IDR to the muxer (may flush the previous GOP).
-        // MUX-OBS-1: count the IDR itself as a frame before append.
-        flush_timing.on_append();
         if let Some(m) = muxer.as_mut() {
             match m.append_packet(&pkt) {
                 Some(segment) => {
@@ -2971,15 +2972,23 @@ fn mux_thread(
                         "[sm-stream-mux] segment flushed ({} bytes) on IDR — sending to channel",
                         segment.len()
                     );
+                    // MUX-OBS-1: on_flush BEFORE on_append — the triggering IDR belongs
+                    // to the NEXT segment (fmp4_muxer pushes it into fresh pending after
+                    // flushing the previous GOP). Call order: on_flush → on_append(IDR).
                     let (seg_frames, seg_interval_ms) = flush_timing.on_flush(Instant::now());
                     eprintln!(
                         "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={}",
                         seg_frames,
                         seg_interval_ms.unwrap_or(0),
                     );
+                    flush_timing.on_append(); // IDR is frame 1 of the next segment
                     emit_segment(&channel, &counters, segment);
                 }
                 None => {
+                    // No segment flushed (first IDR or empty pending): IDR opens the
+                    // first segment, count it now.
+                    // MUX-OBS-1: on_append for the IDR that starts a new segment.
+                    flush_timing.on_append();
                     eprintln!(
                         "[sm-stream-mux] IDR ingested into muxer; pending GOP not yet flushed (first IDR or empty pending)"
                     );
@@ -8876,49 +8885,75 @@ mod tests {
     }
 
     // ─── FlushTiming unit tests (MUX-OBS-1, Slice 2) ─────────────────────────
+    //
+    // These tests model the TRUE production call order (fixed in fix-round-1):
+    //   IDR path: append_packet() → on_flush() → on_append(IDR)
+    //   P-frame path: on_append(P) [before append_packet if unexpected flush]
+    //
+    // The triggering IDR belongs to the NEXT segment (fmp4_muxer::append_packet
+    // pushes the IDR into fresh pending after flushing the previous GOP).
+    // Therefore on_flush() fires BEFORE on_append() for that IDR.
+    // on_flush() resets frames_since_flush to 0; on_append() immediately sets it
+    // to 1. A GOP of N frames (IDR1 + N-1 P-frames, then IDR2 triggers flush)
+    // must report segment_frames == N.
 
     use super::FlushTiming;
 
-    /// First flush: no prior flush → interval_ms is None; frames_since_flush resets to 1.
+    /// First flush: no prior flush → interval_ms is None; frames_since_flush
+    /// resets to 0 by on_flush, then on_append for the triggering IDR sets it to 1.
     #[test]
     fn flush_timing_first_flush_no_interval() {
         let mut ft = FlushTiming::default();
-        // Simulate 5 on_append calls before the first flush.
+        // Production order: IDR1 → append_packet → None (no prior segment).
+        // on_flush is NOT called on that path (no Some(segment) returned).
+        // Instead, on_append is called for IDR1 (it is the first frame of segment 1).
+        // Simulate 5 frames appended (IDR1 + 4 P-frames) with no flush yet,
+        // then IDR2 arrives: append_packet → Some(segment), on_flush, then on_append(IDR2).
         for _ in 0..5 {
-            ft.on_append();
+            ft.on_append(); // frames for the segment being flushed
         }
         let t0 = Instant::now();
+        // Production order: on_flush fires BEFORE on_append for the triggering IDR.
         let (frames, interval_ms) = ft.on_flush(t0);
         assert_eq!(frames, 5, "first flush must report 5 frames");
         assert_eq!(interval_ms, None, "first flush must have no prior interval");
-        // The IDR that triggered the flush starts the next GOP as frame 1.
+        // on_flush resets to 0; the triggering IDR's on_append fires next.
+        assert_eq!(
+            ft.frames_since_flush, 0,
+            "on_flush must reset frames_since_flush to 0 (IDR on_append follows)"
+        );
+        ft.on_append(); // triggering IDR is now frame 1 of the next segment
         assert_eq!(
             ft.frames_since_flush, 1,
-            "frames_since_flush must reset to 1 after flush"
+            "after IDR on_append, frames_since_flush must be 1"
         );
     }
 
-    /// Second flush: interval_ms reflects elapsed time; frame count includes carry-over IDR.
+    /// Second flush: interval_ms reflects elapsed time; frame count equals the
+    /// number of frames appended since the previous flush (no carry-over double-count).
+    /// GOP invariant: IDR1 + 55 P-frames = 56 frames in the segment.
     #[test]
     fn flush_timing_second_flush_interval_and_frames() {
         let mut ft = FlushTiming::default();
-        // First flush: 5 frames.
+        // First flush: 5 frames appended, then on_flush, then on_append for IDR.
         for _ in 0..5 {
             ft.on_append();
         }
         let t0 = Instant::now();
-        ft.on_flush(t0);
-        // Now frames_since_flush == 1 (carry-over IDR).
-        // Append 55 more P-frames.
+        ft.on_flush(t0); // resets to 0
+        ft.on_append(); // triggering IDR2 → frame 1 of next segment; count = 1
+
+        // 55 more P-frames appended for the second segment.
         for _ in 0..55 {
             ft.on_append();
         }
-        // frames_since_flush should now be 1 + 55 = 56.
+        // frames_since_flush should now be 1 (IDR2) + 55 (P-frames) = 56.
         let t1 = t0 + Duration::from_millis(2100);
+        // Production order: on_flush fires BEFORE on_append for IDR3.
         let (frames, interval_ms) = ft.on_flush(t1);
         assert_eq!(
             frames, 56,
-            "second flush must report 56 frames (55 P-frames + 1 IDR carry-over)"
+            "second flush must report 56 frames (1 IDR + 55 P-frames, no double-count)"
         );
         assert_eq!(
             interval_ms,
@@ -8926,22 +8961,32 @@ mod tests {
             "second flush interval must be 2100 ms"
         );
         assert_eq!(
-            ft.frames_since_flush, 1,
-            "frames_since_flush must reset to 1 after second flush"
+            ft.frames_since_flush, 0,
+            "on_flush must reset frames_since_flush to 0 after second flush"
         );
+        ft.on_append(); // IDR3 is frame 1 of next segment
+        assert_eq!(ft.frames_since_flush, 1, "IDR3 on_append sets count to 1");
     }
 
-    /// IDR off-by-one: after a flush, frames_since_flush must be 1 (triggering IDR counts as frame 1 of next GOP).
+    /// IDR off-by-one invariant: a GOP of N frames (IDR + N-1 P-frames, next IDR
+    /// triggers flush) must report segment_frames == N. Production order pin.
     #[test]
     fn flush_timing_idr_off_by_one_reset() {
+        // GOP: IDR1 (1 frame) + 0 P-frames → flushed by IDR2.
         let mut ft = FlushTiming::default();
-        ft.on_append(); // 1 frame before flush
+        ft.on_append(); // IDR1 appended → frame 1 of this segment
         let t0 = Instant::now();
+        // IDR2 arrives: append_packet → Some(segment); on_flush first, then on_append(IDR2).
         let (frames, _) = ft.on_flush(t0);
-        assert_eq!(frames, 1, "single-frame first flush must report 1");
+        assert_eq!(frames, 1, "single-frame GOP must report segment_frames=1");
+        assert_eq!(
+            ft.frames_since_flush, 0,
+            "on_flush resets to 0; IDR2 on_append has not fired yet"
+        );
+        ft.on_append(); // IDR2 is now frame 1 of the next segment
         assert_eq!(
             ft.frames_since_flush, 1,
-            "IDR off-by-one: frames_since_flush must be 1 after flush"
+            "after IDR2 on_append, frames_since_flush must be 1"
         );
     }
 }

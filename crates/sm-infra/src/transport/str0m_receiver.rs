@@ -774,13 +774,18 @@ fn handle_receiver_event(
             gap_state.last_arrival = Some(now);
             if gap_state.window_start.elapsed() >= Duration::from_secs(1) {
                 let window = gap_state.window_start.elapsed();
-                eprintln!(
-                    "[sm-receiver-gap] receive_fps={:.1} max_gap_ms={:.1} mean_gap_ms={:.1} frames={}",
-                    gap_state.stats.receive_fps(window),
-                    gap_state.stats.max_gap_ms(),
-                    gap_state.stats.mean_gap_ms(),
-                    gap_state.stats.count,
-                );
+                // RECV-OBS-1 scenario 3: skip emission when no frames arrived in the
+                // window (count == 0). The window still resets so the cadence stays
+                // event-driven; last_arrival persists for gap measurement continuity.
+                if gap_state.stats.count > 0 {
+                    eprintln!(
+                        "[sm-receiver-gap] receive_fps={:.1} max_gap_ms={:.1} mean_gap_ms={:.1} frames={}",
+                        gap_state.stats.receive_fps(window),
+                        gap_state.stats.max_gap_ms(),
+                        gap_state.stats.mean_gap_ms(),
+                        gap_state.stats.count,
+                    );
+                }
                 gap_state.stats.reset();
                 gap_state.window_start = now;
                 // last_arrival persists across windows so the gap straddling a boundary
