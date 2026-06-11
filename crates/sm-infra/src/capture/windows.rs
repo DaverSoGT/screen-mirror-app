@@ -96,6 +96,25 @@ fn supports_borderless() -> bool {
     })
 }
 
+// ── Shared observability seam (perf-pipeline-throughput Slice 1) ────────────
+//
+// Defined here (no hw-encoder feature gate) so both the capture-side gate in
+// on_frame_arrived and the encode-side gate in pump_loop (windows_mft.rs) call
+// the same tested predicate instead of an inline duplicate.
+
+/// Returns `true` when the elapsed time since `window_start` is at or above `threshold`.
+///
+/// Extracted as a pure function so the cadence predicate is unit-testable with synthetic
+/// `Instant` values — no wall-clock sleeping required (D-PPT-6).
+#[inline]
+pub(crate) fn interval_elapsed(
+    window_start: std::time::Instant,
+    now: std::time::Instant,
+    threshold: std::time::Duration,
+) -> bool {
+    now.duration_since(window_start) >= threshold
+}
+
 // ---------------------------------------------------------------------------
 // Helper: map Monitor errors to CaptureError
 // ---------------------------------------------------------------------------
@@ -248,8 +267,9 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         // Per-second observability window: emit capture_fps and capture drop-delta (I1, D-PPT-1/3).
         // Checked unconditionally after the match so both delivered and dropped frames advance
         // the window clock, keeping the log cadence stable even under backpressure.
-        let elapsed = self.fps_window_start.elapsed();
-        if elapsed >= std::time::Duration::from_secs(1) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.fps_window_start);
+        if interval_elapsed(self.fps_window_start, now, std::time::Duration::from_secs(1)) {
             let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
             tracing::info!(
                 target: "sm_infra::capture::windows",

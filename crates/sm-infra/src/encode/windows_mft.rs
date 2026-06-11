@@ -96,6 +96,10 @@ use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
 
+// Shared observability seam — cadence predicate defined in capture::windows (no hw-encoder
+// gate) so both the encode and capture production gates call the same tested function.
+use crate::capture::interval_elapsed;
+
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
 
 /// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
@@ -1695,8 +1699,9 @@ fn pump_loop(
                             // log fps once per FPS_LOG_INTERVAL. Reveals true encode throughput
                             // to complement the muxer real-DTS-delta fix diagnosis.
                             fps_frame_count += 1;
-                            let elapsed = fps_window_start.elapsed();
-                            if elapsed >= FPS_LOG_INTERVAL {
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(fps_window_start);
+                            if interval_elapsed(fps_window_start, now, FPS_LOG_INTERVAL) {
                                 let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
                                 // CAPT-OBS-6: encode_fps event field names and cadence MUST remain
                                 // unchanged. Do NOT alter the fields or message below.
@@ -2284,19 +2289,6 @@ impl ConvertStats {
     }
 }
 
-/// Returns `true` when the elapsed time since `window_start` is at or above `threshold`.
-///
-/// Extracted as a pure function so the cadence predicate is unit-testable with synthetic
-/// `Instant` values — no wall-clock sleeping required (D-PPT-6).
-#[inline]
-fn interval_elapsed(
-    window_start: std::time::Instant,
-    now: std::time::Instant,
-    threshold: std::time::Duration,
-) -> bool {
-    now.duration_since(window_start) >= threshold
-}
-
 /// Compute the per-interval drop delta for a monotonically-increasing drop counter.
 ///
 /// Returns `(delta, new_last)` where `delta = current.saturating_sub(last)` and
@@ -2791,6 +2783,30 @@ mod tests {
         stats.reset();
         assert_eq!(stats.frames, 0, "frames must be 0 after reset");
         assert_eq!(stats.total_us, 0, "total_us must be 0 after reset");
+    }
+
+    /// Pinning guard: ConvertStats with zero frames must not divide by zero.
+    ///
+    /// Production code fires mean_us()/fps() at the per-second window boundary.  On the
+    /// first window after startup (or after a reset), it is possible that no convert calls
+    /// occurred (quiet first second: D-PPT-5 / spec CAPT-OBS-2 "First frame in window").
+    /// This test pins the guard so a future removal would cause a failure before a panic
+    /// reaches production.
+    #[test]
+    fn convert_stats_zero_frame_guard_returns_zero() {
+        use std::time::Duration;
+
+        let stats = ConvertStats::default();
+        assert_eq!(
+            stats.mean_us(),
+            0,
+            "mean_us() must return 0 when frames == 0 (divide-by-zero guard)"
+        );
+        assert_eq!(
+            stats.fps(Duration::from_secs(1)),
+            0.0,
+            "fps() must return 0.0 when frames == 0 (divide-by-zero guard)"
+        );
     }
 
     /// Task 1.3 [RED]: interval_elapsed returns false below threshold and true at/above threshold.
