@@ -354,6 +354,8 @@ fn stop_sender_fake_session_drains_handles() {
                 shutdown: None,
                 backend_name: "sw_fake".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
+                disarm_escalation_on_rebuild: None,
             })
         }),
     });
@@ -608,7 +610,14 @@ fn signaling_drain_peer_found_logs_and_emits_connecting() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender,
+            stop_clone,
+            ch_clone,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     ev_tx
@@ -642,7 +651,14 @@ fn signaling_drain_answer_received_calls_apply_remote_answer() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     ev_tx
@@ -675,7 +691,14 @@ fn signaling_drain_candidate_received_calls_add_remote_candidate() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     ev_tx
@@ -707,7 +730,14 @@ fn signaling_drain_offer_received_is_silently_ignored() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender_ops, stop_clone, ch, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender_ops,
+            stop_clone,
+            ch,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     ev_tx
@@ -741,7 +771,14 @@ fn signaling_drain_closed_emits_peer_lost_and_exits() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch_clone, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender,
+            stop_clone,
+            ch_clone,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     ev_tx
@@ -767,7 +804,14 @@ fn signaling_drain_disconnected_rx_exits_cleanly() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender,
+            stop_clone,
+            ch,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     drop(ev_tx); // disconnect
@@ -793,7 +837,14 @@ fn signaling_drain_stop_flag_exits_loop() {
         None::<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>,
     ));
     let drain = thread::spawn(move || {
-        run_sender_signaling_drain(ev_rx, fake_sender, stop_clone, ch, none_slot);
+        run_sender_signaling_drain(
+            ev_rx,
+            fake_sender,
+            stop_clone,
+            ch,
+            none_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
     });
 
     stop_flag.store(true, Ordering::Relaxed);
@@ -1024,6 +1075,8 @@ fn fix_c1_session_keeps_production_arcs_alive_until_stop() {
                 })),
                 backend_name: "sw_fake".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
+                disarm_escalation_on_rebuild: None,
             })
         },
     ));

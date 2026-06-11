@@ -130,6 +130,8 @@ fn make_supervised_bridge_with_policy(
                 shutdown: None,
                 backend_name: "sw_fake".to_string(),
                 suppress_bye_on_rebuild: None,
+                stop_signaling_on_rebuild: None,
+                disarm_escalation_on_rebuild: None,
             })
         }),
         sup_tx,
@@ -746,6 +748,8 @@ fn make_supervised_bridge_with_rebuild_hook(
                     shutdown: None,
                     backend_name: "sw_fake".to_string(),
                     suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                    disarm_escalation_on_rebuild: None,
                 })
             },
         ),
@@ -944,6 +948,8 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                     shutdown: None,
                     backend_name: "sw_fake".to_string(),
                     suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                    disarm_escalation_on_rebuild: None,
                 })
             },
         ),
@@ -1282,6 +1288,8 @@ fn rebuild_can_chain_across_generations_swaps_bridge_session_each_time() {
                     shutdown: None,
                     backend_name: "sw_fake".to_string(),
                     suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                    disarm_escalation_on_rebuild: None,
                 })
             },
         );
@@ -1561,6 +1569,8 @@ fn rebuild_does_not_deadlock_during_concurrent_stop() {
                     shutdown: None,
                     backend_name: "sw_fake".to_string(),
                     suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                    disarm_escalation_on_rebuild: None,
                 })
             },
         ),
