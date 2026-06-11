@@ -532,13 +532,8 @@ pub(crate) fn build_moof(
     base_dts: u64,
     samples: &[TrunSample],
     mdat_offset: i32,
+    is_idr: bool,
 ) -> Vec<u8> {
-    // Determine is_idr from sample flags: if sequence_number > 0 and the fragment
-    // starts with an IDR, the caller sets it. We use a simple heuristic:
-    // the caller controls `mdat_offset`; for fragment assembly `is_idr` is always true
-    // (each fragment starts with an IDR per design §3.6).
-    let is_idr = true; // V1 strategy: every fragment starts with an IDR
-
     let mfhd = build_mfhd(sequence_number);
     let traf = build_traf(base_dts, samples, mdat_offset, is_idr);
 
@@ -717,12 +712,20 @@ pub fn annex_b_to_avcc(annex_b: &[u8]) -> Result<Vec<u8>, MuxerError> {
 
 // ─── Mp4Muxer public API ─────────────────────────────────────────────────────
 
+/// Sub-GOP batch size: flush pending non-IDR samples every N frames.
+/// 4 frames ≈ 67ms at 60fps; ~15 moof+IPC sends/s; moof overhead ~120B/fragment.
+/// Increase to 8 if GATE-5 shows WebView2 IPC pressure (133ms, 7.5/s).
+pub(crate) const SUBGOP_FLUSH_FRAMES: usize = 4;
+
 /// Per-sample metadata accumulated during fragment assembly.
 struct PendingSample {
     /// AVCC-framed NAL bytes for this sample.
     avcc: Vec<u8>,
     /// DTS of this sample in 90 kHz units.
     dts_90khz: u64,
+    /// Whether this sample is an IDR (keyframe). Used by flush_pending to compute
+    /// fragment_is_idr from the first sample in pending.
+    is_idr: bool,
 }
 
 /// fMP4 muxer for screen-mirror live streaming.
@@ -909,22 +912,27 @@ impl Mp4Muxer {
         // tick duration after 8 deltas pass the IQR+plausibility guards.
         self.fps_tracker.observe_dts(dts);
 
-        if packet.is_keyframe && !self.pending.is_empty() {
-            // Flush the current accumulated GOP as a media segment.
-            let segment = self.flush_pending();
+        // Unified flush predicate (D-PPT5-1): flush when pending is non-empty AND
+        // either an IDR arrives (GOP boundary) OR we have accumulated SUBGOP_FLUSH_FRAMES.
+        // Uniform invariant: Some(segment) ⟹ segment holds everything BEFORE this packet;
+        // this packet opens fresh pending (IDR boundary semantics preserved verbatim).
+        let should_flush = !self.pending.is_empty()
+            && (packet.is_keyframe || self.pending.len() >= SUBGOP_FLUSH_FRAMES);
 
-            // Accumulate the triggering IDR into the fresh pending buffer.
+        if should_flush {
+            let segment = self.flush_pending();
             self.pending.push(PendingSample {
                 avcc,
                 dts_90khz: dts,
+                is_idr: packet.is_keyframe,
             });
-
             Some(segment)
         } else {
             // P-frame or first IDR: accumulate.
             self.pending.push(PendingSample {
                 avcc,
                 dts_90khz: dts,
+                is_idr: packet.is_keyframe,
             });
             None
         }
@@ -1009,17 +1017,21 @@ impl Mp4Muxer {
             })
             .collect();
 
+        // Determine whether the first sample in this fragment is an IDR.
+        // Used to set the first_sample_flags_present bit in trun (SEG-2, D-PPT5-4).
+        let fragment_is_idr = self.pending.first().is_some_and(|s| s.is_idr);
+
         // Compute moof size to determine data_offset.
         // data_offset = size_of(moof) + 8  (8 bytes for the mdat size+tag header).
         // We approximate by building moof with offset=0 first to get its size.
-        let moof_placeholder = build_moof(seq, base_dts, &trun_samples, 0);
+        let moof_placeholder = build_moof(seq, base_dts, &trun_samples, 0, fragment_is_idr);
         let moof_size = moof_placeholder.len() as i32;
         // data_offset in trun = bytes from start of moof box to first byte of mdat payload.
         // mdat box header = 8 bytes (size + tag).
         let data_offset = moof_size + 8;
 
         // Rebuild moof with the correct data_offset.
-        let moof = build_moof(seq, base_dts, &trun_samples, data_offset);
+        let moof = build_moof(seq, base_dts, &trun_samples, data_offset, fragment_is_idr);
         let mdat = build_mdat(&mdat_payload);
 
         // Clear pending for the next GOP.
@@ -1644,7 +1656,7 @@ mod tests {
     #[test]
     fn build_moof_contains_moof_mfhd_traf_tfhd_tfdt_trun_tags() {
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
         let required: &[&[u8; 4]] = &[b"moof", b"mfhd", b"traf", b"tfhd", b"tfdt", b"trun"];
         for tag in required {
             assert!(
@@ -1658,7 +1670,7 @@ mod tests {
     #[test]
     fn build_moof_mfhd_sequence_number_is_correct() {
         let samples = vec![make_sample(10)];
-        let moof = build_moof(7, 0, &samples, 0);
+        let moof = build_moof(7, 0, &samples, 0, true);
         let mfhd_pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
         // mfhd full-box: [size:4][tag:4][v+f:4][seq_num:4]
         // After tag: v+f at +4, seq at +8
@@ -1675,9 +1687,9 @@ mod tests {
     #[test]
     fn build_moof_sequence_numbers_increment_across_calls() {
         let samples = vec![make_sample(50)];
-        let moof1 = build_moof(1, 0, &samples, 0);
-        let moof2 = build_moof(2, 0, &samples, 0);
-        let moof3 = build_moof(3, 0, &samples, 0);
+        let moof1 = build_moof(1, 0, &samples, 0, true);
+        let moof2 = build_moof(2, 0, &samples, 0, true);
+        let moof3 = build_moof(3, 0, &samples, 0, true);
 
         fn extract_seq(moof: &[u8]) -> u32 {
             let pos = moof.windows(4).position(|w| w == b"mfhd").unwrap();
@@ -1692,7 +1704,7 @@ mod tests {
     #[test]
     fn build_moof_starts_with_moof_box() {
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
         assert_eq!(&moof[4..8], b"moof", "first box tag must be moof");
     }
 
@@ -2184,7 +2196,7 @@ mod tests {
     fn build_tfhd_does_not_set_default_sample_duration_present_bit() {
         // Call build_moof (the real production path) and verify tfhd flags via byte scan.
         let samples = vec![make_sample(100)];
-        let moof = build_moof(1, 0, &samples, 0);
+        let moof = build_moof(1, 0, &samples, 0, true);
 
         let tfhd_pos = moof
             .windows(4)
@@ -2377,30 +2389,20 @@ mod tests {
         );
     }
 
-    // T4.2 — flush_pending uses locked ticks from fps_tracker (60 fps case).
-    // RED until T4.4.
+    // T4.2 — flush_pending uses real intra-GOP DTS deltas (not FpsTracker) for trun.
+    //
+    // Reworked for Slice 5 (sub-GOP flush N=4): original test used IDR1 + 8P + IDR2,
+    // but with N=4 the 5th packet triggers a count-flush mid-GOP, breaking the
+    // "IDR2 flushes GOP0" invariant. Reduced to IDR1 + 3P + IDR2 (4 samples) so
+    // no count-flush fires before IDR2. The intent is preserved: verify that
+    // per-sample trun durations reflect real DTS deltas (not the FpsTracker value).
+    // FpsTracker locking is verified separately in T4.1 (mp4_muxer_append_packet_feeds_fps_tracker).
     #[test]
     fn mp4_muxer_flush_pending_uses_locked_ticks() {
         use std::time::Duration;
-        // Use exact 1500-tick spacing: 1500 / 90_000 s = 1/60 s = 16_666.666...µs.
-        // duration_to_90khz uses f64 * 90_000. To get exact 1500-tick deltas we
-        // need the Duration to round-trip exactly. Use whole-number seconds multiples.
-        // 1500 ticks = 1/60 second = 50_000 µs × (90_000 / 3_000_000)... complex.
-        // Simpler: use 3_000-tick (30 fps) spacing where 1/30 s = 33_333.333..µs,
-        // still imprecise. Use 9_000 ticks = 100 ms exactly = Duration::from_millis(100).
-        // But that's 10 fps. Better: use Duration::from_nanos to get precise 1/60s.
-        // 1/60 s = 16_666_666.67 ns ≈ 16_666_667 ns.
-        // f64: 0.016666667 * 90_000 = 1500.0003 → rounds to 1500 ticks ✓
-        let _tick_ns: u64 = 1_000_000_000 / 60; // = 16_666_666 ns (60 fps) — kept as reference
-        // Verify: 16_666_666 ns = 0.016666666 s * 90_000 = 1499.99994 → rounds to 1499... not exact.
-        // Use Duration::from_nanos(16_666_667): 0.016666667 * 90_000 = 1500.00003 → 1500 ✓
-        // Let's use a tick count that maps exactly: 3000 ticks = 100ms = Duration::from_millis(100).
-        // For 60 fps we need another approach. Use 30 fps (3000 ticks) for locked_ticks test,
-        // and verify the wiring, not the specific fps value.
-        //
-        // Strategy: warm up at 3000-tick (30 fps) spacing using exact 100ms timestamps.
-        // Then flush and assert duration = 3000 (which == warm-up fallback == locked value).
-        // This avoids floating-point imprecision in ms→ticks conversion.
+        // IDR1 + 3 P-frames at 100ms spacing (10 fps, 9000 ticks each).
+        // 4 samples total → pending = 4 = SUBGOP_FLUSH_FRAMES, no count-flush fires
+        // until IDR2 arrives (IDR path takes precedence; predicate checks is_keyframe first).
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
         // IDR1 at t=0.
         muxer.append_packet(&EncodedPacket {
@@ -2413,15 +2415,9 @@ mod tests {
             timestamp: Duration::from_millis(0),
             sequence: 0,
         });
-        // 8 P-frames at exact 100ms intervals = 9000 ticks each, then warm-up is exceeded.
-        // But 9000 ticks at 90 kHz = 10 fps, which passes plausibility (5-240 fps).
-        // Actually for this test we just need the tracker to lock, any valid fps works.
-        // Use 30fps = 3000 ticks: Duration::from_millis(i * 33) → i*33*90 ticks.
-        // i=1..8: deltas = 33*90=2970 ticks (close to 3000 but not exact).
-        // Use Duration::from_millis(i * 1000 / 30) for more exact 30fps:
-        // i=1: 33ms → 2970 ticks; i=2: 66ms → 5940 → delta=2970. IQR of [2970×8] = 0. Locks at 2970.
-        // OR use 100ms exactly (9000 ticks/s = 10 fps, passes bounds).
-        for i in 1..=8u64 {
+        // P1, P2, P3 at 100ms spacing. Pending becomes [IDR1, P1, P2, P3] = 4 samples.
+        // No count-flush fires: P1..P3 each arrive when pending.len() is 1, 2, 3 (<4).
+        for i in 1..=3u64 {
             muxer.append_packet(&EncodedPacket {
                 data: {
                     let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x41];
@@ -2429,11 +2425,11 @@ mod tests {
                     std::sync::Arc::from(d.into_boxed_slice())
                 },
                 is_keyframe: false,
-                timestamp: Duration::from_millis(i * 100), // 9000 ticks each = 10 fps
+                timestamp: Duration::from_millis(i * 100),
                 sequence: i,
             });
         }
-        // IDR2 triggers flush; tracker should be locked at 9000 ticks.
+        // IDR2 at t=400ms triggers IDR-flush of [IDR1, P1, P2, P3] (4 samples).
         let idr2 = EncodedPacket {
             data: {
                 let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
@@ -2441,19 +2437,14 @@ mod tests {
                 std::sync::Arc::from(d.into_boxed_slice())
             },
             is_keyframe: true,
-            timestamp: Duration::from_millis(9 * 100),
-            sequence: 9,
+            timestamp: Duration::from_millis(4 * 100),
+            sequence: 4,
         };
-        let segment = muxer.append_packet(&idr2).expect("IDR2 must flush GOP1");
+        let segment = muxer
+            .append_packet(&idr2)
+            .expect("IDR2 must flush [IDR1+P1+P2+P3]");
 
-        // The tracker must be locked.
-        assert!(
-            muxer.fps_tracker.is_locked(),
-            "fps_tracker must be locked after 9 uniform 100ms packets"
-        );
-        let locked_ticks = muxer.fps_tracker.effective_ticks_per_sample();
-
-        // Parse trun from the flushed segment.
+        // Parse trun from the flushed IDR-started segment.
         let trun_pos = segment
             .windows(4)
             .position(|w| w == b"trun")
@@ -2462,29 +2453,27 @@ mod tests {
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 
         // After the real-DTS-delta fix (T5), per-sample trun durations come from actual
-        // DTS differences, not from FpsTracker directly. At 100ms uniform spacing,
-        // duration_to_90khz(100ms) may yield 8999 or 9000 ticks due to f64 rounding.
-        // The key invariant: durations must approximate the real 100ms inter-frame gap
-        // (within 1 tick of rounding), and must NOT be 3000 (the warm-up fallback).
-        //
-        // FpsTracker is still verified to have locked correctly — it's used for the init
-        // segment trex.default_sample_duration, just no longer for trun per-sample values.
-        assert!(
-            locked_ticks > 8000 && locked_ticks < 10_000,
-            "locked tracker value {locked_ticks} must be near 9000 (10 fps at 100ms)"
+        // DTS differences, not from FpsTracker. At 100ms uniform spacing,
+        // duration_to_90khz(100ms) yields 8999 or 9000 ticks due to f64 rounding.
+        // Invariant: durations approximate the real 100ms gap (NOT 3000 warm-up fallback).
+        assert_eq!(
+            pairs.len(),
+            4,
+            "segment must have 4 samples (IDR1+P1+P2+P3)"
         );
         for (i, &(dur, _)) in pairs.iter().enumerate() {
-            // Real 100ms DTS delta via f64 conversion yields 8999 or 9000 ticks.
             assert!(
                 (8998..=9001).contains(&dur),
-                "post-warm-up sample {i} duration {dur} must approximate real 100ms delta \
-                 (8998–9001 ticks); must NOT be 3000 (FpsTracker warm-up fallback)"
+                "sample {i} duration {dur} must approximate real 100ms delta (8998–9001 ticks); \
+                 must NOT be 3000 (FpsTracker warm-up fallback)"
             );
         }
-        // Sanity: durations must NOT be the warm-up fallback.
+        // Sanity: tracker may or may not be locked (only 4 deltas); the key point is
+        // that even without locking, real DTS deltas are used (not the 3000 fallback).
+        let tracker_val = muxer.fps_tracker.effective_ticks_per_sample();
         assert_ne!(
-            locked_ticks, 3000,
-            "locked value must differ from 30fps fallback (we used 10fps spacing)"
+            pairs[0].0, 3000,
+            "trun durations must use real DTS deltas, not FpsTracker warm-up ({tracker_val})"
         );
     }
 
@@ -2493,48 +2482,40 @@ mod tests {
     // GOP must equal the real DTS span (first sample → first sample of next GOP), within
     // one fallback tick of tolerance for the last-sample duration.
     //
-    // RED on current master (all durations = fps_tracker value, sum = N×fixed_rate ≠ real span).
-    // GREEN after the real-DTS-delta fix in flush_pending.
+    // Reworked for Slice 5 (N=4): original used IDR1+5P+IDR2 (7 frames), but with N=4
+    // a count-flush fires at the 5th packet, so IDR2 no longer receives the full GOP0.
+    // Reduced to IDR1+3P+IDR2 (4 samples = N) — no count-flush fires, IDR2 flushes
+    // [IDR1,P1,P2,P3] exactly. The intent (real DTS deltas, not FpsTracker) is preserved.
     #[test]
     fn flush_pending_trun_duration_sum_equals_real_dts_span_not_fixed_fps() {
         use std::time::Duration;
 
-        // 7 frames at deliberately non-uniform DTS spacing (mix of ~7.5 fps and ~30 fps).
-        // We use Duration::from_millis because make_packet takes ms.
+        // DTS layout (ms → 90kHz ticks) at ~7.5fps (133ms/frame):
+        //   IDR1:  t=0ms   → dts=0
+        //   P1:    t=133ms → dts≈11970
+        //   P2:    t=266ms → dts≈23940
+        //   P3:    t=399ms → dts≈35910
+        //   IDR2:  t=532ms → dts≈47880  (flush of [IDR1,P1,P2,P3], 4 samples)
         //
-        // DTS layout (ms → 90kHz ticks):
-        //   frame 0 (IDR1):  t=0ms      → dts=0
-        //   frame 1 (P):     t=133ms    → dts=11970  (≈12000, ~7.5fps)
-        //   frame 2 (P):     t=266ms    → dts=23940  (≈12000, ~7.5fps)
-        //   frame 3 (P):     t=399ms    → dts=35910  (≈12000, ~7.5fps)
-        //   frame 4 (P):     t=532ms    → dts=47880  (≈12000, ~7.5fps)
-        //   frame 5 (P):     t=665ms    → dts=59850  (≈12000, ~7.5fps)
-        //   IDR2 (flush):    t=798ms    → dts=71820  (≈12000, ~7.5fps)
-        //
-        // Real DTS span for GOP0 = dts[IDR2] - dts[IDR1] = 71820 - 0 = 71820 ticks.
-        //
-        // Current code stamps every sample with fps_tracker.effective_ticks_per_sample().
-        // After 6 deltas at ~12000 ticks, tracker may lock at 12000 (if IQR guard passes).
-        // If locked at 12000: sum = 6×12000 = 72000 ≠ 71820 (close but not exact).
-        // If still warming up: sum = 6×3000 = 18000 ≠ 71820.
-        //
-        // After the fix: sum = real intra-GOP deltas + last-sample fallback ≈ 71820.
-        // We test: abs(sum - real_span) ≤ one_fallback_tick (allow the last-sample approximation).
+        // Real DTS span = dts[IDR2] - dts[IDR1] ≈ 47880 ticks.
+        // With FpsTracker (if stuck at 3000): sum = 4×3000 = 12000 ≠ 47880.
+        // With real DTS deltas: sum ≈ 47880 (within one-frame tolerance on last sample).
         let ms_per_frame: u64 = 133; // ~7.5fps
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
 
-        // IDR1 at t=0
+        // IDR1 at t=0.
         muxer.append_packet(&make_packet(true, 0, 100));
-        // 5 P-frames at ~7.5fps spacing
-        for i in 1..=5u64 {
+        // P1..P3 at ~7.5fps: pending = [IDR1,P1,P2,P3] (4 samples = SUBGOP_FLUSH_FRAMES).
+        // No count-flush: each P arrives when pending.len() < 4.
+        for i in 1..=3u64 {
             muxer.append_packet(&make_packet(false, i * ms_per_frame, 100));
         }
-        // IDR2 triggers flush of GOP0
+        // IDR2 triggers IDR-flush of [IDR1,P1,P2,P3] (4 samples).
         let segment = muxer
-            .append_packet(&make_packet(true, 6 * ms_per_frame, 100))
-            .expect("IDR2 must flush GOP0");
+            .append_packet(&make_packet(true, 4 * ms_per_frame, 100))
+            .expect("IDR2 must flush [IDR1+P1+P2+P3]");
 
-        // Parse per-sample durations from the trun box.
+        // Parse per-sample durations from the trun box (IDR-flagged).
         let trun_pos = segment
             .windows(4)
             .position(|w| w == b"trun")
@@ -2542,39 +2523,32 @@ mod tests {
         let trun = &segment[trun_pos - 4..];
         let pairs = parse_trun_per_sample_durations(trun, true); // IDR fragment
 
-        // Compute real DTS span of GOP0 (rebased: IDR1 at 0, IDR2 at ~71820).
-        // duration_to_90khz: Duration::from_millis(ms) → (ms as f64 / 1000.0 * 90000.0) as u64
+        assert_eq!(pairs.len(), 4, "flushed segment must have 4 samples");
+
+        // Real DTS span: IDR2 DTS - IDR1 DTS ≈ duration_to_90khz(4*133ms).
         let real_span: u64 =
-            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(6 * ms_per_frame));
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(4 * ms_per_frame));
 
         let actual_sum: u64 = pairs.iter().map(|&(dur, _)| dur as u64).sum();
 
-        // Allow ±one maximum fallback tick (12000) for last-sample approximation.
+        // Allow ±one maximum intra-GOP delta (~12000 ticks) for last-sample fallback.
         let tolerance: u64 = 12_001;
         assert!(
             actual_sum.abs_diff(real_span) <= tolerance,
             "trun duration sum {actual_sum} must approximate real DTS span {real_span} \
-             (within ±{tolerance} ticks). Current code produces N×fixed_rate ({} frames × {} ticks/frame = {})",
+             (within ±{tolerance} ticks). Got: {} frames × {} ticks/frame avg",
             pairs.len(),
-            pairs.first().map(|&(d, _)| d).unwrap_or(0),
-            pairs.iter().map(|&(d, _)| d as u64).sum::<u64>(),
+            actual_sum / pairs.len() as u64,
         );
 
-        // Stricter: durations must NOT all be identical when real spacing was uniform.
-        // (The last sample may differ from the others, but the rest should match real deltas.)
-        // Real intra-GOP deltas are all ~11970 (133ms × 90 = 11970 ticks).
-        // After fix, each of the first N-1 samples should have duration ≈ 11970.
-        // Current code: all durations == one fixed value (3000 or ~12000 locked).
-        // The stricter check: per-sample durations must match real deltas individually.
+        // Stricter: first N-1 durations must equal real intra-GOP DTS delta (±1 tick).
         let expected_delta: u64 =
             crate::transport::annex_b::duration_to_90khz(Duration::from_millis(ms_per_frame));
-        // All of samples 0..N-2 must equal the real inter-frame delta (±1 for rounding).
         for (i, &(dur, _)) in pairs.iter().enumerate().take(pairs.len().saturating_sub(1)) {
             assert!(
                 (dur as u64).abs_diff(expected_delta) <= 1,
                 "sample {i} duration {dur} must equal real DTS delta {expected_delta} \
-                 (fix uses intra-GOP DTS deltas; current code stamps all samples with \
-                 FpsTracker value)"
+                 (real-DTS-delta fix; must NOT be FpsTracker fallback value)"
             );
         }
     }
@@ -2626,6 +2600,274 @@ mod tests {
         assert_eq!(
             last_dur, expected_delta,
             "last sample duration must be median of intra-GOP deltas ({expected_delta}); got {last_dur}"
+        );
+    }
+
+    // ─── Slice 5: sub-GOP flush tests (RED-first, Tests 1–5) ─────────────────
+    //
+    // All five tests are written BEFORE any production changes. They fail with
+    // a compile error (SUBGOP_FLUSH_FRAMES undefined) until Phase 2 GREEN.
+    // Design: D-PPT5-6. Spec: SEG-1..SEG-3.
+
+    // Test 1 — D-PPT5-6 #1: flush fires after SUBGOP_FLUSH_FRAMES accumulated samples.
+    // Two-sided mutation guard: N→3 makes the 4th call return Some; N→5 keeps 5th as None.
+    // Spec: SEG-1-SC1. Design: D-PPT5-1, D-PPT5-2.
+    #[test]
+    fn append_packet_flushes_after_subgop_threshold() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // IDR1: opens the first pending segment, returns None (no prior pending).
+        let idr1 = make_packet(true, 0, 100);
+        let r0 = muxer.append_packet(&idr1);
+        assert!(
+            r0.is_none(),
+            "first IDR must return None (nothing to flush)"
+        );
+
+        // P-frames 1–3: each accumulates without flush (pending = 2, 3, 4 including IDR1).
+        // Under the unified predicate (D-PPT5-1): flush when pending.len() >= SUBGOP_FLUSH_FRAMES
+        // fires on the packet that WOULD make pending reach N+1, i.e. the (N+1)-th packet.
+        // IDR1 is pending[0]; P1→pending[1]; P2→pending[2]; P3→pending[3].
+        // At this point pending.len() == 4 == SUBGOP_FLUSH_FRAMES — NOT yet flushed.
+        for i in 1u64..=3 {
+            let p = make_packet(false, i * 17, 100);
+            let r = muxer.append_packet(&p);
+            assert!(
+                r.is_none(),
+                "P-frame {i}: pending={}, must not flush yet (N={})",
+                i + 1,
+                super::SUBGOP_FLUSH_FRAMES
+            );
+        }
+
+        // P-frame 5 (5th packet total): pending was 4; this arrival triggers the flush
+        // (predicate: pending.len() >= SUBGOP_FLUSH_FRAMES while !is_keyframe).
+        let p5 = make_packet(false, 4 * 17, 100);
+        let r5 = muxer.append_packet(&p5);
+        assert!(
+            r5.is_some(),
+            "5th packet must trigger count-flush (pending reached SUBGOP_FLUSH_FRAMES={})",
+            super::SUBGOP_FLUSH_FRAMES
+        );
+    }
+
+    // Test 2 — D-PPT5-6 #2: the flushed segment contains exactly N samples.
+    // Kills inclusive/exclusive off-by-one on the pending count.
+    // Spec: SEG-1-SC1. Design: D-PPT5-1.
+    #[test]
+    fn subgop_flushed_fragment_has_exactly_n_samples() {
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        // IDR1 + 3 P-frames → pending = 4 (= SUBGOP_FLUSH_FRAMES). No flush yet.
+        muxer.append_packet(&make_packet(true, 0, 100));
+        for i in 1u64..=3 {
+            muxer.append_packet(&make_packet(false, i * 17, 100));
+        }
+        // 5th packet triggers flush of the 4 accumulated samples.
+        let segment = muxer
+            .append_packet(&make_packet(false, 4 * 17, 100))
+            .expect("5th packet must trigger count-flush");
+
+        // Parse trun sample_count from the flushed segment.
+        // Count-flushed segments are NOT IDR-flagged (is_idr=false → no first_sample_flags field).
+        let trun_pos = segment
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("segment must contain trun box");
+        let trun = &segment[trun_pos - 4..];
+        let count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]) as usize;
+        assert_eq!(
+            count,
+            super::SUBGOP_FLUSH_FRAMES,
+            "count-flushed segment must contain exactly SUBGOP_FLUSH_FRAMES={} samples, got {}",
+            super::SUBGOP_FLUSH_FRAMES,
+            count
+        );
+    }
+
+    // Test 3 — D-PPT5-6 #3: count-flushed P-frame-only segment has no IDR flag;
+    // IDR-flushed segment has it. Two-sided: kills is_idr hardcode=true AND always-false.
+    // Spec: SEG-2-SC1, SEG-2-SC2. Design: D-PPT5-4.
+    //
+    // Setup for (a): we need a count-flushed segment whose FIRST sample is a P-frame.
+    // IDR1 → 3P → P4 (count-flush of [IDR1,P1,P2,P3] → IDR-flagged, that's seg1).
+    // P4 is now pending[0]. P5,P6,P7 → pending=[P4,P5,P6,P7] (4 samples).
+    // P8 → count-flush of [P4,P5,P6,P7] → NOT IDR-flagged (P4 is a P-frame). That's seg2.
+    #[test]
+    fn subgop_fragment_first_sample_flags() {
+        // ── (a) count-flushed P-frame-only segment: bit 0x4 MUST NOT be set ──
+        {
+            let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+            let ms = 17u64;
+            // Sub-GOP 1: IDR1 + P1..P3 (pending=4). P4 triggers first count-flush.
+            muxer.append_packet(&make_packet(true, 0, 100));
+            for i in 1u64..=3 {
+                muxer.append_packet(&make_packet(false, i * ms, 100));
+            }
+            // P4: count-flush → seg1 = [IDR1,P1,P2,P3] (IDR-flagged, discarded here).
+            let _seg1 = muxer
+                .append_packet(&make_packet(false, 4 * ms, 100))
+                .expect("P4 must trigger first count-flush");
+            // P4 is now in fresh pending. P5..P7: pending=[P4,P5,P6,P7] (4 samples).
+            for i in 5u64..=7 {
+                muxer.append_packet(&make_packet(false, i * ms, 100));
+            }
+            // P8: count-flush → seg2 = [P4,P5,P6,P7] — first sample is P4 (P-frame).
+            let seg2 = muxer
+                .append_packet(&make_packet(false, 8 * ms, 100))
+                .expect("P8 must trigger second count-flush (P-frame-only segment)");
+
+            let trun_pos = seg2
+                .windows(4)
+                .position(|w| w == b"trun")
+                .expect("trun must be present");
+            let trun = &seg2[trun_pos - 4..];
+            // trun full-box: [size:4][tag:4][v+flags:3 bytes at 9,10,11]
+            let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+            assert_eq!(
+                trun_flags & 0x000004,
+                0,
+                "count-flushed P-frame-only segment: first_sample_flags_present (0x4) \
+                 must NOT be set; got trun_flags=0x{trun_flags:06X}"
+            );
+        }
+
+        // ── (b) IDR-flushed segment: bit 0x4 MUST be set ──
+        {
+            let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+            // IDR1 + 1 P-frame, then IDR2 flushes [IDR1, P1] — IDR-flagged.
+            muxer.append_packet(&make_packet(true, 0, 100));
+            muxer.append_packet(&make_packet(false, 17, 100));
+            let segment = muxer
+                .append_packet(&make_packet(true, 34, 100))
+                .expect("IDR2 must flush prior segment");
+
+            let trun_pos = segment
+                .windows(4)
+                .position(|w| w == b"trun")
+                .expect("trun must be present");
+            let trun = &segment[trun_pos - 4..];
+            let trun_flags = u32::from_be_bytes([0, trun[9], trun[10], trun[11]]);
+            assert_ne!(
+                trun_flags & 0x000004,
+                0,
+                "IDR-flushed segment: first_sample_flags_present (0x4) MUST be set; \
+                 got trun_flags=0x{trun_flags:06X}"
+            );
+        }
+    }
+
+    // Test 4 — D-PPT5-6 #4: mfhd sequence numbers are strictly increasing across
+    // both IDR-flush and count-flush trigger types.
+    // Spec: SEG-2-SC3. Design: D-PPT5-1.
+    #[test]
+    fn subgop_sequence_numbers_monotonic_across_trigger_types() {
+        // Sequence: IDR1 → 3P → P5(count-flush→seq=1) → IDR2(IDR-flush→seq=2) → 3P → IDR3(→seq=3).
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+        let ms = 17u64; // ~60fps spacing
+
+        // IDR1 + 3 P-frames: pending = 4, no flush.
+        muxer.append_packet(&make_packet(true, 0, 100));
+        for i in 1u64..=3 {
+            muxer.append_packet(&make_packet(false, i * ms, 100));
+        }
+        // P5 triggers count-flush → segment with seq=1.
+        let seg1 = muxer
+            .append_packet(&make_packet(false, 4 * ms, 100))
+            .expect("count-flush must produce seg1");
+
+        // IDR2 triggers IDR-flush of [P5] → segment with seq=2.
+        let seg2 = muxer
+            .append_packet(&make_packet(true, 5 * ms, 100))
+            .expect("IDR2 must produce seg2");
+
+        // IDR2 is now in pending. 3 more P-frames (pending = 4), no count-flush.
+        for i in 6u64..=8 {
+            muxer.append_packet(&make_packet(false, i * ms, 100));
+        }
+        // IDR3 triggers IDR-flush → segment with seq=3.
+        let seg3 = muxer
+            .append_packet(&make_packet(true, 9 * ms, 100))
+            .expect("IDR3 must produce seg3");
+
+        fn extract_mfhd_seq(seg: &[u8]) -> u32 {
+            let pos = seg
+                .windows(4)
+                .position(|w| w == b"mfhd")
+                .expect("mfhd missing");
+            let off = pos + 4 + 4; // skip tag + version+flags
+            u32::from_be_bytes([seg[off], seg[off + 1], seg[off + 2], seg[off + 3]])
+        }
+
+        let s1 = extract_mfhd_seq(&seg1);
+        let s2 = extract_mfhd_seq(&seg2);
+        let s3 = extract_mfhd_seq(&seg3);
+
+        assert_eq!(s1, 1, "count-flush segment must have seq=1, got {s1}");
+        assert_eq!(s2, 2, "IDR-flush segment must have seq=2, got {s2}");
+        assert_eq!(s3, 3, "second IDR-flush segment must have seq=3, got {s3}");
+        assert!(
+            s1 < s2 && s2 < s3,
+            "sequence numbers must be strictly increasing"
+        );
+    }
+
+    // Test 5 — D-PPT5-6 #5: single-sample remainder segment uses inter-fragment delta,
+    // not the 3000-tick WARMUP_FALLBACK.
+    // Kills prev_flushed_dts path regression when remainder is 1 sample.
+    // Spec: SEG-1-SC5, SEG-3 (indirect). Design: D-PPT5-3.
+    #[test]
+    fn single_sample_remainder_uses_inter_fragment_delta() {
+        use std::time::Duration;
+        // IDR1(t=0) + 4×P(t=67ms each) + IDR2(t=335ms).
+        // The 4 P-frames fill pending to [IDR1, P1, P2, P3] = 4; P4 triggers count-flush.
+        // Then IDR2 triggers IDR-flush of [P4] (1-sample remainder).
+        let ms = 67u64;
+        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
+
+        muxer.append_packet(&make_packet(true, 0, 100)); // IDR1
+        for i in 1u64..=3 {
+            muxer.append_packet(&make_packet(false, i * ms, 100)); // P1..P3
+        }
+        // P4 triggers count-flush (pending was [IDR1, P1, P2, P3] = 4 = SUBGOP_FLUSH_FRAMES).
+        let _seg_count = muxer
+            .append_packet(&make_packet(false, 4 * ms, 100))
+            .expect("P4 must trigger count-flush");
+
+        // IDR2 triggers IDR-flush of [P4] — single-sample remainder.
+        let seg_remainder = muxer
+            .append_packet(&make_packet(true, 5 * ms, 100))
+            .expect("IDR2 must flush single-sample remainder");
+
+        // Parse the remainder segment's trun duration.
+        // Remainder is NOT IDR-flagged (first sample is P4, is_idr=false).
+        let trun_pos = seg_remainder
+            .windows(4)
+            .position(|w| w == b"trun")
+            .expect("remainder segment must contain trun");
+        let trun = &seg_remainder[trun_pos - 4..];
+        // No first_sample_flags field (not IDR), base offset = 8+4+4+4 = 20
+        let sample_count = u32::from_be_bytes([trun[12], trun[13], trun[14], trun[15]]);
+        assert_eq!(sample_count, 1, "remainder must be exactly 1 sample");
+        let dur = u32::from_be_bytes([trun[20], trun[21], trun[22], trun[23]]);
+
+        // Expected: inter-fragment delta ≈ 67ms in 90kHz ticks ≈ 6030.
+        // Must NOT be 3000 (WARMUP_FALLBACK_TICKS).
+        let expected_approx =
+            crate::transport::annex_b::duration_to_90khz(Duration::from_millis(ms)) as u32;
+        assert_ne!(
+            dur, 3000,
+            "single-sample remainder must NOT use WARMUP_FALLBACK (3000 ticks); got {dur}"
+        );
+        // Within 2× expected delta (generous tolerance for DTS arithmetic).
+        assert!(
+            dur <= expected_approx * 2,
+            "single-sample remainder duration {dur} must be ≤ 2×expected_delta ({});  \
+             prev_flushed_dts path must supply a real inter-fragment delta",
+            expected_approx * 2
+        );
+        assert!(
+            dur >= expected_approx / 2,
+            "single-sample remainder duration {dur} must be ≥ ½×expected_delta ({})",
+            expected_approx / 2
         );
     }
 }

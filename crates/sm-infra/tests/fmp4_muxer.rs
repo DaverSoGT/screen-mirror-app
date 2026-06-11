@@ -467,18 +467,18 @@ fn parse_segment_trun_pairs(seg: &[u8], is_idr: bool) -> Vec<(u32, u32)> {
 
 // T5.2 — Post-warm-up pipeline emits per-sample duration = REAL intra-GOP DTS delta.
 //
-// After the real-DTS-delta fix (T5), per-sample trun durations come from actual DTS
-// differences, NOT from FpsTracker. At 100ms uniform spacing, the real DTS delta
-// is (0.1 * 90000) as u64 = 8999 or 9000 ticks (f64 rounding). The test verifies
-// that all durations approximate the real 100ms gap and that the sum-of-durations
-// equals the real elapsed DTS span of the GOP.
+// Reworked for Slice 5 (N=4): original test used IDR1+8P+IDR2 (9 samples), but with
+// SUBGOP_FLUSH_FRAMES=4 the 5th packet triggers a count-flush mid-GOP so IDR2 no
+// longer receives the full GOP1. Reduced to IDR1+3P+IDR2 (4 samples = N) so no
+// count-flush fires before IDR2. The intent is preserved: verify real DTS deltas are
+// used (not the 3000 FpsTracker fallback).
 #[test]
 fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
     use std::time::Duration;
     let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
 
-    // Feed IDR at t=0 (no delta yet).
-    let idr1 = EncodedPacket {
+    // IDR1 at t=0.
+    muxer.append_packet(&EncodedPacket {
         data: {
             let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
             d.extend(vec![0xBBu8; 95]);
@@ -487,12 +487,12 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
         is_keyframe: true,
         timestamp: Duration::from_millis(0),
         sequence: 0,
-    };
-    muxer.append_packet(&idr1);
+    });
 
-    // Feed 8 P-frames at 100ms intervals to warm up the tracker.
-    for i in 1..=8u64 {
-        let pkt = EncodedPacket {
+    // P1..P3 at 100ms intervals. Pending = [IDR1, P1, P2, P3] = 4 = SUBGOP_FLUSH_FRAMES.
+    // No count-flush fires: each P arrives when pending.len() is 1, 2, 3 (<4).
+    for i in 1..=3u64 {
+        muxer.append_packet(&EncodedPacket {
             data: {
                 let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x41];
                 d.extend(vec![0xBBu8; 95]);
@@ -501,32 +501,34 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
             is_keyframe: false,
             timestamp: Duration::from_millis(i * 100),
             sequence: i,
-        };
-        muxer.append_packet(&pkt);
+        });
     }
 
-    // IDR2 triggers flush of GOP1 (9 samples: IDR1 + 8 P-frames).
-    let idr2 = EncodedPacket {
-        data: {
-            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
-            d.extend(vec![0xBBu8; 95]);
-            std::sync::Arc::from(d.into_boxed_slice())
-        },
-        is_keyframe: true,
-        timestamp: Duration::from_millis(9 * 100),
-        sequence: 9,
-    };
+    // IDR2 at t=400ms triggers IDR-flush of [IDR1, P1, P2, P3] (4 samples).
     let segment = muxer
-        .append_packet(&idr2)
-        .expect("IDR2 must flush GOP1 (9 samples)");
+        .append_packet(&EncodedPacket {
+            data: {
+                let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x65];
+                d.extend(vec![0xBBu8; 95]);
+                std::sync::Arc::from(d.into_boxed_slice())
+            },
+            is_keyframe: true,
+            timestamp: Duration::from_millis(4 * 100),
+            sequence: 4,
+        })
+        .expect("IDR2 must flush [IDR1+P1+P2+P3]");
 
-    // Parse per-sample (duration, size) pairs from the flushed trun.
-    let pairs = parse_segment_trun_pairs(&segment, true); // IDR segment
+    // Parse per-sample (duration, size) pairs from the IDR-flagged trun.
+    let pairs = parse_segment_trun_pairs(&segment, true);
 
-    // With the real-DTS-delta fix, durations reflect actual inter-frame DTS differences.
-    // duration_to_90khz(100ms) via f64 yields 8999 or 9000 ticks — allow ±1 for rounding.
-    // Must NOT be 3000 (FpsTracker warm-up fallback — the old broken behavior).
-    assert!(!pairs.is_empty(), "segment must have at least one sample");
+    assert_eq!(
+        pairs.len(),
+        4,
+        "segment must have 4 samples (IDR1+P1+P2+P3)"
+    );
+
+    // Real DTS delta = duration_to_90khz(100ms) ≈ 8999–9000 ticks.
+    // Must NOT be 3000 (FpsTracker warm-up fallback).
     for (i, &(dur, _)) in pairs.iter().enumerate() {
         assert!(
             (8998..=9001).contains(&dur),
@@ -535,11 +537,10 @@ fn mp4_muxer_post_warmup_pipeline_emits_locked_per_sample_duration() {
         );
     }
 
-    // Sum-of-durations must approximate the real elapsed DTS span of GOP1 (9 × ~9000 ticks).
-    // Allow ±9 ticks tolerance for 9 frames × ±1 tick rounding each.
+    // Sum-of-durations must approximate the real DTS span (4 × ~9000 ticks).
     let total_dur: u64 = pairs.iter().map(|&(d, _)| d as u64).sum();
-    let real_span: u64 = (0.9_f64 * 90_000.0) as u64; // 9 × 100ms
-    let tolerance: u64 = 9; // ±1 tick per frame
+    let real_span: u64 = (0.4_f64 * 90_000.0) as u64; // 4 × 100ms
+    let tolerance: u64 = 4; // ±1 tick per frame
     assert!(
         total_dur.abs_diff(real_span) <= tolerance,
         "sum-of-durations {total_dur} must approximate real GOP span {real_span} ticks (±{tolerance})"
