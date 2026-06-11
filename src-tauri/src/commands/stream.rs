@@ -9165,8 +9165,23 @@ mod tests {
             })
             .expect("send IDR2");
 
-        // Give the mux thread time to process all packets.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Deterministic frame accounting for the 10 packets fed above:
+        //   IDR1 (with SPS+PPS) → 1 FRAME_INIT + opens pending=[IDR1].
+        //   P1..P8 + IDR2 drive the count-flush / IDR-flush sequence:
+        //     P1..P3 → pending=[IDR1,P1,P2,P3]; P4 → count-flush seg #1, pending=[P4].
+        //     P5..P7 → pending=[P4,P5,P6,P7]; P8 → count-flush seg #2, pending=[P8].
+        //     IDR2   → IDR-flush of [P8]      → seg #3, pending=[IDR2].
+        // → exactly 3 FRAME_SEGMENT and 1 FRAME_INIT. Total channel frames = 4.
+        const EXPECTED_SEGMENTS: usize = 3;
+        const EXPECTED_INIT: usize = 1;
+        const EXPECTED_TOTAL: usize = EXPECTED_SEGMENTS + EXPECTED_INIT;
+
+        // Poll the fake channel until all expected frames are captured (or the deadline
+        // elapses). Replaces a fixed sleep, which was flaky on loaded CI runners.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake_ch.captured().len() < EXPECTED_TOTAL && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         // Stop the thread.
         stop_flag.store(true, Ordering::Relaxed);
@@ -9183,10 +9198,13 @@ mod tests {
             .filter(|f| f.first() == Some(&FRAME_SEGMENT))
             .count();
 
-        assert_eq!(init_count, 1, "exactly 1 FRAME_INIT must be emitted");
-        assert!(
-            seg_count >= 3,
-            "at least 3 FRAME_SEGMENT must be emitted \
+        assert_eq!(
+            init_count, EXPECTED_INIT,
+            "exactly 1 FRAME_INIT must be emitted"
+        );
+        assert_eq!(
+            seg_count, EXPECTED_SEGMENTS,
+            "exactly {EXPECTED_SEGMENTS} FRAME_SEGMENT must be emitted \
              (8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2); got {seg_count}"
         );
     }

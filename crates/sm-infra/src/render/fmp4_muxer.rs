@@ -986,7 +986,13 @@ impl Mp4Muxer {
         // Last sample (index N-1): no in-fragment successor — use a fallback.
         //   If GOP has ≥ 2 samples: median of the intra-GOP deltas computed above.
         //   If GOP has exactly 1 sample: inter-fragment delta via prev_flushed_dts,
-        //     or WARMUP_FALLBACK_TICKS for the very first fragment.
+        //     or WARMUP_FALLBACK_TICKS when prev_flushed_dts is None.
+        //
+        // prev_flushed_dts == None on a single-sample flush is NOT limited to the very
+        // first fragment: two consecutive IDRs with no intervening P-frames produce a
+        // single-sample flush before any prior fragment has been emitted. This is
+        // realistic for all-intra or scene-change streams, so the WARMUP_FALLBACK_TICKS
+        // branch is genuinely reachable even after warm-up.
         let last_dur: u32 = if n >= 2 {
             // Compute the median of the already-computed intra-GOP deltas.
             let mut sorted = durations.clone();
@@ -2667,7 +2673,10 @@ mod tests {
             .expect("5th packet must trigger count-flush");
 
         // Parse trun sample_count from the flushed segment.
-        // Count-flushed segments are NOT IDR-flagged (is_idr=false → no first_sample_flags field).
+        // This fragment's first sample is IDR1, so it IS IDR-flagged (first_sample_flags
+        // is present in the trun). The sample_count at trun[12..16] precedes that optional
+        // first_sample_flags field, so reading it at this offset is correct regardless of
+        // the IDR flag.
         let trun_pos = segment
             .windows(4)
             .position(|w| w == b"trun")
@@ -2817,8 +2826,9 @@ mod tests {
     #[test]
     fn single_sample_remainder_uses_inter_fragment_delta() {
         use std::time::Duration;
-        // IDR1(t=0) + 4×P(t=67ms each) + IDR2(t=335ms).
-        // The 4 P-frames fill pending to [IDR1, P1, P2, P3] = 4; P4 triggers count-flush.
+        // IDR1(t=0) + P1..P3 + P4 + IDR2(t=335ms), P-frames spaced 67ms apart.
+        // P1..P3 fill pending to [IDR1, P1, P2, P3] = 4 = SUBGOP_FLUSH_FRAMES; the
+        // separately-sent P4 then triggers the count-flush of those 4 samples.
         // Then IDR2 triggers IDR-flush of [P4] (1-sample remainder).
         let ms = 67u64;
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
