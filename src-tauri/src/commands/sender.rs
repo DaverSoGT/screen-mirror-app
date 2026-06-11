@@ -5529,4 +5529,169 @@ mod tests {
             "SC-RFG-5 FAIL: test_stub() must have stop_signaling_on_rebuild = None"
         );
     }
+
+    /// SC-RFG-8 — the post-swap session carries the NEW generation's stop/disarm hooks.
+    ///
+    /// The existing chain coverage used `None` stubs, so nothing proved that step-11
+    /// propagation actually binds the NEW generation's hooks (REQ-RFG-4 / D-RFG-4 +
+    /// D-RFG-6). This drives `make_sender_rebuild_hook` with a builder that returns a
+    /// `new_bundle` whose `stop_signaling_on_rebuild` and `disarm_escalation_on_rebuild`
+    /// are SPIES bound to the NEW generation. After the rebuild succeeds, the swapped-in
+    /// `bridge_session` must hold `Some(_)` for both hooks, and invoking them must fire
+    /// the NEW spies (not a stale OLD hook — the OLD generation's hooks were consumed at
+    /// step 6 and must NOT leak into the new session).
+    ///
+    /// GIVEN: an OLD session with OLD spy hooks; a builder returning a NEW bundle with
+    ///        NEW spy hooks bound to a distinct NEW generation flag.
+    /// WHEN:  the rebuild worker swaps the NEW session into `bridge_session` (step 11).
+    /// THEN:  the post-swap session's `stop_signaling_on_rebuild` and
+    ///        `disarm_escalation_on_rebuild` are `Some`, and invoking each fires the NEW
+    ///        spy — proving the hooks are bound to the NEW generation, not a stale one.
+    #[test]
+    fn post_swap_session_carries_new_generation_stop_and_disarm_hooks() {
+        use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
+        use sm_domain::supervisor::SupervisorSignal as SuperSig;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        // OLD generation spies — these are consumed at step 6 and must NOT survive the swap.
+        let old_stop_fired = Arc::new(AtomicBool::new(false));
+        let old_disarm_fired = Arc::new(AtomicBool::new(false));
+        let old_stop_clone = old_stop_fired.clone();
+        let old_disarm_clone = old_disarm_fired.clone();
+
+        let old_session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            None,
+            "sw_fake".to_string(),
+            None, // suppress_bye_on_rebuild
+            Some(Arc::new(move || {
+                old_stop_clone.store(true, Ordering::SeqCst);
+            })),
+            Some(Arc::new(move || {
+                old_disarm_clone.store(true, Ordering::SeqCst);
+            })),
+        );
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> =
+            Arc::new(Mutex::new(Some(old_session)));
+
+        // NEW generation flags — the NEW spies flip THESE, distinct from the OLD ones.
+        let new_stop_fired = Arc::new(AtomicBool::new(false));
+        let new_disarm_fired = Arc::new(AtomicBool::new(false));
+        let new_stop_for_builder = new_stop_fired.clone();
+        let new_disarm_for_builder = new_disarm_fired.clone();
+
+        let builder: super::SenderBuilderFn = Arc::new(move |_udp, _svc, _stop, _ch, _att| {
+            let new_stop = new_stop_for_builder.clone();
+            let new_disarm = new_disarm_for_builder.clone();
+            Ok(SenderBundle {
+                drain_handles: vec![],
+                shutdown: None,
+                backend_name: "sw_fake".to_string(),
+                suppress_bye_on_rebuild: None,
+                // NEW generation stop hook — bound to the NEW flag (D-RFG-4 propagation).
+                stop_signaling_on_rebuild: Some(Arc::new(move || {
+                    new_stop.store(true, Ordering::SeqCst);
+                })),
+                // NEW generation disarm hook — bound to the NEW flag (D-RFG-6 propagation).
+                disarm_escalation_on_rebuild: Some(Arc::new(move || {
+                    new_disarm.store(true, Ordering::SeqCst);
+                })),
+            })
+        });
+
+        struct FakeChForCache;
+        impl super::ChannelLike for FakeChForCache {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = Arc::new(Mutex::new(Some(super::RestartCache {
+            udp_port: 0,
+            service_name: "test".to_string(),
+            channel: Arc::new(FakeChForCache),
+            session_nonce: 0,
+        })));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let hook = make_sender_rebuild_hook(
+            builder,
+            cache,
+            bridge_session.clone(),
+            old_stop_flag,
+            1,
+            Arc::new(AtomicU8::new(1)),
+        );
+
+        let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
+        hook(sig_tx);
+
+        // Wait for RebuildSucceeded — proves the swap (step 11) has happened.
+        let first = sig_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SC-RFG-8: rebuild must emit RebuildSucceeded");
+        assert!(
+            matches!(first, SuperSig::RebuildSucceeded),
+            "SC-RFG-8 FAIL: first signal must be RebuildSucceeded, got {first:?}"
+        );
+
+        // Step 6 must have fired the OLD generation's hooks (consumed, not propagated).
+        assert!(
+            old_stop_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 FAIL: OLD stop hook must fire at step 6"
+        );
+        assert!(
+            old_disarm_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 FAIL: OLD disarm hook must fire at step 6"
+        );
+
+        // The post-swap session must hold the NEW generation's hooks.
+        let mut guard = bridge_session.lock().unwrap();
+        let new_session = guard
+            .as_mut()
+            .expect("SC-RFG-8 FAIL: bridge_session must hold the swapped NEW session");
+        let new_stop_hook = new_session
+            .stop_signaling_on_rebuild
+            .clone()
+            .expect("SC-RFG-8 FAIL: post-swap stop_signaling_on_rebuild must be Some (D-RFG-4)");
+        let new_disarm_hook = new_session
+            .disarm_escalation_on_rebuild
+            .clone()
+            .expect("SC-RFG-8 FAIL: post-swap disarm_escalation_on_rebuild must be Some (D-RFG-6)");
+        drop(guard);
+
+        // Invoking the post-swap hooks must fire the NEW spies — proving NEW-generation
+        // binding (not stale OLD hooks). The OLD flags were already true from step 6, so
+        // we assert the NEW flags transition false→true here.
+        assert!(
+            !new_stop_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 precondition: NEW stop spy must be unfired before invocation"
+        );
+        assert!(
+            !new_disarm_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 precondition: NEW disarm spy must be unfired before invocation"
+        );
+        new_stop_hook();
+        new_disarm_hook();
+        assert!(
+            new_stop_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 FAIL: post-swap stop hook must fire the NEW generation spy, not a stale one"
+        );
+        assert!(
+            new_disarm_fired.load(Ordering::SeqCst),
+            "SC-RFG-8 FAIL: post-swap disarm hook must fire the NEW generation spy, not a stale one"
+        );
+    }
 }
