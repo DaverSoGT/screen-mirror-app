@@ -1742,10 +1742,8 @@ fn pump_loop(
                         // service pass below — includes dim-mismatch drops per the D-PPT-3
                         // dual-use note. Splitting the counter is out of Slice 1 scope.
                         let current_enc_dropped = state.dropped.load(Ordering::Relaxed);
-                        let (enc_delta, new_enc_last) = compute_drop_delta(
-                            current_enc_dropped,
-                            last_dropped_enc_snapshot,
-                        );
+                        let (enc_delta, new_enc_last) =
+                            compute_drop_delta(current_enc_dropped, last_dropped_enc_snapshot);
                         if enc_delta > 0 {
                             tracing::info!(
                                 target: "sm_infra::encode::windows_mft",

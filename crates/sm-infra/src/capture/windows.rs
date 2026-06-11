@@ -269,7 +269,11 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         // the window clock, keeping the log cadence stable even under backpressure.
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.fps_window_start);
-        if interval_elapsed(self.fps_window_start, now, std::time::Duration::from_secs(1)) {
+        if interval_elapsed(
+            self.fps_window_start,
+            now,
+            std::time::Duration::from_secs(1),
+        ) {
             let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
             tracing::info!(
                 target: "sm_infra::capture::windows",
@@ -751,7 +755,10 @@ mod tests {
         // Second call: counter unchanged current=5, last=5 → delta=0, new_last=5
         let (delta2, new_last2) = compute_drop_delta(5, 5);
         assert_eq!(delta2, 0, "delta must be 0 when counter did not advance");
-        assert_eq!(new_last2, 5, "new_last must equal current even when delta is 0");
+        assert_eq!(
+            new_last2, 5,
+            "new_last must equal current even when delta is 0"
+        );
 
         // Saturating branch: current < last (e.g. counter reset) → delta clamps to 0,
         // new_last re-pins to current rather than underflowing.
