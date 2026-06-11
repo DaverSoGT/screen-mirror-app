@@ -487,6 +487,81 @@ fn apply_offer_to_rtc(rtc: &mut Rtc, offer: SdpOffer) -> Result<SdpAnswer, Trans
 
 // ─── Tick loop ───────────────────────────────────────────────────────────────
 
+// ─── GapStats — RECV-OBS-1 pure seam (Slice 2) ───────────────────────────────
+//
+// Accumulates inter-arrival gap data for a single per-second measurement window.
+// Lives on the tick thread (single-threaded); no allocation, no locks.
+// Mirrors ConvertStats (encode/windows_mft.rs) in structure and scope.
+//
+// NOTE: The per-second window boundary is checked event-driven (at each MediaData),
+// matching the capture_fps pattern in capture/windows.rs. If media stalls, no
+// emission fires that second — that is intentional, not a bug.
+
+#[derive(Default)]
+struct GapStats {
+    count: u32,
+    total_us: u64,
+    max_us: u64,
+}
+
+/// Window state for RECV-OBS-1. Bundled so `handle_receiver_event` stays within
+/// clippy's 7-argument limit.
+struct RecvGapState {
+    stats: GapStats,
+    window_start: Instant,
+    last_arrival: Option<Instant>,
+}
+
+impl RecvGapState {
+    fn new() -> Self {
+        Self {
+            stats: GapStats::default(),
+            window_start: Instant::now(),
+            last_arrival: None,
+        }
+    }
+}
+
+impl GapStats {
+    /// Record one inter-arrival gap.
+    fn record(&mut self, gap: Duration) {
+        let us = gap.as_micros() as u64;
+        self.count += 1;
+        self.total_us += us;
+        if us > self.max_us {
+            self.max_us = us;
+        }
+    }
+
+    /// Frames per second over the given elapsed window. Returns 0.0 when no frames recorded.
+    fn receive_fps(&self, window: Duration) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.count as f64 / window.as_secs_f64()
+    }
+
+    /// Mean inter-arrival gap in milliseconds. Returns 0.0 when no frames recorded.
+    fn mean_gap_ms(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.total_us as f64 / self.count as f64 / 1000.0
+    }
+
+    /// Maximum inter-arrival gap in milliseconds.
+    fn max_gap_ms(&self) -> f64 {
+        self.max_us as f64 / 1000.0
+    }
+
+    /// Reset all accumulators (call after per-second emission).
+    fn reset(&mut self) {
+        self.count = 0;
+        self.total_us = 0;
+        self.max_us = 0;
+    }
+}
+
 /// SansIO tick loop for `Str0mVideoReceiver`.
 ///
 /// Runs on the dedicated OS thread spawned by `start()`.
@@ -507,6 +582,8 @@ fn run_receiver_loop(
     // (datagrams arrive but no working pair).
     let mut first_datagram_logged = false;
     let loop_start = Instant::now();
+    // RECV-OBS-1: arrival-gap accumulator (Slice 2).
+    let mut gap_state = RecvGapState::new();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -551,7 +628,14 @@ fn run_receiver_loop(
                     let _ = udp.send_to(&t.contents, t.destination);
                 }
                 Ok(Output::Event(ev)) => {
-                    handle_receiver_event(ev, &mut pre_neg.mid, &state, &pkt_tx, &event_tx);
+                    handle_receiver_event(
+                        ev,
+                        &mut pre_neg.mid,
+                        &state,
+                        &pkt_tx,
+                        &event_tx,
+                        &mut gap_state,
+                    );
                 }
                 Err(_) => {
                     let _ = event_tx.try_send(TransportEvent::ConnectionLost {
@@ -636,12 +720,16 @@ fn run_receiver_loop(
 }
 
 /// Dispatch str0m events for the receiver.
+///
+/// `gap_state` carries the RECV-OBS-1 accumulator (Slice 2); bundled into one
+/// `&mut RecvGapState` to stay within clippy's 7-argument limit.
 fn handle_receiver_event(
     ev: Event,
     mid_slot: &mut Option<Mid>,
     state: &ReceiverShared,
     pkt_tx: &SyncSender<EncodedPacket>,
     event_tx: &SyncSender<TransportEvent>,
+    gap_state: &mut RecvGapState,
 ) {
     match ev {
         // `Connected` fires when at least one candidate pair is working but gathering
@@ -675,6 +763,35 @@ fn handle_receiver_event(
             *mid_slot = Some(added.mid);
         }
         Event::MediaData(media) => {
+            // RECV-OBS-1 (Slice 2): record inter-arrival gap and emit per-second
+            // diagnostic line. Event-driven cadence: fires only when MediaData arrives;
+            // a stalled second produces no line (intentional, not a bug — mirrors
+            // capture_fps in capture/windows.rs). No allocation, no lock.
+            let now = Instant::now();
+            if let Some(prev) = gap_state.last_arrival {
+                gap_state.stats.record(now.duration_since(prev));
+            }
+            gap_state.last_arrival = Some(now);
+            if gap_state.window_start.elapsed() >= Duration::from_secs(1) {
+                let window = gap_state.window_start.elapsed();
+                // RECV-OBS-1 scenario 3: skip emission when no frames arrived in the
+                // window (count == 0). The window still resets so the cadence stays
+                // event-driven; last_arrival persists for gap measurement continuity.
+                if gap_state.stats.count > 0 {
+                    eprintln!(
+                        "[sm-receiver-gap] receive_fps={:.1} max_gap_ms={:.1} mean_gap_ms={:.1} frames={}",
+                        gap_state.stats.receive_fps(window),
+                        gap_state.stats.max_gap_ms(),
+                        gap_state.stats.mean_gap_ms(),
+                        gap_state.stats.count,
+                    );
+                }
+                gap_state.stats.reset();
+                gap_state.window_start = now;
+                // last_arrival persists across windows so the gap straddling a boundary
+                // is not lost (next gap is measured from this arrival).
+            }
+
             // Media-arrival watchdog (design #971 §D4/O4): signal the FIRST media of
             // this generation so the post-rebuild watchdog in the drain can disarm.
             // One-shot per generation (guarded by `state.media_emitted`); subsequent
@@ -1209,5 +1326,48 @@ mod tests {
             matches!(gen2, Ok(TransportEvent::MediaData)),
             "a fresh generation must re-emit MediaData on its first media, got {gen2:?}"
         );
+    }
+
+    // ─── GapStats unit tests (RECV-OBS-1, Slice 2) ───────────────────────────
+
+    use super::GapStats;
+
+    /// Three synthetic arrivals: record gaps [30ms, 80ms, 40ms] and assert
+    /// max_gap_ms, mean_gap_ms, and receive_fps over a 1-second window.
+    #[test]
+    fn gap_stats_record_three_deltas() {
+        let mut stats = GapStats::default();
+        stats.record(Duration::from_millis(30));
+        stats.record(Duration::from_millis(80));
+        stats.record(Duration::from_millis(40));
+        assert_eq!(stats.max_gap_ms(), 80.0, "max_gap_ms must be 80.0");
+        // mean = (30000 + 80000 + 40000) µs / 3 / 1000 = 50.0 ms
+        assert_eq!(stats.mean_gap_ms(), 50.0, "mean_gap_ms must be 50.0");
+        let fps = stats.receive_fps(Duration::from_secs(1));
+        assert!(
+            (fps - 3.0).abs() < 1e-9,
+            "receive_fps over 1s must be 3.0, got {fps}"
+        );
+    }
+
+    /// Empty GapStats must return 0.0 for all metrics without panicking (div-by-zero guard).
+    #[test]
+    fn gap_stats_zero_guard() {
+        let stats = GapStats::default();
+        assert_eq!(stats.receive_fps(Duration::from_secs(1)), 0.0);
+        assert_eq!(stats.mean_gap_ms(), 0.0);
+        assert_eq!(stats.max_gap_ms(), 0.0);
+    }
+
+    /// After reset(), all fields must return 0.0.
+    #[test]
+    fn gap_stats_reset_zeroes() {
+        let mut stats = GapStats::default();
+        stats.record(Duration::from_millis(30));
+        stats.record(Duration::from_millis(60));
+        stats.reset();
+        assert_eq!(stats.receive_fps(Duration::from_secs(1)), 0.0);
+        assert_eq!(stats.mean_gap_ms(), 0.0);
+        assert_eq!(stats.max_gap_ms(), 0.0);
     }
 }
