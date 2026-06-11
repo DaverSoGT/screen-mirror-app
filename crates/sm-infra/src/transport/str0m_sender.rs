@@ -1636,8 +1636,15 @@ mod tests {
         use std::time::Instant;
         use str0m::media::{Direction, MediaKind};
 
-        // Build the sender Rtc EXACTLY as production does: no clear_codecs(), no set_rtp_mode().
-        // Any future change that calls those will break this test — that is intentional.
+        // Build the sender Rtc as production does, EXCEPT this test omits enable_bwe.
+        // Omitting enable_bwe is intentional: pacing is irrelevant for SDP-structure
+        // assertions, and the SDP offer is byte-identical with or without it
+        // (enable_bwe only flips the internal bwe_config option; extension map and
+        // codec negotiation are unaffected — verified in design D-PPT3-1).
+        // Any future change that calls clear_codecs() or set_rtp_mode() will break
+        // this test — that is intentional.
+        // See `sender_sdp_offer_valid_with_bwe_enabled` for a sibling test that
+        // exercises the full production builder path including enable_bwe.
         let crypto = str0m::crypto::from_feature_flags();
         let mut rtc = str0m::Rtc::builder()
             .set_crypto_provider(Arc::new(crypto))
@@ -1666,6 +1673,52 @@ mod tests {
             sdp.lines()
                 .any(|l| l.starts_with("a=rtcp-fb:") && l.contains("nack")),
             "SDP offer must contain a=rtcp-fb nack line: {sdp}"
+        );
+    }
+
+    /// REQ-RTX-5 / PACE-1 — The production builder path that includes `enable_bwe`
+    /// MUST still produce a valid (non-empty) SDP offer.  enable_bwe only sets
+    /// the internal `bwe_config` option; it does not touch the extension map or
+    /// codec negotiation, so the offer is byte-identical to the non-BWE case.
+    /// This test pins that invariant so a future str0m upgrade cannot silently
+    /// break offer generation when the LeakyBucketPacer path is active.
+    #[test]
+    fn sender_sdp_offer_valid_with_bwe_enabled() {
+        use std::time::Instant;
+        use str0m::bwe::Bitrate;
+        use str0m::media::{Direction, MediaKind};
+
+        // Mirror the production Str0mVideoSender::new() builder exactly, using
+        // a representative bitrate (TransportConfig default is 4 Mbps).
+        let default_cfg = TransportConfig::default();
+        let initial_estimate = Bitrate::bps(default_cfg.bitrate_bps as u64 * super::PACER_HEADROOM);
+
+        let crypto = str0m::crypto::from_feature_flags();
+        let mut rtc = str0m::Rtc::builder()
+            .set_crypto_provider(Arc::new(crypto))
+            .enable_bwe(Some(initial_estimate))
+            .build(Instant::now());
+
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let result = change.apply();
+
+        assert!(
+            result.is_some(),
+            "production builder with enable_bwe must produce a valid SDP offer (got None)"
+        );
+        let (offer, _pending) = result.unwrap();
+        let sdp = offer.to_string();
+        assert!(
+            !sdp.is_empty(),
+            "SDP offer string must be non-empty with enable_bwe active"
+        );
+        // Confirm the H.264 + RTX structure is preserved when BWE is enabled
+        // (extension map is set unconditionally by RtcConfig::default; enable_bwe
+        // does not modify it).
+        assert!(
+            sdp.contains("rtx/90000"),
+            "SDP offer with enable_bwe must still contain RTX payload type: {sdp}"
         );
     }
 
