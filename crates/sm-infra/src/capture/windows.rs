@@ -146,6 +146,14 @@ struct WgcHandler {
     /// Shared with the heartbeat thread; updated on every real frame delivery so the
     /// heartbeat can detect "no real frame in HEARTBEAT_INTERVAL" and inject a duplicate.
     last_frame: LastFrameSlot,
+    /// Frame count accumulated in the current 1-second FPS window (I1, D-PPT-1).
+    /// Counts only frames that reached the channel successfully (delivered rate).
+    fps_frame_count: u32,
+    /// Start of the current 1-second FPS window (I1, D-PPT-1).
+    fps_window_start: std::time::Instant,
+    /// Snapshot of `dropped` at the end of the last 1-second window, used to compute
+    /// per-interval drop delta (I1, D-PPT-3).
+    last_dropped_snapshot: u64,
 }
 
 impl GraphicsCaptureApiHandler for WgcHandler {
@@ -162,6 +170,9 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             tx,
             dropped,
             last_frame,
+            fps_frame_count: 0,
+            fps_window_start: std::time::Instant::now(),
+            last_dropped_snapshot: 0,
         })
     }
 
@@ -218,7 +229,13 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         }
 
         match self.tx.try_send(capture_frame) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Count only frames that were actually delivered to the encoder channel.
+                // Heartbeat-injected frames go through heartbeat_loop's own try_send (line ~295),
+                // NOT through here — so capture_fps measures WGC's true delivery rate only.
+                // On a static screen capture_fps legitimately reads ~0; this is correct (D-PPT-1).
+                self.fps_frame_count += 1;
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -226,6 +243,37 @@ impl GraphicsCaptureApiHandler for WgcHandler {
                 // Consumer dropped the receiver — tear down the WGC session.
                 capture_control.stop();
             }
+        }
+
+        // Per-second observability window: emit capture_fps and capture drop-delta (I1, D-PPT-1/3).
+        // Checked unconditionally after the match so both delivered and dropped frames advance
+        // the window clock, keeping the log cadence stable even under backpressure.
+        let elapsed = self.fps_window_start.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
+            tracing::info!(
+                target: "sm_infra::capture::windows",
+                capture_fps = %format!("{fps:.1}"),
+                frames = self.fps_frame_count,
+                "capture throughput"
+            );
+
+            // Compute per-interval drop delta (D-PPT-3).
+            let current_dropped = self.dropped.load(Ordering::Relaxed);
+            let (delta, new_last) = compute_drop_delta(current_dropped, self.last_dropped_snapshot);
+            if delta > 0 {
+                tracing::info!(
+                    target: "sm_infra::capture::windows",
+                    channel_drops = delta,
+                    channel = "capture_to_enc",
+                    "capture channel drops"
+                );
+            }
+
+            // Reset window state.
+            self.fps_frame_count = 0;
+            self.fps_window_start = std::time::Instant::now();
+            self.last_dropped_snapshot = new_last;
         }
 
         Ok(())
