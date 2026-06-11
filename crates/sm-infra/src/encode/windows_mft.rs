@@ -96,6 +96,10 @@ use windows::core::{Interface, PWSTR};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
 
+// Shared observability seam — cadence predicate defined in capture::windows (no hw-encoder
+// gate) so both the encode and capture production gates call the same tested function.
+use crate::capture::interval_elapsed;
+
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
 
 /// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
@@ -1573,6 +1577,12 @@ fn pump_loop(
     let mut fps_frame_count: u32 = 0;
     let mut fps_window_start = std::time::Instant::now();
     const FPS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    // I2 (D-PPT-2): per-second convert timing accumulator. Shares the encode_fps window
+    // so all encoder-thread metrics reset at the same tick (one timestamp, one reset).
+    let mut convert_stats = ConvertStats::default();
+    // I3 (D-PPT-3): snapshot of state.dropped at the last encode window boundary, used
+    // to compute per-interval drop delta for the enc_to_sender channel.
+    let mut last_dropped_enc_snapshot: u64 = 0;
 
     loop {
         // Top-of-loop stop check — sole exit via stop flag (design DD1, spec R4/S4.1).
@@ -1685,22 +1695,10 @@ fn pump_loop(
                     ho_count -= 1;
                     match tx.try_send(pkt) {
                         Ok(()) => {
-                            // Encode-rate diagnostic: count successfully forwarded frames and
-                            // log fps once per FPS_LOG_INTERVAL. Reveals true encode throughput
-                            // to complement the muxer real-DTS-delta fix diagnosis.
+                            // Encode-rate diagnostic: count only successfully forwarded frames.
+                            // The window emission below runs unconditionally so encode_fps still
+                            // reflects true throughput even when this send did not succeed.
                             fps_frame_count += 1;
-                            let elapsed = fps_window_start.elapsed();
-                            if elapsed >= FPS_LOG_INTERVAL {
-                                let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
-                                tracing::info!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    encode_fps = %format!("{fps:.1}"),
-                                    frames = fps_frame_count,
-                                    "encode throughput"
-                                );
-                                fps_frame_count = 0;
-                                fps_window_start = std::time::Instant::now();
-                            }
                         }
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
                             state.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1709,6 +1707,57 @@ fn pump_loop(
                             tracing::info!("pump_loop: packet channel disconnected, exiting");
                             return mft;
                         }
+                    }
+
+                    // Per-second observability window: emit encode_fps, convert throughput, and
+                    // the enc_to_sender drop delta. Checked unconditionally after the send match
+                    // (mirroring capture/windows.rs) so the window still ticks during sustained
+                    // enc→sender backpressure — exactly when drop-rate visibility matters most.
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(fps_window_start);
+                    if interval_elapsed(fps_window_start, now, FPS_LOG_INTERVAL) {
+                        let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
+                        // CAPT-OBS-6: encode_fps event field names and cadence MUST remain
+                        // unchanged. Do NOT alter the fields or message below.
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            encode_fps = %format!("{fps:.1}"),
+                            frames = fps_frame_count,
+                            "encode throughput"
+                        );
+
+                        // I2 (D-PPT-2): emit convert throughput alongside encode_fps so all
+                        // encoder-thread metrics share one window tick (CAPT-OBS-2).
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            convert_fps = %format!("{:.1}", convert_stats.fps(elapsed)),
+                            convert_us = convert_stats.mean_us(),
+                            frames = convert_stats.frames,
+                            "convert throughput"
+                        );
+
+                        // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
+                        // state.dropped accumulates both drops from the TrySendError::Full arm
+                        // above and dimension-mismatch drops from the drop site in the NeedInput
+                        // service pass below — includes dim-mismatch drops per the D-PPT-3
+                        // dual-use note. Splitting the counter is out of Slice 1 scope.
+                        let current_enc_dropped = state.dropped.load(Ordering::Relaxed);
+                        let (enc_delta, new_enc_last) =
+                            compute_drop_delta(current_enc_dropped, last_dropped_enc_snapshot);
+                        if enc_delta > 0 {
+                            tracing::info!(
+                                target: "sm_infra::encode::windows_mft",
+                                channel_drops = enc_delta,
+                                channel = "enc_to_sender",
+                                "encode channel drops"
+                            );
+                        }
+                        last_dropped_enc_snapshot = new_enc_last;
+
+                        // Reset all window-shared accumulators at the same boundary.
+                        convert_stats.reset();
+                        fps_frame_count = 0;
+                        fps_window_start = std::time::Instant::now();
                     }
                 }
                 Ok(None) => {
@@ -1780,7 +1829,10 @@ fn pump_loop(
                         break;
                     }
                     current_ts = frame.timestamp;
+                    // I2 (D-PPT-2): bracket nv12_convert to accumulate per-frame convert latency.
+                    let t0 = std::time::Instant::now();
                     nv12_convert(&frame, &mut nv12_scratch);
+                    convert_stats.record(t0.elapsed());
 
                     // Consume force_keyframe_icodecapi_pending BEFORE submit_frame /
                     // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).
@@ -2181,6 +2233,73 @@ impl WindowsMftH264Encoder {
             .force_keyframe_icodecapi_pending
             .store(true, Ordering::Release);
     }
+}
+
+// ── Observability seams (perf-pipeline-throughput Slice 1) ───────────────────
+//
+// Pure helpers extracted for unit-testability (D-PPT-5, D-PPT-6). No COM, no
+// heap allocation, no locks — safe to call on the encoder pump_loop hot path.
+
+/// Per-second accumulator for NV12 convert timing (I2, D-PPT-5).
+///
+/// Accumulates a frame count and a total microsecond sum across one 1-second window.
+/// At the window boundary, callers read `mean_us()` and `fps()`, emit the log event,
+/// then call `reset()`. Follows the `FpsTracker` pure-struct-with-cfg(test)-accessor
+/// precedent (render/fps_tracker.rs).
+#[derive(Default)]
+struct ConvertStats {
+    /// Number of `nv12_convert` calls recorded in the current window.
+    frames: u32,
+    /// Cumulative duration of all recorded calls in the current window, in microseconds.
+    total_us: u64,
+}
+
+impl ConvertStats {
+    /// Record one convert duration into the current window.
+    #[inline]
+    fn record(&mut self, dur: std::time::Duration) {
+        self.frames += 1;
+        self.total_us += dur.as_micros() as u64;
+    }
+
+    /// Per-frame mean convert latency in microseconds over the current window.
+    /// Returns 0 when no frames have been recorded (avoids divide-by-zero).
+    #[inline]
+    fn mean_us(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_us / self.frames as u64
+        }
+    }
+
+    /// Frames-per-second computed over the provided elapsed window duration.
+    /// Returns 0.0 when no frames have been recorded.
+    #[inline]
+    fn fps(&self, window: std::time::Duration) -> f64 {
+        if self.frames == 0 {
+            0.0
+        } else {
+            self.frames as f64 / window.as_secs_f64()
+        }
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_us = 0;
+    }
+}
+
+/// Compute the per-interval drop delta for a monotonically-increasing drop counter.
+///
+/// Returns `(delta, new_last)` where `delta = current.saturating_sub(last)` and
+/// `new_last = current`. Used by pump_loop (I3, D-PPT-3) to surface the
+/// enc_to_sender drop rate without cumulative totals in the per-second log event.
+#[inline]
+fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
+    (current.saturating_sub(last), current)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -2631,5 +2750,93 @@ mod tests {
 
         unsafe { CoUninitialize() }; // for the recheck CoInitializeEx
         unsafe { CoUninitialize() }; // for the initial STA init
+    }
+
+    // ── Observability seam tests (WU-A RED — perf-pipeline-throughput Slice 1) ──
+    //
+    // These tests are RED until Phase 2 adds ConvertStats and interval_elapsed.
+    // All tests are pure (no COM, no hardware, no tracing subscriber).
+
+    /// Task 1.1 [RED]: ConvertStats accumulates durations and computes mean_us and fps correctly.
+    #[test]
+    fn convert_stats_record_and_mean_us() {
+        use std::time::{Duration, Instant};
+
+        let mut stats = ConvertStats::default();
+        // Record 3 durations: 10 ms, 20 ms, 30 ms → total 60 ms, mean = 20 ms = 20_000 us.
+        stats.record(Duration::from_millis(10));
+        stats.record(Duration::from_millis(20));
+        stats.record(Duration::from_millis(30));
+        assert_eq!(stats.mean_us(), 20_000, "mean_us must be total_us / frames");
+
+        // fps over a 3-second window: 3 frames / 3 s = 1.0 fps
+        let fps = stats.fps(Duration::from_secs(3));
+        assert!(
+            (fps - 1.0_f64).abs() < 1e-9,
+            "fps must be frames / elapsed_secs, got {fps}"
+        );
+        let _ = Instant::now(); // ensure Instant is in scope (compile smoke)
+    }
+
+    /// Task 1.2 [RED]: ConvertStats::reset zeroes all accumulated state.
+    #[test]
+    fn convert_stats_reset_zeroes_state() {
+        let mut stats = ConvertStats::default();
+        stats.record(std::time::Duration::from_millis(5));
+        stats.reset();
+        assert_eq!(stats.frames, 0, "frames must be 0 after reset");
+        assert_eq!(stats.total_us, 0, "total_us must be 0 after reset");
+    }
+
+    /// Pinning guard: ConvertStats with zero frames must not divide by zero.
+    ///
+    /// Production code fires mean_us()/fps() at the per-second window boundary.  On the
+    /// first window after startup (or after a reset), it is possible that no convert calls
+    /// occurred (quiet first second: D-PPT-5 / spec CAPT-OBS-2 "First frame in window").
+    /// This test pins the guard so a future removal would cause a failure before a panic
+    /// reaches production.
+    #[test]
+    fn convert_stats_zero_frame_guard_returns_zero() {
+        use std::time::Duration;
+
+        let stats = ConvertStats::default();
+        assert_eq!(
+            stats.mean_us(),
+            0,
+            "mean_us() must return 0 when frames == 0 (divide-by-zero guard)"
+        );
+        assert_eq!(
+            stats.fps(Duration::from_secs(1)),
+            0.0,
+            "fps() must return 0.0 when frames == 0 (divide-by-zero guard)"
+        );
+    }
+
+    /// Task 1.3 [RED]: interval_elapsed returns false below threshold and true at/above threshold.
+    #[test]
+    fn window_gate_below_threshold_returns_false_and_at_or_above_returns_true() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        // Simulate "now" 500 ms after start — below the 1 s threshold.
+        let below = start + Duration::from_millis(500);
+        assert!(
+            !interval_elapsed(start, below, Duration::from_secs(1)),
+            "500 ms elapsed must return false for a 1 s threshold"
+        );
+
+        // Simulate "now" 1001 ms after start — above the threshold.
+        let above = start + Duration::from_millis(1001);
+        assert!(
+            interval_elapsed(start, above, Duration::from_secs(1)),
+            "1001 ms elapsed must return true for a 1 s threshold"
+        );
+
+        // Exactly at the boundary — inclusive (>= semantics, matching FPS_LOG_INTERVAL).
+        let exact = start + Duration::from_secs(1);
+        assert!(
+            interval_elapsed(start, exact, Duration::from_secs(1)),
+            "exactly 1 s elapsed must return true (inclusive boundary)"
+        );
     }
 }

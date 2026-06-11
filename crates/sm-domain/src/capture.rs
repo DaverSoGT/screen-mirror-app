@@ -167,21 +167,13 @@ pub enum BorderPolicy {
 ///
 /// - `monitor`: `MonitorSelector::Primary`
 /// - `cursor`: `true` (cursor is included in the capture)
-/// - `max_fps`: `None` (uncapped; WGC delivers frames as they become available)
 /// - `border`: `BorderPolicy::Auto` (border disabled automatically on Win11 22H2+)
-///
-/// # Notes
-///
-/// `max_fps = Some(0)` is invalid and will cause the adapter's `new()` to return
-/// `Err(CaptureError::Internal("max_fps must be > 0"))`.
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     /// Which monitor to capture.
     pub monitor: MonitorSelector,
     /// Whether to include the mouse cursor in the captured frames.
     pub cursor: bool,
-    /// Optional frame-rate cap. `None` means uncapped. `Some(0)` is rejected by the adapter.
-    pub max_fps: Option<u32>,
     /// Whether to show the system capture border overlay.
     pub border: BorderPolicy,
 }
@@ -191,7 +183,6 @@ impl Default for CaptureConfig {
         Self {
             monitor: MonitorSelector::Primary,
             cursor: true,
-            max_fps: None,
             border: BorderPolicy::Auto,
         }
     }
@@ -200,13 +191,8 @@ impl Default for CaptureConfig {
 impl CaptureConfig {
     /// Validate that this configuration satisfies all domain invariants.
     ///
-    /// Returns `Err(CaptureError::Internal("max_fps must be > 0"))` when
-    /// `max_fps == Some(0)`. All adapters MUST call this from `new()` before
-    /// performing any platform work.
+    /// All adapters MUST call this from `new()` before performing any platform work.
     pub fn validate(&self) -> Result<(), CaptureError> {
-        if self.max_fps == Some(0) {
-            return Err(CaptureError::Internal("max_fps must be > 0".into()));
-        }
         Ok(())
     }
 }
@@ -239,7 +225,6 @@ pub trait CaptureSource: Send {
     /// Construct a new capture session with the given configuration.
     ///
     /// Does NOT start the WGC session. Call [`start`](CaptureSource::start) to begin capture.
-    /// `max_fps = Some(0)` is rejected with `Err(CaptureError::Internal(_))`.
     fn new(config: CaptureConfig) -> Result<Self, CaptureError>
     where
         Self: Sized;
@@ -448,35 +433,13 @@ mod tests {
     fn capture_config_default_cursor_is_true() {
         let c = CaptureConfig::default();
         assert!(c.cursor);
-        assert!(c.max_fps.is_none());
         assert!(matches!(c.border, BorderPolicy::Auto));
         assert!(matches!(c.monitor, MonitorSelector::Primary));
     }
 
     #[test]
-    fn validate_rejects_max_fps_zero() {
-        let cfg = CaptureConfig {
-            max_fps: Some(0),
-            ..CaptureConfig::default()
-        };
-        match cfg.validate() {
-            Err(CaptureError::Internal(msg)) => {
-                assert!(msg.contains("max_fps must be > 0"), "unexpected msg: {msg}");
-            }
-            other => panic!("expected Err(CaptureError::Internal(_)), got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn validate_accepts_none_and_positive_max_fps() {
-        // max_fps: None — uncapped, valid.
+    fn validate_default_config_is_ok() {
         assert!(CaptureConfig::default().validate().is_ok());
-        // max_fps: Some(30) — valid.
-        let cfg = CaptureConfig {
-            max_fps: Some(30),
-            ..CaptureConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
     }
 
     #[test]

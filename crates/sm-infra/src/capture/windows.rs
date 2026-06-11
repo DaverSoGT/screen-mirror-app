@@ -96,6 +96,25 @@ fn supports_borderless() -> bool {
     })
 }
 
+// ── Shared observability seam (perf-pipeline-throughput Slice 1) ────────────
+//
+// Defined here (no hw-encoder feature gate) so both the capture-side gate in
+// on_frame_arrived and the encode-side gate in pump_loop (windows_mft.rs) call
+// the same tested predicate instead of an inline duplicate.
+
+/// Returns `true` when the elapsed time since `window_start` is at or above `threshold`.
+///
+/// Extracted as a pure function so the cadence predicate is unit-testable with synthetic
+/// `Instant` values — no wall-clock sleeping required (D-PPT-6).
+#[inline]
+pub(crate) fn interval_elapsed(
+    window_start: std::time::Instant,
+    now: std::time::Instant,
+    threshold: std::time::Duration,
+) -> bool {
+    now.duration_since(window_start) >= threshold
+}
+
 // ---------------------------------------------------------------------------
 // Helper: map Monitor errors to CaptureError
 // ---------------------------------------------------------------------------
@@ -146,6 +165,14 @@ struct WgcHandler {
     /// Shared with the heartbeat thread; updated on every real frame delivery so the
     /// heartbeat can detect "no real frame in HEARTBEAT_INTERVAL" and inject a duplicate.
     last_frame: LastFrameSlot,
+    /// Frame count accumulated in the current 1-second FPS window (I1, D-PPT-1).
+    /// Counts only frames that reached the channel successfully (delivered rate).
+    fps_frame_count: u32,
+    /// Start of the current 1-second FPS window (I1, D-PPT-1).
+    fps_window_start: std::time::Instant,
+    /// Snapshot of `dropped` at the end of the last 1-second window, used to compute
+    /// per-interval drop delta (I1, D-PPT-3).
+    last_dropped_snapshot: u64,
 }
 
 impl GraphicsCaptureApiHandler for WgcHandler {
@@ -162,6 +189,9 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             tx,
             dropped,
             last_frame,
+            fps_frame_count: 0,
+            fps_window_start: std::time::Instant::now(),
+            last_dropped_snapshot: 0,
         })
     }
 
@@ -218,7 +248,13 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         }
 
         match self.tx.try_send(capture_frame) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Count only frames that were actually delivered to the encoder channel.
+                // Heartbeat-injected frames go through heartbeat_loop's own try_send,
+                // NOT through here — so capture_fps measures WGC's true delivery rate only.
+                // On a static screen capture_fps legitimately reads ~0; this is correct (D-PPT-1).
+                self.fps_frame_count += 1;
+            }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -226,6 +262,42 @@ impl GraphicsCaptureApiHandler for WgcHandler {
                 // Consumer dropped the receiver — tear down the WGC session.
                 capture_control.stop();
             }
+        }
+
+        // Per-second observability window: emit capture_fps and capture drop-delta (I1, D-PPT-1/3).
+        // Checked unconditionally after the match so both delivered and dropped frames advance
+        // the window clock, keeping the log cadence stable even under backpressure.
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.fps_window_start);
+        if interval_elapsed(
+            self.fps_window_start,
+            now,
+            std::time::Duration::from_secs(1),
+        ) {
+            let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
+            tracing::info!(
+                target: "sm_infra::capture::windows",
+                capture_fps = %format!("{fps:.1}"),
+                frames = self.fps_frame_count,
+                "capture throughput"
+            );
+
+            // Compute per-interval drop delta (D-PPT-3).
+            let current_dropped = self.dropped.load(Ordering::Relaxed);
+            let (delta, new_last) = compute_drop_delta(current_dropped, self.last_dropped_snapshot);
+            if delta > 0 {
+                tracing::info!(
+                    target: "sm_infra::capture::windows",
+                    channel_drops = delta,
+                    channel = "capture_to_enc",
+                    "capture channel drops"
+                );
+            }
+
+            // Reset window state.
+            self.fps_frame_count = 0;
+            self.fps_window_start = std::time::Instant::now();
+            self.last_dropped_snapshot = new_last;
         }
 
         Ok(())
@@ -528,6 +600,24 @@ impl WindowsCaptureSource {
 }
 
 // ---------------------------------------------------------------------------
+// Observability seams (perf-pipeline-throughput Slice 1)
+// ---------------------------------------------------------------------------
+
+/// Compute the per-interval drop delta for a monotonically-increasing drop counter.
+///
+/// Returns `(delta, new_last)` where:
+/// - `delta` is the number of drops that occurred since the last snapshot
+///   (`current.saturating_sub(last)` — monotonic, never negative),
+/// - `new_last` is the snapshot to store for the next interval (equals `current`).
+///
+/// Called by `on_frame_arrived` (I1, D-PPT-3) at each 1-second window boundary
+/// with `self.dropped.load(Relaxed)` as `current`.
+#[inline]
+fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
+    (current.saturating_sub(last), current)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -649,5 +739,33 @@ mod tests {
     fn djb2_is_deterministic_across_calls() {
         let input = b"\\\\.\\ DISPLAY2";
         assert_eq!(djb2(input), djb2(input));
+    }
+
+    // ── Observability seam tests (WU-A RED — perf-pipeline-throughput Slice 1) ──
+
+    /// Task 1.4 [RED]: compute_drop_delta computes the per-interval delta and advances
+    /// the snapshot to the current cumulative value.
+    #[test]
+    fn drop_delta_computes_and_advances_snapshot() {
+        // First call: current=5, last=2 → delta=3, new_last=5
+        let (delta, new_last) = compute_drop_delta(5, 2);
+        assert_eq!(delta, 3, "delta must be current - last");
+        assert_eq!(new_last, 5, "new_last must equal current");
+
+        // Second call: counter unchanged current=5, last=5 → delta=0, new_last=5
+        let (delta2, new_last2) = compute_drop_delta(5, 5);
+        assert_eq!(delta2, 0, "delta must be 0 when counter did not advance");
+        assert_eq!(
+            new_last2, 5,
+            "new_last must equal current even when delta is 0"
+        );
+
+        // Saturating branch: current < last (e.g. counter reset) → delta clamps to 0,
+        // new_last re-pins to current rather than underflowing.
+        assert_eq!(
+            compute_drop_delta(2, 5),
+            (0, 2),
+            "delta must saturate to 0 and re-pin new_last when current < last"
+        );
     }
 }
