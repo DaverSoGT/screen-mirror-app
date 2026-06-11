@@ -7557,7 +7557,10 @@ mod tests {
                     sup_tx,
                     fast_single_attempt_policy(),
                     Duration::from_millis(10), // ack_timeout — fast so supervisor cycles quickly
-                    Duration::from_millis(100), // rebuild_timeout
+                    Duration::from_millis(5_000), // rebuild_timeout — large so CI slow runners never
+                    // expire the rebuild window before the coordinator can process InitiateRebuild
+                    // and deliver RebuildSucceeded; Stop interrupts immediately so total test time
+                    // is unaffected (deflake: SC-WD macOS flake root cause).
                     hooks,
                     watchdog_timeout,
                     max_fires,                  // CAP-2-v3 fire cap
@@ -8031,7 +8034,7 @@ mod tests {
                     sup_tx,
                     fast_single_attempt_policy(),
                     Duration::from_millis(10),
-                    Duration::from_millis(100),
+                    Duration::from_millis(5_000), // large rebuild_timeout — deflake (same root cause as SC-WD)
                     hooks,
                     Some(Duration::from_millis(150)),
                     Some(5), // cap is HIGH — must NOT be reached; supervisor Dead wins

@@ -4421,7 +4421,10 @@ mod tests {
                     sup_tx,
                     fast_policy,
                     std::time::Duration::from_millis(10), // ack_timeout — fast so supervisor cycles quickly
-                    std::time::Duration::from_millis(100), // rebuild_timeout
+                    std::time::Duration::from_millis(5_000), // rebuild_timeout — large so CI slow runners never
+                    // expire the rebuild window before the coordinator can process InitiateRebuild
+                    // and deliver RebuildSucceeded; Stop interrupts immediately so total test time
+                    // is unaffected (deflake: SC-WD macOS flake root cause).
                     hooks,
                     std::sync::Arc::new(super::NoopSignalingRefresh)
                         as std::sync::Arc<dyn super::SignalingSupervisorRefresh>,
@@ -4891,7 +4894,7 @@ mod tests {
                     sup_tx,
                     fast_policy,
                     Duration::from_millis(10),
-                    Duration::from_millis(100),
+                    Duration::from_millis(5_000), // large rebuild_timeout — deflake (same root cause as SC-WD)
                     hooks,
                     Arc::new(super::NoopSignalingRefresh)
                         as Arc<dyn super::SignalingSupervisorRefresh>,
