@@ -791,6 +791,79 @@ fn bind_udp_socket_reusable(addr: SocketAddr) -> io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
+// ─── PaceStats seam ──────────────────────────────────────────────────────────
+
+/// Pure-data accumulator for the `[sm-sender-pace]` per-second instrument.
+///
+/// No I/O, no clock, no network dependency — unit-testable in isolation.
+/// One instance lives on the `run_sender_loop` stack; reset every second.
+///
+/// Field semantics (per design D-PPT3-4):
+/// - `ticks`: loop iterations (incremented once per main-loop tick via `on_tick`).
+/// - `pkts`: total `Output::Transmit` (UDP `send_to`) calls (incremented per packet).
+/// - `max_burst`: maximum number of `Output::Transmit` calls emitted within a
+///   single `poll_output` drain.  The burst discriminator: 1–3 → pacing active;
+///   dozens → NullPacer (pre-fix behavior).
+/// - `cur_burst`: transient counter reset by `on_drain_end`.
+struct PaceStats {
+    ticks: u32,
+    pkts: u64,
+    max_burst: u32,
+    cur_burst: u32,
+}
+
+impl PaceStats {
+    fn new() -> Self {
+        Self {
+            ticks: 0,
+            pkts: 0,
+            max_burst: 0,
+            cur_burst: 0,
+        }
+    }
+
+    /// Called once per main-loop iteration (before the `poll_output` drain).
+    #[inline]
+    fn on_tick(&mut self) {
+        self.ticks += 1;
+    }
+
+    /// Called immediately after each successful `send_to` inside the drain.
+    #[inline]
+    fn on_transmit(&mut self) {
+        self.cur_burst += 1;
+        self.pkts += 1;
+    }
+
+    /// Called after the `poll_output` drain exits (`Output::Timeout` reached).
+    /// Records the burst size for this drain and resets the transient counter.
+    #[inline]
+    fn on_drain_end(&mut self) {
+        if self.cur_burst > self.max_burst {
+            self.max_burst = self.cur_burst;
+        }
+        self.cur_burst = 0;
+    }
+
+    /// Returns `(ticks_per_s, pkts_per_s, max_burst)` for the current window.
+    ///
+    /// Divides accumulated counters by `elapsed_secs` so the caller does not
+    /// need to track the denominator separately.
+    fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32) {
+        let ticks_s = self.ticks as f64 / elapsed_secs;
+        let pkts_s = self.pkts as f64 / elapsed_secs;
+        (ticks_s, pkts_s, self.max_burst)
+    }
+
+    /// Zeroes all fields.  Called after emitting the per-second log line.
+    fn reset(&mut self) {
+        self.ticks = 0;
+        self.pkts = 0;
+        self.max_burst = 0;
+        self.cur_burst = 0;
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -804,7 +877,7 @@ mod tests {
     use str0m::{Event, IceConnectionState};
 
     use super::bind_udp_socket_reusable;
-    use crate::transport::str0m_sender::{Str0mVideoSender, is_ice_ready_event};
+    use crate::transport::str0m_sender::{PaceStats, Str0mVideoSender, is_ice_ready_event};
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
 
@@ -1610,5 +1683,106 @@ mod tests {
             "live UDP rebind on Windows must succeed, got: {:?}",
             result.err()
         );
+    }
+
+    // ─── PaceStats seam unit tests (PACE-4 / D-PPT3-4) ───────────────────────
+
+    /// on_transmit × 3 → on_drain_end → max_burst == 3, cur_burst == 0.
+    #[test]
+    fn pace_stats_single_drain() {
+        let mut s = PaceStats::new();
+        s.on_transmit();
+        s.on_transmit();
+        s.on_transmit();
+        s.on_drain_end();
+        assert_eq!(s.max_burst, 3, "max_burst must be 3 after one drain of 3");
+        assert_eq!(s.cur_burst, 0, "cur_burst must reset to 0 after on_drain_end");
+    }
+
+    /// Three drains of 5, 2, 8 → max_burst == 8; cur_burst resets after each.
+    #[test]
+    fn pace_stats_multi_drain_max() {
+        let mut s = PaceStats::new();
+        // drain 1: 5 packets
+        for _ in 0..5 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        // drain 2: 2 packets
+        for _ in 0..2 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        // drain 3: 8 packets
+        for _ in 0..8 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        assert_eq!(s.max_burst, 8, "max_burst must equal the largest drain (8)");
+    }
+
+    /// 4 on_tick calls, 10 total on_transmit → ticks == 4, pkts == 10.
+    #[test]
+    fn pace_stats_ticks_and_pkts() {
+        let mut s = PaceStats::new();
+        for _ in 0..4 {
+            s.on_tick();
+        }
+        // 10 transmits spread across multiple drains (totals matter, not per-drain)
+        for _ in 0..6 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        for _ in 0..4 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.ticks, 4, "ticks must equal on_tick call count");
+        assert_eq!(s.pkts, 10, "pkts must equal total on_transmit calls");
+    }
+
+    /// Seed ticks=60, pkts=120, max_burst=4 → snapshot_per_s(1.0) returns (60.0, 120.0, 4).
+    ///
+    /// Build 30 drains of 4 packets each (30×4 = 120 pkts, max_burst = 4), plus 60 ticks.
+    #[test]
+    fn pace_stats_snapshot_divides() {
+        let mut s = PaceStats::new();
+        for _ in 0..60 {
+            s.on_tick();
+        }
+        // 30 drains × 4 packets = 120 pkts total; max_burst stays at 4
+        for _ in 0..30 {
+            for _ in 0..4 {
+                s.on_transmit();
+            }
+            s.on_drain_end();
+        }
+        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(1.0);
+        assert!(
+            (ticks_s - 60.0).abs() < f64::EPSILON,
+            "ticks_per_s must be 60.0, got {ticks_s}"
+        );
+        assert!(
+            (pkts_s - 120.0).abs() < f64::EPSILON,
+            "pkts_per_s must be 120.0, got {pkts_s}"
+        );
+        assert_eq!(max_burst, 4, "max_burst must be 4");
+    }
+
+    /// After populating, reset() → all fields are zero.
+    #[test]
+    fn pace_stats_reset() {
+        let mut s = PaceStats::new();
+        s.on_tick();
+        s.on_transmit();
+        s.on_drain_end();
+        s.reset();
+        assert_eq!(s.ticks, 0, "ticks must be 0 after reset");
+        assert_eq!(s.pkts, 0, "pkts must be 0 after reset");
+        assert_eq!(s.max_burst, 0, "max_burst must be 0 after reset");
+        assert_eq!(s.cur_burst, 0, "cur_burst must be 0 after reset");
     }
 }
