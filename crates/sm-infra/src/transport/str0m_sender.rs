@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use str0m::bwe::Bitrate;
 use str0m::change::SdpPendingOffer;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
@@ -103,6 +104,9 @@ impl SenderShared {
     }
 }
 
+/// Latency-first: drain a worst-case IDR within one frame interval. See design D-PPT3-2.
+const PACER_HEADROOM: u64 = 4;
+
 // ─── Str0mVideoSender ────────────────────────────────────────────────────────
 
 /// str0m-backed video sender. Implements [`VideoSender`].
@@ -169,9 +173,15 @@ impl VideoSender for Str0mVideoSender {
         Self: Sized,
     {
         // Build the str0m Rtc with the rust-crypto backend.
+        // enable_bwe selects LeakyBucketPacer over NullPacer (design D-PPT3-1).
+        // Initial estimate = encode bitrate × PACER_HEADROOM so a worst-case IDR
+        // drains within one frame interval without queuing into the next gap (D-PPT3-2).
         let crypto = str0m::crypto::from_feature_flags();
         let mut rtc = Rtc::builder()
             .set_crypto_provider(Arc::new(crypto))
+            .enable_bwe(Some(Bitrate::bps(
+                config.bitrate_bps as u64 * PACER_HEADROOM,
+            )))
             .build(Instant::now());
 
         // Generate the SDP offer (add a SendOnly video m-line).
@@ -479,11 +489,28 @@ fn run_sender_loop(
     // Transmit destination is logged exactly once. Reveals whether THIS
     // generation targets a usable receiver media addr:port.
     let mut first_transmit_logged = false;
+    // [sm-sender-pace] seam: counters reset every second.
+    // Window boundary owned by the loop (design D-PPT3-4).
+    let mut pace_stats = PaceStats::new();
+    let mut pace_window_start = Instant::now();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
         if state.stop.load(Ordering::Acquire) {
             break;
+        }
+
+        // ── 1b. Pace tick + per-second emission ──────────────────────────
+        pace_stats.on_tick();
+        let pace_elapsed = pace_window_start.elapsed();
+        if pace_elapsed >= Duration::from_secs(1) {
+            let (ticks_s, pkts_s, max_burst) =
+                pace_stats.snapshot_per_s(pace_elapsed.as_secs_f64());
+            eprintln!(
+                "[sm-sender-pace] ticks_per_s={ticks_s:.1} pkts_sent_per_s={pkts_s:.1} max_burst={max_burst}"
+            );
+            pace_stats.reset();
+            pace_window_start = Instant::now();
         }
 
         // ── 2. Drain control inbox ────────────────────────────────────────
@@ -621,6 +648,8 @@ fn run_sender_loop(
                         );
                     }
                     let _ = udp.send_to(&t.contents, t.destination);
+                    // [sm-sender-pace] burst accounting: count every UDP send (design D-PPT3-4).
+                    pace_stats.on_transmit();
                 }
                 Ok(Output::Event(ev)) => {
                     // Capture mid from MediaAdded; resolve PT lazily in the write path.
@@ -659,6 +688,8 @@ fn run_sender_loop(
                 }
             }
         };
+        // [sm-sender-pace] drain boundary: record max burst for this poll_output cycle.
+        pace_stats.on_drain_end();
 
         if state.stop.load(Ordering::Acquire) {
             break;
@@ -1696,7 +1727,10 @@ mod tests {
         s.on_transmit();
         s.on_drain_end();
         assert_eq!(s.max_burst, 3, "max_burst must be 3 after one drain of 3");
-        assert_eq!(s.cur_burst, 0, "cur_burst must reset to 0 after on_drain_end");
+        assert_eq!(
+            s.cur_burst, 0,
+            "cur_burst must reset to 0 after on_drain_end"
+        );
     }
 
     /// Three drains of 5, 2, 8 → max_burst == 8; cur_burst resets after each.
