@@ -880,9 +880,14 @@ impl PaceStats {
     ///
     /// Divides accumulated counters by `elapsed_secs` so the caller does not
     /// need to track the denominator separately.
+    ///
+    /// Precondition: the production caller only invokes this once `elapsed_secs`
+    /// has reached ≥ 1 s. The denominator is floored at `f64::MIN_POSITIVE` to
+    /// keep the seam total (no division by zero / no infinities) for any caller.
     fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32) {
-        let ticks_s = self.ticks as f64 / elapsed_secs;
-        let pkts_s = self.pkts as f64 / elapsed_secs;
+        let d = elapsed_secs.max(f64::MIN_POSITIVE);
+        let ticks_s = self.ticks as f64 / d;
+        let pkts_s = self.pkts as f64 / d;
         (ticks_s, pkts_s, self.max_burst)
     }
 
@@ -1786,7 +1791,12 @@ mod tests {
         );
     }
 
-    /// Three drains of 5, 2, 8 → max_burst == 8; cur_burst resets after each.
+    /// Three drains of 5, 8, 2 → max_burst == 8; cur_burst resets after each.
+    ///
+    /// The maximum drain (8) is NOT last: the final drain (2) is smaller. This
+    /// discriminates the max-across-drains semantics from a last-write-wins
+    /// overwrite (`max_burst = cur_burst` unconditionally), which would leave
+    /// max_burst == 2 and fail the final assertion.
     #[test]
     fn pace_stats_multi_drain_max() {
         let mut s = PaceStats::new();
@@ -1796,19 +1806,24 @@ mod tests {
         }
         s.on_drain_end();
         assert_eq!(s.cur_burst, 0);
-        // drain 2: 2 packets
-        for _ in 0..2 {
-            s.on_transmit();
-        }
-        s.on_drain_end();
-        assert_eq!(s.cur_burst, 0);
-        // drain 3: 8 packets
+        assert_eq!(s.max_burst, 5, "max_burst must be 5 after the first drain");
+        // drain 2: 8 packets (new maximum)
         for _ in 0..8 {
             s.on_transmit();
         }
         s.on_drain_end();
         assert_eq!(s.cur_burst, 0);
-        assert_eq!(s.max_burst, 8, "max_burst must equal the largest drain (8)");
+        assert_eq!(s.max_burst, 8, "max_burst must rise to 8 on the larger drain");
+        // drain 3: 2 packets (smaller than the running max — must NOT lower it)
+        for _ in 0..2 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        assert_eq!(
+            s.max_burst, 8,
+            "max_burst must stay at the largest drain (8), not the last drain (2)"
+        );
     }
 
     /// 4 on_tick calls, 10 total on_transmit → ticks == 4, pkts == 10.
@@ -1857,6 +1872,26 @@ mod tests {
             "pkts_per_s must be 120.0, got {pkts_s}"
         );
         assert_eq!(max_burst, 4, "max_burst must be 4");
+    }
+
+    /// snapshot_per_s(0.0): the floored denominator keeps the result finite
+    /// (no division by zero / NaN / infinity), pinning the total-seam guard.
+    #[test]
+    fn pace_stats_snapshot_zero_elapsed_is_finite() {
+        let mut s = PaceStats::new();
+        s.on_tick();
+        s.on_transmit();
+        s.on_drain_end();
+        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(0.0);
+        assert!(
+            ticks_s.is_finite(),
+            "ticks_per_s must be finite for zero elapsed, got {ticks_s}"
+        );
+        assert!(
+            pkts_s.is_finite(),
+            "pkts_per_s must be finite for zero elapsed, got {pkts_s}"
+        );
+        assert_eq!(max_burst, 1, "max_burst is unaffected by the denominator");
     }
 
     /// After populating, reset() → all fields are zero.
