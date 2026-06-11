@@ -2068,6 +2068,40 @@ fn stamp_and_publish_offer(
 
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
 
+/// Configured encoder framerate for the production sender.
+///
+/// MFT CBR budgets `bitrate_bps / framerate` bits per frame. At `framerate = 30` with
+/// real 60 fps capture, the encoder produces ≈7.5 Mbps (GATE-3 measured; the theoretical
+/// ceiling would be ≈8 Mbps at 2× the 30fps budget) vs ≈6.6 Mbps wire capacity — a ≈12 %
+/// deficit causing unbounded pacer-queue latency growth (GATE-3).
+/// Setting `framerate = 60` halves per-frame budget (≈133.3 kbit/frame at 30fps →
+/// ≈66.7 kbit/frame, i.e. ≈8.3 KB) and aligns `MF_MT_FRAME_RATE` with actual capture rate.
+///
+/// `intra_period` stays 60 frames, so the nominal IDR interval becomes ~1s at 60fps
+/// (vs ~2s nominal at 30fps). GATE-3 measured the driver already keying at ~588ms, so the
+/// real-world keyframe cadence change is expected to be minor.
+///
+/// Cycle-5 TODO: replace with `capture.refresh_rate()` dynamic query — only the value
+/// source changes, not the build-site plumbing.
+const SENDER_ENCODER_FRAMERATE: u32 = 60;
+
+/// Build the production sender `EncoderConfig` for the given capture dimensions.
+///
+/// This is the single production encoder-config construction boundary. Extracted as a
+/// pure, CI-runnable seam so the `framerate == 60` and dimensions-propagation contracts
+/// are testable on all targets without real capture/encoder hardware:
+/// `build_production_sender_bundle` (Windows-only) and the test contract both call this,
+/// so the production path and the assertions cannot diverge.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline; #[cfg(test)] still exercises it on all targets (memory #434)
+fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
+    sm_domain::EncoderConfig {
+        width,
+        height,
+        framerate: SENDER_ENCODER_FRAMERATE,
+        ..sm_domain::EncoderConfig::default()
+    }
+}
+
 /// Build the production sender bundle.
 ///
 /// Windows-only: `WindowsCaptureSource`, `WindowsOpenH264Encoder`, `Str0mVideoSender`,
@@ -2102,7 +2136,7 @@ fn build_production_sender_bundle(
     use sm_domain::capture::BorderPolicy;
     use sm_domain::signaling::{Signaling, SignalingConfig, SignalingRole};
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
-    use sm_domain::{CaptureConfig, CaptureSource, EncoderConfig, MonitorSelector};
+    use sm_domain::{CaptureConfig, CaptureSource, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
@@ -2144,11 +2178,7 @@ fn build_production_sender_bundle(
     // back to 1920×1080 in setup_mft (effective_dimensions DD3). Production path
     // supplies real screen dimensions so the HW MFT is configured at matching resolution.
     let (cap_w, cap_h) = capture.dimensions();
-    let encoder_config = EncoderConfig {
-        width: cap_w,
-        height: cap_h,
-        ..EncoderConfig::default()
-    };
+    let encoder_config = sender_encoder_config(cap_w, cap_h);
     let mut encoder =
         build_video_encoder(encoder_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
@@ -3752,6 +3782,46 @@ mod tests {
         assert_ne!(
             encoder_config.height, 0,
             "non-zero height must not be replaced with sentinel"
+        );
+    }
+
+    // ─── T4.1: sender_encoder_config_framerate_is_60 ─────────────────────────────
+    //
+    // CI-runnable. Exercises the SAME `sender_encoder_config` helper that
+    // `build_production_sender_bundle` calls, so the production build site produces an
+    // EncoderConfig with framerate == 60. Asserts against the LITERAL 60 (not the const)
+    // — kills BOTH the mutant that edits the const back to 30 AND the mutant that deletes
+    // the `framerate:` field (which would fall back to the default 30). Also verifies the
+    // width/height params propagate through the helper.
+    // Spec: FPS-1, FPS-4. Design: D-PPT4-2(a).
+
+    #[test]
+    fn sender_encoder_config_framerate_is_60() {
+        let encoder_config = super::sender_encoder_config(1920, 1080);
+        assert_eq!(
+            encoder_config.framerate, 60,
+            "build site framerate must be 60 (literal — mutation guard)"
+        );
+        assert_eq!(
+            (encoder_config.width, encoder_config.height),
+            (1920, 1080),
+            "helper must propagate the capture dimensions it is given"
+        );
+    }
+
+    // ─── T4.2: encoder_config_default_framerate_stays_30 ─────────────────────────
+    //
+    // CI-runnable. Guards against fixing the domain default instead of the build
+    // site. EncoderConfig::default() MUST stay at framerate == 30.
+    // Spec: FPS-2, FPS-4. Design: D-PPT4-2(b).
+
+    #[test]
+    fn encoder_config_default_framerate_stays_30() {
+        // domain/test default — production overrides at sender build site
+        assert_eq!(
+            EncoderConfig::default().framerate,
+            30,
+            "domain default framerate must remain 30; production override lives at build site"
         );
     }
 
