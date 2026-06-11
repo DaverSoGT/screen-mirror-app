@@ -504,6 +504,24 @@ struct GapStats {
     max_us: u64,
 }
 
+/// Window state for RECV-OBS-1. Bundled so `handle_receiver_event` stays within
+/// clippy's 7-argument limit.
+struct RecvGapState {
+    stats: GapStats,
+    window_start: Instant,
+    last_arrival: Option<Instant>,
+}
+
+impl RecvGapState {
+    fn new() -> Self {
+        Self {
+            stats: GapStats::default(),
+            window_start: Instant::now(),
+            last_arrival: None,
+        }
+    }
+}
+
 impl GapStats {
     /// Record one inter-arrival gap.
     fn record(&mut self, gap: Duration) {
@@ -565,9 +583,7 @@ fn run_receiver_loop(
     let mut first_datagram_logged = false;
     let loop_start = Instant::now();
     // RECV-OBS-1: arrival-gap accumulator (Slice 2).
-    let mut gap_stats = GapStats::default();
-    let mut gap_window_start = Instant::now();
-    let mut last_arrival: Option<Instant> = None;
+    let mut gap_state = RecvGapState::new();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -618,9 +634,7 @@ fn run_receiver_loop(
                         &state,
                         &pkt_tx,
                         &event_tx,
-                        &mut gap_stats,
-                        &mut gap_window_start,
-                        &mut last_arrival,
+                        &mut gap_state,
                     );
                 }
                 Err(_) => {
@@ -707,18 +721,15 @@ fn run_receiver_loop(
 
 /// Dispatch str0m events for the receiver.
 ///
-/// The `gap_stats`, `gap_window_start`, and `last_arrival` parameters are the
-/// RECV-OBS-1 accumulator state (Slice 2); they live on the tick thread and are
-/// passed by `&mut` to avoid global state or allocation.
+/// `gap_state` carries the RECV-OBS-1 accumulator (Slice 2); bundled into one
+/// `&mut RecvGapState` to stay within clippy's 7-argument limit.
 fn handle_receiver_event(
     ev: Event,
     mid_slot: &mut Option<Mid>,
     state: &ReceiverShared,
     pkt_tx: &SyncSender<EncodedPacket>,
     event_tx: &SyncSender<TransportEvent>,
-    gap_stats: &mut GapStats,
-    gap_window_start: &mut Instant,
-    last_arrival: &mut Option<Instant>,
+    gap_state: &mut RecvGapState,
 ) {
     match ev {
         // `Connected` fires when at least one candidate pair is working but gathering
@@ -757,21 +768,21 @@ fn handle_receiver_event(
             // a stalled second produces no line (intentional, not a bug — mirrors
             // capture_fps in capture/windows.rs). No allocation, no lock.
             let now = Instant::now();
-            if let Some(prev) = *last_arrival {
-                gap_stats.record(now.duration_since(prev));
+            if let Some(prev) = gap_state.last_arrival {
+                gap_state.stats.record(now.duration_since(prev));
             }
-            *last_arrival = Some(now);
-            if gap_window_start.elapsed() >= Duration::from_secs(1) {
-                let window = gap_window_start.elapsed();
+            gap_state.last_arrival = Some(now);
+            if gap_state.window_start.elapsed() >= Duration::from_secs(1) {
+                let window = gap_state.window_start.elapsed();
                 eprintln!(
                     "[sm-receiver-gap] receive_fps={:.1} max_gap_ms={:.1} mean_gap_ms={:.1} frames={}",
-                    gap_stats.receive_fps(window),
-                    gap_stats.max_gap_ms(),
-                    gap_stats.mean_gap_ms(),
-                    gap_stats.count,
+                    gap_state.stats.receive_fps(window),
+                    gap_state.stats.max_gap_ms(),
+                    gap_state.stats.mean_gap_ms(),
+                    gap_state.stats.count,
                 );
-                gap_stats.reset();
-                *gap_window_start = now;
+                gap_state.stats.reset();
+                gap_state.window_start = now;
                 // last_arrival persists across windows so the gap straddling a boundary
                 // is not lost (next gap is measured from this arrival).
             }

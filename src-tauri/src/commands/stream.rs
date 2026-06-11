@@ -2769,6 +2769,46 @@ pub fn stream_diagnostics(bridge: tauri::State<StreamBridge>) -> Result<StreamSt
 
 /// The `sm-stream-mux` thread body.
 ///
+// ─── FlushTiming — MUX-OBS-1 pure seam (Slice 2) ────────────────────────────
+//
+// Tracks per-segment frame count and inter-flush wall-clock interval for the
+// mux_thread. Lives on the mux thread (single-threaded); no allocation, no locks.
+// Mirrors ConvertStats (sm-infra/encode/windows_mft.rs) in structure and scope.
+//
+// The IDR off-by-one: the IDR that triggers a flush starts the NEXT GOP, so
+// frames_since_flush resets to 1 (not 0) after each on_flush call. This matches
+// fmp4_muxer.rs append_packet semantics (the triggering IDR becomes the first
+// frame of the new pending segment).
+
+#[derive(Default)]
+struct FlushTiming {
+    last_flush: Option<Instant>,
+    /// Frame count since the last flush (or since thread start). Starts at 0;
+    /// resets to 1 after each flush (the triggering IDR opens the next GOP).
+    frames_since_flush: u32,
+}
+
+impl FlushTiming {
+    /// Increment the frame counter (call for every packet fed to the muxer).
+    fn on_append(&mut self) {
+        self.frames_since_flush += 1;
+    }
+
+    /// Called when a segment flush occurs. Returns `(frames_in_segment, interval_ms_since_last_flush)`.
+    ///
+    /// After return, `frames_since_flush` resets to 1 — the triggering IDR is
+    /// frame 1 of the next GOP (off-by-one invariant per D-PPT2-5).
+    fn on_flush(&mut self, now: Instant) -> (u32, Option<u64>) {
+        let frames = self.frames_since_flush;
+        let interval_ms = self
+            .last_flush
+            .map(|t| now.duration_since(t).as_millis() as u64);
+        self.last_flush = Some(now);
+        self.frames_since_flush = 1;
+        (frames, interval_ms)
+    }
+}
+
 /// Drains `pkt_rx`, fires PLI on the first packet, buffers non-keyframe
 /// packets until the first IDR, builds the fMP4 init segment from SPS+PPS,
 /// and sends frames through the `ChannelLike` (F-fix-2: replaces app.emit).
@@ -2791,6 +2831,8 @@ fn mux_thread(
     let mut packet_count: u64 = 0;
     let mut keyframe_count: u64 = 0;
     let mut last_summary = std::time::Instant::now();
+    // MUX-OBS-1: flush-timing accumulator (Slice 2).
+    let mut flush_timing = FlushTiming::default();
     eprintln!("[sm-stream-mux] thread spawned; waiting for first packet…");
 
     loop {
@@ -2840,11 +2882,19 @@ fn mux_thread(
                 continue;
             }
             // After init is emitted: feed to muxer.
+            // MUX-OBS-1: count every P-frame fed to the muxer.
+            flush_timing.on_append();
             if let Some(m) = muxer.as_mut() {
                 if let Some(segment) = m.append_packet(&pkt) {
                     eprintln!(
                         "[sm-stream-mux] segment flushed ({} bytes) on P-frame trigger (unexpected)",
                         segment.len()
+                    );
+                    let (seg_frames, seg_interval_ms) = flush_timing.on_flush(Instant::now());
+                    eprintln!(
+                        "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={} (p-frame-trigger)",
+                        seg_frames,
+                        seg_interval_ms.unwrap_or(0),
                     );
                     emit_segment(&channel, &counters, segment);
                 }
@@ -2912,12 +2962,20 @@ fn mux_thread(
         }
 
         // Feed the IDR to the muxer (may flush the previous GOP).
+        // MUX-OBS-1: count the IDR itself as a frame before append.
+        flush_timing.on_append();
         if let Some(m) = muxer.as_mut() {
             match m.append_packet(&pkt) {
                 Some(segment) => {
                     eprintln!(
                         "[sm-stream-mux] segment flushed ({} bytes) on IDR — sending to channel",
                         segment.len()
+                    );
+                    let (seg_frames, seg_interval_ms) = flush_timing.on_flush(Instant::now());
+                    eprintln!(
+                        "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={}",
+                        seg_frames,
+                        seg_interval_ms.unwrap_or(0),
                     );
                     emit_segment(&channel, &counters, segment);
                 }
@@ -8814,6 +8872,76 @@ mod tests {
                 }
             ),
             "SC-CONV-2-13 FAIL: wrong signal: {sig:?}"
+        );
+    }
+
+    // ─── FlushTiming unit tests (MUX-OBS-1, Slice 2) ─────────────────────────
+
+    use super::FlushTiming;
+
+    /// First flush: no prior flush → interval_ms is None; frames_since_flush resets to 1.
+    #[test]
+    fn flush_timing_first_flush_no_interval() {
+        let mut ft = FlushTiming::default();
+        // Simulate 5 on_append calls before the first flush.
+        for _ in 0..5 {
+            ft.on_append();
+        }
+        let t0 = Instant::now();
+        let (frames, interval_ms) = ft.on_flush(t0);
+        assert_eq!(frames, 5, "first flush must report 5 frames");
+        assert_eq!(interval_ms, None, "first flush must have no prior interval");
+        // The IDR that triggered the flush starts the next GOP as frame 1.
+        assert_eq!(
+            ft.frames_since_flush, 1,
+            "frames_since_flush must reset to 1 after flush"
+        );
+    }
+
+    /// Second flush: interval_ms reflects elapsed time; frame count includes carry-over IDR.
+    #[test]
+    fn flush_timing_second_flush_interval_and_frames() {
+        let mut ft = FlushTiming::default();
+        // First flush: 5 frames.
+        for _ in 0..5 {
+            ft.on_append();
+        }
+        let t0 = Instant::now();
+        ft.on_flush(t0);
+        // Now frames_since_flush == 1 (carry-over IDR).
+        // Append 55 more P-frames.
+        for _ in 0..55 {
+            ft.on_append();
+        }
+        // frames_since_flush should now be 1 + 55 = 56.
+        let t1 = t0 + Duration::from_millis(2100);
+        let (frames, interval_ms) = ft.on_flush(t1);
+        assert_eq!(
+            frames, 56,
+            "second flush must report 56 frames (55 P-frames + 1 IDR carry-over)"
+        );
+        assert_eq!(
+            interval_ms,
+            Some(2100),
+            "second flush interval must be 2100 ms"
+        );
+        assert_eq!(
+            ft.frames_since_flush, 1,
+            "frames_since_flush must reset to 1 after second flush"
+        );
+    }
+
+    /// IDR off-by-one: after a flush, frames_since_flush must be 1 (triggering IDR counts as frame 1 of next GOP).
+    #[test]
+    fn flush_timing_idr_off_by_one_reset() {
+        let mut ft = FlushTiming::default();
+        ft.on_append(); // 1 frame before flush
+        let t0 = Instant::now();
+        let (frames, _) = ft.on_flush(t0);
+        assert_eq!(frames, 1, "single-frame first flush must report 1");
+        assert_eq!(
+            ft.frames_since_flush, 1,
+            "IDR off-by-one: frames_since_flush must be 1 after flush"
         );
     }
 }
