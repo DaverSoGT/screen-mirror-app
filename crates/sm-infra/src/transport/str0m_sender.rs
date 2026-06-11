@@ -34,6 +34,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use str0m::bwe::Bitrate;
 use str0m::change::SdpPendingOffer;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
@@ -103,6 +104,9 @@ impl SenderShared {
     }
 }
 
+/// Latency-first: drain a worst-case IDR within one frame interval. See design D-PPT3-2.
+const PACER_HEADROOM: u64 = 4;
+
 // ─── Str0mVideoSender ────────────────────────────────────────────────────────
 
 /// str0m-backed video sender. Implements [`VideoSender`].
@@ -169,9 +173,15 @@ impl VideoSender for Str0mVideoSender {
         Self: Sized,
     {
         // Build the str0m Rtc with the rust-crypto backend.
+        // enable_bwe selects LeakyBucketPacer over NullPacer (design D-PPT3-1).
+        // Initial estimate = encode bitrate × PACER_HEADROOM so a worst-case IDR
+        // drains within one frame interval without queuing into the next gap (D-PPT3-2).
         let crypto = str0m::crypto::from_feature_flags();
         let mut rtc = Rtc::builder()
             .set_crypto_provider(Arc::new(crypto))
+            .enable_bwe(Some(Bitrate::bps(
+                config.bitrate_bps as u64 * PACER_HEADROOM,
+            )))
             .build(Instant::now());
 
         // Generate the SDP offer (add a SendOnly video m-line).
@@ -479,11 +489,28 @@ fn run_sender_loop(
     // Transmit destination is logged exactly once. Reveals whether THIS
     // generation targets a usable receiver media addr:port.
     let mut first_transmit_logged = false;
+    // [sm-sender-pace] seam: counters reset every second.
+    // Window boundary owned by the loop (design D-PPT3-4).
+    let mut pace_stats = PaceStats::new();
+    let mut pace_window_start = Instant::now();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
         if state.stop.load(Ordering::Acquire) {
             break;
+        }
+
+        // ── 1b. Pace tick + per-second emission ──────────────────────────
+        pace_stats.on_tick();
+        let pace_elapsed = pace_window_start.elapsed();
+        if pace_elapsed >= Duration::from_secs(1) {
+            let (ticks_s, pkts_s, max_burst) =
+                pace_stats.snapshot_per_s(pace_elapsed.as_secs_f64());
+            eprintln!(
+                "[sm-sender-pace] ticks_per_s={ticks_s:.1} pkts_sent_per_s={pkts_s:.1} max_burst={max_burst}"
+            );
+            pace_stats.reset();
+            pace_window_start = Instant::now();
         }
 
         // ── 2. Drain control inbox ────────────────────────────────────────
@@ -621,6 +648,8 @@ fn run_sender_loop(
                         );
                     }
                     let _ = udp.send_to(&t.contents, t.destination);
+                    // [sm-sender-pace] burst accounting: count every UDP send (design D-PPT3-4).
+                    pace_stats.on_transmit();
                 }
                 Ok(Output::Event(ev)) => {
                     // Capture mid from MediaAdded; resolve PT lazily in the write path.
@@ -659,6 +688,8 @@ fn run_sender_loop(
                 }
             }
         };
+        // [sm-sender-pace] drain boundary: record max burst for this poll_output cycle.
+        pace_stats.on_drain_end();
 
         if state.stop.load(Ordering::Acquire) {
             break;
@@ -791,6 +822,92 @@ fn bind_udp_socket_reusable(addr: SocketAddr) -> io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
+// ─── PaceStats seam ──────────────────────────────────────────────────────────
+
+/// Pure-data accumulator for the `[sm-sender-pace]` per-second instrument.
+///
+/// No I/O, no clock, no network dependency — unit-testable in isolation.
+/// One instance lives on the `run_sender_loop` stack; reset every second.
+///
+/// Field semantics (per design D-PPT3-4):
+/// - `ticks`: loop iterations (incremented once per main-loop tick via `on_tick`).
+/// - `pkts`: total `Output::Transmit` (UDP `send_to`) calls (incremented per packet).
+/// - `max_burst`: maximum number of `Output::Transmit` calls emitted within a
+///   single `poll_output` drain.  The burst discriminator: 1–3 → pacing active;
+///   dozens → NullPacer (pre-fix behavior).
+/// - `cur_burst`: transient counter reset by `on_drain_end`.
+struct PaceStats {
+    ticks: u32,
+    pkts: u64,
+    max_burst: u32,
+    cur_burst: u32,
+}
+
+impl PaceStats {
+    fn new() -> Self {
+        Self {
+            ticks: 0,
+            pkts: 0,
+            max_burst: 0,
+            cur_burst: 0,
+        }
+    }
+
+    /// Called once per main-loop iteration (before the `poll_output` drain).
+    #[inline]
+    fn on_tick(&mut self) {
+        self.ticks += 1;
+    }
+
+    /// Called immediately after each successful `send_to` inside the drain.
+    #[inline]
+    fn on_transmit(&mut self) {
+        self.cur_burst += 1;
+        self.pkts += 1;
+    }
+
+    /// Called after the `poll_output` drain exits (`Output::Timeout` reached).
+    /// Records the burst size for this drain and resets the transient counter.
+    #[inline]
+    fn on_drain_end(&mut self) {
+        if self.cur_burst > self.max_burst {
+            self.max_burst = self.cur_burst;
+        }
+        self.cur_burst = 0;
+    }
+
+    /// Returns `(ticks_per_s, pkts_per_s, max_burst)` for the current window.
+    ///
+    /// Divides accumulated counters by `elapsed_secs` so the caller does not
+    /// need to track the denominator separately.
+    ///
+    /// Behavior: on non-positive `elapsed_secs` (`<= 0.0`) the function returns
+    /// `(0.0, 0.0, self.max_burst)` instead of dividing. This keeps the seam
+    /// genuinely total — finite rates with no division by zero and no infinities
+    /// for any caller, including the `elapsed = 0.0` edge case where a floored
+    /// `f64::MIN_POSITIVE` denominator would otherwise overflow large numerators
+    /// to `+inf`. `max_burst` is a count, not a rate, so it is always preserved.
+    ///
+    /// Precondition: the production caller only invokes this once `elapsed_secs`
+    /// has reached ≥ 1 s, so it never reaches the zero-elapsed branch in practice.
+    fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32) {
+        if elapsed_secs <= 0.0 {
+            return (0.0, 0.0, self.max_burst);
+        }
+        let ticks_s = self.ticks as f64 / elapsed_secs;
+        let pkts_s = self.pkts as f64 / elapsed_secs;
+        (ticks_s, pkts_s, self.max_burst)
+    }
+
+    /// Zeroes all fields.  Called after emitting the per-second log line.
+    fn reset(&mut self) {
+        self.ticks = 0;
+        self.pkts = 0;
+        self.max_burst = 0;
+        self.cur_burst = 0;
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -804,7 +921,7 @@ mod tests {
     use str0m::{Event, IceConnectionState};
 
     use super::bind_udp_socket_reusable;
-    use crate::transport::str0m_sender::{Str0mVideoSender, is_ice_ready_event};
+    use crate::transport::str0m_sender::{PaceStats, Str0mVideoSender, is_ice_ready_event};
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
 
@@ -1532,8 +1649,15 @@ mod tests {
         use std::time::Instant;
         use str0m::media::{Direction, MediaKind};
 
-        // Build the sender Rtc EXACTLY as production does: no clear_codecs(), no set_rtp_mode().
-        // Any future change that calls those will break this test — that is intentional.
+        // Build the sender Rtc as production does, EXCEPT this test omits enable_bwe.
+        // Omitting enable_bwe is intentional: pacing is irrelevant for SDP-structure
+        // assertions, and the SDP offer is byte-identical with or without it
+        // (enable_bwe only flips the internal bwe_config option; extension map and
+        // codec negotiation are unaffected — verified in design D-PPT3-1).
+        // Any future change that calls clear_codecs() or set_rtp_mode() will break
+        // this test — that is intentional.
+        // See `sender_sdp_offer_valid_with_bwe_enabled` for a sibling test that
+        // exercises the full production builder path including enable_bwe.
         let crypto = str0m::crypto::from_feature_flags();
         let mut rtc = str0m::Rtc::builder()
             .set_crypto_provider(Arc::new(crypto))
@@ -1562,6 +1686,52 @@ mod tests {
             sdp.lines()
                 .any(|l| l.starts_with("a=rtcp-fb:") && l.contains("nack")),
             "SDP offer must contain a=rtcp-fb nack line: {sdp}"
+        );
+    }
+
+    /// REQ-RTX-5 / PACE-1 — The production builder path that includes `enable_bwe`
+    /// MUST still produce a valid (non-empty) SDP offer.  enable_bwe only sets
+    /// the internal `bwe_config` option; it does not touch the extension map or
+    /// codec negotiation, so the offer is byte-identical to the non-BWE case.
+    /// This test pins that invariant so a future str0m upgrade cannot silently
+    /// break offer generation when the LeakyBucketPacer path is active.
+    #[test]
+    fn sender_sdp_offer_valid_with_bwe_enabled() {
+        use std::time::Instant;
+        use str0m::bwe::Bitrate;
+        use str0m::media::{Direction, MediaKind};
+
+        // Mirror the production Str0mVideoSender::new() builder exactly, using
+        // a representative bitrate (TransportConfig default is 4 Mbps).
+        let default_cfg = TransportConfig::default();
+        let initial_estimate = Bitrate::bps(default_cfg.bitrate_bps as u64 * super::PACER_HEADROOM);
+
+        let crypto = str0m::crypto::from_feature_flags();
+        let mut rtc = str0m::Rtc::builder()
+            .set_crypto_provider(Arc::new(crypto))
+            .enable_bwe(Some(initial_estimate))
+            .build(Instant::now());
+
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let result = change.apply();
+
+        assert!(
+            result.is_some(),
+            "production builder with enable_bwe must produce a valid SDP offer (got None)"
+        );
+        let (offer, _pending) = result.unwrap();
+        let sdp = offer.to_string();
+        assert!(
+            !sdp.is_empty(),
+            "SDP offer string must be non-empty with enable_bwe active"
+        );
+        // Confirm the H.264 + RTX structure is preserved when BWE is enabled
+        // (extension map is set unconditionally by RtcConfig::default; enable_bwe
+        // does not modify it).
+        assert!(
+            sdp.contains("rtx/90000"),
+            "SDP offer with enable_bwe must still contain RTX payload type: {sdp}"
         );
     }
 
@@ -1610,5 +1780,165 @@ mod tests {
             "live UDP rebind on Windows must succeed, got: {:?}",
             result.err()
         );
+    }
+
+    // ─── PaceStats seam unit tests (PACE-4 / D-PPT3-4) ───────────────────────
+
+    /// on_transmit × 3 → on_drain_end → max_burst == 3, cur_burst == 0.
+    #[test]
+    fn pace_stats_single_drain() {
+        let mut s = PaceStats::new();
+        s.on_transmit();
+        s.on_transmit();
+        s.on_transmit();
+        s.on_drain_end();
+        assert_eq!(s.max_burst, 3, "max_burst must be 3 after one drain of 3");
+        assert_eq!(
+            s.cur_burst, 0,
+            "cur_burst must reset to 0 after on_drain_end"
+        );
+    }
+
+    /// Three drains of 5, 8, 2 → max_burst == 8; cur_burst resets after each.
+    ///
+    /// The maximum drain (8) is NOT last: the final drain (2) is smaller. This
+    /// discriminates the max-across-drains semantics from a last-write-wins
+    /// overwrite (`max_burst = cur_burst` unconditionally), which would leave
+    /// max_burst == 2 and fail the final assertion.
+    #[test]
+    fn pace_stats_multi_drain_max() {
+        let mut s = PaceStats::new();
+        // drain 1: 5 packets
+        for _ in 0..5 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        assert_eq!(s.max_burst, 5, "max_burst must be 5 after the first drain");
+        // drain 2: 8 packets (new maximum)
+        for _ in 0..8 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        assert_eq!(
+            s.max_burst, 8,
+            "max_burst must rise to 8 on the larger drain"
+        );
+        // drain 3: 2 packets (smaller than the running max — must NOT lower it)
+        for _ in 0..2 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.cur_burst, 0);
+        assert_eq!(
+            s.max_burst, 8,
+            "max_burst must stay at the largest drain (8), not the last drain (2)"
+        );
+    }
+
+    /// 4 on_tick calls, 10 total on_transmit → ticks == 4, pkts == 10.
+    #[test]
+    fn pace_stats_ticks_and_pkts() {
+        let mut s = PaceStats::new();
+        for _ in 0..4 {
+            s.on_tick();
+        }
+        // 10 transmits spread across multiple drains (totals matter, not per-drain)
+        for _ in 0..6 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        for _ in 0..4 {
+            s.on_transmit();
+        }
+        s.on_drain_end();
+        assert_eq!(s.ticks, 4, "ticks must equal on_tick call count");
+        assert_eq!(s.pkts, 10, "pkts must equal total on_transmit calls");
+    }
+
+    /// Seed ticks=60, pkts=120, max_burst=4 → snapshot_per_s(1.0) returns (60.0, 120.0, 4).
+    ///
+    /// Build 30 drains of 4 packets each (30×4 = 120 pkts, max_burst = 4), plus 60 ticks.
+    #[test]
+    fn pace_stats_snapshot_divides() {
+        let mut s = PaceStats::new();
+        for _ in 0..60 {
+            s.on_tick();
+        }
+        // 30 drains × 4 packets = 120 pkts total; max_burst stays at 4
+        for _ in 0..30 {
+            for _ in 0..4 {
+                s.on_transmit();
+            }
+            s.on_drain_end();
+        }
+        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(1.0);
+        assert!(
+            (ticks_s - 60.0).abs() < f64::EPSILON,
+            "ticks_per_s must be 60.0, got {ticks_s}"
+        );
+        assert!(
+            (pkts_s - 120.0).abs() < f64::EPSILON,
+            "pkts_per_s must be 120.0, got {pkts_s}"
+        );
+        assert_eq!(max_burst, 4, "max_burst must be 4");
+    }
+
+    /// snapshot_per_s(0.0): the non-positive-elapsed early return makes the seam
+    /// genuinely total — exact 0.0 rates (finite, no division by zero / NaN /
+    /// infinity) even with large counters, while max_burst is preserved.
+    #[test]
+    fn pace_stats_snapshot_zero_elapsed_is_finite() {
+        let mut s = PaceStats::new();
+        s.on_tick();
+        s.on_transmit();
+        s.on_drain_end();
+        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(0.0);
+        assert!(
+            ticks_s.is_finite(),
+            "ticks_per_s must be finite for zero elapsed, got {ticks_s}"
+        );
+        assert!(
+            pkts_s.is_finite(),
+            "pkts_per_s must be finite for zero elapsed, got {pkts_s}"
+        );
+        assert_eq!(max_burst, 1, "max_burst is unaffected by the denominator");
+
+        // Realistic large counters: a floored f64::MIN_POSITIVE denominator
+        // would overflow these to +inf. The early return must yield exact 0.0.
+        let mut big = PaceStats::new();
+        for _ in 0..5000 {
+            big.on_tick();
+        }
+        for _ in 0..5000 {
+            big.on_transmit();
+        }
+        big.on_drain_end();
+        let (ticks_s, pkts_s, max_burst) = big.snapshot_per_s(0.0);
+        assert_eq!(
+            ticks_s, 0.0,
+            "ticks_per_s must be exactly 0.0 for zero elapsed, got {ticks_s}"
+        );
+        assert_eq!(
+            pkts_s, 0.0,
+            "pkts_per_s must be exactly 0.0 for zero elapsed, got {pkts_s}"
+        );
+        assert!(ticks_s.is_finite() && pkts_s.is_finite());
+        assert_eq!(max_burst, 5000, "max_burst must be preserved at 5000");
+    }
+
+    /// After populating, reset() → all fields are zero.
+    #[test]
+    fn pace_stats_reset() {
+        let mut s = PaceStats::new();
+        s.on_tick();
+        s.on_transmit();
+        s.on_drain_end();
+        s.reset();
+        assert_eq!(s.ticks, 0, "ticks must be 0 after reset");
+        assert_eq!(s.pkts, 0, "pkts must be 0 after reset");
+        assert_eq!(s.max_burst, 0, "max_burst must be 0 after reset");
+        assert_eq!(s.cur_burst, 0, "cur_burst must be 0 after reset");
     }
 }
