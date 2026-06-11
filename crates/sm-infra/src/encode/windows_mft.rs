@@ -1695,58 +1695,10 @@ fn pump_loop(
                     ho_count -= 1;
                     match tx.try_send(pkt) {
                         Ok(()) => {
-                            // Encode-rate diagnostic: count successfully forwarded frames and
-                            // log fps once per FPS_LOG_INTERVAL. Reveals true encode throughput
-                            // to complement the muxer real-DTS-delta fix diagnosis.
+                            // Encode-rate diagnostic: count only successfully forwarded frames.
+                            // The window emission below runs unconditionally so encode_fps still
+                            // reflects true throughput even when this send did not succeed.
                             fps_frame_count += 1;
-                            let now = std::time::Instant::now();
-                            let elapsed = now.duration_since(fps_window_start);
-                            if interval_elapsed(fps_window_start, now, FPS_LOG_INTERVAL) {
-                                let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
-                                // CAPT-OBS-6: encode_fps event field names and cadence MUST remain
-                                // unchanged. Do NOT alter the fields or message below.
-                                tracing::info!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    encode_fps = %format!("{fps:.1}"),
-                                    frames = fps_frame_count,
-                                    "encode throughput"
-                                );
-
-                                // I2 (D-PPT-2): emit convert throughput alongside encode_fps so all
-                                // encoder-thread metrics share one window tick (CAPT-OBS-2).
-                                tracing::info!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    convert_fps = %format!("{:.1}", convert_stats.fps(elapsed)),
-                                    convert_us = convert_stats.mean_us(),
-                                    frames = convert_stats.frames,
-                                    "convert throughput"
-                                );
-
-                                // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
-                                // state.dropped accumulates both TrySendError::Full drops (line ~1706)
-                                // and dimension-mismatch drops (line ~1774) — includes dim-mismatch
-                                // drops per D-PPT-3 dual-use note. Splitting the counter is out of
-                                // Slice 1 scope.
-                                let current_enc_dropped = state.dropped.load(Ordering::Relaxed);
-                                let (enc_delta, new_enc_last) = compute_drop_delta(
-                                    current_enc_dropped,
-                                    last_dropped_enc_snapshot,
-                                );
-                                if enc_delta > 0 {
-                                    tracing::info!(
-                                        target: "sm_infra::encode::windows_mft",
-                                        channel_drops = enc_delta,
-                                        channel = "enc_to_sender",
-                                        "encode channel drops"
-                                    );
-                                }
-                                last_dropped_enc_snapshot = new_enc_last;
-
-                                // Reset all window-shared accumulators at the same boundary.
-                                convert_stats.reset();
-                                fps_frame_count = 0;
-                                fps_window_start = std::time::Instant::now();
-                            }
                         }
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
                             state.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1755,6 +1707,59 @@ fn pump_loop(
                             tracing::info!("pump_loop: packet channel disconnected, exiting");
                             return mft;
                         }
+                    }
+
+                    // Per-second observability window: emit encode_fps, convert throughput, and
+                    // the enc_to_sender drop delta. Checked unconditionally after the send match
+                    // (mirroring capture/windows.rs) so the window still ticks during sustained
+                    // enc→sender backpressure — exactly when drop-rate visibility matters most.
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(fps_window_start);
+                    if interval_elapsed(fps_window_start, now, FPS_LOG_INTERVAL) {
+                        let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
+                        // CAPT-OBS-6: encode_fps event field names and cadence MUST remain
+                        // unchanged. Do NOT alter the fields or message below.
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            encode_fps = %format!("{fps:.1}"),
+                            frames = fps_frame_count,
+                            "encode throughput"
+                        );
+
+                        // I2 (D-PPT-2): emit convert throughput alongside encode_fps so all
+                        // encoder-thread metrics share one window tick (CAPT-OBS-2).
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            convert_fps = %format!("{:.1}", convert_stats.fps(elapsed)),
+                            convert_us = convert_stats.mean_us(),
+                            frames = convert_stats.frames,
+                            "convert throughput"
+                        );
+
+                        // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
+                        // state.dropped accumulates both drops from the TrySendError::Full arm
+                        // above and dimension-mismatch drops from the drop site in the NeedInput
+                        // service pass below — includes dim-mismatch drops per the D-PPT-3
+                        // dual-use note. Splitting the counter is out of Slice 1 scope.
+                        let current_enc_dropped = state.dropped.load(Ordering::Relaxed);
+                        let (enc_delta, new_enc_last) = compute_drop_delta(
+                            current_enc_dropped,
+                            last_dropped_enc_snapshot,
+                        );
+                        if enc_delta > 0 {
+                            tracing::info!(
+                                target: "sm_infra::encode::windows_mft",
+                                channel_drops = enc_delta,
+                                channel = "enc_to_sender",
+                                "encode channel drops"
+                            );
+                        }
+                        last_dropped_enc_snapshot = new_enc_last;
+
+                        // Reset all window-shared accumulators at the same boundary.
+                        convert_stats.reset();
+                        fps_frame_count = 0;
+                        fps_window_start = std::time::Instant::now();
                     }
                 }
                 Ok(None) => {
@@ -1827,9 +1832,9 @@ fn pump_loop(
                     }
                     current_ts = frame.timestamp;
                     // I2 (D-PPT-2): bracket nv12_convert to accumulate per-frame convert latency.
-                    let _t0 = std::time::Instant::now();
+                    let t0 = std::time::Instant::now();
                     nv12_convert(&frame, &mut nv12_scratch);
-                    convert_stats.record(_t0.elapsed());
+                    convert_stats.record(t0.elapsed());
 
                     // Consume force_keyframe_icodecapi_pending BEFORE submit_frame /
                     // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).

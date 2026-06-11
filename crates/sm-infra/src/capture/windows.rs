@@ -250,7 +250,7 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         match self.tx.try_send(capture_frame) {
             Ok(()) => {
                 // Count only frames that were actually delivered to the encoder channel.
-                // Heartbeat-injected frames go through heartbeat_loop's own try_send (line ~295),
+                // Heartbeat-injected frames go through heartbeat_loop's own try_send,
                 // NOT through here — so capture_fps measures WGC's true delivery rate only.
                 // On a static screen capture_fps legitimately reads ~0; this is correct (D-PPT-1).
                 self.fps_frame_count += 1;
@@ -752,5 +752,13 @@ mod tests {
         let (delta2, new_last2) = compute_drop_delta(5, 5);
         assert_eq!(delta2, 0, "delta must be 0 when counter did not advance");
         assert_eq!(new_last2, 5, "new_last must equal current even when delta is 0");
+
+        // Saturating branch: current < last (e.g. counter reset) → delta clamps to 0,
+        // new_last re-pins to current rather than underflowing.
+        assert_eq!(
+            compute_drop_delta(2, 5),
+            (0, 2),
+            "delta must saturate to 0 and re-pin new_last when current < last"
+        );
     }
 }
