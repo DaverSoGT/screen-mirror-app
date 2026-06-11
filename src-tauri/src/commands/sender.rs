@@ -688,9 +688,11 @@ pub fn run_sender_signaling_drain(
     // flag to true at step 6. A buffered OLD-generation `Error` consumed AFTER step 6
     // then reads `true` and does NOT escalate — NARROWING the buffered-channel gap that
     // joining the producer alone cannot flush. This does NOT fully close it: a residual
-    // sub-instruction race remains where the OLD drain dequeues an `Error` and stores the
-    // gate just as the worker sets it; full closure would require draining `sig_ev_rx`
-    // after the join. The residual is backstopped by the supervisor's `rebuild_timeout`.
+    // sub-instruction race remains where the OLD drain dequeues an `Error` and reads the
+    // gate just as the worker stores it; full closure would require draining `sig_ev_rx`
+    // after the join. If the residual ever fires, the supervisor re-converges on the
+    // next attempt (the #57 accepted race); `rebuild_timeout` covers only the
+    // silence/FIFO-full case.
     // The NEW generation's flag stays `false`, so its genuine RebuildFailed still escalates.
     escalation_disarmed: Arc<AtomicBool>,
 ) {
@@ -1748,9 +1750,10 @@ pub fn make_sender_rebuild_hook(
                     // supervisor slot still armed. Setting this flag first NARROWS that
                     // window to a sub-instruction worker-internal race (dequeue-vs-store);
                     // it does not fully close it — full closure would require draining
-                    // `sig_ev_rx` after the join. The residual is backstopped by the
-                    // supervisor's `rebuild_timeout`, while the NEW generation (fresh flag =
-                    // false) keeps its genuine escalation. Ordering: suppress→disarm→stop→shutdown.
+                    // `sig_ev_rx` after the join. If the residual fires, the supervisor
+                    // re-converges on the next attempt (#57 accepted race); the NEW
+                    // generation (fresh flag = false) keeps its genuine escalation.
+                    // Ordering: suppress→disarm→stop→shutdown.
                     if let Some(ref hook) = s.disarm_escalation_on_rebuild {
                         hook();
                     }
@@ -1759,7 +1762,7 @@ pub fn make_sender_rebuild_hook(
                     // the OLD sm-signaling-mdns thread is dead and cannot call emit_error
                     // again — stopping NEW emits into the #58 RebuildFailed FIFO. Already-
                     // buffered Errors are handled by the disarm gate above (narrowed, not
-                    // fully closed; rebuild_timeout backstops the residual). Ordering:
+                    // fully closed; a residual fire re-converges on the next attempt). Ordering:
                     // suppress→stop→shutdown is load-bearing (see D-RFG-3 ordering proof
                     // in design): suppress must precede stop so the frame loop observes
                     // suppress_bye=true before it exits; stop must precede shutdown so the
