@@ -686,9 +686,12 @@ pub fn run_sender_signaling_drain(
     // genuine escalation (#57 SC-RFE-*). This flag is generation-scoped: each drain
     // gets its OWN fresh `false` flag, and the rebuild worker sets the OLD generation's
     // flag to true at step 6. A buffered OLD-generation `Error` consumed AFTER step 6
-    // then reads `true` and does NOT escalate — closing the buffered-channel gap that
-    // joining the producer alone cannot flush. The NEW generation's flag stays `false`,
-    // so its genuine RebuildFailed still escalates.
+    // then reads `true` and does NOT escalate — NARROWING the buffered-channel gap that
+    // joining the producer alone cannot flush. This does NOT fully close it: a residual
+    // sub-instruction race remains where the OLD drain dequeues an `Error` and stores the
+    // gate just as the worker sets it; full closure would require draining `sig_ev_rx`
+    // after the join. The residual is backstopped by the supervisor's `rebuild_timeout`.
+    // The NEW generation's flag stays `false`, so its genuine RebuildFailed still escalates.
     escalation_disarmed: Arc<AtomicBool>,
 ) {
     loop {
@@ -1742,17 +1745,21 @@ pub fn make_sender_rebuild_hook(
                     // Joining the producer (stop hook below) flushes no already-buffered
                     // event: an `Error` emitted just before stop() still sits in the OLD
                     // drain's `sig_ev_rx` and is consumed AFTER the join, finding the SHARED
-                    // supervisor slot still armed. Setting this flag first guarantees the
-                    // OLD drain reads `disarmed=true` in its Error arm and drops the spurious
-                    // RebuildFailed, while the NEW generation (fresh flag = false) keeps its
-                    // genuine escalation. Ordering: suppress→disarm→stop→shutdown.
+                    // supervisor slot still armed. Setting this flag first NARROWS that
+                    // window to a sub-instruction worker-internal race (dequeue-vs-store);
+                    // it does not fully close it — full closure would require draining
+                    // `sig_ev_rx` after the join. The residual is backstopped by the
+                    // supervisor's `rebuild_timeout`, while the NEW generation (fresh flag =
+                    // false) keeps its genuine escalation. Ordering: suppress→disarm→stop→shutdown.
                     if let Some(ref hook) = s.disarm_escalation_on_rebuild {
                         hook();
                     }
                     // D-RFG (REQ-RFG-3): join the OLD frame-loop thread AFTER suppressing
                     // the Bye and BEFORE running the shutdown closure. After this returns,
                     // the OLD sm-signaling-mdns thread is dead and cannot call emit_error
-                    // again — closing the #58 RebuildFailed FIFO window. Ordering:
+                    // again — stopping NEW emits into the #58 RebuildFailed FIFO. Already-
+                    // buffered Errors are handled by the disarm gate above (narrowed, not
+                    // fully closed; rebuild_timeout backstops the residual). Ordering:
                     // suppress→stop→shutdown is load-bearing (see D-RFG-3 ordering proof
                     // in design): suppress must precede stop so the frame loop observes
                     // suppress_bye=true before it exits; stop must precede shutdown so the
@@ -5460,6 +5467,113 @@ mod tests {
             order.as_slice(),
             &["suppress", "stop", "shutdown"],
             "SC-RFG-2 FAIL: hooks must fire in order [suppress, stop, shutdown], got {order:?}"
+        );
+    }
+
+    /// SC-RFG-2b — rebuild step 6 DISARMS escalation BEFORE stopping signaling.
+    ///
+    /// Regression-lock for the load-bearing step-6 order suppress→disarm→stop→shutdown.
+    /// SC-RFG-2 only covers suppress/stop/shutdown, so a future reorder to stop→disarm
+    /// would re-widen the #58 buffered-channel gap while every existing test still passes.
+    /// This extends the same call_order spy harness with a disarm spy and asserts the
+    /// FULL order, pinning `disarm` strictly before `stop`.
+    ///
+    /// Order-lock semantics: this is GREEN against current code (the order is already
+    /// correct). That is intentional for a regression-lock test — its value is failing
+    /// loudly if the order is ever reordered, not driving new behavior.
+    #[test]
+    fn rebuild_step6_disarms_escalation_before_stopping_signaling() {
+        use super::{SenderBundle, SenderCounters, SenderSession, make_sender_rebuild_hook};
+        use sm_domain::supervisor::SupervisorSignal as SuperSig;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        use std::sync::mpsc::sync_channel;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        struct FakeCh;
+        impl super::ChannelLike for FakeCh {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let call_order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_for_suppress = call_order.clone();
+        let order_for_disarm = call_order.clone();
+        let order_for_stop = call_order.clone();
+        let order_for_shutdown = call_order.clone();
+
+        let session = SenderSession::new(
+            Arc::new(AtomicBool::new(false)),
+            vec![],
+            Arc::new(FakeCh),
+            Arc::new(SenderCounters::default()),
+            Some(Box::new(move || {
+                order_for_shutdown.lock().unwrap().push("shutdown");
+            })),
+            "sw_fake".to_string(),
+            Some(Arc::new(move || {
+                order_for_suppress.lock().unwrap().push("suppress");
+            })),
+            Some(Arc::new(move || {
+                order_for_stop.lock().unwrap().push("stop");
+            })),
+            Some(Arc::new(move || {
+                order_for_disarm.lock().unwrap().push("disarm");
+            })),
+        );
+
+        let bridge_session: Arc<Mutex<Option<SenderSession>>> = Arc::new(Mutex::new(Some(session)));
+
+        let (sig_tx, sig_rx) = sync_channel::<SuperSig>(8);
+        struct FakeChForCache;
+        impl super::ChannelLike for FakeChForCache {
+            fn send_raw(&self, _: u8, _: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let cache = Arc::new(Mutex::new(Some(super::RestartCache {
+            udp_port: 0,
+            service_name: "test".to_string(),
+            channel: Arc::new(FakeChForCache),
+            session_nonce: 0,
+        })));
+        let old_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let hook = make_sender_rebuild_hook(
+            Arc::new(move |_udp, _svc, _stop, _ch, _att| {
+                Ok(SenderBundle {
+                    drain_handles: vec![],
+                    shutdown: None,
+                    backend_name: "sw_fake".to_string(),
+                    suppress_bye_on_rebuild: None,
+                    stop_signaling_on_rebuild: None,
+                    disarm_escalation_on_rebuild: None,
+                })
+            }),
+            cache,
+            bridge_session,
+            old_stop_flag,
+            1,
+            Arc::new(AtomicU8::new(1)),
+        );
+
+        hook(sig_tx);
+
+        let signal = sig_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SC-RFG-2b: rebuild must emit RebuildSucceeded");
+        assert!(
+            matches!(signal, SuperSig::RebuildSucceeded),
+            "SC-RFG-2b FAIL: expected RebuildSucceeded, got {signal:?}"
+        );
+
+        let order = call_order.lock().unwrap().clone();
+        assert_eq!(
+            order.as_slice(),
+            &["suppress", "disarm", "stop", "shutdown"],
+            "SC-RFG-2b FAIL: step-6 hooks must fire in order \
+             [suppress, disarm, stop, shutdown] (disarm strictly before stop), got {order:?}"
         );
     }
 
