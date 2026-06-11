@@ -2812,6 +2812,39 @@ impl FlushTiming {
     }
 }
 
+/// Feed one `EncodedPacket` to the muxer and update `FlushTiming` in the correct order.
+///
+/// This helper unifies the FlushTiming call ordering for both the P-frame branch and the
+/// IDR feed in `mux_thread` (D-PPT5-5, SEG-3). Without this helper the P-frame branch
+/// had `on_append()` BEFORE `append_packet()`, overcounting `segment_frames` by 1 on
+/// every count-flush.
+///
+/// Ordering contract (SEG-3-SC1, SEG-3-SC2):
+/// - `append_packet` first.
+/// - If `Some(segment)`: `on_flush` (captures frame count of the flushed segment) THEN
+///   `on_append` (trigger packet opens the next sub-segment as frame 1).
+/// - If `None`: `on_append` only (packet accumulated into current sub-segment).
+///
+/// Returns `Some((segment_bytes, seg_frames, seg_interval_ms))` on flush, else `None`.
+fn mux_append(
+    m: &mut Mp4Muxer,
+    ft: &mut FlushTiming,
+    pkt: &sm_domain::encode::EncodedPacket,
+    now: Instant,
+) -> Option<(Vec<u8>, u32, Option<u64>)> {
+    match m.append_packet(pkt) {
+        Some(seg) => {
+            let (f, i) = ft.on_flush(now);
+            ft.on_append();
+            Some((seg, f, i))
+        }
+        None => {
+            ft.on_append();
+            None
+        }
+    }
+}
+
 /// Drains `pkt_rx`, fires PLI on the first packet, buffers non-keyframe
 /// packets until the first IDR, builds the fMP4 init segment from SPS+PPS,
 /// and sends frames through the `ChannelLike` (F-fix-2: replaces app.emit).
@@ -2884,18 +2917,19 @@ fn mux_thread(
                 pre_idr_buffer.push(pkt);
                 continue;
             }
-            // After init is emitted: feed to muxer.
-            // MUX-OBS-1: count every P-frame fed to the muxer.
-            flush_timing.on_append();
+            // After init is emitted: feed to muxer via mux_append (D-PPT5-5).
+            // mux_append fixes the FlushTiming ordering bug (SEG-3): on_append fires
+            // AFTER append_packet, so on_flush captures the correct frame count.
             if let Some(m) = muxer.as_mut() {
-                if let Some(segment) = m.append_packet(&pkt) {
+                if let Some((segment, seg_frames, seg_interval_ms)) =
+                    mux_append(m, &mut flush_timing, &pkt, Instant::now())
+                {
                     eprintln!(
-                        "[sm-stream-mux] segment flushed ({} bytes) on P-frame trigger (unexpected)",
+                        "[sm-stream-mux] segment flushed ({} bytes) on sub-GOP count-flush",
                         segment.len()
                     );
-                    let (seg_frames, seg_interval_ms) = flush_timing.on_flush(Instant::now());
                     eprintln!(
-                        "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={} (p-frame-trigger)",
+                        "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={} (sub-gop-flush)",
                         seg_frames,
                         seg_interval_ms.unwrap_or(0),
                     );
@@ -2964,31 +2998,26 @@ fn mux_thread(
             }
         }
 
-        // Feed the IDR to the muxer (may flush the previous GOP).
+        // Feed the IDR to the muxer via mux_append (SEG-3-SC3, D-PPT5-5).
+        // mux_append preserves the IDR branch ordering: on_flush → on_append (IDR is
+        // frame 1 of the next sub-segment). Behavior is identical to the pre-Slice-5 IDR path.
         if let Some(m) = muxer.as_mut() {
-            match m.append_packet(&pkt) {
-                Some(segment) => {
+            match mux_append(m, &mut flush_timing, &pkt, Instant::now()) {
+                Some((segment, seg_frames, seg_interval_ms)) => {
                     eprintln!(
                         "[sm-stream-mux] segment flushed ({} bytes) on IDR — sending to channel",
                         segment.len()
                     );
-                    // MUX-OBS-1: on_flush BEFORE on_append — the triggering IDR belongs
-                    // to the NEXT segment (fmp4_muxer pushes it into fresh pending after
-                    // flushing the previous GOP). Call order: on_flush → on_append(IDR).
-                    let (seg_frames, seg_interval_ms) = flush_timing.on_flush(Instant::now());
                     eprintln!(
                         "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={}",
                         seg_frames,
                         seg_interval_ms.unwrap_or(0),
                     );
-                    flush_timing.on_append(); // IDR is frame 1 of the next segment
                     emit_segment(&channel, &counters, segment);
                 }
                 None => {
                     // No segment flushed (first IDR or empty pending): IDR opens the
-                    // first segment, count it now.
-                    // MUX-OBS-1: on_append for the IDR that starts a new segment.
-                    flush_timing.on_append();
+                    // first segment. mux_append already called on_append.
                     eprintln!(
                         "[sm-stream-mux] IDR ingested into muxer; pending GOP not yet flushed (first IDR or empty pending)"
                     );
@@ -8987,6 +9016,178 @@ mod tests {
         assert_eq!(
             ft.frames_since_flush, 1,
             "after IDR2 on_append, frames_since_flush must be 1"
+        );
+    }
+
+    // ─── Slice 5: mux_append + mux_thread sub-GOP tests (RED-first, Tests 6–7) ─
+    //
+    // Tests 6–7 are written BEFORE Phase 5 production code. They fail with compile
+    // errors (mux_append undefined) until Phase 5 GREEN.
+    // Design: D-PPT5-5, D-PPT5-6. Spec: SEG-3, SEG-1-SC1, SEG-4-SC1.
+
+    // Test 6 — D-PPT5-6 #6: mux_append ordering invariant.
+    // seg_frames returned equals frames counted BEFORE the trigger (not including it).
+    // After the trigger, frames_since_flush = 1 (trigger opens next sub-segment).
+    // Kills: on_append-before-append_packet revert (yields 5); swapped on_flush/on_append.
+    // Spec: SEG-3-SC1, SEG-3-SC2. Design: D-PPT5-5.
+    #[test]
+    fn mux_append_flush_counts_exclude_trigger() {
+        use sm_infra::render::fmp4_muxer::Mp4Muxer;
+
+        let mut m = Mp4Muxer::new(320, 240, 30, 1);
+        let mut ft = FlushTiming::default();
+        let now = std::time::Instant::now();
+
+        // Helper: make a minimal EncodedPacket.
+        let make_pkt = |is_kf: bool, ts_ms: u64| -> sm_domain::encode::EncodedPacket {
+            let nal_byte: u8 = if is_kf { 0x65 } else { 0x41 };
+            sm_domain::encode::EncodedPacket {
+                data: {
+                    let mut d = vec![0x00u8, 0x00, 0x00, 0x01, nal_byte];
+                    d.extend(vec![0xAAu8; 20]);
+                    std::sync::Arc::from(d.into_boxed_slice())
+                },
+                is_keyframe: is_kf,
+                timestamp: std::time::Duration::from_millis(ts_ms),
+                sequence: ts_ms,
+            }
+        };
+
+        // IDR1 + 3 P-frames: all return None, on_append fires 4 times via mux_append.
+        // pending = [IDR1, P1, P2, P3] — not yet flushed (len==4, trigger fires on NEXT).
+        let r0 = mux_append(&mut m, &mut ft, &make_pkt(true, 0), now);
+        assert!(r0.is_none(), "IDR1 must return None");
+        let r1 = mux_append(&mut m, &mut ft, &make_pkt(false, 17), now);
+        assert!(r1.is_none(), "P1 must return None");
+        let r2 = mux_append(&mut m, &mut ft, &make_pkt(false, 34), now);
+        assert!(r2.is_none(), "P2 must return None");
+        let r3 = mux_append(&mut m, &mut ft, &make_pkt(false, 51), now);
+        assert!(r3.is_none(), "P3 must return None");
+
+        // frames_since_flush == 4 at this point (on_append fired 4× via None path).
+        assert_eq!(
+            ft.frames_since_flush, 4,
+            "after 4 None-returning packets, frames_since_flush must be 4"
+        );
+
+        // P4 (5th packet): triggers count-flush → returns Some((seg, frames, interval)).
+        // seg_frames must be 4 (frames accumulated BEFORE this trigger).
+        // After call: frames_since_flush must be 1 (trigger is frame 1 of next sub-segment).
+        let r4 = mux_append(&mut m, &mut ft, &make_pkt(false, 68), now);
+        let (_, seg_frames, _) = r4.expect("P4 (5th packet) must trigger count-flush → Some");
+        assert_eq!(
+            seg_frames, 4,
+            "seg_frames must be 4 (frames before trigger); got {seg_frames}. \
+             on_append-before-append_packet bug yields 5."
+        );
+        assert_eq!(
+            ft.frames_since_flush, 1,
+            "after count-flush, frames_since_flush must be 1 (trigger opens next sub-segment)"
+        );
+    }
+
+    // Test 7 — D-PPT5-6 #7: mux_thread emits sub-GOP segments via P-frame branch.
+    // IDR(SPS+PPS) + 8 P-frames + IDR2 → 1 FRAME_INIT + ≥3 FRAME_SEGMENT.
+    // 8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2.
+    // Kills: P-branch forgot emit_segment wiring.
+    // Spec: SEG-1-SC1, SEG-4-SC1. Design: D-PPT5-5, D-PPT5-6.
+    #[test]
+    fn mux_thread_subgop_emits_segments() {
+        // Real SPS (Baseline Level 1.3, 320×240) and minimal PPS — same as fmp4_muxer tests.
+        const SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0];
+        const PPS: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+
+        // Build IDR Annex-B packet: SPS NAL + PPS NAL + IDR slice NAL.
+        let make_idr_data = || -> std::sync::Arc<[u8]> {
+            let mut d = Vec::new();
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01]);
+            d.extend_from_slice(SPS);
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01]);
+            d.extend_from_slice(PPS);
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01, 0x65]);
+            d.extend(vec![0x88u8; 20]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        };
+
+        let make_p_data = |idx: u8| -> std::sync::Arc<[u8]> {
+            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x41];
+            d.extend(vec![idx; 20]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        };
+
+        let (pkt_tx, pkt_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(32);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(BridgeCounters::default());
+
+        // Keep a typed Arc<FakeChannel> for later inspection alongside the trait-object clone.
+        let fake_ch = FakeChannel::new();
+        let channel: Arc<dyn ChannelLike> = fake_ch.clone();
+
+        // Spawn mux_thread.
+        let stop_clone = stop_flag.clone();
+        let counters_clone = counters.clone();
+        let handle = std::thread::spawn(move || {
+            mux_thread(pkt_rx, stop_clone, counters_clone, channel);
+        });
+
+        let ms = 17u64; // ~60fps spacing
+
+        // IDR1 (with SPS+PPS) triggers init segment emission.
+        pkt_tx
+            .send(sm_domain::encode::EncodedPacket {
+                data: make_idr_data(),
+                is_keyframe: true,
+                timestamp: std::time::Duration::from_millis(0),
+                sequence: 0,
+            })
+            .expect("send IDR1");
+
+        // 8 P-frames at ~60fps: expect 2 count-flushes (at P4 and P8).
+        for i in 1u64..=8 {
+            pkt_tx
+                .send(sm_domain::encode::EncodedPacket {
+                    data: make_p_data(i as u8),
+                    is_keyframe: false,
+                    timestamp: std::time::Duration::from_millis(i * ms),
+                    sequence: i,
+                })
+                .expect("send P-frame");
+        }
+
+        // IDR2: triggers IDR-flush of remaining 1 P-frame in pending.
+        pkt_tx
+            .send(sm_domain::encode::EncodedPacket {
+                data: make_idr_data(),
+                is_keyframe: true,
+                timestamp: std::time::Duration::from_millis(9 * ms),
+                sequence: 9,
+            })
+            .expect("send IDR2");
+
+        // Give the mux thread time to process all packets.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Stop the thread.
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(pkt_tx);
+        handle.join().expect("mux_thread must not panic");
+
+        let frames = fake_ch.captured();
+        let init_count = frames
+            .iter()
+            .filter(|f| f.first() == Some(&FRAME_INIT))
+            .count();
+        let seg_count = frames
+            .iter()
+            .filter(|f| f.first() == Some(&FRAME_SEGMENT))
+            .count();
+
+        assert_eq!(init_count, 1, "exactly 1 FRAME_INIT must be emitted");
+        assert!(
+            seg_count >= 3,
+            "at least 3 FRAME_SEGMENT must be emitted \
+             (8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2); got {seg_count}"
         );
     }
 }
