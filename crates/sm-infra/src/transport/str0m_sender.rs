@@ -881,13 +881,21 @@ impl PaceStats {
     /// Divides accumulated counters by `elapsed_secs` so the caller does not
     /// need to track the denominator separately.
     ///
+    /// Behavior: on non-positive `elapsed_secs` (`<= 0.0`) the function returns
+    /// `(0.0, 0.0, self.max_burst)` instead of dividing. This keeps the seam
+    /// genuinely total — finite rates with no division by zero and no infinities
+    /// for any caller, including the `elapsed = 0.0` edge case where a floored
+    /// `f64::MIN_POSITIVE` denominator would otherwise overflow large numerators
+    /// to `+inf`. `max_burst` is a count, not a rate, so it is always preserved.
+    ///
     /// Precondition: the production caller only invokes this once `elapsed_secs`
-    /// has reached ≥ 1 s. The denominator is floored at `f64::MIN_POSITIVE` to
-    /// keep the seam total (no division by zero / no infinities) for any caller.
+    /// has reached ≥ 1 s, so it never reaches the zero-elapsed branch in practice.
     fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32) {
-        let d = elapsed_secs.max(f64::MIN_POSITIVE);
-        let ticks_s = self.ticks as f64 / d;
-        let pkts_s = self.pkts as f64 / d;
+        if elapsed_secs <= 0.0 {
+            return (0.0, 0.0, self.max_burst);
+        }
+        let ticks_s = self.ticks as f64 / elapsed_secs;
+        let pkts_s = self.pkts as f64 / elapsed_secs;
         (ticks_s, pkts_s, self.max_burst)
     }
 
@@ -1813,7 +1821,10 @@ mod tests {
         }
         s.on_drain_end();
         assert_eq!(s.cur_burst, 0);
-        assert_eq!(s.max_burst, 8, "max_burst must rise to 8 on the larger drain");
+        assert_eq!(
+            s.max_burst, 8,
+            "max_burst must rise to 8 on the larger drain"
+        );
         // drain 3: 2 packets (smaller than the running max — must NOT lower it)
         for _ in 0..2 {
             s.on_transmit();
@@ -1874,8 +1885,9 @@ mod tests {
         assert_eq!(max_burst, 4, "max_burst must be 4");
     }
 
-    /// snapshot_per_s(0.0): the floored denominator keeps the result finite
-    /// (no division by zero / NaN / infinity), pinning the total-seam guard.
+    /// snapshot_per_s(0.0): the non-positive-elapsed early return makes the seam
+    /// genuinely total — exact 0.0 rates (finite, no division by zero / NaN /
+    /// infinity) even with large counters, while max_burst is preserved.
     #[test]
     fn pace_stats_snapshot_zero_elapsed_is_finite() {
         let mut s = PaceStats::new();
@@ -1892,6 +1904,28 @@ mod tests {
             "pkts_per_s must be finite for zero elapsed, got {pkts_s}"
         );
         assert_eq!(max_burst, 1, "max_burst is unaffected by the denominator");
+
+        // Realistic large counters: a floored f64::MIN_POSITIVE denominator
+        // would overflow these to +inf. The early return must yield exact 0.0.
+        let mut big = PaceStats::new();
+        for _ in 0..5000 {
+            big.on_tick();
+        }
+        for _ in 0..5000 {
+            big.on_transmit();
+        }
+        big.on_drain_end();
+        let (ticks_s, pkts_s, max_burst) = big.snapshot_per_s(0.0);
+        assert_eq!(
+            ticks_s, 0.0,
+            "ticks_per_s must be exactly 0.0 for zero elapsed, got {ticks_s}"
+        );
+        assert_eq!(
+            pkts_s, 0.0,
+            "pkts_per_s must be exactly 0.0 for zero elapsed, got {pkts_s}"
+        );
+        assert!(ticks_s.is_finite() && pkts_s.is_finite());
+        assert_eq!(max_burst, 5000, "max_burst must be preserved at 5000");
     }
 
     /// After populating, reset() → all fields are zero.
