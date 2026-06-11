@@ -2132,7 +2132,6 @@ fn build_production_sender_bundle(
     // unsupported builds). Explicit > implicit `Auto` to match spec R5 intent (W2 fix).
     let capture_config = CaptureConfig {
         monitor: MonitorSelector::Primary,
-        max_fps: Some(30),
         border: BorderPolicy::AlwaysOff,
         ..CaptureConfig::default()
     };
