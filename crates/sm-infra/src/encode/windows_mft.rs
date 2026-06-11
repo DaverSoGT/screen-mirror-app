@@ -1573,6 +1573,12 @@ fn pump_loop(
     let mut fps_frame_count: u32 = 0;
     let mut fps_window_start = std::time::Instant::now();
     const FPS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    // I2 (D-PPT-2): per-second convert timing accumulator. Shares the encode_fps window
+    // so all encoder-thread metrics reset at the same tick (one timestamp, one reset).
+    let mut convert_stats = ConvertStats::default();
+    // I3 (D-PPT-3): snapshot of state.dropped at the last encode window boundary, used
+    // to compute per-interval drop delta for the enc_to_sender channel.
+    let mut last_dropped_enc_snapshot: u64 = 0;
 
     loop {
         // Top-of-loop stop check — sole exit via stop flag (design DD1, spec R4/S4.1).
@@ -1692,12 +1698,47 @@ fn pump_loop(
                             let elapsed = fps_window_start.elapsed();
                             if elapsed >= FPS_LOG_INTERVAL {
                                 let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
+                                // CAPT-OBS-6: encode_fps event field names and cadence MUST remain
+                                // unchanged. Do NOT alter the fields or message below.
                                 tracing::info!(
                                     target: "sm_infra::encode::windows_mft",
                                     encode_fps = %format!("{fps:.1}"),
                                     frames = fps_frame_count,
                                     "encode throughput"
                                 );
+
+                                // I2 (D-PPT-2): emit convert throughput alongside encode_fps so all
+                                // encoder-thread metrics share one window tick (CAPT-OBS-2).
+                                tracing::info!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    convert_fps = %format!("{:.1}", convert_stats.fps(elapsed)),
+                                    convert_us = convert_stats.mean_us(),
+                                    frames = convert_stats.frames,
+                                    "convert throughput"
+                                );
+
+                                // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
+                                // state.dropped accumulates both TrySendError::Full drops (line ~1706)
+                                // and dimension-mismatch drops (line ~1774) — includes dim-mismatch
+                                // drops per D-PPT-3 dual-use note. Splitting the counter is out of
+                                // Slice 1 scope.
+                                let current_enc_dropped = state.dropped.load(Ordering::Relaxed);
+                                let (enc_delta, new_enc_last) = compute_drop_delta(
+                                    current_enc_dropped,
+                                    last_dropped_enc_snapshot,
+                                );
+                                if enc_delta > 0 {
+                                    tracing::info!(
+                                        target: "sm_infra::encode::windows_mft",
+                                        channel_drops = enc_delta,
+                                        channel = "enc_to_sender",
+                                        "encode channel drops"
+                                    );
+                                }
+                                last_dropped_enc_snapshot = new_enc_last;
+
+                                // Reset all window-shared accumulators at the same boundary.
+                                convert_stats.reset();
                                 fps_frame_count = 0;
                                 fps_window_start = std::time::Instant::now();
                             }
@@ -1780,7 +1821,10 @@ fn pump_loop(
                         break;
                     }
                     current_ts = frame.timestamp;
+                    // I2 (D-PPT-2): bracket nv12_convert to accumulate per-frame convert latency.
+                    let _t0 = std::time::Instant::now();
                     nv12_convert(&frame, &mut nv12_scratch);
+                    convert_stats.record(_t0.elapsed());
 
                     // Consume force_keyframe_icodecapi_pending BEFORE submit_frame /
                     // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).
@@ -2251,6 +2295,16 @@ fn interval_elapsed(
     threshold: std::time::Duration,
 ) -> bool {
     now.duration_since(window_start) >= threshold
+}
+
+/// Compute the per-interval drop delta for a monotonically-increasing drop counter.
+///
+/// Returns `(delta, new_last)` where `delta = current.saturating_sub(last)` and
+/// `new_last = current`. Used by pump_loop (I3, D-PPT-3) to surface the
+/// enc_to_sender drop rate without cumulative totals in the per-second log event.
+#[inline]
+fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
+    (current.saturating_sub(last), current)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
