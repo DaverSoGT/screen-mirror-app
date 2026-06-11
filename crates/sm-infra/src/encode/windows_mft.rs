@@ -2183,6 +2183,76 @@ impl WindowsMftH264Encoder {
     }
 }
 
+// ── Observability seams (perf-pipeline-throughput Slice 1) ───────────────────
+//
+// Pure helpers extracted for unit-testability (D-PPT-5, D-PPT-6). No COM, no
+// heap allocation, no locks — safe to call on the encoder pump_loop hot path.
+
+/// Per-second accumulator for NV12 convert timing (I2, D-PPT-5).
+///
+/// Accumulates a frame count and a total microsecond sum across one 1-second window.
+/// At the window boundary, callers read `mean_us()` and `fps()`, emit the log event,
+/// then call `reset()`. Follows the `FpsTracker` pure-struct-with-cfg(test)-accessor
+/// precedent (render/fps_tracker.rs).
+#[derive(Default)]
+struct ConvertStats {
+    /// Number of `nv12_convert` calls recorded in the current window.
+    frames: u32,
+    /// Cumulative duration of all recorded calls in the current window, in microseconds.
+    total_us: u64,
+}
+
+impl ConvertStats {
+    /// Record one convert duration into the current window.
+    #[inline]
+    fn record(&mut self, dur: std::time::Duration) {
+        self.frames += 1;
+        self.total_us += dur.as_micros() as u64;
+    }
+
+    /// Per-frame mean convert latency in microseconds over the current window.
+    /// Returns 0 when no frames have been recorded (avoids divide-by-zero).
+    #[inline]
+    fn mean_us(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_us / self.frames as u64
+        }
+    }
+
+    /// Frames-per-second computed over the provided elapsed window duration.
+    /// Returns 0.0 when no frames have been recorded.
+    #[inline]
+    fn fps(&self, window: std::time::Duration) -> f64 {
+        if self.frames == 0 {
+            0.0
+        } else {
+            self.frames as f64 / window.as_secs_f64()
+        }
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_us = 0;
+    }
+}
+
+/// Returns `true` when the elapsed time since `window_start` is at or above `threshold`.
+///
+/// Extracted as a pure function so the cadence predicate is unit-testable with synthetic
+/// `Instant` values — no wall-clock sleeping required (D-PPT-6).
+#[inline]
+fn interval_elapsed(
+    window_start: std::time::Instant,
+    now: std::time::Instant,
+    threshold: std::time::Duration,
+) -> bool {
+    now.duration_since(window_start) >= threshold
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 // ── Test-only helpers ────────────────────────────────────────────────────────

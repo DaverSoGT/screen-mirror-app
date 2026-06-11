@@ -528,6 +528,24 @@ impl WindowsCaptureSource {
 }
 
 // ---------------------------------------------------------------------------
+// Observability seams (perf-pipeline-throughput Slice 1)
+// ---------------------------------------------------------------------------
+
+/// Compute the per-interval drop delta for a monotonically-increasing drop counter.
+///
+/// Returns `(delta, new_last)` where:
+/// - `delta` is the number of drops that occurred since the last snapshot
+///   (`current.saturating_sub(last)` — monotonic, never negative),
+/// - `new_last` is the snapshot to store for the next interval (equals `current`).
+///
+/// Called by `on_frame_arrived` (I1, D-PPT-3) at each 1-second window boundary
+/// with `self.dropped.load(Relaxed)` as `current`.
+#[inline]
+fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
+    (current.saturating_sub(last), current)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
