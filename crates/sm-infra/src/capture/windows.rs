@@ -650,4 +650,21 @@ mod tests {
         let input = b"\\\\.\\ DISPLAY2";
         assert_eq!(djb2(input), djb2(input));
     }
+
+    // ── Observability seam tests (WU-A RED — perf-pipeline-throughput Slice 1) ──
+
+    /// Task 1.4 [RED]: compute_drop_delta computes the per-interval delta and advances
+    /// the snapshot to the current cumulative value.
+    #[test]
+    fn drop_delta_computes_and_advances_snapshot() {
+        // First call: current=5, last=2 → delta=3, new_last=5
+        let (delta, new_last) = compute_drop_delta(5, 2);
+        assert_eq!(delta, 3, "delta must be current - last");
+        assert_eq!(new_last, 5, "new_last must equal current");
+
+        // Second call: counter unchanged current=5, last=5 → delta=0, new_last=5
+        let (delta2, new_last2) = compute_drop_delta(5, 5);
+        assert_eq!(delta2, 0, "delta must be 0 when counter did not advance");
+        assert_eq!(new_last2, 5, "new_last must equal current even when delta is 0");
+    }
 }

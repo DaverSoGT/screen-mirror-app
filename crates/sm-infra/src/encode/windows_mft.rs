@@ -2632,4 +2632,68 @@ mod tests {
         unsafe { CoUninitialize() }; // for the recheck CoInitializeEx
         unsafe { CoUninitialize() }; // for the initial STA init
     }
+
+    // ── Observability seam tests (WU-A RED — perf-pipeline-throughput Slice 1) ──
+    //
+    // These tests are RED until Phase 2 adds ConvertStats and interval_elapsed.
+    // All tests are pure (no COM, no hardware, no tracing subscriber).
+
+    /// Task 1.1 [RED]: ConvertStats accumulates durations and computes mean_us and fps correctly.
+    #[test]
+    fn convert_stats_record_and_mean_us() {
+        use std::time::{Duration, Instant};
+
+        let mut stats = ConvertStats::default();
+        // Record 3 durations: 10 ms, 20 ms, 30 ms → total 60 ms, mean = 20 ms = 20_000 us.
+        stats.record(Duration::from_millis(10));
+        stats.record(Duration::from_millis(20));
+        stats.record(Duration::from_millis(30));
+        assert_eq!(stats.mean_us(), 20_000, "mean_us must be total_us / frames");
+
+        // fps over a 3-second window: 3 frames / 3 s = 1.0 fps
+        let fps = stats.fps(Duration::from_secs(3));
+        assert!(
+            (fps - 1.0_f64).abs() < 1e-9,
+            "fps must be frames / elapsed_secs, got {fps}"
+        );
+        let _ = Instant::now(); // ensure Instant is in scope (compile smoke)
+    }
+
+    /// Task 1.2 [RED]: ConvertStats::reset zeroes all accumulated state.
+    #[test]
+    fn convert_stats_reset_zeroes_state() {
+        let mut stats = ConvertStats::default();
+        stats.record(std::time::Duration::from_millis(5));
+        stats.reset();
+        assert_eq!(stats.frames, 0, "frames must be 0 after reset");
+        assert_eq!(stats.total_us, 0, "total_us must be 0 after reset");
+    }
+
+    /// Task 1.3 [RED]: interval_elapsed returns false below threshold and true at/above threshold.
+    #[test]
+    fn window_gate_below_threshold_returns_false_and_at_or_above_returns_true() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        // Simulate "now" 500 ms after start — below the 1 s threshold.
+        let below = start + Duration::from_millis(500);
+        assert!(
+            !interval_elapsed(start, below, Duration::from_secs(1)),
+            "500 ms elapsed must return false for a 1 s threshold"
+        );
+
+        // Simulate "now" 1001 ms after start — above the threshold.
+        let above = start + Duration::from_millis(1001);
+        assert!(
+            interval_elapsed(start, above, Duration::from_secs(1)),
+            "1001 ms elapsed must return true for a 1 s threshold"
+        );
+
+        // Exactly at the boundary — inclusive (>= semantics, matching FPS_LOG_INTERVAL).
+        let exact = start + Duration::from_secs(1);
+        assert!(
+            interval_elapsed(start, exact, Duration::from_secs(1)),
+            "exactly 1 s elapsed must return true (inclusive boundary)"
+        );
+    }
 }
