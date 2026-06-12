@@ -154,6 +154,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     videoEl.dispatchEvent(new Event('waiting'));
 
     const lines = getMseLogLines(tauri);
+    // S7-4-SC1: mseLog called exactly once (spec "exactly once")
+    expect(lines.length).toBe(1);
     expect(lines.some((l) => l.includes('result=stall_snap'))).toBe(true);
   });
 
@@ -170,6 +172,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(videoEl.currentTime).toBeCloseTo(expectedTarget, 5);
 
     const lines = getMseLogLines(tauri);
+    // S7-4-SC1: mseLog called exactly once (spec "exactly once")
+    expect(lines.length).toBe(1);
     const snapLine = lines.find((l) => l.includes('result=stall_snap'));
     expect(snapLine).toBeDefined();
     expect(snapLine).toContain('from=' + ct.toFixed(3));
@@ -209,8 +213,6 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     exports.onVideoWaiting();
 
     expect(videoEl.currentTime).toBe(ctBefore);
-    const lines = getMseLogLines(tauri);
-    expect(lines.some((l) => l.includes('mse_log') || l.includes('result=stall_snap'))).toBe(false);
     expect(tauri.invoke.mock.calls.filter(([cmd]) => cmd === 'mse_log').length).toBe(0);
   });
 
@@ -343,29 +345,39 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
     sb.buffered = makeBuffered(0, bufEnd);
 
-    // Override currentTime: getter returns ct, setter throws.
+    // W2: getter returns ct (10.016) on FIRST read only; sentinel (99.999) on any
+    // subsequent read. This kills mutants that re-read VIDEO_EL.currentTime inside
+    // the catch block — they would capture 99.999 and produce wrong from= values.
+    let getterCallCount = 0;
     overrideProperty(videoEl, 'currentTime', {
-      get: () => ct,
+      get() {
+        getterCallCount += 1;
+        return getterCallCount === 1 ? ct : 99.999;
+      },
       set() { throw new Error('DOM err'); },
     });
 
     expect(() => exports.onVideoWaiting()).not.toThrow();
 
     const lines = getMseLogLines(tauri);
-    const snapLine  = lines.find((l) => l.includes('result=stall_snap'));
-    const throwLine = lines.find((l) => l.includes('result=throw'));
 
-    // First log: result=stall_snap
-    expect(snapLine).toBeDefined();
-    expect(snapLine).toContain('from=' + ct.toFixed(3));
-    expect(snapLine).toContain('to=' + expectedTarget);
-    expect(snapLine).toContain('drift=' + expectedDrift);
+    // W1: assert positional ORDER — stall_snap MUST come before throw.
+    // A mutant that moves the mseLog call after assignment would emit
+    // [throw, stall_snap] instead of [stall_snap, throw] — killed here.
+    expect(lines[0]).toContain('result=stall_snap');
+    expect(lines[1]).toContain('result=throw');
 
-    // Second log: result=throw, same values from locals (no getter re-reads).
-    expect(throwLine).toBeDefined();
-    expect(throwLine).toContain('from=' + ct.toFixed(3));
-    expect(throwLine).toContain('to=' + expectedTarget);
-    expect(throwLine).toContain('drift=' + expectedDrift);
+    // Exact-value field checks on stall_snap line (lines[0]).
+    expect(lines[0]).toContain('from=' + ct.toFixed(3));
+    expect(lines[0]).toContain('to=' + expectedTarget);
+    expect(lines[0]).toContain('drift=' + expectedDrift);
+
+    // Exact-value field checks on throw line (lines[1]).
+    // Values MUST equal the first-read ct (10.016), not the sentinel (99.999).
+    // This kills mutants that re-read VIDEO_EL.currentTime in the catch block.
+    expect(lines[1]).toContain('from=' + ct.toFixed(3));
+    expect(lines[1]).toContain('to=' + expectedTarget);
+    expect(lines[1]).toContain('drift=' + expectedDrift);
   });
 
   // ── T-S7-14: Idempotency — post-stall-snap seekToLiveEdge no-ops ──────────
