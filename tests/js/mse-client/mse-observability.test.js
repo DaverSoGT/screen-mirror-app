@@ -144,25 +144,34 @@ describe('mse-client — mseLog helper unit tests (SC-MSE-LOG-9, 10, 11a, 11b)',
     consoleSpy.mockRestore();
   });
 
-  // SC-MSE-LOG-11b: invoke rejection is swallowed — no unhandled rejection.
-  // RED: fails until mseLog is exported and .catch guard is present.
-  it('SC-MSE-LOG-11b: invoke("mse_log") rejection is swallowed — no unhandled rejection', async () => {
+  // SC-MSE-LOG-11b: invoke rejection is swallowed — .catch guard is called.
+  // Mutation-resistant: a spy wraps the rejected promise; if .catch is removed
+  // from mseLog the spy is never invoked and the test fails.
+  it('SC-MSE-LOG-11b: invoke("mse_log") rejection is swallowed — .catch guard is attached to the returned promise', async () => {
     const { mseLog } = exports;
-    tauri.invoke.mockRejectedValueOnce(new Error('IPC failure'));
 
-    let unhandledRejection = null;
-    const handler = (e) => { unhandledRejection = e; };
-    process.on('unhandledRejection', handler);
+    // Build a spy promise: the underlying promise is rejected, but .catch is
+    // intercepted so we can assert the guard was actually attached.
+    let catchCalled = false;
+    const rejection = Promise.reject(new Error('IPC failure'));
+    const spyPromise = {
+      catch: (fn) => {
+        catchCalled = true;
+        return rejection.catch(fn);
+      },
+    };
+    // Suppress the unhandled rejection on our side — the .catch inside mseLog
+    // handles it; we only need a safety drain here for the test environment.
+    rejection.catch(() => {});
+    tauri.invoke.mockReturnValueOnce(spyPromise);
 
-    try {
-      expect(() => mseLog('event=test')).not.toThrow();
-      // Flush microtasks so the rejected promise and .catch have time to settle.
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(unhandledRejection).toBeNull();
-    } finally {
-      process.off('unhandledRejection', handler);
-    }
+    expect(() => mseLog('event=test')).not.toThrow();
+    // Allow the microtask queue to settle so the .catch chain runs.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The .catch guard in mseLog MUST have been called on the returned promise.
+    expect(catchCalled).toBe(true);
   });
 });
 
@@ -281,6 +290,69 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
     expect(sb.remove).toHaveBeenCalled();
   });
 
+  // SC-MSE-LOG-3b: trimSourceBuffer with sb.updating=true → action=busy log.
+  // Frozen contract D-PPT6-3 #3: busy guard must be logged, not silently skipped.
+  // RED: currently fails — busy guard returns silently without logging.
+  it('SC-MSE-LOG-3b: trimSourceBuffer with sb.updating=true → mse_log event=trim action=busy', () => {
+    const videoEl = document.getElementById('player');
+    videoEl.currentTime = 100;
+
+    // sb exists but is currently updating — the busy guard fires.
+    sb.updating = true;
+    sb.buffered = makeBuffered([[10, 95]]);
+    tauri.invoke.mockClear();
+
+    vi.advanceTimersByTime(5000);
+
+    const lines = getMseLogLines(tauri);
+    const busyLines = lines.filter((l) => l.startsWith('event=trim'));
+    expect(busyLines.length).toBeGreaterThanOrEqual(1);
+    expect(busyLines[0]).toMatch(/action=busy/);
+    // N/A fields must carry "-" sentinel per NFR-2, not be omitted.
+    expect(busyLines[0]).toMatch(/cutoff=-/);
+    expect(busyLines[0]).toMatch(/buf_start=-/);
+    expect(busyLines[0]).toMatch(/name=-/);
+  });
+
+  // SC-MSE-LOG-3c: N/A sentinel "-" present in remove/noop/throw trim lines.
+  // Frozen contract D-PPT6-3: absent values use "-", not field omission.
+  // RED: currently fails — name= field absent on remove/noop; cutoff/buf_start absent on throw.
+  it('SC-MSE-LOG-3c: trim remove/noop lines carry name="-" sentinel; throw line carries cutoff="-" and buf_start="-"', () => {
+    const videoEl = document.getElementById('player');
+    videoEl.currentTime = 100;
+
+    // noop path — name field must be "-"
+    sb.updating = false;
+    sb.buffered = makeBuffered([[80, 95]]);
+    tauri.invoke.mockClear();
+    vi.advanceTimersByTime(5000);
+    const noopLines = getMseLogLines(tauri).filter((l) => l.includes('action=noop'));
+    expect(noopLines.length).toBeGreaterThanOrEqual(1);
+    expect(noopLines[0]).toMatch(/name=-/);
+
+    // remove path — name field must be "-"
+    sb.buffered = makeBuffered([[10, 95]]);
+    tauri.invoke.mockClear();
+    sb.remove.mockClear();
+    vi.advanceTimersByTime(5000);
+    const removeLines = getMseLogLines(tauri).filter((l) => l.includes('action=remove'));
+    expect(removeLines.length).toBeGreaterThanOrEqual(1);
+    expect(removeLines[0]).toMatch(/name=-/);
+
+    // throw path — sb.remove throws (SourceBuffer detached after remove call begins);
+    // cutoff=- and buf_start=- sentinels must appear in the throw trim line.
+    sb.buffered = makeBuffered([[10, 95]]); // start < cutoff → remove branch
+    sb.remove.mockImplementationOnce(() => {
+      throw new DOMException('InvalidStateError', 'InvalidStateError');
+    });
+    tauri.invoke.mockClear();
+    vi.advanceTimersByTime(5000);
+    const throwLines = getMseLogLines(tauri).filter((l) => l.includes('action=throw'));
+    expect(throwLines.length).toBeGreaterThanOrEqual(1);
+    expect(throwLines[0]).toMatch(/cutoff=-/);
+    expect(throwLines[0]).toMatch(/buf_start=-/);
+  });
+
   // SC-MSE-LOG-4: seekToLiveEdge — two sides.
   // (a) After instrumentation: result=guard_backward logged when target<=currentTime AND drift>0.5.
   //     Note: with LIVE_EDGE_TARGET_LEAD_SEC=0.2 and LIVE_EDGE_MAX_DRIFT_SEC=0.5, guard_backward
@@ -340,7 +412,7 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
     const tick = tickLines[0];
     expect(tick).toMatch(/ct=/);
     expect(tick).toMatch(/paused=/);
-    expect(tick).toMatch(/rs=/);
+    expect(tick).toMatch(/ rs=\d/);   // anchored: must not match ms_rs= substring
     expect(tick).toMatch(/pending=/);
     expect(tick).toMatch(/sb_updating=/);
     expect(tick).toMatch(/ms_rs=/);
