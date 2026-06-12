@@ -3137,7 +3137,24 @@ pub fn retry_session_stream(
 // Fire-and-forget: no return value, no panic on any input (D-PPT6-1).
 
 pub(crate) fn format_mse_log(line: &str) -> String {
-    format!("[sm-mse] {line}")
+    // Defense-in-depth for the one-event-per-line contract: even if a
+    // newline-bearing line slips past the JS-side strip, collapse interior
+    // runs of `\n`/`\r` to a single space so one call always emits exactly one
+    // stderr line. Mirrors the JS-side `.replace(/[\r\n]+/g, " ")` collapse.
+    let mut sanitized = String::with_capacity(line.len());
+    let mut prev_was_newline = false;
+    for c in line.chars() {
+        if c == '\n' || c == '\r' {
+            if !prev_was_newline {
+                sanitized.push(' ');
+            }
+            prev_was_newline = true;
+        } else {
+            sanitized.push(c);
+            prev_was_newline = false;
+        }
+    }
+    format!("[sm-mse] {sanitized}")
 }
 
 #[tauri::command]

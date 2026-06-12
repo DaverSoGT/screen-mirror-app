@@ -197,12 +197,31 @@ const FRAME_STATUS = 0x02;
 // Returns comma-joined "[start→end]" ranges (each .toFixed(3)) or "<none>"
 // when buffered.length === 0. Pure function, no side effects (D-PPT6-3).
 function bufferedSummary(buffered) {
-  if (!buffered || buffered.length === 0) return "<none>";
-  const parts = [];
-  for (let i = 0; i < buffered.length; i++) {
-    parts.push("[" + buffered.start(i).toFixed(3) + "→" + buffered.end(i).toFixed(3) + "]");
+  // Telemetry-only: reading a TimeRanges getter on a detached SourceBuffer can
+  // throw InvalidStateError. Swallow any getter throw and return the "-" N/A
+  // sentinel so this never escapes into the exception-safe channel pump / tick.
+  try {
+    if (!buffered || buffered.length === 0) return "<none>";
+    const parts = [];
+    for (let i = 0; i < buffered.length; i++) {
+      parts.push("[" + buffered.start(i).toFixed(3) + "→" + buffered.end(i).toFixed(3) + "]");
+    }
+    return parts.join(",");
+  } catch (_) {
+    return "-";
   }
-  return parts.join(",");
+}
+
+// updatingFlag — telemetry-only defensive read of sb.updating. Reading the
+// getter on a detached SourceBuffer can throw InvalidStateError; swallow it and
+// return the "-" N/A sentinel so log-line construction stays exception-free in
+// the previously exception-safe catch handlers and heartbeat tick.
+function updatingFlag(sb) {
+  try {
+    return sb.updating;
+  } catch (_) {
+    return "-";
+  }
 }
 
 // mseLog — fire-and-forget IPC bridge to the Rust mse_log command (D-PPT6-2).
@@ -630,11 +649,13 @@ function flushQueue() {
     } else {
       console.error("[mse] appendBuffer error", e);
     }
-    // GATE-6 MSEO-2a: log every appendBuffer error (quota + generic) with name/state
+    // GATE-6 MSEO-2a: log every appendBuffer error (quota + generic) with name/state.
+    // sb_updating read defensively: a detached SourceBuffer can throw on the getter,
+    // and this catch handler must stay exception-free (escapes would hit the channel pump).
     mseLog(
       "event=append_error name=" + e.name +
       " pending=" + pending.length +
-      " sb_updating=" + sb.updating +
+      " sb_updating=" + updatingFlag(sb) +
       " buffered=" + bufferedSummary(sb.buffered)
     );
   }
@@ -991,15 +1012,18 @@ async function main() {
       "buffered=" + (ranges.join(",") || "<none>"),
       curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
-    // GATE-6 MSEO-4: emit structured tick line (H1/H2/H3/H4 backbone signal)
+    // GATE-6 MSEO-4: emit structured tick line (H1/H2/H3/H4 backbone signal).
+    // sb_updating read defensively (detached SB can throw) and buffered routed
+    // through bufferedSummary so getter throws are swallowed internally — this
+    // setInterval body must stay exception-free exactly like the original code.
     mseLog(
       "event=tick ct=" + VIDEO_EL.currentTime.toFixed(3) +
       " paused=" + VIDEO_EL.paused +
       " rs=" + VIDEO_EL.readyState +
       " pending=" + mseState.pending.length +
-      " sb_updating=" + sb.updating +
+      " sb_updating=" + updatingFlag(sb) +
       " ms_rs=" + (curMs ? curMs.readyState : "null") +
-      " buffered=" + (ranges.join(",") || "<none>")
+      " buffered=" + bufferedSummary(sb.buffered)
     );
     seekToLiveEdge();
   }, 2000);
@@ -1082,16 +1106,26 @@ async function main() {
 // invocation in vitest (happy-dom dispatchEvent limitation per D-PPT6-5).
 
 function onWindowError(ev) {
+  // F2: strip control newlines BEFORE truncation so the one-event-per-line
+  // contract holds even when a multi-line error message slips through.
+  // F4: null-safe — lineno/colno 0 and reason=0/false/"" are valid values that
+  // must be preserved (?? not ||), and only null/undefined become "".
+  const msg = (ev.message == null ? "" : String(ev.message))
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 200);
   mseLog(
     "event=js_error src=" + (ev.filename || "-") +
-    " line=" + (ev.lineno || 0) +
-    " col=" + (ev.colno || 0) +
-    " msg=" + String(ev.message || "").slice(0, 200)
+    " line=" + (ev.lineno ?? 0) +
+    " col=" + (ev.colno ?? 0) +
+    " msg=" + msg
   );
 }
 
 function onUnhandledRejection(ev) {
-  mseLog("event=unhandled_rejection reason=" + String(ev.reason || "").slice(0, 200));
+  const reason = (ev.reason == null ? "" : String(ev.reason))
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 200);
+  mseLog("event=unhandled_rejection reason=" + reason);
 }
 
 window.addEventListener("error", onWindowError);
