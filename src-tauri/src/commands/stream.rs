@@ -3130,6 +3130,21 @@ pub fn retry_session_stream(
     retry_session_stream_inner(&bridge, channel_arc)
 }
 
+// ─── mse_log bridge command ───────────────────────────────────────────────────
+//
+// Receives a bare log line from the JS MSE client and emits it to stderr
+// with the [sm-mse] prefix so the GATE-6 Tee log can grep on that prefix.
+// Fire-and-forget: no return value, no panic on any input (D-PPT6-1).
+
+pub(crate) fn format_mse_log(line: &str) -> String {
+    format!("[sm-mse] {line}")
+}
+
+#[tauri::command]
+pub fn mse_log(line: String) {
+    eprintln!("{}", format_mse_log(&line));
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

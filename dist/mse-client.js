@@ -191,6 +191,30 @@ const FRAME_INIT = 0x00;
 const FRAME_SEGMENT = 0x01;
 const FRAME_STATUS = 0x02;
 
+// ── GATE-6 observability helpers ─────────────────────────────────────────────
+//
+// bufferedSummary — formats a TimeRanges object into a compact log string.
+// Returns comma-joined "[start→end]" ranges (each .toFixed(3)) or "<none>"
+// when buffered.length === 0. Pure function, no side effects (D-PPT6-3).
+function bufferedSummary(buffered) {
+  if (!buffered || buffered.length === 0) return "<none>";
+  const parts = [];
+  for (let i = 0; i < buffered.length; i++) {
+    parts.push("[" + buffered.start(i).toFixed(3) + "→" + buffered.end(i).toFixed(3) + "]");
+  }
+  return parts.join(",");
+}
+
+// mseLog — fire-and-forget IPC bridge to the Rust mse_log command (D-PPT6-2).
+// Mirrors to console.log("[sm-mse] "+line) for devtools parity.
+// The bare `line` (without prefix) is sent over IPC; Rust prepends "[sm-mse] ".
+// .catch guard ensures IPC failure never cascades into the MSE pipeline (MSEO-6).
+function mseLog(line) {
+  console.log("[sm-mse] " + line);
+  const inv = window.__TAURI__?.core?.invoke;
+  if (inv) inv("mse_log", { line }).catch(() => {});
+}
+
 // ── dispatchChannelMessage ───────────────────────────────────────────────────
 // Module-scoped frame dispatcher, extracted from the inline onmessage closure
 // that was previously defined only inside main(). Extraction enables the R-6
@@ -599,11 +623,20 @@ function flushQueue() {
     sb.appendBuffer(next);
   } catch (e) {
     if (e.name === "QuotaExceededError") {
+      pending.unshift(next); // re-queue BEFORE counting so pending reflects the retry
+      // GATE-6 MSEO-2a: log quota branch separately (H1 smoking gun — currently 100% silent)
+      mseLog("event=append_quota pending=" + pending.length + " buffered=" + bufferedSummary(sb.buffered));
       trimSourceBuffer();
-      pending.unshift(next); // retry after trim
     } else {
       console.error("[mse] appendBuffer error", e);
     }
+    // GATE-6 MSEO-2a: log every appendBuffer error (quota + generic) with name/state
+    mseLog(
+      "event=append_error name=" + e.name +
+      " pending=" + pending.length +
+      " sb_updating=" + sb.updating +
+      " buffered=" + bufferedSummary(sb.buffered)
+    );
   }
 }
 
@@ -613,12 +646,25 @@ function trimSourceBuffer() {
   try {
     const cur = VIDEO_EL.currentTime;
     const cutoff = Math.max(0, cur - 30);
-    if (sb.buffered.length > 0 && sb.buffered.start(0) < cutoff) {
-      sb.remove(sb.buffered.start(0), cutoff);
+    const bufStart = sb.buffered.length > 0 ? sb.buffered.start(0) : null;
+    if (bufStart !== null && bufStart < cutoff) {
+      // GATE-6 MSEO-2b: log trim action=remove before sb.remove call
+      mseLog(
+        "event=trim action=remove cutoff=" + cutoff.toFixed(3) +
+        " buf_start=" + bufStart.toFixed(3)
+      );
+      sb.remove(bufStart, cutoff);
+    } else {
+      // GATE-6 MSEO-2b: log noop (H1 smoking gun — completely silent without this)
+      mseLog(
+        "event=trim action=noop cutoff=" + cutoff.toFixed(3) +
+        " buf_start=" + (bufStart !== null ? bufStart.toFixed(3) : "none")
+      );
     }
   } catch (e) {
     // Buffered/remove can throw if SourceBuffer detached — log once, don't spam.
     console.warn("[mse] trim skipped", e.name);
+    mseLog("event=trim action=throw name=" + e.name);
   }
 }
 
@@ -647,19 +693,35 @@ function seekToLiveEdge() {
   } catch (e) {
     return;
   }
-  const drift = bufEnd - VIDEO_EL.currentTime;
-  if (drift <= LIVE_EDGE_MAX_DRIFT_SEC) return;
+  const ct = VIDEO_EL.currentTime;
+  const drift = bufEnd - ct;
+  if (drift <= LIVE_EDGE_MAX_DRIFT_SEC) return; // guard_drift — silent per D-PPT6-4
   const target = bufEnd - LIVE_EDGE_TARGET_LEAD_SEC;
-  if (target <= VIDEO_EL.currentTime) return;
+  if (target <= ct) {
+    // GATE-6 MSEO-3: guard_backward logged (drift > threshold but target behind playhead)
+    mseLog(
+      "event=seek result=guard_backward from=" + ct.toFixed(3) +
+      " to=" + target.toFixed(3) +
+      " drift=" + drift.toFixed(3)
+    );
+    return;
+  }
   console.log(
-    "[mse] live-edge seek: " + VIDEO_EL.currentTime.toFixed(3) +
+    "[mse] live-edge seek: " + ct.toFixed(3) +
     " → " + target.toFixed(3) +
     " (drift was " + drift.toFixed(3) + "s)"
+  );
+  // GATE-6 MSEO-3: snap logged BEFORE the seek assignment
+  mseLog(
+    "event=seek result=snap from=" + ct.toFixed(3) +
+    " to=" + target.toFixed(3) +
+    " drift=" + drift.toFixed(3)
   );
   try {
     VIDEO_EL.currentTime = target;
   } catch (e) {
     console.warn("[mse] live-edge seek failed", e);
+    mseLog("event=seek result=throw from=" + ct.toFixed(3) + " to=" + target.toFixed(3) + " drift=" + drift.toFixed(3));
   }
 }
 
@@ -739,6 +801,8 @@ function applyInit(ms, data, frameBytes) {
   // Surface SourceBuffer error and updateend events so MSE failures are visible.
   sb.addEventListener("error", (e) => {
     console.error("[mse] SourceBuffer error event", e);
+    // GATE-6 MSEO-2c: log sb_error beside existing console.error (H4 discriminator)
+    mseLog("event=sb_error type=" + (e && e.type ? e.type : "unknown"));
   });
   sb.addEventListener("abort", () => {
     console.warn("[mse] SourceBuffer abort event");
@@ -916,6 +980,16 @@ async function main() {
       "buffered=" + (ranges.join(",") || "<none>"),
       curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
+    // GATE-6 MSEO-4: emit structured tick line (H1/H2/H3/H4 backbone signal)
+    mseLog(
+      "event=tick ct=" + VIDEO_EL.currentTime.toFixed(3) +
+      " paused=" + VIDEO_EL.paused +
+      " rs=" + VIDEO_EL.readyState +
+      " pending=" + mseState.pending.length +
+      " sb_updating=" + sb.updating +
+      " ms_rs=" + (curMs ? curMs.readyState : "null") +
+      " buffered=" + (ranges.join(",") || "<none>")
+    );
     seekToLiveEdge();
   }, 2000);
 
@@ -989,6 +1063,29 @@ async function main() {
   }
 }
 
+// ── GATE-6 global error visibility (MSEO-5) ──────────────────────────────────
+//
+// Additive listeners — NO preventDefault(), NO return true. Pure observers.
+// Installed before main() so module-load errors are captured (D-PPT6-5).
+// Named functions exported via __SCREEN_MIRROR_TEST_EXPORTS__ for direct
+// invocation in vitest (happy-dom dispatchEvent limitation per D-PPT6-5).
+
+function onWindowError(ev) {
+  mseLog(
+    "event=js_error src=" + (ev.filename || "-") +
+    " line=" + (ev.lineno || 0) +
+    " col=" + (ev.colno || 0) +
+    " msg=" + String(ev.message || "").slice(0, 200)
+  );
+}
+
+function onUnhandledRejection(ev) {
+  mseLog("event=unhandled_rejection reason=" + String(ev.reason || "").slice(0, 200));
+}
+
+window.addEventListener("error", onWindowError);
+window.addEventListener("unhandledrejection", onUnhandledRejection);
+
 main().catch((e) => setStatus("startup failed: " + e));
 
 // TEST EXPORT SEAM — do not remove. See tests/js/setup.test.js for rationale.
@@ -1002,5 +1099,9 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     LIVE_EDGE_MAX_DRIFT_SEC,
     LIVE_EDGE_TARGET_LEAD_SEC,
     mseState, // D-IR-8: expose for init-recovery drain assertions
+    mseLog,           // GATE-6: unit-test the helper contract (SC-MSE-LOG-10,11a,11b)
+    bufferedSummary,  // GATE-6: expose for direct test verification
+    onWindowError,    // GATE-6: direct invocation tests (D-PPT6-5 happy-dom limitation)
+    onUnhandledRejection, // GATE-6: direct invocation tests
   });
 }
