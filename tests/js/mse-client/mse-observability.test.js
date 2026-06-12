@@ -511,4 +511,98 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
       expect(reasonMatch[1].length).toBeLessThanOrEqual(200);
     });
   });
+
+  // SC-MSE-LOG-12: detached-SourceBuffer `buffered` getter throws InvalidStateError.
+  //
+  // Per the MSE spec, reading SourceBuffer.buffered on a detached/removed
+  // SourceBuffer throws InvalidStateError. bufferedSummary MUST read sb.buffered
+  // INSIDE its own try/catch (D-PPT6-3 signature bufferedSummary(sb)) so the getter
+  // throw is swallowed and emitted as buffered=-, and NO exception escapes the
+  // exception-safe channel pump (flushQueue quota + append_error paths) or the
+  // bare setInterval tick body (which would otherwise fire window.onerror →
+  // onWindowError → self-inflicted event=js_error spam polluting GATE-6).
+  //
+  // Install a throwing getter that replaces the plain `buffered` data property.
+  function installThrowingBuffered(target) {
+    Object.defineProperty(target, 'buffered', {
+      configurable: true,
+      get() {
+        throw new DOMException('SourceBuffer detached', 'InvalidStateError');
+      },
+    });
+  }
+
+  // (a) flushQueue quota branch: throwing getter → append_quota carries buffered=-,
+  //     append_error carries buffered=-, and dispatching the segment does NOT throw.
+  it('SC-MSE-LOG-12a: detached buffered getter in flushQueue quota branch → buffered=- on append_quota + append_error, no throw escapes', async () => {
+    sb.appendBuffer.mockImplementationOnce(() => {
+      throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+    });
+    sb.updating = false;
+    installThrowingBuffered(sb);
+
+    const ch = tauri.lastChannel();
+    const segment = new Uint8Array([0x01, 0xDE, 0xAD]);
+    // The channel onmessage pump is exception-safe: a getter throw escaping
+    // bufferedSummary would propagate out of flushQueue → enqueue → this dispatch.
+    expect(() => ch._dispatch(segment.buffer)).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const lines = getMseLogLines(tauri);
+    const quotaLine = lines.find((l) => l.startsWith('event=append_quota'));
+    expect(quotaLine).toBeTruthy();
+    expect(quotaLine).toMatch(/(^| )buffered=-( |$)/);
+
+    const errorLine = lines.find((l) => l.startsWith('event=append_error'));
+    expect(errorLine).toBeTruthy();
+    expect(errorLine).toMatch(/name=QuotaExceededError/);
+    expect(errorLine).toMatch(/(^| )buffered=-( |$)/);
+  });
+
+  // (b) flushQueue non-quota append_error branch: throwing getter → buffered=-,
+  //     and dispatching the segment does NOT throw.
+  it('SC-MSE-LOG-12b: detached buffered getter in flushQueue append_error branch → buffered=-, no throw escapes', async () => {
+    sb.appendBuffer.mockImplementationOnce(() => {
+      throw new DOMException('InvalidStateError', 'InvalidStateError');
+    });
+    sb.updating = false;
+    installThrowingBuffered(sb);
+
+    const ch = tauri.lastChannel();
+    const segment = new Uint8Array([0x01, 0xBE, 0xEF]);
+    expect(() => ch._dispatch(segment.buffer)).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const lines = getMseLogLines(tauri);
+    const errorLines = lines.filter((l) => l.startsWith('event=append_error'));
+    expect(errorLines.length).toBe(1);
+    expect(errorLines[0]).toMatch(/name=InvalidStateError/);
+    expect(errorLines[0]).toMatch(/(^| )buffered=-( |$)/);
+    // Non-quota path must not have produced an append_quota line.
+    expect(lines.some((l) => l.startsWith('event=append_quota'))).toBe(false);
+  });
+
+  // (c) heartbeat tick body: throwing getter → tick line carries buffered=-, and
+  //     NO exception escapes the bare setInterval body (which would fire
+  //     window.onerror → onWindowError → a self-inflicted event=js_error line).
+  it('SC-MSE-LOG-12c: detached buffered getter in 2s tick → buffered=-, no throw escapes tick body (no self-inflicted js_error)', async () => {
+    sb.updating = false;
+    installThrowingBuffered(sb);
+    videoEl.currentTime = 1.5;
+
+    tauri.invoke.mockClear();
+    // advanceTimersByTimeAsync rejects if the timer callback throws synchronously;
+    // a getter escaping bufferedSummary in the tick body would surface here.
+    await expect(vi.advanceTimersByTimeAsync(2000)).resolves.not.toThrow();
+    await Promise.resolve();
+
+    const lines = getMseLogLines(tauri);
+    const tickLines = lines.filter((l) => l.startsWith('event=tick'));
+    expect(tickLines.length).toBeGreaterThanOrEqual(1);
+    expect(tickLines[0]).toMatch(/(^| )buffered=-( |$)/);
+    // The tick body must NOT have produced a self-inflicted js_error line.
+    expect(lines.some((l) => l.startsWith('event=js_error'))).toBe(false);
+  });
 });
