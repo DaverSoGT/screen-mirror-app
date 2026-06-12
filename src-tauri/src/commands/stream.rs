@@ -9208,4 +9208,39 @@ mod tests {
              (8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2); got {seg_count}"
         );
     }
+
+    // ─── MSEO-1 RED: mse_log bridge command seam tests ───────────────────────
+    //
+    // These tests exercise the pure `format_mse_log` helper so that the
+    // `eprintln!`-based `mse_log` command can be verified without I/O mocking.
+
+    /// MSEO-1-SC1/SC2 — `format_mse_log` prepends the `[sm-mse]` prefix exactly.
+    /// RED: fails until `format_mse_log` is defined in stream.rs.
+    #[test]
+    fn format_mse_log_exact_prefix() {
+        assert_eq!(format_mse_log("x"), "[sm-mse] x");
+        assert_eq!(format_mse_log(""), "[sm-mse] ");
+        assert_eq!(
+            format_mse_log("event=tick ct=1.234 paused=false"),
+            "[sm-mse] event=tick ct=1.234 paused=false"
+        );
+    }
+
+    /// MSEO-1-SC3 — `format_mse_log` does not panic on hostile input.
+    /// RED: fails until `format_mse_log` is defined.
+    #[test]
+    fn format_mse_log_no_panic_on_hostile_input() {
+        // 1 MB string
+        let long = "a".repeat(1_000_000);
+        let result = format_mse_log(&long);
+        assert!(result.starts_with("[sm-mse] "), "must have prefix");
+        // Unicode multibyte chars
+        let unicode = "こんにちは世界 🎉";
+        let result2 = format_mse_log(unicode);
+        assert!(result2.starts_with("[sm-mse] "));
+        // Literal brace strings that could confuse format!() if misused
+        let braces = "{}  {line}  {0}";
+        let result3 = format_mse_log(braces);
+        assert_eq!(result3, "[sm-mse] {}  {line}  {0}");
+    }
 }
