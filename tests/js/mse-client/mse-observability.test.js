@@ -220,12 +220,17 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
 
     const quotaLine = lines.find((l) => l.startsWith('event=append_quota'));
     expect(quotaLine).toBeTruthy();
-    expect(quotaLine).toMatch(/pending=\d+/);
+    // Exact: the chunk is re-queued via pending.unshift BEFORE counting, so
+    // pending reflects the retry. Off-by-one mutant (read length before unshift)
+    // would emit pending=0 here — pin the exact post-unshift value to kill it.
+    expect(quotaLine).toMatch(/(^| )pending=1( |$)/);
     expect(quotaLine).toMatch(/buffered=/);
 
     const errorLine = lines.find((l) => l.startsWith('event=append_error'));
     expect(errorLine).toBeTruthy();
     expect(errorLine).toMatch(/name=QuotaExceededError/);
+    // The append_error line follows the quota branch's unshift; pending is still 1.
+    expect(errorLine).toMatch(/(^| )pending=1( |$)/);
   });
 
   // SC-MSE-LOG-2: Non-quota appendBuffer throw → one mse_log call.
@@ -394,8 +399,10 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
     });
   });
 
-  // SC-MSE-LOG-5: heartbeat 2s tick → mse_log with event=tick, all required fields.
-  it('SC-MSE-LOG-5: 2s tick fires → mse_log contains event=tick with pending, sb_updating, rs, ms_rs, buffered', async () => {
+  // SC-MSE-LOG-5: heartbeat 2s tick → mse_log with event=tick, exact field values.
+  // Exact assertions (not presence-only) so design-claimed mutants cannot survive:
+  // hardcoding sb_updating=false, dropping a field, or fudging ct/buffered all fail.
+  it('SC-MSE-LOG-5: 2s tick fires → mse_log event=tick with exact ct/sb_updating/pending/buffered values', async () => {
     sb.updating = false;
     sb.buffered = makeBuffered([[0, 3]]);
     // currentTime is settable on the mock video element from happy-dom.
@@ -410,13 +417,32 @@ describe('mse-client — GATE-6 call-site tests (SC-MSE-LOG-1..8)', () => {
     expect(tickLines.length).toBeGreaterThanOrEqual(1);
 
     const tick = tickLines[0];
-    expect(tick).toMatch(/ct=/);
-    expect(tick).toMatch(/paused=/);
+    // Exact values the fixture sets — not /\d/ presence-only.
+    expect(tick).toMatch(/(^| )ct=1\.500( |$)/);
+    expect(tick).toMatch(/(^| )paused=/);
     expect(tick).toMatch(/ rs=\d/);   // anchored: must not match ms_rs= substring
-    expect(tick).toMatch(/pending=/);
-    expect(tick).toMatch(/sb_updating=/);
-    expect(tick).toMatch(/ms_rs=/);
-    expect(tick).toMatch(/buffered=/);
+    expect(tick).toMatch(/(^| )pending=0( |$)/);     // queue drained after init
+    expect(tick).toMatch(/(^| )sb_updating=false( |$)/);
+    expect(tick).toMatch(/(^| )ms_rs=/);
+    expect(tick).toMatch(/(^| )buffered=\[0\.000→3\.000\]( |$)/);
+  });
+
+  // SC-MSE-LOG-5b: sb_updating reflects the live SourceBuffer state — a tick with
+  // sb.updating=true MUST emit sb_updating=true. Kills the hardcode-false mutant
+  // that SC-MSE-LOG-5's false-case alone cannot catch.
+  it('SC-MSE-LOG-5b: 2s tick with sb.updating=true → mse_log event=tick sb_updating=true', async () => {
+    sb.updating = true;
+    sb.buffered = makeBuffered([[0, 3]]);
+    videoEl.currentTime = 2.0;
+
+    tauri.invoke.mockClear();
+    await vi.advanceTimersByTimeAsync(2000);
+    await Promise.resolve();
+
+    const lines = getMseLogLines(tauri);
+    const tickLines = lines.filter((l) => l.startsWith('event=tick'));
+    expect(tickLines.length).toBeGreaterThanOrEqual(1);
+    expect(tickLines[0]).toMatch(/(^| )sb_updating=true( |$)/);
   });
 
   // SC-MSE-LOG-6: SourceBuffer "error" event → mse_log with event=sb_error.

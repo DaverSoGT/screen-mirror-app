@@ -9258,4 +9258,28 @@ mod tests {
         let result3 = format_mse_log(braces);
         assert_eq!(result3, "[sm-mse] {}  {line}  {0}");
     }
+
+    /// MSEO-1-SC4 — `format_mse_log` collapses interior newlines so one call
+    /// always emits exactly one stderr line (one-event-per-line contract).
+    /// Defense-in-depth for the JS-side newline strip: even a newline-bearing
+    /// line that slips through must not split into multiple log lines.
+    #[test]
+    fn format_mse_log_collapses_interior_newlines_to_single_line() {
+        // \n, \r, and \r\n inside the payload must become spaces.
+        let input = "event=js_error msg=line1\nline2\rline3\r\nline4";
+        let result = format_mse_log(input);
+        // Exactly one line: the result itself must contain no raw \n or \r.
+        assert!(!result.contains('\n'), "no raw newline in output");
+        assert!(!result.contains('\r'), "no raw carriage return in output");
+        assert_eq!(result.lines().count(), 1, "must be exactly one line");
+        assert_eq!(
+            result,
+            "[sm-mse] event=js_error msg=line1 line2 line3 line4"
+        );
+
+        // Trailing/leading newlines also collapse to spaces (no empty splits).
+        let trailing = format_mse_log("event=tick\n");
+        assert!(!trailing.contains('\n'));
+        assert_eq!(trailing.lines().count(), 1);
+    }
 }
