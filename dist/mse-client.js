@@ -642,29 +642,40 @@ function flushQueue() {
 
 function trimSourceBuffer() {
   const sb = mseState.sb;
-  if (!sb || sb.updating || !VIDEO_EL) return;
+  if (!sb || !VIDEO_EL) return;
+  // GATE-6 MSEO-2b / D-PPT6-3 #3: log action=busy when SourceBuffer is mid-update
+  // (H4 discriminator — silent in original code; now emitted for gate diagnostics).
+  if (sb.updating) {
+    mseLog("event=trim action=busy cutoff=- buf_start=- name=-");
+    return;
+  }
   try {
     const cur = VIDEO_EL.currentTime;
     const cutoff = Math.max(0, cur - 30);
     const bufStart = sb.buffered.length > 0 ? sb.buffered.start(0) : null;
     if (bufStart !== null && bufStart < cutoff) {
-      // GATE-6 MSEO-2b: log trim action=remove before sb.remove call
+      // GATE-6 MSEO-2b: log trim action=remove before sb.remove call.
+      // name=- sentinel per D-PPT6-3 NFR-2 (absent fields use "-", not omission).
       mseLog(
         "event=trim action=remove cutoff=" + cutoff.toFixed(3) +
-        " buf_start=" + bufStart.toFixed(3)
+        " buf_start=" + bufStart.toFixed(3) +
+        " name=-"
       );
       sb.remove(bufStart, cutoff);
     } else {
-      // GATE-6 MSEO-2b: log noop (H1 smoking gun — completely silent without this)
+      // GATE-6 MSEO-2b: log noop (H1 smoking gun — completely silent without this).
+      // name=- sentinel per D-PPT6-3 NFR-2.
       mseLog(
         "event=trim action=noop cutoff=" + cutoff.toFixed(3) +
-        " buf_start=" + (bufStart !== null ? bufStart.toFixed(3) : "none")
+        " buf_start=" + (bufStart !== null ? bufStart.toFixed(3) : "none") +
+        " name=-"
       );
     }
   } catch (e) {
     // Buffered/remove can throw if SourceBuffer detached — log once, don't spam.
+    // cutoff=- buf_start=- sentinels per D-PPT6-3 NFR-2 (values not reachable in catch).
     console.warn("[mse] trim skipped", e.name);
-    mseLog("event=trim action=throw name=" + e.name);
+    mseLog("event=trim action=throw cutoff=- buf_start=- name=" + e.name);
   }
 }
 
