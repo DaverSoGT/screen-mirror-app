@@ -193,14 +193,20 @@ const FRAME_STATUS = 0x02;
 
 // ── GATE-6 observability helpers ─────────────────────────────────────────────
 //
-// bufferedSummary — formats a TimeRanges object into a compact log string.
-// Returns comma-joined "[start→end]" ranges (each .toFixed(3)) or "<none>"
-// when buffered.length === 0. Pure function, no side effects (D-PPT6-3).
-function bufferedSummary(buffered) {
-  // Telemetry-only: reading a TimeRanges getter on a detached SourceBuffer can
-  // throw InvalidStateError. Swallow any getter throw and return the "-" N/A
-  // sentinel so this never escapes into the exception-safe channel pump / tick.
+// bufferedSummary — formats a SourceBuffer's TimeRanges into a compact log
+// string. Returns comma-joined "[start→end]" ranges (each .toFixed(3)) or
+// "<none>" when buffered.length === 0. Pure function, no side effects (D-PPT6-3).
+//
+// Takes the SourceBuffer (NOT the dereferenced TimeRanges) so the `sb.buffered`
+// property getter is read INSIDE this try/catch. Per the MSE spec the getter
+// throws InvalidStateError on a detached SourceBuffer; reading it in the caller
+// would put the throw outside this guard, escaping the exception-safe channel
+// pump (flushQueue catch) and the heartbeat tick body.
+function bufferedSummary(sb) {
+  // Telemetry-only: swallow any getter throw and return the "-" N/A sentinel so
+  // this never escapes into the exception-safe channel pump / tick.
   try {
+    const buffered = sb && sb.buffered;
     if (!buffered || buffered.length === 0) return "<none>";
     const parts = [];
     for (let i = 0; i < buffered.length; i++) {
@@ -644,19 +650,21 @@ function flushQueue() {
     if (e.name === "QuotaExceededError") {
       pending.unshift(next); // re-queue BEFORE counting so pending reflects the retry
       // GATE-6 MSEO-2a: log quota branch separately (H1 smoking gun — currently 100% silent)
-      mseLog("event=append_quota pending=" + pending.length + " buffered=" + bufferedSummary(sb.buffered));
+      mseLog("event=append_quota pending=" + pending.length + " buffered=" + bufferedSummary(sb));
       trimSourceBuffer();
     } else {
       console.error("[mse] appendBuffer error", e);
     }
     // GATE-6 MSEO-2a: log every appendBuffer error (quota + generic) with name/state.
-    // sb_updating read defensively: a detached SourceBuffer can throw on the getter,
-    // and this catch handler must stay exception-free (escapes would hit the channel pump).
+    // sb_updating (updatingFlag) and buffered (bufferedSummary) both take the
+    // SourceBuffer and read its getter INSIDE their own try/catch — a detached
+    // SourceBuffer throws InvalidStateError on either getter, so reading them here
+    // would escape this catch handler into the exception-safe channel pump.
     mseLog(
       "event=append_error name=" + e.name +
       " pending=" + pending.length +
       " sb_updating=" + updatingFlag(sb) +
-      " buffered=" + bufferedSummary(sb.buffered)
+      " buffered=" + bufferedSummary(sb)
     );
   }
 }
@@ -1013,9 +1021,11 @@ async function main() {
       curMs ? "ms.readyState=" + curMs.readyState : "ms=null"
     );
     // GATE-6 MSEO-4: emit structured tick line (H1/H2/H3/H4 backbone signal).
-    // sb_updating read defensively (detached SB can throw) and buffered routed
-    // through bufferedSummary so getter throws are swallowed internally — this
-    // setInterval body must stay exception-free exactly like the original code.
+    // sb_updating (updatingFlag) and buffered (bufferedSummary) both take the
+    // SourceBuffer and read its getter INSIDE their own try/catch, so a detached
+    // SourceBuffer's InvalidStateError throw is swallowed there and never escapes
+    // this bare setInterval body (an escape would fire window.onerror →
+    // onWindowError → a self-inflicted event=js_error line every 2s).
     mseLog(
       "event=tick ct=" + VIDEO_EL.currentTime.toFixed(3) +
       " paused=" + VIDEO_EL.paused +
@@ -1023,7 +1033,7 @@ async function main() {
       " pending=" + mseState.pending.length +
       " sb_updating=" + updatingFlag(sb) +
       " ms_rs=" + (curMs ? curMs.readyState : "null") +
-      " buffered=" + bufferedSummary(sb.buffered)
+      " buffered=" + bufferedSummary(sb)
     );
     seekToLiveEdge();
   }, 2000);
