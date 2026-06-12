@@ -19,6 +19,7 @@ pub fn run() {
             commands::stream::attach_stream,
             commands::stream::stream_diagnostics,
             commands::stream::retry_session_stream,
+            commands::stream::mse_log,
             commands::sender::start_sender,
             commands::sender::stop_sender,
             commands::sender::sender_diagnostics,

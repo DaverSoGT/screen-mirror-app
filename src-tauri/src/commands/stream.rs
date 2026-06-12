@@ -3130,6 +3130,38 @@ pub fn retry_session_stream(
     retry_session_stream_inner(&bridge, channel_arc)
 }
 
+// ─── mse_log bridge command ───────────────────────────────────────────────────
+//
+// Receives a bare log line from the JS MSE client and emits it to stderr
+// with the [sm-mse] prefix so the GATE-6 Tee log can grep on that prefix.
+// Fire-and-forget: no return value, no panic on any input (D-PPT6-1).
+
+pub(crate) fn format_mse_log(line: &str) -> String {
+    // Defense-in-depth for the one-event-per-line contract: even if a
+    // newline-bearing line slips past the JS-side strip, collapse interior
+    // runs of `\n`/`\r` to a single space so one call always emits exactly one
+    // stderr line. Mirrors the JS-side `.replace(/[\r\n]+/g, " ")` collapse.
+    let mut sanitized = String::with_capacity(line.len());
+    let mut prev_was_newline = false;
+    for c in line.chars() {
+        if c == '\n' || c == '\r' {
+            if !prev_was_newline {
+                sanitized.push(' ');
+            }
+            prev_was_newline = true;
+        } else {
+            sanitized.push(c);
+            prev_was_newline = false;
+        }
+    }
+    format!("[sm-mse] {sanitized}")
+}
+
+#[tauri::command]
+pub fn mse_log(line: String) {
+    eprintln!("{}", format_mse_log(&line));
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -9207,5 +9239,64 @@ mod tests {
             "exactly {EXPECTED_SEGMENTS} FRAME_SEGMENT must be emitted \
              (8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2); got {seg_count}"
         );
+    }
+
+    // ─── MSEO-1 RED: mse_log bridge command seam tests ───────────────────────
+    //
+    // These tests exercise the pure `format_mse_log` helper so that the
+    // `eprintln!`-based `mse_log` command can be verified without I/O mocking.
+
+    /// MSEO-1-SC1/SC2 — `format_mse_log` prepends the `[sm-mse]` prefix exactly.
+    /// RED: fails until `format_mse_log` is defined in stream.rs.
+    #[test]
+    fn format_mse_log_exact_prefix() {
+        assert_eq!(format_mse_log("x"), "[sm-mse] x");
+        assert_eq!(format_mse_log(""), "[sm-mse] ");
+        assert_eq!(
+            format_mse_log("event=tick ct=1.234 paused=false"),
+            "[sm-mse] event=tick ct=1.234 paused=false"
+        );
+    }
+
+    /// MSEO-1-SC3 — `format_mse_log` does not panic on hostile input.
+    /// RED: fails until `format_mse_log` is defined.
+    #[test]
+    fn format_mse_log_no_panic_on_hostile_input() {
+        // 1 MB string
+        let long = "a".repeat(1_000_000);
+        let result = format_mse_log(&long);
+        assert!(result.starts_with("[sm-mse] "), "must have prefix");
+        // Unicode multibyte chars
+        let unicode = "こんにちは世界 🎉";
+        let result2 = format_mse_log(unicode);
+        assert!(result2.starts_with("[sm-mse] "));
+        // Literal brace strings that could confuse format!() if misused
+        let braces = "{}  {line}  {0}";
+        let result3 = format_mse_log(braces);
+        assert_eq!(result3, "[sm-mse] {}  {line}  {0}");
+    }
+
+    /// MSEO-1-SC4 — `format_mse_log` collapses interior newlines so one call
+    /// always emits exactly one stderr line (one-event-per-line contract).
+    /// Defense-in-depth for the JS-side newline strip: even a newline-bearing
+    /// line that slips through must not split into multiple log lines.
+    #[test]
+    fn format_mse_log_collapses_interior_newlines_to_single_line() {
+        // \n, \r, and \r\n inside the payload must become spaces.
+        let input = "event=js_error msg=line1\nline2\rline3\r\nline4";
+        let result = format_mse_log(input);
+        // Exactly one line: the result itself must contain no raw \n or \r.
+        assert!(!result.contains('\n'), "no raw newline in output");
+        assert!(!result.contains('\r'), "no raw carriage return in output");
+        assert_eq!(result.lines().count(), 1, "must be exactly one line");
+        assert_eq!(
+            result,
+            "[sm-mse] event=js_error msg=line1 line2 line3 line4"
+        );
+
+        // Trailing/leading newlines also collapse to spaces (no empty splits).
+        let trailing = format_mse_log("event=tick\n");
+        assert!(!trailing.contains('\n'));
+        assert_eq!(trailing.lines().count(), 1);
     }
 }
