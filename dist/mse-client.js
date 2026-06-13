@@ -48,6 +48,35 @@ const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.3;
 // Minimum required gap between bufEnd and computed snap target (loop-protection
 // on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
 const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
+// Stall-snap debounce window: suppress a 'waiting'-triggered snap if one already
+// executed within this many ms (kills the 95% back-to-back self-retrigger storm,
+// GATE-7). FIXED, short on purpose — prioritizes fast genuine-stall recovery; the
+// GATE-6 max feed gap (258 ms) fits just under it. Bypassed only on hard
+// starvation (rs<=1, D-PPT8-4); the effectiveness guard still gates that path.
+const LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS = 300;
+// ── Stall-snap storm debounce / effectiveness state (Slice 8, D-PPT8-1) ──────
+// Tracks the LAST EXECUTED stall snap (NOT the last 'waiting' event) so the
+// debounce window + effectiveness guard rate-limit the self-retrigger storm.
+// Lifetime = module load → reset only by vi.resetModules() in tests; PERSISTS
+// across tearDownMse/setUpMse (session-cumulative; see D-PPT8-7).
+const ADV_EPS = 1e-3; // 1 ms; below toFixed(3) log resolution and frame time (33 ms @30fps)
+let lastSnapAtMs    = -Infinity; // performance.now() of last EXECUTED snap
+let lastSnapCt      = -Infinity; // VIDEO_EL.currentTime captured at that snap
+let lastSnapBufEnd  = -Infinity; // buffered end captured at that snap
+let suppressedDebounceCount = 0; // monotonic; appended to event=tick
+let suppressedGuardCount    = 0; // monotonic; appended to event=tick
+function getSuppressedDebounceCount() { return suppressedDebounceCount; }
+function getSuppressedGuardCount()    { return suppressedGuardCount; }
+// State-seeding helper for tests (seam surface, D-PPT8-9).
+function setLastSnapState({ lastSnapAtMs: atMs, lastSnapCt: ct, lastSnapBufEnd: bufEnd }) {
+  lastSnapAtMs   = atMs;
+  lastSnapCt     = ct;
+  lastSnapBufEnd = bufEnd;
+}
+// State-reading helper for tests (seam surface, D-PPT8-9).
+function getLastSnapState() {
+  return { lastSnapAtMs, lastSnapCt, lastSnapBufEnd };
+}
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
 // Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
@@ -800,9 +829,29 @@ function onVideoWaiting() {
   } catch {
     return;
   }
+  // Entry locals — captured once for both new guards and existing computation.
+  const ct          = VIDEO_EL.currentTime;
+  const target      = Math.max(lastStart, bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC);
+  const now         = performance.now();
+  const hardStarve  = VIDEO_EL.readyState <= 1;
+  // N1 EFFECTIVENESS GUARD (runs first — gates ALL paths including escape hatch).
+  // Suppresses futile re-snaps where neither ct nor bufEnd has advanced by > ADV_EPS
+  // since the last EXECUTED snap baseline (the 147x dead-position storm, GATE-7).
+  const advanced = (ct > lastSnapCt + ADV_EPS) || (bufEnd > lastSnapBufEnd + ADV_EPS);
+  if (!advanced) { suppressedGuardCount++; return; }
+  // N2 DEBOUNCE GUARD (escape-hatch-bypassable on rs<=1).
+  // Collapses the 95% back-to-back storm by rate-limiting to one snap per 300 ms.
+  // rs<=1 (HAVE_NOTHING | HAVE_METADATA) = genuine hard starvation: instant recovery
+  // must not be delayed. Bypassing ONLY this guard; N1 already passed above.
+  if (!hardStarve && (now - lastSnapAtMs) < LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS) {
+    suppressedDebounceCount++;
+    return;
+  }
+  // N3 NO-OP KILL: eliminates the 438 exact seek-to-self events (target===ct).
+  // Placed after target is computed and before G6 so these events are attributed
+  // to suppressedGuardCount rather than silently disappearing in the S7 cushion path.
+  if (target === ct) { suppressedGuardCount++; return; }
   // G6: cushion guard — prevent tight replay loops on sliver ranges.
-  const ct     = VIDEO_EL.currentTime;
-  const target = Math.max(lastStart, bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC);
   if (bufEnd - target < LIVE_EDGE_STALL_MIN_CUSHION_SEC) return;
   // Log BEFORE assignment (seekToLiveEdge precedent, D-PPT7-3).
   const drift = bufEnd - ct;
@@ -821,6 +870,11 @@ function onVideoWaiting() {
       " drift=" + drift.toFixed(3)
     );
   }
+  // Record the executed (or attempted) snap — prevents retry-storm on
+  // a persistently-throwing setter (belt-and-suspenders per D-PPT8-2 step 4 rationale).
+  lastSnapAtMs   = now;
+  lastSnapCt     = ct;
+  lastSnapBufEnd = bufEnd;
 }
 
 // ── applyInit — commit an init segment to an open MediaSource (D-IR-3) ───────
@@ -1094,7 +1148,9 @@ async function main() {
       " pending=" + mseState.pending.length +
       " sb_updating=" + updatingFlag(sb) +
       " ms_rs=" + (curMs ? curMs.readyState : "null") +
-      " buffered=" + bufferedSummary(sb)
+      " buffered=" + bufferedSummary(sb) +
+      " suppressed_debounce=" + suppressedDebounceCount +
+      " suppressed_guard=" + suppressedGuardCount
     );
     seekToLiveEdge();
   }, 2000);
@@ -1222,5 +1278,12 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     LIVE_EDGE_STALL_SNAP_LEAD_SEC,   // S7-1: constant verification
     LIVE_EDGE_STALL_MIN_CUSHION_SEC, // S7-1: constant verification
     onVideoWaiting,                  // S7-5: handler exported for direct test invocation
+    LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS, // S8-1: debounce window constant (=== 300)
+    ADV_EPS,                          // S8-1: effectiveness epsilon (=== 1e-3)
+    getSuppressedDebounceCount,       // S8-8: getter fn for live debounce counter
+    getSuppressedGuardCount,          // S8-8: getter fn for live guard counter
+    setLastSnapState,                 // S8-8: state-seeding helper for tests
+    getLastSnapState,                 // S8-8: state-reading helper for tests
+    tearDownMse,                      // S8-8: for session-cumulative lifetime test (T-S8-28)
   });
 }
