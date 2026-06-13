@@ -431,12 +431,12 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
 // ── Slice 8: Snap-Storm Debounce + Effectiveness Guard (T-S8-1..29) ───────────
 //
-// Harness reuses the Slice-7 setup pattern:
-//   vi.useFakeTimers()  in beforeEach — controls performance.now() for debounce window
-//   vi.useRealTimers()  in afterEach
-//   vi.resetModules()   in beforeEach — fresh module-scope state per test
+// Harness reuses the Slice-7 setup pattern with one critical addition:
+//   vi.useFakeTimers() does NOT advance performance.now() in vitest 2.1 + happy-dom.
+//   Instead, tests use vi.spyOn(performance, 'now') via the harness perfNow helper.
 //
 // Key Slice-8 helpers:
+//   h.perfNow(ms)   — set the value that performance.now() will return (spy-based)
 //   exports.setLastSnapState({lastSnapAtMs, lastSnapCt, lastSnapBufEnd})
 //     — seeds the module-level debounce / effectiveness state
 //   exports.getLastSnapState()
@@ -452,8 +452,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 // regex-match on the filtered subset.
 
 // ── Shared harness factory for Slice-8 describe blocks ─────────────────────────
-// Returns { tauri, exports, videoEl, sb, _restoreFns, overrideProperty }
-// after completing the standard import + init sequence with fake timers.
+// Returns { tauri, exports, videoEl, sb, _restoreFns, overrideProperty, perfNow }
+// perfNow(ms) — sets the value performance.now() will return (spy controlled).
 async function makeS8Harness() {
   installDom();
   const tauri = installTauriMock();
@@ -480,8 +480,26 @@ async function makeS8Harness() {
   sb.updating = false;
   sb.buffered = makeBuffered(0, 10.030);
   videoEl.currentTime = 10.016;
+  // readyState is getter-only in happy-dom; override via defineProperty.
+  // Default = 4 (HAVE_ENOUGH_DATA) so N2 debounce is NOT bypassed by the
+  // hardStarve escape hatch (rs <= 1). Tests that need rs<=1 use overrideProperty.
+  const _readyStateOrig = Object.getOwnPropertyDescriptor(videoEl, 'readyState');
+  Object.defineProperty(videoEl, 'readyState', { value: 4, configurable: true });
 
-  const _restoreFns = [];
+  // performance.now() spy: vi.advanceTimersByTime does NOT advance performance.now()
+  // in vitest 2.1 + happy-dom. Use a spy with a controlled value instead.
+  let _fakeNow = 0;
+  const _perfSpy = vi.spyOn(performance, 'now').mockImplementation(() => _fakeNow);
+  function perfNow(ms) { _fakeNow = ms; }
+
+  const _restoreFns = [
+    () => _perfSpy.mockRestore(),
+    () => {
+      if (_readyStateOrig) {
+        Object.defineProperty(videoEl, 'readyState', _readyStateOrig);
+      }
+    },
+  ];
   function overrideProperty(obj, prop, descriptor) {
     const orig = Object.getOwnPropertyDescriptor(obj, prop);
     Object.defineProperty(obj, prop, { ...descriptor, configurable: true });
@@ -494,7 +512,7 @@ async function makeS8Harness() {
     });
   }
 
-  return { tauri, exports, videoEl, sb, _restoreFns, overrideProperty };
+  return { tauri, exports, videoEl, sb, _restoreFns, overrideProperty, perfNow };
 }
 
 function teardownS8Harness(h) {
@@ -545,9 +563,10 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
   it('T-S8-2: first snap — lastSnapAtMs=-Infinity — N1+N2 bypass, snap executes; counters both 0', () => {
     // Fresh module: lastSnapCt=-Inf, lastSnapBufEnd=-Inf, lastSnapAtMs=-Inf
     // N1: ct(10.016) > -Inf + 1e-3 = true → passes
-    // N2: now(0) - (-Inf) = +Inf >= 300 → not debounced → passes
+    // N2: now(any) - (-Inf) = +Inf >= 300 → not debounced → passes
     // N3: target=9.730 != ct=10.016 → passes
     // G6: 10.030-9.730=0.300 >= 0.1 → passes → snap executes
+    h.perfNow(100); // arbitrary; any value: Inf elapsed from -Inf baseline
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
 
@@ -565,14 +584,16 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
 
   // T-S8-25: State NOT updated on suppressed snap — write rule (S8-2-SC2)
   it('T-S8-25: state NOT updated on N1-suppressed snap; getLastSnapState unchanged from snap#1', () => {
-    // Snap#1: executes, records lastSnapCt=10.016, lastSnapBufEnd=10.030
+    // Snap#1: executes at perfNow=100, records lastSnapCt=10.016, lastSnapBufEnd=10.030
+    h.perfNow(100);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
-    // After snap#1: lastSnapCt=10.016, lastSnapBufEnd=10.030
+    // After snap#1: lastSnapCt=10.016, lastSnapBufEnd=10.030, lastSnapAtMs=100
 
     // Trigger N1 suppression: ct and bufEnd NOT advanced past ADV_EPS
     // (ct=10.016 unchanged, bufEnd=10.030 unchanged → N1 fires)
+    h.perfNow(500); // well outside debounce window (N2 would pass if N1 didn't fire first)
     tauri_clearInvoke(h.tauri);
     h.exports.onVideoWaiting();
 
@@ -582,17 +603,19 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
     const state = h.exports.getLastSnapState();
     expect(state.lastSnapCt).toBeCloseTo(10.016, 5);
     expect(state.lastSnapBufEnd).toBeCloseTo(10.030, 5);
+    expect(state.lastSnapAtMs).toBe(100); // unchanged from snap#1
   });
 
   // T-S8-26: State IS updated on executed snap (S8-7 / S8-2)
   it('T-S8-26: state IS updated after executed snap#2; getLastSnapState reflects snap#2 values', () => {
-    // Snap#1: executes
+    // Snap#1: executes at perfNow=100
+    h.perfNow(100);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
 
-    // Advance time >= 300ms (pass N2), advance ct and bufEnd past ADV_EPS (pass N1)
-    vi.advanceTimersByTime(350);
+    // Advance perfNow past debounce (400 = 300ms elapsed), advance ct and bufEnd > ADV_EPS
+    h.perfNow(500); // 500-100=400 >= 300 → N2 passes
     const bufEnd2 = 10.030 + 0.500; // 10.530
     const ct2 = 10.016 + 0.300;    // 10.316
     h.sb.buffered = makeBuffered(0, bufEnd2);
@@ -600,12 +623,11 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
 
     h.exports.onVideoWaiting();
 
-    // Snap#2 should have executed
+    // Snap#2 should have executed — state updated to snap#2 values
     const state = h.exports.getLastSnapState();
     expect(state.lastSnapCt).toBeCloseTo(ct2, 5);
     expect(state.lastSnapBufEnd).toBeCloseTo(bufEnd2, 5);
-    // lastSnapAtMs should be ~350 (performance.now after advanceTimersByTime(350))
-    expect(state.lastSnapAtMs).toBeGreaterThan(0);
+    expect(state.lastSnapAtMs).toBe(500); // now at snap#2 perfNow
   });
 });
 
@@ -623,35 +645,33 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
 
   // T-S8-3: snap inside 300ms window → N2 fires (S8-3-SC1)
   it('T-S8-3: snap#2 at T+50ms (inside 300ms window) → N2 fires; debounce count = 1', () => {
-    // Snap#1: executes at now=0
+    // Snap#1: executes at perfNow=0 (lastSnapAtMs=0)
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
 
-    // Advance 50ms (inside window). Advance ct and bufEnd past ADV_EPS so N1 passes.
-    vi.advanceTimersByTime(50);
+    // Snap#2: perfNow=50 (50ms elapsed < 300ms). Advance ct/bufEnd > ADV_EPS so N1 passes.
+    h.perfNow(50);
     h.sb.buffered = makeBuffered(0, 10.032);  // bufEnd advanced by 2ms > ADV_EPS=1ms
     h.videoEl.currentTime = 10.018;            // ct advanced by 2ms > ADV_EPS=1ms
 
     const ctBefore = h.videoEl.currentTime;
     h.exports.onVideoWaiting();
 
-    // N2 fires: no seek
+    // N2 fires: no seek, debounce count = 1
     expect(h.videoEl.currentTime).toBe(ctBefore);
     expect(h.exports.getSuppressedDebounceCount()).toBe(1);
-    // No stall_snap log emitted for this call
-    const lines = getMseLogLines(h.tauri).filter((l) => l.includes('result=stall_snap'));
-    // snap#1 line is still present from before; we want only the count since snap#2
-    // Use the fact that debounce count is 1 (already asserted above)
   });
 
   // T-S8-4: snap outside 300ms window → N2 does NOT fire (S8-3-SC2)
   it('T-S8-4: snap#2 at T+350ms (outside window) → N2 does not fire; snap executes', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // snap#1: lastSnapAtMs=0
 
-    vi.advanceTimersByTime(350); // outside 300ms window
+    h.perfNow(350); // 350 - 0 = 350 >= 300 → N2 does not fire
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
 
@@ -659,17 +679,17 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
 
     // Snap executes: debounce count unchanged at 0
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    // currentTime was updated to new target
     expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
   });
 
   // T-S8-5: snap at exactly 300ms boundary → NOT suppressed (S8-3-SC3)
   it('T-S8-5: snap#2 at T+300ms exactly (boundary) → N2 does not fire; snap executes', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // snap#1: lastSnapAtMs=0
 
-    vi.advanceTimersByTime(300); // exactly 300ms (elapsed >= 300 → not suppressed)
+    h.perfNow(300); // 300 - 0 = 300 >= 300 → NOT suppressed (boundary)
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
 
@@ -681,17 +701,18 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
 
   // T-S8-17: 3 consecutive N2 suppressions → debounce count = 3 (S8-6-SC1)
   it('T-S8-17: 3 consecutive N2 suppressions in window → getSuppressedDebounceCount() === 3', () => {
-    // Snap#1: executes at t=0
+    // Snap#1: executes at perfNow=0
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
     let bufEnd = 10.030;
     let ct = 10.016;
 
-    // 3 snaps inside 300ms window, each with ct/bufEnd advanced > ADV_EPS to pass N1
+    // 3 snaps inside 300ms window (perfNow stays < 300), each with ct/bufEnd > ADV_EPS
     for (let i = 0; i < 3; i++) {
-      vi.advanceTimersByTime(30); // 30ms each, well inside 300ms
+      h.perfNow((i + 1) * 30); // 30ms, 60ms, 90ms — all inside 300ms window
       bufEnd += 0.002; // advance by 2ms > ADV_EPS
       ct += 0.002;
       h.sb.buffered = makeBuffered(0, bufEnd);
@@ -712,30 +733,32 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
   // T-S8-6: rs=1 inside window, N1 passes → N2 bypassed, snap executes (S8-3-SC4)
   it('T-S8-6: rs=1 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting(); // snap#1 at t=0
+    h.exports.onVideoWaiting(); // snap#1 at perfNow=0; lastSnapAtMs=0
 
-    vi.advanceTimersByTime(50); // inside 300ms
+    // perfNow=50: 50ms elapsed < 300ms (inside window); hardStarve=true → bypasses N2
+    h.perfNow(50);
     h.sb.buffered = makeBuffered(0, 10.032);
-    h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS
-    // Set readyState to 1 (HAVE_METADATA, hardStarve=true)
+    h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 1, configurable: true });
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed: snap executes, debounce count unchanged
+    // N2 bypassed: snap executes, debounce count unchanged at 0
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
     expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
   });
 
   // T-S8-7: rs=1 inside window, NO ct/bufEnd progress → N1 fires first (S8-3-SC5)
   it('T-S8-7: rs=1 inside window, no ct/bufEnd progress → N1 fires; suppressedGuardCount++; N2 NOT reached', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting(); // snap#1 at t=0; records ct=10.016, bufEnd=10.030
+    h.exports.onVideoWaiting(); // snap#1; records ct=10.016, bufEnd=10.030
 
-    vi.advanceTimersByTime(50);
+    h.perfNow(50); // inside 300ms window
     // ct and bufEnd NOT advanced (still at snap#1 baseline)
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
@@ -743,18 +766,19 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
     h.exports.onVideoWaiting();
 
-    // N1 fires: suppressedGuardCount incremented; N2 NOT reached
+    // N1 fires first: suppressedGuardCount incremented; N2 NOT reached
     expect(h.exports.getSuppressedGuardCount()).toBe(1);
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
   });
 
   // T-S8-8: rs=2 inside window → N2 applies (rs=2 NOT escape hatch) (S8-3-SC6)
   it('T-S8-8: rs=2 inside 300ms window, ct/bufEnd advanced → N2 fires (rs=2 is NOT escape hatch)', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1
 
-    vi.advanceTimersByTime(50);
+    h.perfNow(50); // inside 300ms
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
     Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 NOT escape hatch
@@ -766,11 +790,12 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
   // T-S8-9: rs=0 inside window, ct/bufEnd advanced → N2 bypassed (rs=0 <= 1) (S8-3-SC7)
   it('T-S8-9: rs=0 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1
 
-    vi.advanceTimersByTime(50);
+    h.perfNow(50); // inside 300ms
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
     Object.defineProperty(h.videoEl, 'readyState', { value: 0, configurable: true }); // rs=0 <= 1
@@ -783,11 +808,12 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
   // T-S8-24: rs=1 inside window, no progress → N1 fires (suppressedGuardCount++), NOT N2 (S8-7-SC3)
   it('T-S8-24: rs=1 inside window, no ct/bufEnd progress → N1 fires (suppressedGuard++); N2 NOT reached (suppressedDebounce unchanged)', () => {
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1 records state
 
-    vi.advanceTimersByTime(50);
+    h.perfNow(50); // inside 300ms
     // No progress: ct and bufEnd at same values as snap#1
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
@@ -809,11 +835,10 @@ describe('stall-snap — Slice 8 N1 effectiveness guard (T-S8-10..14, T-S8-18)',
 
   beforeEach(async () => {
     h = await makeS8Harness();
-    // Seed state: lastSnapCt=5.000, lastSnapBufEnd=5.300; lastSnapAtMs=0 (so elapsed=0 initially)
-    // We'll advance time past debounce to avoid N2 interference unless specifically testing it.
+    // Seed state: lastSnapCt=5.000, lastSnapBufEnd=5.300; lastSnapAtMs=0
+    // perfNow set to 350 so N2 sees elapsed=350-0=350>=300 (outside window) — N2 will not fire.
     h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 5.000, lastSnapBufEnd: 5.300 });
-    // Advance past 300ms debounce window so N2 does not interfere with N1 tests
-    vi.advanceTimersByTime(350);
+    h.perfNow(350); // outside 300ms debounce window
     // Set a good buffer geometry (will be overridden per test)
     h.sb.buffered = makeBuffered(0, 10.030);
   });
@@ -900,23 +925,23 @@ describe('stall-snap — Slice 8 N3 no-op kill (T-S8-15..16)', () => {
 
   beforeEach(async () => {
     h = await makeS8Harness();
-    // Advance past debounce window and seed state with a baseline far from current geometry
+    // Seed state with baseline far from test geometry; perfNow=350 → N2 sees elapsed=350>=300 (outside window)
     h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 0.000, lastSnapBufEnd: 0.000 });
-    vi.advanceTimersByTime(350); // outside 300ms window
+    h.perfNow(350); // outside 300ms debounce window
   });
   afterEach(() => teardownS8Harness(h));
 
   // T-S8-15: target === ct → N3 fires (S8-5-SC1)
-  // ct=9.730, bufEnd=10.030, lastRangeStart=0.000
-  // target = Math.max(0.000, 10.030-0.300) = 9.730 === ct → N3 fires
-  it('T-S8-15: target === ct (9.730 === 9.730) → N3 fires; no seek; suppressedGuardCount++', () => {
-    h.sb.buffered = makeBuffered(0, 10.030); // lastRangeStart=0, bufEnd=10.030
-    h.videoEl.currentTime = 9.730;           // ct = 9.730; target = 10.030-0.300 = 9.730 === ct
+  // ct=9.700, bufEnd=10.000, lastRangeStart=0.000
+  // target = Math.max(0.000, 10.000-0.300) = 9.7 === ct (IEEE 754 exact)
+  it('T-S8-15: target === ct (9.700 === 9.700, IEEE 754 exact) → N3 fires; no seek; suppressedGuardCount++', () => {
+    h.sb.buffered = makeBuffered(0, 10.000); // lastRangeStart=0, bufEnd=10.000
+    h.videoEl.currentTime = 9.700;           // ct = 9.7; target = 10.000-0.300 = 9.7 === ct
 
     const ctBefore = h.videoEl.currentTime;
     h.exports.onVideoWaiting();
 
-    expect(h.videoEl.currentTime).toBe(ctBefore); // no seek
+    expect(h.videoEl.currentTime).toBe(ctBefore); // no seek — N3 fired
     const logLines = getMseLogLines(h.tauri);
     expect(logLines.some((l) => l.includes('result=stall_snap'))).toBe(false);
     expect(h.exports.getSuppressedGuardCount()).toBe(1);
@@ -945,15 +970,18 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
   it('T-S8-19: 3 N2 suppressions then 2 N1 suppressions then 1 N2 → debounce=4, guard=2 (monotonic)', () => {
     let bufEnd = 10.030;
     let ct = 10.016;
+    let perfT = 0;
 
-    // Snap#1 at t=0
+    // Snap#1 at perfNow=0
+    h.perfNow(perfT);
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
-    // 3 N2 suppressions inside window (ct/bufEnd advanced > ADV_EPS each time)
+    // 3 N2 suppressions inside window (perfNow 20/40/60 — all inside 300ms from t=0)
     for (let i = 0; i < 3; i++) {
-      vi.advanceTimersByTime(20);
+      perfT += 20;
+      h.perfNow(perfT); // 20ms, 40ms, 60ms — inside 300ms window
       bufEnd += 0.002;
       ct += 0.002;
       h.sb.buffered = makeBuffered(0, bufEnd);
@@ -963,32 +991,32 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
     expect(h.exports.getSuppressedDebounceCount()).toBe(3);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
 
-    // Now force an executed snap to update the baseline, then trigger 2 N1 suppressions
-    vi.advanceTimersByTime(400); // clear debounce window
+    // Snap#2: perfNow=500 (outside 300ms window from t=0=60ms last snap check)
+    perfT = 500;
+    h.perfNow(perfT);
     bufEnd += 0.500;
     ct += 0.500;
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting(); // snap#2 executes (updates baseline to new ct/bufEnd)
+    h.exports.onVideoWaiting(); // snap#2 executes (updates baseline to new ct/bufEnd); lastSnapAtMs=500
 
-    // 2 N1 suppressions: no progress past the new baseline
-    vi.advanceTimersByTime(400);
-    h.exports.onVideoWaiting();
-    h.exports.onVideoWaiting();
+    // 2 N1 suppressions: no progress past the new baseline (ct/bufEnd unchanged)
+    perfT = 1000;
+    h.perfNow(perfT); // outside 300ms from snap#2
+    h.exports.onVideoWaiting(); // N1 fires
+    h.exports.onVideoWaiting(); // N1 fires again
     expect(h.exports.getSuppressedGuardCount()).toBe(2);
 
-    // 1 more N2 suppression: advance past baseline, then advance time < 300ms
-    const snap2Ct = ct;
-    const snap2BufEnd = bufEnd;
-    // Take another snap to reset the lastSnapAtMs
-    vi.advanceTimersByTime(400);
+    // Snap#3: advance ct/bufEnd, outside window from snap#2
     bufEnd += 0.500;
     ct += 0.500;
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting(); // snap#3 executes
+    h.exports.onVideoWaiting(); // snap#3 executes; lastSnapAtMs=1000
 
-    vi.advanceTimersByTime(50); // inside 300ms
+    // 1 more N2 suppression: inside 300ms from snap#3 (perfNow=1000), ct/bufEnd advanced
+    perfT = 1050; // 1050 - 1000 = 50ms < 300ms
+    h.perfNow(perfT);
     bufEnd += 0.002;
     ct += 0.002;
     h.sb.buffered = makeBuffered(0, bufEnd);
@@ -1004,36 +1032,42 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
     // Set up known counter values: 2 N2 suppressions (debounce=2) + 1 N1 suppression (guard=1)
     let bufEnd = 10.030;
     let ct = 10.016;
+    let perfT = 0;
 
+    h.perfNow(perfT);
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
     h.exports.onVideoWaiting(); // snap#1
 
     // 2 N2 suppressions inside window
     for (let i = 0; i < 2; i++) {
-      vi.advanceTimersByTime(20);
+      perfT += 20;
+      h.perfNow(perfT); // 20ms, 40ms — inside 300ms window
       bufEnd += 0.002;
       ct += 0.002;
       h.sb.buffered = makeBuffered(0, bufEnd);
       h.videoEl.currentTime = ct;
       h.exports.onVideoWaiting();
     }
-    // 1 N1 suppression: advance past window, take a snap to update baseline, then no progress
-    vi.advanceTimersByTime(400);
+    // Snap#2: outside debounce window
+    perfT = 500;
+    h.perfNow(perfT);
     bufEnd += 0.500;
     ct += 0.500;
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting(); // snap#2
+    h.exports.onVideoWaiting(); // snap#2 executes
 
-    vi.advanceTimersByTime(400);
+    // 1 N1 suppression: outside debounce window, no ct/bufEnd progress
+    perfT = 1000;
+    h.perfNow(perfT);
     h.exports.onVideoWaiting(); // N1 fires
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(2);
     expect(h.exports.getSuppressedGuardCount()).toBe(1);
 
-    // Trigger heartbeat tick (2s interval)
-    h.tauri.invoke.mock.calls.length = 0; // clear existing calls
+    // Trigger heartbeat tick (2s interval via fake timer — vi.advanceTimersByTimeAsync works for setInterval)
+    h.tauri.invoke.mock.calls.length = 0;
     await vi.advanceTimersByTimeAsync(2000);
 
     const tickLines = getTickLines(h.tauri);
@@ -1068,30 +1102,36 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
   it('T-S8-28: counters persist across tearDownMse — NOT reset to 0', () => {
     let bufEnd = 10.030;
     let ct = 10.016;
+    let perfT = 0;
 
-    // Build up known counter values via suppressions
-    // Snap#1
+    // Snap#1 at perfNow=0
+    h.perfNow(perfT);
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
-    // 5 N2 suppressions inside window
+    // 5 N2 suppressions inside window (perfNow stays inside 300ms from t=0)
     for (let i = 0; i < 5; i++) {
-      vi.advanceTimersByTime(20);
+      perfT += 20;
+      h.perfNow(perfT); // 20,40,60,80,100ms — all inside 300ms
       bufEnd += 0.002;
       ct += 0.002;
       h.sb.buffered = makeBuffered(0, bufEnd);
       h.videoEl.currentTime = ct;
       h.exports.onVideoWaiting();
     }
-    // 3 N1 suppressions: update baseline, then no progress
-    vi.advanceTimersByTime(400);
+    // Snap#2: outside debounce window, update baseline
+    perfT = 500;
+    h.perfNow(perfT);
     bufEnd += 0.500;
     ct += 0.500;
     h.sb.buffered = makeBuffered(0, bufEnd);
     h.videoEl.currentTime = ct;
-    h.exports.onVideoWaiting(); // baseline snap
-    vi.advanceTimersByTime(400);
+    h.exports.onVideoWaiting(); // snap#2; lastSnapAtMs=500
+
+    // 3 N1 suppressions: no ct/bufEnd progress
+    perfT = 1000;
+    h.perfNow(perfT); // outside 300ms from snap#2
     h.exports.onVideoWaiting();
     h.exports.onVideoWaiting();
     h.exports.onVideoWaiting();
@@ -1102,7 +1142,7 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
     // Tear down MSE session (simulates reconnect)
     h.exports.tearDownMse();
 
-    // Counters must still be at same values — NOT reset
+    // Counters must still be at same values — NOT reset by teardown
     expect(h.exports.getSuppressedDebounceCount()).toBe(5);
     expect(h.exports.getSuppressedGuardCount()).toBe(3);
   });
@@ -1117,8 +1157,8 @@ describe('stall-snap — Slice 8 guard ordering (T-S8-22..23)', () => {
 
   // T-S8-22: G1 fires before N1 is evaluated (S8-7-SC1)
   it('T-S8-22: G1 (mseState.sb=null) fires before N1; neither counter incremented', () => {
-    vi.advanceTimersByTime(5000); // debounce would pass
-    // Set sb=null: G1 fires
+    // G1 fires before N1 is evaluated — no time manipulation needed for this test
+    // (initial lastSnapAtMs=-Inf → debounce would pass anyway, but G1 fires first)
     const origSb = h.exports.mseState.sb;
     h.exports.mseState.sb = null;
 
@@ -1134,7 +1174,7 @@ describe('stall-snap — Slice 8 guard ordering (T-S8-22..23)', () => {
   it('T-S8-23: G6 (sliver: bufEnd-target < 0.1) fires after N1/N2/N3 pass; neither counter incremented', () => {
     // Seed state far from current geometry to ensure N1 passes
     h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 0.000, lastSnapBufEnd: 0.000 });
-    vi.advanceTimersByTime(350); // outside debounce window
+    h.perfNow(350); // outside debounce window (350-0=350>=300)
 
     // G6 sliver geometry: target=Math.max(5.0, 5.05-0.3)=5.0; ct=5.04; target!=ct (N3 passes)
     // cushion = 5.05-5.0 = 0.05 < 0.1 → G6 fires
@@ -1158,16 +1198,17 @@ describe('stall-snap — Slice 8 getter export contract (T-S8-27)', () => {
 
   // T-S8-27: getter functions return live state (not snapshot-at-0) (S8-8-SC2)
   it('T-S8-27: getSuppressedDebounceCount() reads live state after N2 suppression; getSuppressedGuardCount() independent', () => {
-    // Snap#1 at t=0
+    // Snap#1 at perfNow=0
+    h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
-    // Trigger one N2 suppression: inside window, ct/bufEnd advanced
-    vi.advanceTimersByTime(50);
+    // Trigger one N2 suppression: perfNow=50 (inside 300ms), ct/bufEnd advanced > ADV_EPS
+    h.perfNow(50);
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
-    h.exports.onVideoWaiting();
+    h.exports.onVideoWaiting(); // N2 fires
 
     // getSuppressedDebounceCount() must return 1 (live state, not snapshot-at-0)
     expect(h.exports.getSuppressedDebounceCount()).toBe(1);
