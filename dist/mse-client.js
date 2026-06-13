@@ -41,6 +41,13 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
 // After a snap, sit this far behind the edge (small playable cushion).
 const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
+// Stall-snap path: seat this far behind buffered end when 'waiting' fires.
+// Distinct from LIVE_EDGE_TARGET_LEAD_SEC (0.2) used by normal seekToLiveEdge snaps.
+// 0.3 s provides ~42 ms margin over the observed max feed gap (258 ms, GATE-6).
+const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.3;
+// Minimum required gap between bufEnd and computed snap target (loop-protection
+// on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
+const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
 // Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
@@ -765,6 +772,57 @@ function seekToLiveEdge() {
   }
 }
 
+// ── onVideoWaiting — stall-triggered early snap (D-PPT7-1, S7-2) ─────────────
+// Fires on the video element's 'waiting' event (rs=2, next frame unavailable).
+// Immediately snaps to bufEnd−LIVE_EDGE_STALL_SNAP_LEAD_SEC of the LAST buffered
+// range, converting a 0.5–1.9 s heartbeat-wait freeze into an instant resume.
+// In the dominant GATE-6 geometry (ct 14–40 ms behind bufEnd), target < ct —
+// a deliberate backward replay-cushion micro-seek. Handler takes NO event arg.
+// Guard chain (D-PPT7-2): G1 sb-null, G2 updating/pending, G3 seeking,
+// G4 buffered-throws, G5 empty, G6 insufficient-cushion — ALL silent no-ops.
+// Normal snap path (seekToLiveEdge, heartbeat, LIVE_EDGE_TARGET_LEAD_SEC) is
+// byte-identical. Post-snap drift=0.3 ≤ 0.5 → heartbeat idempotent (D-PPT7-6).
+function onVideoWaiting() {
+  // G1: not streaming / no SourceBuffer.
+  const sb = mseState.sb;
+  if (!sb) return;
+  // G2: SourceBuffer is updating OR pending queue non-empty.
+  if (sb.updating || mseState.pending.length > 0) return;
+  // G3: seek already in flight (re-entrancy guard).
+  if (VIDEO_EL.seeking) return;
+  // G4+G5: read buffered ranges inside try/catch (getter throws on detached SB).
+  let buf, lastStart, bufEnd;
+  try {
+    buf = sb.buffered;
+    if (buf.length === 0) return;
+    lastStart = buf.start(buf.length - 1);
+    bufEnd    = buf.end(buf.length - 1);
+  } catch {
+    return;
+  }
+  // G6: cushion guard — prevent tight replay loops on sliver ranges.
+  const ct     = VIDEO_EL.currentTime;
+  const target = Math.max(lastStart, bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC);
+  if (bufEnd - target < LIVE_EDGE_STALL_MIN_CUSHION_SEC) return;
+  // Log BEFORE assignment (seekToLiveEdge precedent, D-PPT7-3).
+  const drift = bufEnd - ct;
+  mseLog(
+    "event=seek result=stall_snap from=" + ct.toFixed(3) +
+    " to=" + target.toFixed(3) +
+    " drift=" + drift.toFixed(3)
+  );
+  try {
+    VIDEO_EL.currentTime = target;
+  } catch {
+    // Build throw line from already-computed locals — no getter re-reads (D-PPT7-8).
+    mseLog(
+      "event=seek result=throw from=" + ct.toFixed(3) +
+      " to=" + target.toFixed(3) +
+      " drift=" + drift.toFixed(3)
+    );
+  }
+}
+
 // ── applyInit — commit an init segment to an open MediaSource (D-IR-3) ───────
 // Extracted verbatim from the original onInitFrame body. Requires:
 //   ms.readyState === "open" (addSourceBuffer throws otherwise — R-IR-7)
@@ -1001,6 +1059,9 @@ async function main() {
   // Stage-2 reconnect (no effect on normal playback). Handles the FRAME_INIT
   // self-arm recovery path (D-IR-4) that bypasses handleStatus("streaming").
   VIDEO_EL.addEventListener("playing", dismissReconnectOverlayOnRecovery);
+  // Stall-snap: immediately snap to live edge on 'waiting' (rs=2), eliminating
+  // the 0.5–1.9 s heartbeat-wait freeze window confirmed by GATE-6. (D-PPT7-1, S7-2)
+  VIDEO_EL.addEventListener("waiting", onVideoWaiting);
   // Heartbeat: report buffered ranges + currentTime every 2 s while a SB exists.
   // Reads from mseState (updated by tearDownMse / setUpMse / onInitFrame).
   setInterval(() => {
@@ -1158,5 +1219,8 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     bufferedSummary,  // GATE-6: expose for direct test verification
     onWindowError,    // GATE-6: direct invocation tests (D-PPT6-5 happy-dom limitation)
     onUnhandledRejection, // GATE-6: direct invocation tests
+    LIVE_EDGE_STALL_SNAP_LEAD_SEC,   // S7-1: constant verification
+    LIVE_EDGE_STALL_MIN_CUSHION_SEC, // S7-1: constant verification
+    onVideoWaiting,                  // S7-5: handler exported for direct test invocation
   });
 }
