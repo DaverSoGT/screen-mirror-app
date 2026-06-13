@@ -917,6 +917,61 @@ describe('stall-snap — Slice 8 N1 effectiveness guard (T-S8-10..14, T-S8-18)',
     expect(h.exports.getSuppressedGuardCount()).toBe(2);
     expect(h.exports.getSuppressedDebounceCount()).toBe(0); // debounce unaffected
   });
+
+  // T-S8-31: N1 epsilon boundary — ct half. Advance EXACTLY ADV_EPS → N1 fires.
+  // N1 uses strict `>`: ct > lastSnapCt + ADV_EPS. At exact equality the comparison
+  // is FALSE → advanced=false → guard++. The `>`→`>=` mutant would make it TRUE
+  // (N1 passes, snap executes, guard unchanged) — killed by the guard++ assertion.
+  // Equality holds BY CONSTRUCTION: baseline + the exported ADV_EPS, so floating-point
+  // representation is identical on both sides of the comparison.
+  it('T-S8-31: ct advanced by EXACTLY ADV_EPS (ct === lastSnapCt + ADV_EPS), bufEnd unchanged → N1 fires (strict > boundary); kills >→>=', () => {
+    const eps        = h.exports.ADV_EPS; // exact same value the production guard uses
+    const baseCt     = 5.000;
+    const baseBufEnd = 5.300;
+    h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: baseCt, lastSnapBufEnd: baseBufEnd });
+    h.perfNow(350); // outside 300ms window — isolates N1 from N2
+
+    // bufEnd held at baseline (no progress); ct exactly at the boundary.
+    h.sb.buffered = makeBuffered(0, baseBufEnd);
+    h.videoEl.currentTime = baseCt + eps; // === lastSnapCt + ADV_EPS → `>` is FALSE
+
+    const guardBefore    = h.exports.getSuppressedGuardCount();
+    const debounceBefore = h.exports.getSuppressedDebounceCount();
+    const ctBefore       = h.videoEl.currentTime;
+
+    h.exports.onVideoWaiting();
+
+    // Strict `>`: at exact equality N1 fires. `>=` mutant would let it pass.
+    expect(h.exports.getSuppressedGuardCount()).toBe(guardBefore + 1);
+    expect(h.exports.getSuppressedDebounceCount()).toBe(debounceBefore); // N2 not reached
+    expect(h.videoEl.currentTime).toBe(ctBefore); // no seek
+  });
+
+  // T-S8-32: N1 epsilon boundary — bufEnd half (symmetric to T-S8-31).
+  // bufEnd === lastSnapBufEnd + ADV_EPS, ct held at baseline. Strict `>` → FALSE on
+  // both disjuncts → advanced=false → guard++. The `>`→`>=` mutant on the bufEnd
+  // disjunct would make it TRUE — killed by the guard++ assertion.
+  it('T-S8-32: bufEnd advanced by EXACTLY ADV_EPS (bufEnd === lastSnapBufEnd + ADV_EPS), ct unchanged → N1 fires (strict > boundary); kills >→>=', () => {
+    const eps        = h.exports.ADV_EPS;
+    const baseCt     = 5.000;
+    const baseBufEnd = 5.300;
+    h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: baseCt, lastSnapBufEnd: baseBufEnd });
+    h.perfNow(350); // outside 300ms window — isolates N1 from N2
+
+    // ct held at baseline (no progress); bufEnd exactly at the boundary.
+    h.sb.buffered = makeBuffered(0, baseBufEnd + eps); // === lastSnapBufEnd + ADV_EPS → `>` is FALSE
+    h.videoEl.currentTime = baseCt;
+
+    const guardBefore    = h.exports.getSuppressedGuardCount();
+    const debounceBefore = h.exports.getSuppressedDebounceCount();
+    const ctBefore       = h.videoEl.currentTime;
+
+    h.exports.onVideoWaiting();
+
+    expect(h.exports.getSuppressedGuardCount()).toBe(guardBefore + 1);
+    expect(h.exports.getSuppressedDebounceCount()).toBe(debounceBefore); // N2 not reached
+    expect(h.videoEl.currentTime).toBe(ctBefore); // no seek
+  });
 });
 
 // ── T-S8 describe 6: N3 no-op kill ───────────────────────────────────────────
@@ -1176,7 +1231,7 @@ describe('stall-snap — Slice 8 guard ordering (T-S8-22..23)', () => {
     h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 0.000, lastSnapBufEnd: 0.000 });
     h.perfNow(350); // outside debounce window (350-0=350>=300)
 
-    // G6 sliver geometry: target=Math.max(5.0, 5.05-0.3)=5.0; ct=5.04; target!=ct (N3 passes)
+    // G6 sliver geometry: target=Math.max(5.0, 4.75)=5.0; ct=5.04; target!=ct (N3 passes)
     // cushion = 5.05-5.0 = 0.05 < 0.1 → G6 fires
     h.sb.buffered = makeBuffered(5.0, 5.05);
     h.videoEl.currentTime = 5.04;
@@ -1186,6 +1241,45 @@ describe('stall-snap — Slice 8 guard ordering (T-S8-22..23)', () => {
     // G6 silent: neither counter incremented
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
+  });
+
+  // T-S8-30: N1 EFFECTIVENESS runs BEFORE N2 DEBOUNCE — kills the N1<->N2 swap mutant.
+  // The discriminating scenario: rs>=2 (NOT the hardStarve escape hatch) + inside the
+  // 300ms debounce window + neither ct nor bufEnd advanced past the last EXECUTED snap
+  // baseline. Under correct N1-first ordering, N1 fires (guard++) and returns before N2
+  // is reached, so debounce stays 0. Under the swap, N2 would fire first (debounce++)
+  // and guard would stay 0 — caught by the exact-delta partition asserts below.
+  it('T-S8-30: rs>=2 + inside debounce window + no ct/bufEnd progress → N1 fires first (guard++), N2 NOT reached (debounce unchanged); no seek', () => {
+    // Seed last-snap baseline directly via the state seam. lastSnapAtMs=100 so that
+    // perfNow elapsed (100ms below) sits INSIDE the 300ms debounce window.
+    const baseAtMs   = 100;
+    const baseCt     = 5.000;
+    const baseBufEnd = 5.300;
+    h.exports.setLastSnapState({ lastSnapAtMs: baseAtMs, lastSnapCt: baseCt, lastSnapBufEnd: baseBufEnd });
+
+    // now - lastSnapAtMs = 200 - 100 = 100ms < 300ms → N2 WOULD fire if reached.
+    h.perfNow(baseAtMs + 100);
+
+    // rs>=2 (NOT escape hatch): rs=3 (HAVE_FUTURE_DATA). hardStarve=false → N2 not bypassed.
+    Object.defineProperty(h.videoEl, 'readyState', { value: 3, configurable: true });
+
+    // Hold ct and bufEnd at the EXACT baseline values — no progress past ADV_EPS.
+    // N1 sees advanced=false → fires and returns before N2 is evaluated.
+    h.sb.buffered = makeBuffered(0, baseBufEnd);
+    h.videoEl.currentTime = baseCt;
+
+    const guardBefore    = h.exports.getSuppressedGuardCount();
+    const debounceBefore = h.exports.getSuppressedDebounceCount();
+    const ctBefore       = h.videoEl.currentTime;
+
+    h.exports.onVideoWaiting();
+
+    // N1-first: guard incremented by exactly 1, debounce unchanged (N2 never reached).
+    // Under the N1<->N2 swap mutant the deltas invert (debounce++, guard unchanged).
+    expect(h.exports.getSuppressedGuardCount()).toBe(guardBefore + 1);
+    expect(h.exports.getSuppressedDebounceCount()).toBe(debounceBefore);
+    // No seek occurred — currentTime untouched.
+    expect(h.videoEl.currentTime).toBe(ctBefore);
   });
 });
 
