@@ -54,6 +54,24 @@ const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
 // GATE-6 max feed gap (258 ms) fits just under it. Bypassed only on hard
 // starvation (rs<=1, D-PPT8-4); the effectiveness guard still gates that path.
 const LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS = 300;
+// ── Gap-stranding watchdog constants (Slice 9, D-PPT9-CONST) ─────────────────
+// Consecutive 2s-heartbeat ticks with no meaningful ct progress AND data ahead
+// before the watchdog force-rescues. 2 ticks ~= 4s — bounds a stranding far below
+// the GATE-8 26s freeze while staying above a transient 1-tick pause. (locked D1)
+const WATCHDOG_STUCK_TICKS = 2;
+// Minimum media-seconds a tick must advance to count as "progress" (not stuck).
+// Tuned to separate the GATE-8 freeze (~0.013 s/tick) from healthy playback
+// (~2 s/tick @1.0x). 0.5 s/tick = 0.25x real-time floor. Distinct from ADV_EPS
+// (1e-3) which is the onVideoWaiting float-noise floor — the watchdog needs a
+// PLAYBACK-meaningful floor, not a noise floor. (D-PPT9-A3b — operationalizes D1)
+const WATCHDOG_PROGRESS_EPS = 0.5;
+// Minimum media-seconds of buffered data past ct for the watchdog to consider a
+// rescue worthwhile (don't jump if there's nothing real ahead). (D-PPT9-A3)
+const WATCHDOG_DATA_AHEAD_SEC = 0.5;
+// No-hole clamp: ranges shorter than this are slivers (PLI-minted sub-GOP
+// keyframe fragments, GATE-8) — skipped as snap targets so a rescue lands on a
+// substantial range, never a sliver/hole. ~300 ms per locked D2. (D-PPT9-B)
+const SNAP_SLIVER_MIN_SEC = 0.3;
 // ── Stall-snap storm debounce / effectiveness state (Slice 8, D-PPT8-1) ──────
 // Tracks the LAST EXECUTED stall snap (NOT the last 'waiting' event) so the
 // debounce window + effectiveness guard rate-limit the self-retrigger storm.
@@ -77,6 +95,23 @@ function setLastSnapState({ lastSnapAtMs: atMs, lastSnapCt: ct, lastSnapBufEnd: 
 function getLastSnapState() {
   return { lastSnapAtMs, lastSnapCt, lastSnapBufEnd };
 }
+// ── Gap-stranding watchdog state (Slice 9, D-PPT9-A2) ───────────────────────
+// Rides the existing 2s heartbeat (NO new timer). Tracks ct across ticks so a
+// no-progress-with-data-ahead stranding (GATE-8 B-prime) is rescued reactively
+// WITHOUT depending on a 'waiting' event re-firing. Lifetime = module load;
+// PERSISTS across tearDownMse/setUpMse (like the S8 counters, D-PPT9-D).
+let watchdogLastTickCt = -Infinity; // ct observed on the previous heartbeat tick
+let watchdogStuckTicks = 0;         // consecutive ticks with no ct progress + data ahead
+let watchdogRescues    = 0;         // monotonic; appended to event=tick (D7)
+function getWatchdogRescues() { return watchdogRescues; }
+// Test seam: seed/read watchdog progress state deterministically (analogous to
+// setLastSnapState/getLastSnapState). Lets strict-TDD RED tests drive the
+// 2-tick threshold without simulating real playback timing.
+function setWatchdogState({ watchdogLastTickCt: c, watchdogStuckTicks: s }) {
+  if (c !== undefined) watchdogLastTickCt = c;
+  if (s !== undefined) watchdogStuckTicks = s;
+}
+function getWatchdogState() { return { watchdogLastTickCt, watchdogStuckTicks }; }
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
 // Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
@@ -744,6 +779,50 @@ function trimSourceBuffer() {
   }
 }
 
+// ── clampSnapTarget — gap-aware no-hole clamp (Slice 9, D-PPT9-B) ───────────
+// Given a raw desired target and the FULL set of buffered TimeRanges, return a
+// target guaranteed to sit inside a real, substantial buffered range — NEVER in
+// a gap. (D-PPT9-B, locked D2/D3)
+//   buf      : the TimeRanges-like object (buf.length, buf.start(i), buf.end(i))
+//   ct       : current playhead time (passed through; directionality is caller-owned)
+//   rawTarget: the path's geometry-preferred target (already lead-adjusted)
+// Returns: a Number target inside a real substantial range, or null if no
+//          substantial range exists (caller treats null as "do not seek").
+function clampSnapTarget(buf, ct, rawTarget) {
+  if (buf.length === 0) return null;
+  // Step 2: check if rawTarget is already inside a substantial range (pass-through).
+  for (let i = 0; i < buf.length; i++) {
+    const s = buf.start(i);
+    const e = buf.end(i);
+    if (s <= rawTarget && rawTarget < e) {
+      if (e - s >= SNAP_SLIVER_MIN_SEC) {
+        // Substantial containing range — accept rawTarget as-is (byte-compat).
+        return rawTarget;
+      }
+      // Sliver range — treat as gap, fall through to forward scan.
+      break;
+    }
+  }
+  // Step 3: rawTarget in gap or sliver. Find first forward substantial range.
+  for (let i = 0; i < buf.length; i++) {
+    const s = buf.start(i);
+    const e = buf.end(i);
+    if (s > rawTarget && (e - s) >= SNAP_SLIVER_MIN_SEC) {
+      return s;
+    }
+  }
+  // Step 4: no forward substantial range. Fall back to last substantial range start.
+  for (let i = buf.length - 1; i >= 0; i--) {
+    const s = buf.start(i);
+    const e = buf.end(i);
+    if (e - s >= SNAP_SLIVER_MIN_SEC) {
+      return s;
+    }
+  }
+  // No substantial range anywhere.
+  return null;
+}
+
 // ── seekToLiveEdge ───────────────────────────────────────────────────────────
 // Snaps playback to the live edge when currentTime falls too far behind the
 // newest buffered content. Called on every updateend (once the burst is fully
@@ -761,9 +840,9 @@ function seekToLiveEdge() {
   const sb = mseState.sb;
   if (!sb || sb.updating || mseState.pending.length > 0) return;
   if (VIDEO_EL.seeking) return;
-  let bufEnd;
+  let buf, bufEnd;
   try {
-    const buf = sb.buffered;
+    buf = sb.buffered;
     if (buf.length === 0) return;
     bufEnd = buf.end(buf.length - 1);
   } catch (e) {
@@ -772,7 +851,9 @@ function seekToLiveEdge() {
   const ct = VIDEO_EL.currentTime;
   const drift = bufEnd - ct;
   if (drift <= LIVE_EDGE_MAX_DRIFT_SEC) return; // guard_drift — silent per D-PPT6-4
-  const target = bufEnd - LIVE_EDGE_TARGET_LEAD_SEC;
+  const rawTarget = bufEnd - LIVE_EDGE_TARGET_LEAD_SEC;
+  const target = clampSnapTarget(buf, ct, rawTarget); // no-hole clamp (D-PPT9-B4)
+  if (target === null) return;
   if (target <= ct) {
     // GATE-6 MSEO-3: guard_backward logged (drift > threshold but target behind playhead)
     mseLog(
@@ -820,20 +901,22 @@ function onVideoWaiting() {
   // G3: seek already in flight (re-entrancy guard).
   if (VIDEO_EL.seeking) return;
   // G4+G5: read buffered ranges inside try/catch (getter throws on detached SB).
-  let buf, lastStart, bufEnd;
+  // Full buf object needed by clampSnapTarget (Slice 9, D-PPT9-B4 — scans ALL ranges).
+  let buf, bufEnd;
   try {
     buf = sb.buffered;
     if (buf.length === 0) return;
-    lastStart = buf.start(buf.length - 1);
-    bufEnd    = buf.end(buf.length - 1);
+    bufEnd = buf.end(buf.length - 1);
   } catch {
     return;
   }
   // Entry locals — captured once for both new guards and existing computation.
   const ct          = VIDEO_EL.currentTime;
-  const target      = Math.max(lastStart, bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC);
+  const rawTarget   = bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC;
+  const target      = clampSnapTarget(buf, ct, rawTarget); // no-hole clamp (D-PPT9-B4)
+  if (target === null) return; // no substantial range to land in — silent no-op
   const now         = performance.now();
-  const hardStarve  = VIDEO_EL.readyState <= 1;
+  const hardStarve  = VIDEO_EL.readyState <= 2; // was <=1; widened to rs<=2 (D-PPT9-C, locked D4)
   // N1 EFFECTIVENESS GUARD (runs first — gates ALL paths including escape hatch).
   // Suppresses futile re-snaps where neither ct nor bufEnd has advanced by > ADV_EPS
   // since the last EXECUTED snap baseline (the 147x dead-position storm, GATE-7).
@@ -1150,9 +1233,61 @@ async function main() {
       " ms_rs=" + (curMs ? curMs.readyState : "null") +
       " buffered=" + bufferedSummary(sb) +
       " suppressed_debounce=" + suppressedDebounceCount +
-      " suppressed_guard=" + suppressedGuardCount
+      " suppressed_guard=" + suppressedGuardCount +
+      " watchdog_rescues=" + watchdogRescues  // D-PPT9-D2: strictly last field
     );
-    seekToLiveEdge();
+    // ── Gap-stranding watchdog (Slice 9, D-PPT9-A). Rescues a no-progress,
+    // data-ahead stranding that seekToLiveEdge's sb.updating/seeking guards block. ──
+    {
+      let wBuf, wBufEnd;
+      try {
+        wBuf = sb.buffered;
+        if (wBuf.length === 0) {
+          watchdogLastTickCt = -Infinity;
+          watchdogStuckTicks = 0;
+        } else {
+          wBufEnd = wBuf.end(wBuf.length - 1);
+          const wCt = VIDEO_EL.currentTime;
+          const progressed = wCt > watchdogLastTickCt + WATCHDOG_PROGRESS_EPS;
+          const dataAhead  = wBufEnd > wCt + WATCHDOG_DATA_AHEAD_SEC;
+          if (progressed || !dataAhead) {
+            watchdogStuckTicks = 0; // healthy or nothing to rescue toward
+          } else {
+            watchdogStuckTicks++;   // no progress AND data ahead
+          }
+          watchdogLastTickCt = wCt;
+          // Rescue after WATCHDOG_STUCK_TICKS consecutive stuck ticks (~4s @ 2s heartbeat),
+          // but ONLY if not already seeking (respect VIDEO_EL.seeking to avoid double-seek).
+          // BYPASSES N1 effectiveness + N2 debounce by design (locked D5): after ~4s stuck
+          // with data ahead, "no progress" is the SIGNAL to rescue, not to suppress.
+          // FORCES through sb.updating (locked D6): assigning currentTime during an updating
+          // SourceBuffer is VALID in MSE (only appendBuffer/remove throw). This is the unblock.
+          if (watchdogStuckTicks >= WATCHDOG_STUCK_TICKS && !VIDEO_EL.seeking) {
+            const wRaw = wBufEnd - LIVE_EDGE_TARGET_LEAD_SEC;
+            const wTarget = clampSnapTarget(wBuf, wCt, wRaw); // no-hole clamp (Mechanism B)
+            if (wTarget !== null && wTarget > wCt) {           // forward-only
+              const wDrift = wBufEnd - wCt;
+              mseLog(
+                "event=seek result=watchdog_snap from=" + wCt.toFixed(3) +
+                " to=" + wTarget.toFixed(3) +
+                " drift=" + wDrift.toFixed(3)
+              );
+              try { VIDEO_EL.currentTime = wTarget; } catch {
+                mseLog(
+                  "event=seek result=throw from=" + wCt.toFixed(3) +
+                  " to=" + wTarget.toFixed(3) +
+                  " drift=" + wDrift.toFixed(3)
+                );
+              }
+              watchdogRescues++;
+              watchdogStuckTicks = 0;       // reset after rescue (prevent retry-storm)
+              watchdogLastTickCt = wTarget; // baseline forward so next tick measures from new pos
+            }
+          }
+        }
+      } catch { /* detached SB: swallow (same containment as tick body) */ }
+    }
+    seekToLiveEdge(); // existing line — UNCHANGED, runs after the watchdog (augment)
   }, 2000);
 
   try {
@@ -1285,5 +1420,13 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     setLastSnapState,                 // S8-8: state-seeding helper for tests
     getLastSnapState,                 // S8-8: state-reading helper for tests
     tearDownMse,                      // S8-8: for session-cumulative lifetime test (T-S8-28)
+    clampSnapTarget,                  // S9: no-hole clamp — direct unit tests (gap/sliver/containing)
+    WATCHDOG_STUCK_TICKS,             // S9: constant verification (=== 2)
+    WATCHDOG_PROGRESS_EPS,            // S9: constant verification (=== 0.5)
+    WATCHDOG_DATA_AHEAD_SEC,          // S9: constant verification (=== 0.5)
+    SNAP_SLIVER_MIN_SEC,              // S9: constant verification (=== 0.3)
+    getWatchdogRescues,               // S9: GETTER fn for live rescue counter (value-vs-ref trap)
+    setWatchdogState,                 // S9: seed watchdog progress state for deterministic RED tests
+    getWatchdogState,                 // S9: read watchdog progress state (write-rule assertions)
   });
 }
