@@ -1261,7 +1261,7 @@ describe('stall-snap — Slice 8 guard ordering (T-S8-22..23)', () => {
     h.perfNow(baseAtMs + 100);
 
     // rs>=2 (NOT escape hatch): rs=3 (HAVE_FUTURE_DATA). hardStarve=false → N2 not bypassed.
-    Object.defineProperty(h.videoEl, 'readyState', { value: 3, configurable: true });
+    h.overrideProperty(h.videoEl, 'readyState', { value: 3 });
 
     // Hold ct and bufEnd at the EXACT baseline values — no progress past ADV_EPS.
     // N1 sees advanced=false → fires and returns before N2 is evaluated.
