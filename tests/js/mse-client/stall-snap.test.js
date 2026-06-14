@@ -310,25 +310,22 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(snapLine).toContain('drift=7.850');
   });
 
-  // ── T-S7-11: Clamp to range start (narrow last range) ────────────────────
-  it('T-S7-11: range [5.0,5.2]; ct=5.2 → target clamped to 5.000; cushion=0.200≥0.1 → snaps', () => {
-    // lastStart=5.0, bufEnd=5.2, bufEnd−0.3=4.9 < lastStart=5.0 → clamp to 5.0
-    // cushion = bufEnd−target = 5.2−5.0 = 0.200 ≥ 0.1 → passes G6
+  // ── T-S7-11: Sliver-only range — Slice 9 no-hole clamp returns null → silent no-op
+  // UPDATED Slice 9: range [5.0,5.2] is 200ms < SNAP_SLIVER_MIN_SEC(0.3s) — a sliver.
+  // clampSnapTarget returns null (no substantial range to land in) → onVideoWaiting
+  // silently returns. Old behavior (Math.max clamp to 5.0) is superseded by Slice 9
+  // no-hole guarantee (D-PPT9-B, SNAP_SLIVER_MIN_SEC=0.3). No seek, no log.
+  it('T-S7-11: range [5.0,5.2] is a sliver (0.2s < 0.3s) → clampSnapTarget returns null → silent no-op (Slice 9)', () => {
     sb.buffered = makeBuffered(5.0, 5.2);
     videoEl.currentTime = 5.2;
+    const ctBefore = videoEl.currentTime;
 
     exports.onVideoWaiting();
 
-    expect(videoEl.currentTime).toBeCloseTo(5.000, 5);
-
+    // Slice 9: sliver range returns null from clamp → no seek
+    expect(videoEl.currentTime).toBe(ctBefore);
     const lines = getMseLogLines(tauri);
-    const snapLine = lines.find((l) => l.includes('result=stall_snap'));
-    expect(snapLine).toBeDefined();
-    // Geometry: range [5.0,5.2], ct=5.2 → target=Math.max(5.0,4.9)=5.000;
-    // drift = bufEnd − ct = 5.2 − 5.2 = 0.000.
-    expect(snapLine).toContain('from=5.200');
-    expect(snapLine).toContain('to=5.000');
-    expect(snapLine).toContain('drift=0.000');
+    expect(lines.filter(l => l.includes('result=stall_snap')).length).toBe(0);
   });
 
   // ── T-S7-12: G6 — cushion guard, sliver range → silent ───────────────────
@@ -771,8 +768,10 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
   });
 
-  // T-S8-8: rs=2 inside window → N2 applies (rs=2 NOT escape hatch) (S8-3-SC6)
-  it('T-S8-8: rs=2 inside 300ms window, ct/bufEnd advanced → N2 fires (rs=2 is NOT escape hatch)', () => {
+  // T-S8-8 (UPDATED Slice 9 — T1-B inversion): rs=2 inside window, ct/bufEnd advanced → N2 BYPASSED (rs<=2 escape hatch widened)
+  // Slice 8 had rs<=1; Slice 9 widens to rs<=2 (D-PPT9-C, hardStarve = readyState <= 2).
+  // N1 passes (ct/bufEnd advanced). N2 is now bypassed. Snap executes.
+  it('T-S8-8: rs=2 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes (Slice 9 rs<=2 hatch)', () => {
     h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
@@ -780,12 +779,14 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
     h.perfNow(50); // inside 300ms
     h.sb.buffered = makeBuffered(0, 10.032);
-    h.videoEl.currentTime = 10.018;
-    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 NOT escape hatch
+    h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
+    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 now IS escape hatch (Slice 9)
 
     h.exports.onVideoWaiting();
 
-    expect(h.exports.getSuppressedDebounceCount()).toBe(1); // N2 applied
+    // N2 bypassed: snap executes, debounce count unchanged at 0
+    expect(h.exports.getSuppressedDebounceCount()).toBe(0);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
   });
 
   // T-S8-9: rs=0 inside window, ct/bufEnd advanced → N2 bypassed (rs=0 <= 1) (S8-3-SC7)
@@ -1083,7 +1084,8 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
   });
 
   // T-S8-20: tick line emits suppressed_debounce and suppressed_guard in correct position (S8-6-SC4)
-  it('T-S8-20: tick line matches regex /suppressed_debounce=(\\d+) suppressed_guard=(\\d+)$/ with correct values', async () => {
+  // NOTE (Slice 9): the old $-anchor is relaxed because watchdog_rescues=N is now the trailing field.
+  it('T-S8-20: tick line matches /suppressed_debounce=(\\d+) suppressed_guard=(\\d+) watchdog_rescues=(\\d+)$/ with correct values', async () => {
     // Set up known counter values: 2 N2 suppressions (debounce=2) + 1 N1 suppression (guard=1)
     let bufEnd = 10.030;
     let ct = 10.016;
@@ -1129,10 +1131,10 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
     expect(tickLines.length).toBeGreaterThan(0);
     const lastTick = tickLines[tickLines.length - 1];
 
-    // Must match trailing regex
-    expect(lastTick).toMatch(/suppressed_debounce=(\d+) suppressed_guard=(\d+)$/);
+    // Must match trailing regex (watchdog_rescues=N is now the last field after suppressed_guard)
+    expect(lastTick).toMatch(/suppressed_debounce=(\d+) suppressed_guard=(\d+) watchdog_rescues=(\d+)$/);
     // Extract values and compare with getter
-    const match = lastTick.match(/suppressed_debounce=(\d+) suppressed_guard=(\d+)$/);
+    const match = lastTick.match(/suppressed_debounce=(\d+) suppressed_guard=(\d+) watchdog_rescues=(\d+)$/);
     expect(parseInt(match[1], 10)).toBe(h.exports.getSuppressedDebounceCount());
     expect(parseInt(match[2], 10)).toBe(h.exports.getSuppressedGuardCount());
     // suppressed_debounce= appears after buffered=
@@ -1142,7 +1144,8 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
   });
 
   // T-S8-21: tick line has fields even when counters are 0 (S8-6-SC5)
-  it('T-S8-21: no suppressions → tick line ends with suppressed_debounce=0 suppressed_guard=0', async () => {
+  // NOTE (Slice 9): watchdog_rescues=N is now the trailing field; relax the $-anchor to include it.
+  it('T-S8-21: no suppressions → tick line ends with suppressed_debounce=0 suppressed_guard=0 watchdog_rescues=0', async () => {
     // No snaps, no suppressions — counters at 0
     h.tauri.invoke.mock.calls.length = 0;
     await vi.advanceTimersByTimeAsync(2000);
@@ -1150,7 +1153,7 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
     const tickLines = getTickLines(h.tauri);
     expect(tickLines.length).toBeGreaterThan(0);
     const lastTick = tickLines[tickLines.length - 1];
-    expect(lastTick).toMatch(/suppressed_debounce=0 suppressed_guard=0$/);
+    expect(lastTick).toMatch(/suppressed_debounce=0 suppressed_guard=0 watchdog_rescues=0$/);
   });
 
   // T-S8-28: counters persist across tearDownMse (NOT reset to 0) (S8-6-SC6)
@@ -1308,5 +1311,783 @@ describe('stall-snap — Slice 8 getter export contract (T-S8-27)', () => {
     expect(h.exports.getSuppressedDebounceCount()).toBe(1);
     // getSuppressedGuardCount() must return 0 (independent counter, unchanged)
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE 9 — Gap-stranding freeze-fix: watchdog + no-hole clamp + rs<=2 + telemetry
+// T-S9-* tests (RED before GREEN per strict TDD; all FAIL until GREEN implementation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── T2-A: clampSnapTarget unit tests ─────────────────────────────────────────
+describe('clampSnapTarget — no-hole clamp unit (T-S9-C1..C8)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-C1: rawTarget inside a substantial range → returns rawTarget unchanged (pass-through)
+  it('T-S9-C1: rawTarget inside a substantial range → returns rawTarget unchanged', () => {
+    const buf = makeBufferedMulti([[0, 5.0], [6.0, 10.0]]);
+    const result = h.exports.clampSnapTarget(buf, 6.5, 8.0);
+    expect(result).toBeCloseTo(8.0, 10);
+  });
+
+  // T-S9-C2: rawTarget in a gap → returns buf.start(i) of next substantial range
+  it('T-S9-C2: rawTarget in a gap → returns start of next substantial range', () => {
+    const buf = makeBufferedMulti([[0, 2.0], [4.0, 8.0]]);
+    // rawTarget=3.0 is in gap [2.0, 4.0]
+    const result = h.exports.clampSnapTarget(buf, 1.5, 3.0);
+    expect(result).toBeCloseTo(4.0, 10);
+  });
+
+  // T-S9-C3: GATE-8 exact geometry
+  it('T-S9-C3: GATE-8 exact geometry [[0,0.261],[1.895,2.239]] ct=1.761 rawTarget=1.761 → returns 1.895', () => {
+    const buf = makeBufferedMulti([[0, 0.261], [1.895, 2.239]]);
+    const result = h.exports.clampSnapTarget(buf, 1.761, 1.761);
+    expect(result).toBeCloseTo(1.895, 5);
+  });
+
+  // T-S9-C4: next forward range is a sliver (<0.3s) → skip sliver, return next substantial range start
+  it('T-S9-C4: next forward range is a sliver (<0.3s) → skip sliver, return next substantial range start', () => {
+    // gap from 2.0→3.0; sliver [3.0, 3.2] (0.2s < 0.3s); substantial [4.0, 8.0]
+    const buf = makeBufferedMulti([[0, 2.0], [3.0, 3.2], [4.0, 8.0]]);
+    const result = h.exports.clampSnapTarget(buf, 1.5, 2.5);
+    expect(result).toBeCloseTo(4.0, 10);
+  });
+
+  // T-S9-C5: no forward substantial range → last-substantial fallback
+  it('T-S9-C5: no forward substantial range → last substantial range start fallback', () => {
+    // buf has one substantial range [0, 5.0]; rawTarget=6.0 is past it
+    const buf = makeBufferedMulti([[0, 5.0]]);
+    const result = h.exports.clampSnapTarget(buf, 0.5, 6.0);
+    expect(result).toBeCloseTo(0.0, 10);
+  });
+
+  // T-S9-C6: empty buf → returns null
+  it('T-S9-C6: empty buf (buf.length===0) → returns null', () => {
+    const buf = makeBufferedMulti([]);
+    const result = h.exports.clampSnapTarget(buf, 1.0, 2.0);
+    expect(result).toBeNull();
+  });
+
+  // T-S9-C7: all ranges are slivers, no substantial range → returns null
+  it('T-S9-C7: all ranges are slivers (< SNAP_SLIVER_MIN_SEC=0.3s), no substantial range → returns null', () => {
+    const buf = makeBufferedMulti([[0, 0.1], [1.0, 1.2], [2.0, 2.25]]);
+    const result = h.exports.clampSnapTarget(buf, 0.05, 1.5);
+    expect(result).toBeNull();
+  });
+
+  // T-S9-C8: rawTarget in a sliver range → treated as gap, forwards to next substantial range
+  it('T-S9-C8: rawTarget inside a sliver range → treated as gap, returns next substantial range start', () => {
+    // sliver [0, 0.2]; gap; substantial [1.0, 5.0]
+    const buf = makeBufferedMulti([[0, 0.2], [1.0, 5.0]]);
+    // rawTarget=0.1 is inside the sliver
+    const result = h.exports.clampSnapTarget(buf, 0.05, 0.1);
+    expect(result).toBeCloseTo(1.0, 10);
+  });
+
+  // T-S9-11 (S9-3-SC4): EXACT-0.300 boundary — a range of duration EXACTLY SNAP_SLIVER_MIN_SEC
+  // is SUBSTANTIAL (selectable / pass-through), NOT a sliver. The clamp uses `e - s >= 0.3`;
+  // this pins the `>=` boundary and KILLS the `>=` → `>` mutant (which would treat a 0.300
+  // range as a sliver and reject it). Two complementary cases:
+  //   (a) rawTarget INSIDE the exact-0.3 range → pass-through (returns rawTarget unchanged).
+  //   (b) rawTarget in a gap, exact-0.3 range AHEAD → selected as the forward substantial range.
+  // NOTE: durations must be float-EXACT 0.3 for this boundary to be meaningful — many decimal
+  // pairs (e.g. 5.3-5.0) evaluate to 0.2999999999999998 in IEEE-754 and would read as slivers.
+  // [0,0.3] and [0.3,0.6] both subtract to exactly 0.3, so `>=0.3` is true while `>0.3` is false.
+  it('T-S9-11: range of duration EXACTLY 0.300 is SUBSTANTIAL (selectable / pass-through), killing the >=→> mutant', () => {
+    // (a) pass-through: rawTarget 0.1 inside the exact-0.300 range [0, 0.3].
+    //     Correct (>=0.3 substantial): returns 0.1. Mutant (>0.3 sliver): would skip to 1.0.
+    const bufA = makeBufferedMulti([[0, 0.3], [1.0, 2.0]]);
+    const passThrough = h.exports.clampSnapTarget(bufA, 0.05, 0.1);
+    expect(passThrough).toBeCloseTo(0.1, 10); // accepted as-is — exact-0.3 range is substantial
+
+    // (b) forward-select: rawTarget 0.05 inside sliver [0,0.1]; the exact-0.300 range [0.3, 0.6]
+    //     must be chosen as the next substantial range start (not skipped as a sliver).
+    //     Correct (>=0.3): returns 0.3. Mutant (>0.3): [0.3,0.6] read as sliver → null.
+    const bufB = makeBufferedMulti([[0, 0.1], [0.3, 0.6]]);
+    const forwardSelect = h.exports.clampSnapTarget(bufB, 0.02, 0.05);
+    expect(forwardSelect).toBeCloseTo(0.3, 10); // exact-0.3 range selected, not skipped
+  });
+});
+
+// ── T2-B: watchdog 2-tick stuck threshold ────────────────────────────────────
+describe('watchdog — 2-tick stuck threshold (T-S9-W1..W6)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-W1: 1 stuck tick → NO rescue
+  it('T-S9-W1: 1 stuck tick (stuckTicks starts at 0, no-progress + data ahead, 1 tick) → NO rescue', async () => {
+    // arm: watchdogStuckTicks=0 (default), set up stuck scenario
+    h.exports.setWatchdogState({ watchdogStuckTicks: 0, watchdogLastTickCt: 5.0 });
+    // ct below watchdogLastTickCt + WATCHDOG_PROGRESS_EPS(0.5)
+    h.videoEl.currentTime = 5.0; // no meaningful progress (5.0 - 5.0 = 0 < 0.5)
+    // data substantially ahead: bufEnd = 10.0 > ct + 0.5
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // stuckTicks incremented to 1, but threshold is 2 → no rescue
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
+  });
+
+  // T-S9-W2: 2 stuck ticks → rescue fires
+  it('T-S9-W2: 2 stuck ticks (pre-arm stuckTicks=1, no-progress + data ahead, 1 tick) → rescue fires', async () => {
+    // pre-arm to stuckTicks=1 via setWatchdogState
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0; // no progress (0 < WATCHDOG_PROGRESS_EPS=0.5)
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]); // substantial data ahead
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // stuckTicks reaches 2 → rescue fires
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore + 1);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(true);
+  });
+
+  // T-S9-W3: ct progress resets stuck counter
+  it('T-S9-W3: ct progress (>= WATCHDOG_PROGRESS_EPS=0.5) resets stuckTicks to 0, no rescue', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    // ct advanced by 0.6 > WATCHDOG_PROGRESS_EPS(0.5) → "progressed"
+    h.videoEl.currentTime = 5.6;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // progress detected → stuckTicks reset to 0, no rescue
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
+    // getWatchdogState shows stuckTicks reset
+    expect(h.exports.getWatchdogState().watchdogStuckTicks).toBe(0);
+  });
+
+  // T-S9-W4: no data-ahead resets counter
+  it('T-S9-W4: no data-ahead (bufEnd <= ct + WATCHDOG_DATA_AHEAD_SEC=0.5) resets stuckTicks to 0, no rescue', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    // bufEnd = 5.3 which is NOT > ct(5.0) + 0.5 → no data ahead
+    h.sb.buffered = makeBufferedMulti([[0, 5.3]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    expect(h.exports.getWatchdogState().watchdogStuckTicks).toBe(0);
+  });
+
+  // T-S9-W5: empty buffered resets counter and sentinel
+  it('T-S9-W5: empty buf resets stuckTicks=0 and watchdogLastTickCt=-Infinity, no rescue', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.sb.buffered = makeBufferedMulti([]); // empty
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    expect(h.exports.getWatchdogState().watchdogStuckTicks).toBe(0);
+    expect(h.exports.getWatchdogState().watchdogLastTickCt).toBe(-Infinity);
+  });
+
+  // T-S9-W6: rescue resets stuckTicks; subsequent cycle needs 2 more ticks to re-rescue
+  it('T-S9-W6: after rescue, stuckTicks=0; next stuck tick does NOT immediately re-rescue', async () => {
+    // First rescue: pre-arm to threshold
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    await vi.advanceTimersByTimeAsync(2000); // rescue fires, stuckTicks reset to 0
+
+    const rescuesAfterFirst = h.exports.getWatchdogRescues();
+    expect(rescuesAfterFirst).toBeGreaterThan(0);
+
+    // Now simulate another tick with no-progress from the rescue landing position
+    // The watchdog should NOT re-rescue on this tick (stuckTicks was just reset to 0 → now 1)
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000); // stuckTicks=0 → increments to 1, NOT rescue yet
+
+    // No additional rescue on this tick
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesAfterFirst);
+  });
+
+  // T-S9-W7 (reconcile #7): clamp-null / sliver-only-ahead → NO rescue AND stuckTicks NOT reset.
+  // Geometry: all-sliver buffer [[0,0.2],[0.5,0.7],[1.0,1.2]] (every range < SNAP_SLIVER_MIN_SEC=0.3),
+  //   ct=0.0 stuck, pre-armed to threshold (stuckTicks=1, lastTickCt=0.0).
+  // Tick path: dataAhead = bufEnd(1.2) > ct(0.0)+WATCHDOG_DATA_AHEAD_SEC(0.5) ✓; no progress
+  //   → stuckTicks 1→2 → enters rescue block → clampSnapTarget returns null (no substantial range
+  //   to land in) → wTarget===null → NO seek, NO counter reset.
+  // Invariant: the watchdog must NOT silently swallow the stuck state — stuckTicks stays at 2 so
+  // the next tick (once a substantial range arrives) retries immediately instead of re-counting
+  // from zero. Pins the no-rescue-on-null branch AND the no-reset retry behavior.
+  it('T-S9-W7: only slivers ahead (clamp null) → NO watchdog_snap fires AND stuckTicks NOT reset (retries next tick)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 0.0 });
+    h.videoEl.currentTime = 0.0; // stuck — no progress
+    h.sb.buffered = makeBufferedMulti([[0, 0.2], [0.5, 0.7], [1.0, 1.2]]); // all slivers, data ahead
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // No rescue: clampSnapTarget returned null.
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
+    // stuckTicks NOT reset (reached 2, no rescue → stays armed so the next tick retries).
+    expect(h.exports.getWatchdogState().watchdogStuckTicks).toBe(2);
+  });
+
+  // T-S9-W8 (FIX-6): watchdog forward-only guard. clampSnapTarget resolves to a value <= ct
+  //   (via the last-substantial fallback / only-behind geometry) → the `wTarget > wCt` guard
+  //   MUST block the rescue. Pins forward-only and KILLS dropping `wTarget > wCt`.
+  // Geometry: substantial range BEHIND ct [0,5.0] plus a trailing sliver [8.0,8.2]; ct=7.0.
+  //   dataAhead = bufEnd(8.2) > ct(7.0)+0.5 ✓; pre-armed stuck (no progress) → reaches rescue block.
+  //   wRaw = bufEnd(8.2) - 0.2 = 8.0 → inside the sliver [8.0,8.2] → treated as gap; no forward
+  //   substantial range → last-substantial fallback → start of [0,5.0] = 0.0, which is <= ct(7.0).
+  //   Forward-only guard (wTarget > wCt) → 0.0 > 7.0 is false → NO rescue.
+  // If `wTarget > wCt` is dropped the watchdog would seek BACKWARD to 0.0 → this test FAILS.
+  it('T-S9-W8: clamp resolves <= ct (only-behind substantial range) → forward-only guard blocks rescue (kills dropping wTarget>wCt)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 7.0 });
+    h.videoEl.currentTime = 7.0; // stuck — no progress
+    h.sb.buffered = makeBufferedMulti([[0, 5.0], [8.0, 8.2]]); // substantial behind, sliver ahead
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // No rescue: clamp target (0.0) is <= ct (7.0) → forward-only guard blocks.
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
+  });
+});
+
+// ── T2-C: watchdog forces through sb.updating ────────────────────────────────
+describe('watchdog — forces through sb.updating (T-S9-U1, T-S9-U2)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-U1: sb.updating=true, watchdog pre-armed → rescue fires anyway
+  it('T-S9-U1: sb.updating=true, pre-armed watchdog → rescue fires (no sb.updating guard in watchdog)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    h.sb.updating = true; // SourceBuffer is updating
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // Watchdog fires despite sb.updating (no sb.updating guard)
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore + 1);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(true);
+  });
+
+  // T-S9-U2: sb.updating=true blocks seekToLiveEdge but NOT watchdog (contrast test)
+  it('T-S9-U2: sb.updating=true blocks seekToLiveEdge but watchdog is the only path that unblocks', async () => {
+    // seekToLiveEdge direct call: should be blocked by sb.updating
+    h.sb.updating = true;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    h.videoEl.currentTime = 5.0;
+    const ctBefore = h.videoEl.currentTime;
+
+    h.exports.seekToLiveEdge();
+
+    // seekToLiveEdge blocked: currentTime unchanged
+    expect(h.videoEl.currentTime).toBe(ctBefore);
+  });
+});
+
+// ── T2-D: watchdog respects VIDEO_EL.seeking ─────────────────────────────────
+describe('watchdog — respects VIDEO_EL.seeking (T-S9-SK1)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-SK1: VIDEO_EL.seeking=true → watchdog does NOT rescue
+  it('T-S9-SK1: VIDEO_EL.seeking=true with pre-armed watchdog → NO rescue (watchdog respects seeking guard)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    // Override seeking to true
+    h.overrideProperty(h.videoEl, 'seeking', { get: () => true });
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // No rescue: seeking guard prevents double-seek
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
+  });
+
+  // T-S9-SK2 (FIX-7, judgment R2): no-double-seek in the SAME tick, pinned at the
+  //   seekToLiveEdge SEEKING guard (L842) — NOT the drift gate (L853).
+  //   The watchdog runs BEFORE seekToLiveEdge in the heartbeat. The watchdog rescue's
+  //   currentTime assignment flips seeking=true; the subsequent seekToLiveEdge() call
+  //   (guard: `if (VIDEO_EL.seeking) return`) MUST be a no-op — it must return at L842
+  //   BEFORE reaching the drift gate or any log line.
+  // Geometry (FAR-BACK landing so the drift gate canNOT mask the seeking guard):
+  //   buf [[0,4.0],[8.0,12.0],[19.85,20.0]], wCt=5.0, watchdogLastTickCt=5.0.
+  //   Watchdog: dataAhead = bufEnd(20.0) > wCt(5.0)+0.5 ✓; progressed = 5.0 > 5.0+0.5 false →
+  //     stuck 1→2 ✓. wRaw = bufEnd(20.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 19.8 → in gap
+  //     [12.0, 19.85]; forward range [19.85,20.0] is a sliver (0.15 < 0.3) → step-4 fallback →
+  //     last substantial range start = [8.0,12.0].start = 8.0. forward-only 8.0 > 5.0 ✓ → rescue
+  //     lands ct=8.0. POST-RESCUE drift = bufEnd(20.0) - 8.0 = 12.0 > LIVE_EDGE_MAX_DRIFT_SEC(0.5),
+  //     so the drift gate does NOT fire — the seeking guard is the ONLY thing that can suppress
+  //     the second seek.
+  //   The rescue assignment flips seeking=true (real-element seam below); seekToLiveEdge then
+  //   returns at the L842 seeking guard, BEFORE the drift computation, so it emits NO seek line.
+  // Setup: override the currentTime SETTER so any assignment flips seeking=true (mimicking the
+  //   real <video> element starting a seek), via the existing overrideProperty/defineProperty seam.
+  // Mutation kill (verified): removing the L842 seeking guard lets seekToLiveEdge proceed past it;
+  //   with drift 12.0 > 0.5 the drift gate passes and seekToLiveEdge emits a SECOND seek line
+  //   (result=guard_backward, since target 8.0 <= new ct 8.0). With the guard present that line is
+  //   absent. Asserting ZERO result=snap AND ZERO result=guard_backward pins the seeking guard.
+  it('T-S9-SK2: watchdog rescue lands far behind live (drift>0.5) and flips seeking=true → seekToLiveEdge bails at the L842 seeking guard, NO second seek line', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.sb.buffered = makeBufferedMulti([[0, 4.0], [8.0, 12.0], [19.85, 20.0]]);
+
+    // Backing store for currentTime; the setter flips seeking=true on assignment (real-element seam).
+    let _ct = 5.0;
+    let _seeking = false;
+    h.overrideProperty(h.videoEl, 'seeking', { get: () => _seeking, configurable: true });
+    h.overrideProperty(h.videoEl, 'currentTime', {
+      get: () => _ct,
+      set: (v) => { _ct = v; _seeking = true; }, // assignment starts a seek
+      configurable: true,
+    });
+
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const logLines = getMseLogLines(h.tauri);
+    // Watchdog rescue fired exactly once, landing far behind live (step-4 fallback → 8.000).
+    const watchdogLines = logLines.filter(l => l.includes('result=watchdog_snap'));
+    expect(watchdogLines.length).toBe(1);
+    expect(watchdogLines[0]).toMatch(/ to=8\.000 /);
+    // seekToLiveEdge produced NO second seek line of ANY kind: it returned at the seeking guard
+    // (L842) BEFORE the drift gate. With the seeking guard removed it would emit a second line
+    // (drift 12.0 > 0.5 passes the drift gate), so both of these pin the seeking guard.
+    expect(logLines.some(l => l.includes('result=snap'))).toBe(false);
+    expect(logLines.some(l => l.includes('result=guard_backward'))).toBe(false);
+  });
+});
+
+// ── T2-E: watchdog bypasses N1/N2 ────────────────────────────────────────────
+describe('watchdog — bypasses N1/N2 effectiveness+debounce (T-S9-N1, T-S9-N2)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-N1: N2 debounce would fire (lastSnapAt within 300ms) but watchdog fires anyway
+  it('T-S9-N1: lastSnapAt within 300ms window (N2 would suppress) but watchdog rescue still fires', async () => {
+    // Simulate N2 debounce scenario: set lastSnapAtMs to recent time (50ms ago)
+    h.perfNow(50); // current perf.now = 50ms
+    h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 5.0, lastSnapBufEnd: 10.0 });
+    // Arm watchdog at threshold
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // Watchdog fires despite N2 debounce being active
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore + 1);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(true);
+  });
+
+  // T-S9-N2: N1 effectiveness would fire (no ct/bufEnd progress vs lastSnap*) but watchdog fires anyway
+  it('T-S9-N2: no ct/bufEnd progress vs lastSnap* (N1 would suppress) but watchdog rescue still fires', async () => {
+    h.perfNow(0);
+    // Set lastSnap* to exact same ct/bufEnd as current state (N1 would suppress)
+    h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 5.0, lastSnapBufEnd: 10.0 });
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // Watchdog structurally bypasses N1/N2 (they live in onVideoWaiting, not heartbeat)
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore + 1);
+    const logLines = getMseLogLines(h.tauri);
+    expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(true);
+  });
+});
+
+// ── T2-F: no-hole guarantee on all 3 snap paths ──────────────────────────────
+describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // ── GEOMETRY NOTE (judgment R2) ───────────────────────────────────────────────
+  // The clamp's step-3 (forward-cross) branch is UNREACHABLE at the integration level
+  // for ALL three paths, because each path computes rawTarget = bufEnd - LEAD with
+  // LEAD ∈ {0.2 (watchdog/seekToLiveEdge), 0.3 (onVideoWaiting)}. For step-3 to fire,
+  // a SUBSTANTIAL forward range (span >= SNAP_SLIVER_MIN_SEC = 0.3) must START after
+  // rawTarget and END at or before bufEnd; that range must therefore fit a >= 0.3 span
+  // into a window of width < LEAD <= 0.3 before bufEnd — impossible. A 2,000,000-sample
+  // brute-force search over random multi-range geometries confirmed ZERO step-3 hits at
+  // integration for either LEAD. The step-3 branch IS pinned directly at unit level by
+  // T-S9-C2/C3/C4 (which pass rawTarget explicitly, bypassing the bufEnd-LEAD coupling).
+  // Therefore H1/H2/H3 pin the only gap-redirecting branch that IS reachable at
+  // integration: step-4 (last-substantial fallback). The geometry below is tightened so
+  // the fallback lands ~2.2 s behind live (NOT the prior ~6.2 s baked-in target), keeping
+  // the clamp load-bearing while removing the artificial far-behind framing.
+
+  // T-S9-H1: watchdog path — rawTarget MUST land in a GAP so the clamp is load-bearing.
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], wCt=5.0.
+  //   wRaw = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
+  // Preconditions: dataAhead = bufEnd(11.7) > wCt(5.0)+WATCHDOG_DATA_AHEAD_SEC(0.5) ✓;
+  //   progressed = wCt(5.0) > watchdogLastTickCt(5.0)+WATCHDOG_PROGRESS_EPS(0.5) false → stuck
+  //   1→2 ✓; forward-only 9.5 > 5.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
+  // If the clamp call is replaced with the raw target the watchdog still fires (11.5 > 5.0) but
+  // lands in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H1: watchdog rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=5.0 → rescue to=9.500 (step-4 clamp redirect, NOT gap 11.500)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
+
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const logLines = getMseLogLines(h.tauri);
+    const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
+    // The seek line MUST exist (unconditional — no guard).
+    expect(watchdogLine).toBeTruthy();
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    expect(watchdogLine).toMatch(/ to=9\.500 /);
+    expect(watchdogLine).not.toMatch(/ to=11\.500 /);
+    const toMatch = watchdogLine.match(/to=(\d+\.\d+)/);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
+  });
+
+  // T-S9-H2: seekToLiveEdge path — rawTarget MUST land in a GAP so the clamp is load-bearing.
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
+  // Preconditions: drift = bufEnd(11.7) - ct(1.0) = 10.7 > LIVE_EDGE_MAX_DRIFT_SEC(0.5) ✓;
+  //   forward-only target 9.5 > ct 1.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
+  // If the clamp call is replaced with the raw target the seek still fires (11.5 > 1.0) but lands
+  // in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → snap to=9.500 (step-4 clamp redirect, NOT gap 11.500)', () => {
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
+    h.videoEl.currentTime = 1.0;
+    h.tauri.invoke.mock.calls.length = 0;
+
+    h.exports.seekToLiveEdge();
+
+    const logLines = getMseLogLines(h.tauri);
+    const snapLine = logLines.find(l => l.includes('result=snap'));
+    // The seek line MUST exist (unconditional — no guard).
+    expect(snapLine).toBeTruthy();
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    expect(snapLine).toMatch(/ to=9\.500 /);
+    expect(snapLine).not.toMatch(/ to=11\.500 /);
+    const toMatch = snapLine.match(/to=(\d+\.\d+)/);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
+  });
+
+  // T-S9-H3: onVideoWaiting path — rawTarget MUST land in a GAP so the clamp is load-bearing.
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_STALL_SNAP_LEAD_SEC(0.3) = 11.4 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
+  // Preconditions: N1 (fresh lastSnap*=-Infinity → advanced ✓); N2 (lastSnapAtMs=-Infinity →
+  //   not debounced ✓); N3 target(9.5) !== ct(1.0) ✓; G6 cushion = bufEnd(11.7)-target(9.5) =
+  //   2.2 >= LIVE_EDGE_STALL_MIN_CUSHION_SEC(0.1) ✓. Post-snap drift = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.400.
+  // If the clamp call is replaced with the raw target the snap still fires but lands in the gap
+  // → to=11.400 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → stall_snap to=9.500 (step-4 clamp redirect, NOT gap 11.400)', () => {
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
+    h.videoEl.currentTime = 1.0;
+    h.perfNow(0);
+    h.tauri.invoke.mock.calls.length = 0;
+
+    h.exports.onVideoWaiting();
+
+    const logLines = getMseLogLines(h.tauri);
+    const stall = logLines.find(l => l.includes('result=stall_snap'));
+    // The seek line MUST exist (unconditional — no guard).
+    expect(stall).toBeTruthy();
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.4) to the substantial range start.
+    expect(stall).toMatch(/ to=9\.500 /);
+    expect(stall).not.toMatch(/ to=11\.400 /);
+    const toMatch = stall.match(/to=(\d+\.\d+)/);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
+  });
+});
+
+// ── T2-G: rs<=2 escape hatch + re-storm defense ──────────────────────────────
+describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-R1: rs=2 inside 300ms window WITH progress → executes (was suppressed under Slice 8 rs<=1)
+  it('T-S9-R1: rs=2 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, stall_snap executes', () => {
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1
+
+    h.perfNow(50); // inside 300ms
+    h.sb.buffered = makeBuffered(0, 10.033);
+    h.videoEl.currentTime = 10.019; // advanced > ADV_EPS → N1 passes
+    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 escape hatch
+
+    h.exports.onVideoWaiting();
+
+    // N2 bypassed (rs=2 now IS escape hatch): snap executes
+    expect(h.exports.getSuppressedDebounceCount()).toBe(0);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.033 - 0.300, 5);
+  });
+
+  // T-S9-R2: rs=2, NO ct/bufEnd progress → N1 fires (re-storm defense intact)
+  it('T-S9-R2: rs=2 inside window, NO ct/bufEnd progress → N1 fires (suppressedGuardCount++), no execute', () => {
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1, records ct=10.016, bufEnd=10.030
+
+    h.perfNow(50);
+    // ct and bufEnd NOT advanced (still at snap#1 baseline) → N1 fires
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+
+    h.exports.onVideoWaiting();
+
+    // N1 fired first; no execute (re-storm defense)
+    expect(h.exports.getSuppressedGuardCount()).toBe(1);
+    expect(h.exports.getSuppressedDebounceCount()).toBe(0);
+  });
+
+  // T-S9-R3: rs=3 inside 300ms → still debounced by N2 (N2 bypass only for rs<=2)
+  it('T-S9-R3: rs=3 inside 300ms window, ct/bufEnd advanced → N2 applies (rs=3 not escape hatch)', () => {
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1
+
+    h.perfNow(50);
+    h.sb.buffered = makeBuffered(0, 10.032);
+    h.videoEl.currentTime = 10.018;
+    // rs=3 is NOT the escape hatch; readyState default is 4, set to 3 explicitly
+    Object.defineProperty(h.videoEl, 'readyState', { value: 3, configurable: true });
+
+    h.exports.onVideoWaiting();
+
+    expect(h.exports.getSuppressedDebounceCount()).toBe(1); // N2 still fires
+  });
+});
+
+// ── T2-H: watchdog telemetry ──────────────────────────────────────────────────
+describe('watchdog telemetry — watchdog_snap signal + watchdog_rescues counter (T-S9-T1..T5)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-T1: rescue log line matches expected format
+  it('T-S9-T1: rescue emits log line matching /event=seek result=watchdog_snap from=N to=N drift=N/', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const logLines = getMseLogLines(h.tauri);
+    const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
+    expect(watchdogLine).toBeTruthy();
+    expect(watchdogLine).toMatch(/event=seek result=watchdog_snap from=\d+\.\d+ to=\d+\.\d+ drift=\d+\.\d+/);
+    // to= value must be > ct (forward-only)
+    const toMatch = watchdogLine.match(/to=(\d+\.\d+)/);
+    expect(toMatch).toBeTruthy();
+    expect(parseFloat(toMatch[1])).toBeGreaterThan(5.0);
+  });
+
+  // T-S9-T1b (FIX-5): EXACT to=/drift= pin. Single substantial range [0,10], ct=5.0.
+  //   wRaw = bufEnd(10.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 9.8 → inside [0,10] → pass-through.
+  //   wDrift = bufEnd(10.0) - ct(5.0) = 5.0.
+  // Pins to=9.800 AND drift=5.000 EXACTLY. Kills a mutated lead in `wRaw = wBufEnd -
+  // LIVE_EDGE_TARGET_LEAD_SEC` (any other lead shifts to= off 9.800) and a mutated drift formula.
+  it('T-S9-T1b: watchdog rescue emits EXACT to=9.800 drift=5.000 for buf [[0,10]] lead 0.2 ct 5.0 (kills mutated lead)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const logLines = getMseLogLines(h.tauri);
+    const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
+    expect(watchdogLine).toBeTruthy();
+    expect(watchdogLine).toMatch(/event=seek result=watchdog_snap from=5\.000 to=9\.800 drift=5\.000/);
+  });
+
+  // T-S9-T2: monotonic counter — 3 rescues → getWatchdogRescues() === 3
+  it('T-S9-T2: 3 sequential rescues → getWatchdogRescues() monotonically increases to 3', async () => {
+    for (let i = 0; i < 3; i++) {
+      h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+      h.videoEl.currentTime = 5.0;
+      h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+      await vi.advanceTimersByTimeAsync(2000);
+    }
+    expect(h.exports.getWatchdogRescues()).toBe(3);
+  });
+
+  // T-S9-T3: watchdog_rescues is the trailing field on tick lines
+  it('T-S9-T3: tick line trailing field matches /watchdog_rescues=(\\d+)$/ equaling getWatchdogRescues()', async () => {
+    // Fire a rescue
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const rescueCount = h.exports.getWatchdogRescues();
+    expect(rescueCount).toBeGreaterThan(0);
+
+    // Fire a clean tick (watchdog won't re-rescue since stuckTicks reset)
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const tickLines = getTickLines(h.tauri);
+    expect(tickLines.length).toBeGreaterThan(0);
+    const lastTick = tickLines[tickLines.length - 1];
+    expect(lastTick).toMatch(/watchdog_rescues=(\d+)$/);
+    const m = lastTick.match(/watchdog_rescues=(\d+)$/);
+    expect(parseInt(m[1], 10)).toBe(h.exports.getWatchdogRescues());
+  });
+
+  // T-S9-T4: getWatchdogRescues() persists across tearDownMse
+  it('T-S9-T4: watchdogRescues persists across tearDownMse (module-scope, not mseState-scoped)', async () => {
+    // Rescue once
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    expect(rescuesBefore).toBeGreaterThan(0);
+
+    // tearDownMse and re-setup
+    h.exports.tearDownMse();
+
+    // Counter unchanged after teardown
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore);
+  });
+
+  // T-S9-T5: WATCHDOG_PROGRESS_EPS=0.5 is meaningful — small creep reads as stuck
+  it('T-S9-T5: ct creeping 0.013s/tick (< WATCHDOG_PROGRESS_EPS=0.5) → reads as stuck, watchdog fires', async () => {
+    // Simulate GATE-8 freeze creep: 0.013s/tick
+    // Pre-arm: lastTickCt=5.0, stuckTicks=1
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.013; // advanced only 0.013s < WATCHDOG_PROGRESS_EPS(0.5) → stuck
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesBefore = h.exports.getWatchdogRescues();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // 0.013 < 0.5 → still "stuck" → rescue fires on this tick (stuckTicks 1→2)
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesBefore + 1);
+
+    // Counter-test: ct increment of 0.6s/tick (> WATCHDOG_PROGRESS_EPS) → progresses, no rescue
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.6; // 0.6 > 0.5 → progressed
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    const rescuesAfterFirstSet = h.exports.getWatchdogRescues();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    // No rescue: ct considered progressing
+    expect(h.exports.getWatchdogRescues()).toBe(rescuesAfterFirstSet);
+  });
+});
+
+// ── T2-I: Slice 9 seam exports and constants ─────────────────────────────────
+describe('Slice 9 seam exports and constants (T-S9-E1..E8)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S9-E1: WATCHDOG_STUCK_TICKS === 2
+  it('T-S9-E1: WATCHDOG_STUCK_TICKS exported === 2', () => {
+    expect(h.exports.WATCHDOG_STUCK_TICKS).toBe(2);
+  });
+
+  // T-S9-E2: WATCHDOG_PROGRESS_EPS === 0.5
+  it('T-S9-E2: WATCHDOG_PROGRESS_EPS exported === 0.5', () => {
+    expect(h.exports.WATCHDOG_PROGRESS_EPS).toBe(0.5);
+  });
+
+  // T-S9-E3: WATCHDOG_DATA_AHEAD_SEC === 0.5
+  it('T-S9-E3: WATCHDOG_DATA_AHEAD_SEC exported === 0.5', () => {
+    expect(h.exports.WATCHDOG_DATA_AHEAD_SEC).toBe(0.5);
+  });
+
+  // T-S9-E4: SNAP_SLIVER_MIN_SEC === 0.3
+  it('T-S9-E4: SNAP_SLIVER_MIN_SEC exported === 0.3', () => {
+    expect(h.exports.SNAP_SLIVER_MIN_SEC).toBe(0.3);
+  });
+
+  // T-S9-E5: getWatchdogRescues is a function that returns a number
+  it('T-S9-E5: getWatchdogRescues is a function returning a number', () => {
+    expect(typeof h.exports.getWatchdogRescues).toBe('function');
+    expect(typeof h.exports.getWatchdogRescues()).toBe('number');
+  });
+
+  // T-S9-E6: setWatchdogState and getWatchdogState are functions
+  it('T-S9-E6: setWatchdogState and getWatchdogState are both functions', () => {
+    expect(typeof h.exports.setWatchdogState).toBe('function');
+    expect(typeof h.exports.getWatchdogState).toBe('function');
+  });
+
+  // T-S9-E7: clampSnapTarget is a function
+  it('T-S9-E7: clampSnapTarget is a function', () => {
+    expect(typeof h.exports.clampSnapTarget).toBe('function');
+  });
+
+  // T-S9-E8: getWatchdogRescues returns live value (not snapshot-at-0)
+  it('T-S9-E8: getWatchdogRescues returns live value — rescue once → getter returns 1 (not snapshotted 0)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(h.exports.getWatchdogRescues()).toBe(1);
   });
 });
