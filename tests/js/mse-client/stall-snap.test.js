@@ -1637,17 +1637,32 @@ describe('watchdog — respects VIDEO_EL.seeking (T-S9-SK1)', () => {
     expect(logLines.some(l => l.includes('result=watchdog_snap'))).toBe(false);
   });
 
-  // T-S9-SK2 (FIX-7): no-double-seek in the SAME tick. The watchdog runs BEFORE seekToLiveEdge
-  //   in the heartbeat. If the watchdog rescue's currentTime assignment flips seeking=true,
-  //   the subsequent seekToLiveEdge() call (guard: `if (VIDEO_EL.seeking) return`) MUST be a
-  //   no-op — no second seek line in the same tick.
+  // T-S9-SK2 (FIX-7, judgment R2): no-double-seek in the SAME tick, pinned at the
+  //   seekToLiveEdge SEEKING guard (L842) — NOT the drift gate (L853).
+  //   The watchdog runs BEFORE seekToLiveEdge in the heartbeat. The watchdog rescue's
+  //   currentTime assignment flips seeking=true; the subsequent seekToLiveEdge() call
+  //   (guard: `if (VIDEO_EL.seeking) return`) MUST be a no-op — it must return at L842
+  //   BEFORE reaching the drift gate or any log line.
+  // Geometry (FAR-BACK landing so the drift gate canNOT mask the seeking guard):
+  //   buf [[0,4.0],[8.0,12.0],[19.85,20.0]], wCt=5.0, watchdogLastTickCt=5.0.
+  //   Watchdog: dataAhead = bufEnd(20.0) > wCt(5.0)+0.5 ✓; progressed = 5.0 > 5.0+0.5 false →
+  //     stuck 1→2 ✓. wRaw = bufEnd(20.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 19.8 → in gap
+  //     [12.0, 19.85]; forward range [19.85,20.0] is a sliver (0.15 < 0.3) → step-4 fallback →
+  //     last substantial range start = [8.0,12.0].start = 8.0. forward-only 8.0 > 5.0 ✓ → rescue
+  //     lands ct=8.0. POST-RESCUE drift = bufEnd(20.0) - 8.0 = 12.0 > LIVE_EDGE_MAX_DRIFT_SEC(0.5),
+  //     so the drift gate does NOT fire — the seeking guard is the ONLY thing that can suppress
+  //     the second seek.
+  //   The rescue assignment flips seeking=true (real-element seam below); seekToLiveEdge then
+  //   returns at the L842 seeking guard, BEFORE the drift computation, so it emits NO seek line.
   // Setup: override the currentTime SETTER so any assignment flips seeking=true (mimicking the
   //   real <video> element starting a seek), via the existing overrideProperty/defineProperty seam.
-  //   Pre-arm the watchdog to threshold with buf [[0,10]] ct=5.0 → rescue fires (watchdog_snap),
-  //   the assignment sets seeking=true, then seekToLiveEdge bails on the seeking guard.
-  it('T-S9-SK2: watchdog rescue assignment flips seeking=true → seekToLiveEdge produces NO second seek in the same tick', async () => {
+  // Mutation kill (verified): removing the L842 seeking guard lets seekToLiveEdge proceed past it;
+  //   with drift 12.0 > 0.5 the drift gate passes and seekToLiveEdge emits a SECOND seek line
+  //   (result=guard_backward, since target 8.0 <= new ct 8.0). With the guard present that line is
+  //   absent. Asserting ZERO result=snap AND ZERO result=guard_backward pins the seeking guard.
+  it('T-S9-SK2: watchdog rescue lands far behind live (drift>0.5) and flips seeking=true → seekToLiveEdge bails at the L842 seeking guard, NO second seek line', async () => {
     h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
-    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+    h.sb.buffered = makeBufferedMulti([[0, 4.0], [8.0, 12.0], [19.85, 20.0]]);
 
     // Backing store for currentTime; the setter flips seeking=true on assignment (real-element seam).
     let _ct = 5.0;
@@ -1663,10 +1678,15 @@ describe('watchdog — respects VIDEO_EL.seeking (T-S9-SK1)', () => {
     await vi.advanceTimersByTimeAsync(2000);
 
     const logLines = getMseLogLines(h.tauri);
-    // Watchdog rescue fired (one seek).
-    expect(logLines.filter(l => l.includes('result=watchdog_snap')).length).toBe(1);
-    // seekToLiveEdge produced NO second seek (blocked by seeking guard set during the rescue).
+    // Watchdog rescue fired exactly once, landing far behind live (step-4 fallback → 8.000).
+    const watchdogLines = logLines.filter(l => l.includes('result=watchdog_snap'));
+    expect(watchdogLines.length).toBe(1);
+    expect(watchdogLines[0]).toMatch(/ to=8\.000 /);
+    // seekToLiveEdge produced NO second seek line of ANY kind: it returned at the seeking guard
+    // (L842) BEFORE the drift gate. With the seeking guard removed it would emit a second line
+    // (drift 12.0 > 0.5 passes the drift gate), so both of these pin the seeking guard.
     expect(logLines.some(l => l.includes('result=snap'))).toBe(false);
+    expect(logLines.some(l => l.includes('result=guard_backward'))).toBe(false);
   });
 });
 
@@ -1724,20 +1744,36 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
   beforeEach(async () => { h = await makeS8Harness(); });
   afterEach(() => teardownS8Harness(h));
 
+  // ── GEOMETRY NOTE (judgment R2) ───────────────────────────────────────────────
+  // The clamp's step-3 (forward-cross) branch is UNREACHABLE at the integration level
+  // for ALL three paths, because each path computes rawTarget = bufEnd - LEAD with
+  // LEAD ∈ {0.2 (watchdog/seekToLiveEdge), 0.3 (onVideoWaiting)}. For step-3 to fire,
+  // a SUBSTANTIAL forward range (span >= SNAP_SLIVER_MIN_SEC = 0.3) must START after
+  // rawTarget and END at or before bufEnd; that range must therefore fit a >= 0.3 span
+  // into a window of width < LEAD <= 0.3 before bufEnd — impossible. A 2,000,000-sample
+  // brute-force search over random multi-range geometries confirmed ZERO step-3 hits at
+  // integration for either LEAD. The step-3 branch IS pinned directly at unit level by
+  // T-S9-C2/C3/C4 (which pass rawTarget explicitly, bypassing the bufEnd-LEAD coupling).
+  // Therefore H1/H2/H3 pin the only gap-redirecting branch that IS reachable at
+  // integration: step-4 (last-substantial fallback). The geometry below is tightened so
+  // the fallback lands ~2.2 s behind live (NOT the prior ~6.2 s baked-in target), keeping
+  // the clamp load-bearing while removing the artificial far-behind framing.
+
   // T-S9-H1: watchdog path — rawTarget MUST land in a GAP so the clamp is load-bearing.
-  // Geometry: [[0,5.0],[5.4,11.0],[11.5,11.6]], wCt=5.0.
-  //   wRaw = bufEnd(11.6) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.4 → in gap [11.0, 11.5].
-  //   clampSnapTarget: forward range [11.5,11.6] is a sliver (0.1 < 0.3) → skipped; no forward
-  //   substantial range → last-substantial fallback → start of [5.4,11.0] = 5.400.
-  // Preconditions: dataAhead = bufEnd(11.6) > wCt(5.0)+WATCHDOG_DATA_AHEAD_SEC(0.5) ✓;
-  //   2 stuck ticks (pre-armed to 1, this tick makes 2); forward-only 5.4 > 5.0 ✓.
-  // Strict no-hole pin: to= must EXACTLY equal 5.400 AND must NOT be the raw gap value 11.400.
-  // If the clamp call is replaced with the raw target the watchdog still fires (11.4 > 5.0) but
-  // lands in the gap → to=11.400 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H1: watchdog rawTarget in gap [[0,5.0],[5.4,11.0],[11.5,11.6]] ct=5.0 → rescue to=5.400 (clamp redirect, NOT gap 11.400)', async () => {
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], wCt=5.0.
+  //   wRaw = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
+  // Preconditions: dataAhead = bufEnd(11.7) > wCt(5.0)+WATCHDOG_DATA_AHEAD_SEC(0.5) ✓;
+  //   progressed = wCt(5.0) > watchdogLastTickCt(5.0)+WATCHDOG_PROGRESS_EPS(0.5) false → stuck
+  //   1→2 ✓; forward-only 9.5 > 5.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
+  // If the clamp call is replaced with the raw target the watchdog still fires (11.5 > 5.0) but
+  // lands in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H1: watchdog rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=5.0 → rescue to=9.500 (step-4 clamp redirect, NOT gap 11.500)', async () => {
     h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
     h.videoEl.currentTime = 5.0;
-    h.sb.buffered = makeBufferedMulti([[0, 5.0], [5.4, 11.0], [11.5, 11.6]]);
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
 
     h.tauri.invoke.mock.calls.length = 0;
     await vi.advanceTimersByTimeAsync(2000);
@@ -1746,25 +1782,25 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(watchdogLine).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.4) to the substantial range start.
-    expect(watchdogLine).toMatch(/ to=5\.400 /);
-    expect(watchdogLine).not.toMatch(/ to=11\.400 /);
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    expect(watchdogLine).toMatch(/ to=9\.500 /);
+    expect(watchdogLine).not.toMatch(/ to=11\.500 /);
     const toMatch = watchdogLine.match(/to=(\d+\.\d+)/);
-    expect(parseFloat(toMatch[1])).toBeCloseTo(5.400, 5);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
 
   // T-S9-H2: seekToLiveEdge path — rawTarget MUST land in a GAP so the clamp is load-bearing.
-  // Geometry: [[0,4.0],[4.4,9.0],[9.5,9.6]], ct=1.0.
-  //   rawTarget = bufEnd(9.6) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 9.4 → in gap [9.0, 9.5].
-  //   clampSnapTarget: forward range [9.5,9.6] is a sliver (0.1 < 0.3) → skipped; no forward
-  //   substantial range → last-substantial fallback → start of [4.4,9.0] = 4.400.
-  // Preconditions: drift = bufEnd(9.6) - ct(1.0) = 8.6 > LIVE_EDGE_MAX_DRIFT_SEC(0.5) ✓;
-  //   forward-only target 4.4 > ct 1.0 ✓.
-  // Strict no-hole pin: to= must EXACTLY equal 4.400 AND must NOT be the raw gap value 9.400.
-  // If the clamp call is replaced with the raw target the seek still fires (9.4 > 1.0) but lands
-  // in the gap → to=9.400 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,4.0],[4.4,9.0],[9.5,9.6]] ct=1.0 → snap to=4.400 (clamp redirect, NOT gap 9.400)', () => {
-    h.sb.buffered = makeBufferedMulti([[0, 4.0], [4.4, 9.0], [9.5, 9.6]]);
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
+  // Preconditions: drift = bufEnd(11.7) - ct(1.0) = 10.7 > LIVE_EDGE_MAX_DRIFT_SEC(0.5) ✓;
+  //   forward-only target 9.5 > ct 1.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
+  // If the clamp call is replaced with the raw target the seek still fires (11.5 > 1.0) but lands
+  // in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → snap to=9.500 (step-4 clamp redirect, NOT gap 11.500)', () => {
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
     h.tauri.invoke.mock.calls.length = 0;
 
@@ -1774,26 +1810,26 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const snapLine = logLines.find(l => l.includes('result=snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(snapLine).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (9.4) to the substantial range start.
-    expect(snapLine).toMatch(/ to=4\.400 /);
-    expect(snapLine).not.toMatch(/ to=9\.400 /);
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    expect(snapLine).toMatch(/ to=9\.500 /);
+    expect(snapLine).not.toMatch(/ to=11\.500 /);
     const toMatch = snapLine.match(/to=(\d+\.\d+)/);
-    expect(parseFloat(toMatch[1])).toBeCloseTo(4.400, 5);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
 
   // T-S9-H3: onVideoWaiting path — rawTarget MUST land in a GAP so the clamp is load-bearing.
-  // Geometry: [[0,4.0],[4.4,9.0],[9.5,9.6]], ct=1.0.
-  //   rawTarget = bufEnd(9.6) - LIVE_EDGE_STALL_SNAP_LEAD_SEC(0.3) = 9.3 → in gap [9.0, 9.5].
-  //   clampSnapTarget: forward range [9.5,9.6] is a sliver (0.1 < 0.3) → skipped; no forward
-  //   substantial range → last-substantial fallback → start of [4.4,9.0] = 4.400.
+  // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_STALL_SNAP_LEAD_SEC(0.3) = 11.4 → in gap [10.0, 11.6].
+  //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
+  //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
   // Preconditions: N1 (fresh lastSnap*=-Infinity → advanced ✓); N2 (lastSnapAtMs=-Infinity →
-  //   not debounced ✓); N3 target(4.4) !== ct(1.0) ✓; G6 cushion = bufEnd(9.6)-target(4.4) =
-  //   5.2 >= LIVE_EDGE_STALL_MIN_CUSHION_SEC(0.1) ✓.
-  // Strict no-hole pin: to= must EXACTLY equal 4.400 AND must NOT be the raw gap value 9.300.
+  //   not debounced ✓); N3 target(9.5) !== ct(1.0) ✓; G6 cushion = bufEnd(11.7)-target(9.5) =
+  //   2.2 >= LIVE_EDGE_STALL_MIN_CUSHION_SEC(0.1) ✓. Post-snap drift = 2.2 s (tightened).
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.400.
   // If the clamp call is replaced with the raw target the snap still fires but lands in the gap
-  // → to=9.300 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,4.0],[4.4,9.0],[9.5,9.6]] ct=1.0 → stall_snap to=4.400 (clamp redirect, NOT gap 9.300)', () => {
-    h.sb.buffered = makeBufferedMulti([[0, 4.0], [4.4, 9.0], [9.5, 9.6]]);
+  // → to=11.400 → this test FAILS (mutation-killing). Unconditional assert.
+  it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → stall_snap to=9.500 (step-4 clamp redirect, NOT gap 11.400)', () => {
+    h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
     h.perfNow(0);
     h.tauri.invoke.mock.calls.length = 0;
@@ -1804,11 +1840,11 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const stall = logLines.find(l => l.includes('result=stall_snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(stall).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (9.3) to the substantial range start.
-    expect(stall).toMatch(/ to=4\.400 /);
-    expect(stall).not.toMatch(/ to=9\.300 /);
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.4) to the substantial range start.
+    expect(stall).toMatch(/ to=9\.500 /);
+    expect(stall).not.toMatch(/ to=11\.400 /);
     const toMatch = stall.match(/to=(\d+\.\d+)/);
-    expect(parseFloat(toMatch[1])).toBeCloseTo(4.400, 5);
+    expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
 });
 
