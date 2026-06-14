@@ -292,21 +292,21 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(tauri.invoke.mock.calls.filter(([cmd]) => cmd === 'mse_log').length).toBe(0);
   });
 
-  // ── T-S7-10: Multi-range — last-range anchor, forward gap-jump ────────────
-  it('T-S7-10: ranges [0,0.15],[2.5,8.0]; ct=0.15 → target=7.700 (forward gap-jump)', () => {
+  // ── T-S7-10: Multi-range — last-range anchor, forward gap-jump (S10: lead 0.45)
+  it('T-S7-10: ranges [0,0.15],[2.5,8.0]; ct=0.15 → target=7.550 (forward gap-jump, S10 lead 0.45)', () => {
     sb.buffered = makeBufferedMulti([[0, 0.15], [2.5, 8.0]]);
     videoEl.currentTime = 0.150;
 
     exports.onVideoWaiting();
 
-    // lastStart=2.5, bufEnd=8.0, target=Math.max(2.5, 8.0−0.3)=7.700
-    expect(videoEl.currentTime).toBeCloseTo(7.700, 5);
+    // lastStart=2.5, bufEnd=8.0, target=Math.max(2.5, 8.0−0.450)=7.550
+    expect(videoEl.currentTime).toBeCloseTo(7.550, 5);
 
     const lines = getMseLogLines(tauri);
     const snapLine = lines.find((l) => l.includes('result=stall_snap'));
     expect(snapLine).toBeDefined();
     expect(snapLine).toContain('from=0.150');
-    expect(snapLine).toContain('to=7.700');
+    expect(snapLine).toContain('to=7.550');
     expect(snapLine).toContain('drift=7.850');
   });
 
@@ -2170,20 +2170,19 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1; readyState=4 (default) → hardStarve=false, no increment
 
-    const ctAfterSnap1 = h.videoEl.currentTime; // should be ~9.580 after GREEN
-
     // 50ms later (inside 300ms debounce window): ct/bufEnd advance (N1 passes), rs=2
     h.perfNow(50);
     h.sb.buffered = makeBuffered(0, 10.032);
-    h.videoEl.currentTime = 10.018;
+    h.videoEl.currentTime = 10.018; // set ct to 10.018 for N1 to pass
     h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
     // streak is 0 before this call; this is the 1-shot transient dip
+    const ctBefore2ndCall = h.videoEl.currentTime; // 10.018 — the test manually set it
 
     h.exports.onVideoWaiting();
 
     // 2-strike gate: !(true && 1>=2) = !(false) = true AND inside window → N2 fires, snap suppressed
     expect(h.exports.getSuppressedDebounceCount()).toBe(1);
-    expect(h.videoEl.currentTime).toBe(ctAfterSnap1); // currentTime unchanged from snap#1
+    expect(h.videoEl.currentTime).toBe(ctBefore2ndCall); // currentTime unchanged (10.018, not snapped)
     expect(h.exports.getHardStarveStreak()).toBe(1);   // streak incremented to 1
   });
 
