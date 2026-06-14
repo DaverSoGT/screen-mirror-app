@@ -230,15 +230,48 @@ fn make_bridge_with_counting_hooks(
 /// CRITICAL-2: When the supervisor emits `InitiateRebuild`, the coordinator MUST
 /// invoke the `initiate_rebuild` hook.
 ///
-/// Sequence: start → IceFailed → await AwaitingAck → send PeerAck → coordinator
-/// should receive InitiateRebuild from supervisor → hooks.initiate_rebuild called.
+/// Sequence: start → IceConnected (latches ice_connected=true) → IceFailed →
+/// await AwaitingAck → send PeerRequest (loser path) → supervisor emits
+/// PublishReconnectAck AND InitiateRebuild signal-driven → hooks.initiate_rebuild called.
+///
+/// De-flake: uses the deterministic PeerRequest-loser drive (a role-equal Sender
+/// tie with peer_nonce=0 resolves to "peer wins" via `decide_tiebreak`, so the
+/// supervisor emits PublishReconnectAck + InitiateRebuild immediately, without
+/// depending on the ack_timeout). See `ReconnectSupervisor` AwaitingAck handling
+/// (the `is_active_reconnector` false branch → `SupervisorOutcome::InitiateRebuild`).
 #[test]
 fn coordinator_invokes_builder_on_initiate_rebuild() {
-    let (bridge, ev_tx, ch, rebuild_count, _pr, _pa, _re) =
-        make_bridge_with_counting_hooks(Duration::from_millis(200));
+    // 2s ack_timeout (per make_bridge_with_counting_hooks' doc for PeerRequest-driven
+    // tests): generous enough that the multi-step deterministic setup (latch
+    // ice_connected → IceFailed → wait sup_tx → dispatch PeerRequest) completes while
+    // the supervisor is still in AwaitingAck. With this timeout the ONLY way
+    // InitiateRebuild can fire is the deterministic PeerRequest-loser path — NOT the
+    // AwaitingAck wall-clock fallback (which would also emit InitiateMdnsReset). The
+    // publish_ack==1 / reset==0 asserts below pin that we took the loser path, not the
+    // timeout fallback.
+    let (bridge, ev_tx, ch, rebuild_count, _pr, publish_ack_count, reset_count) =
+        make_bridge_with_counting_hooks(Duration::from_secs(2));
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
+
+    // De-flake (REQ-SRR-1 guard): send IceConnected first so ice_connected latches true,
+    // making the sender SRR guard (`!ice_connected && peer_ack_seen`) INERT — the
+    // PeerRequest-loser InitiateRebuild fires the rebuild hook immediately, signal-driven,
+    // with NO dependency on the ack_timeout. The role-equal tie-break is deterministic:
+    // the peer_nonce passed below is 0, and the tie-break evaluates `my_nonce < peer_nonce`
+    // (i.e. `my_nonce < 0`), which is ALWAYS false for a u64 — so the sender ALWAYS Defers
+    // (peer wins), for every possible my_nonce, with zero collision case. The PeerRequest-loser
+    // path then emits InitiateRebuild via the supervisor, which is NOT suppressed once
+    // ice_connected=true.
+    ev_tx.send(TransportEvent::IceConnected).unwrap();
+    // Wait for the drain to process IceConnected (it emits a streaming status frame).
+    let streaming =
+        ch.wait_for_message_containing("\"kind\":\"streaming\"", Duration::from_millis(500));
+    assert!(
+        streaming,
+        "expected streaming event after IceConnected (ice_connected latched)"
+    );
 
     // Trigger reconnect.
     ev_tx.send(TransportEvent::IceFailed).unwrap();
@@ -248,24 +281,25 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
         ch.wait_for_message_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
     assert!(got, "expected reconnecting event after IceFailed");
 
-    // Get session nonce from restart_cache.
-    let nonce = bridge
-        .restart_cache
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|c| c.session_nonce)
-        .unwrap_or(1);
-
     let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(500));
 
-    // Send PeerAck to advance supervisor from AwaitingAck → Rebuilding → InitiateRebuild.
+    // De-flake (engram #1171): the supervisor's my_nonce is an INDEPENDENT
+    // rand::random(), NOT restart_cache.session_nonce, so a PeerAck keyed on the
+    // cache nonce is rejected as stale and the rebuild only fired via the ack_timeout
+    // — flaky under CI load. Instead drive the deterministic PeerRequest-loser path:
+    // with peer_nonce=0 the role-equal (Sender) tie-break (`decide_tiebreak`,
+    // `my_nonce < peer_nonce`) is ALWAYS Defer ("peer wins"), so the supervisor emits
+    // PublishReconnectAck AND InitiateRebuild immediately, signal-driven, with zero
+    // wall-clock-timeout dependency (the `is_active_reconnector` false branch in
+    // `ReconnectSupervisor`'s AwaitingAck handling). IceConnected was sent first so the
+    // sender SRR guard is INERT and InitiateRebuild fires unconditionally.
     sup_tx
-        .try_send(SupervisorSignal::PeerAck {
-            session_nonce: nonce,
+        .send(SupervisorSignal::PeerRequest {
+            peer_nonce: 0,
+            peer_role: sm_domain::signaling::SignalingRole::Sender,
             attempt: 1,
         })
-        .ok();
+        .expect("supervisor signal channel must accept PeerRequest");
 
     // Wait for rebuild hook to be called.
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -276,6 +310,23 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
     assert!(
         rebuild_count.load(Ordering::Relaxed) >= 1,
         "initiate_rebuild hook must be called at least once on InitiateRebuild outcome"
+    );
+
+    // Pin the DETERMINISTIC loser path (not the ack_timeout fallback): the loser path
+    // publishes exactly one ReconnectAck, and the AwaitingAck timeout fallback (which
+    // emits InitiateMdnsReset + InitiateRebuild) did NOT run. If these fail the test was
+    // previously green only via the wall-clock fallback.
+    assert_eq!(
+        publish_ack_count.load(Ordering::Relaxed),
+        1,
+        "loser path must publish exactly one ReconnectAck (proves the deterministic \
+         PeerRequest-loser path drove InitiateRebuild, not the ack_timeout fallback)"
+    );
+    assert_eq!(
+        reset_count.load(Ordering::Relaxed),
+        0,
+        "initiate_mdns_reset must NOT fire — the AwaitingAck wall-clock timeout fallback \
+         (which emits InitiateMdnsReset) must not have run"
     );
 
     stop_sender_session(&bridge);
@@ -380,19 +431,19 @@ fn coordinator_calls_publish_reconnect_ack_hook_on_outcome() {
     // sup_tx is populated by the drain thread once the supervisor exists.
     let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(1000));
 
-    // Use peer_nonce = 0 to deterministically lose the race: the supervisor's
-    // own nonce is generated via rand::random::<u64>() inside the drain thread
-    // (sender.rs line 655) and is NOT the same as restart_cache.session_nonce
-    // (sender.rs line 933 — start_sender_inner generates an independent nonce
-    // for the cache). Since rand::random::<u64>() returns 0 with probability
-    // 2^-64, peer_nonce=0 is virtually always strictly less than the
-    // supervisor's nonce, so the supervisor will deterministically take the
-    // "peer wins" branch and emit PublishReconnectAck. Use blocking send so
-    // the signal is not silently dropped if the supervisor's signal channel
-    // buffer is momentarily full.
+    // Use peer_nonce = 0 to deterministically lose the race. The role-equal
+    // (Sender vs Sender) tie-break in `decide_tiebreak` is `my_nonce < peer_nonce`
+    // ⇒ ActiveReconnector, else Defer. With peer_nonce = 0 the comparison is
+    // `my_nonce < 0`, which is false for EVERY u64 (including my_nonce == 0, since
+    // 0 < 0 is false), so the supervisor ALWAYS takes the Defer / "peer wins" loser
+    // branch and emits PublishReconnectAck — deterministic for every my_nonce, with
+    // no collision case. The supervisor's own nonce (generated via rand::random in
+    // the drain thread) and the independent cache nonce from `start_sender_inner`
+    // are both irrelevant to the outcome. Use blocking send so the signal is not
+    // silently dropped if the supervisor's signal channel buffer is momentarily full.
     let peer_nonce: u64 = 0;
-    // Role-equal (both Sender) so the legacy nonce fallback decides: peer_nonce=0
-    // < my_nonce ⇒ the sender supervisor takes the "peer wins" / loser branch.
+    // Role-equal (both Sender) ⇒ the nonce fallback decides: `my_nonce < 0` is always
+    // false ⇒ the sender supervisor always Defers to the "peer wins" / loser branch.
     sup_tx
         .send(SupervisorSignal::PeerRequest {
             peer_nonce,

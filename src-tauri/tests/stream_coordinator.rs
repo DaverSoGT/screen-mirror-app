@@ -117,8 +117,18 @@ fn wait_for_sup_tx(bridge: &StreamBridge, timeout: Duration) -> SyncSender<Super
     }
 }
 
+/// Build a `StreamBridge` with custom coordinator hooks (counters) and a fast policy.
+///
+/// `ack_timeout` is parametrized because tests have conflicting needs:
+///   - The PeerRequest-driven InitiateRebuild test wants a GENEROUS timeout (2s) so the
+///     deterministic loser path is the ONLY way InitiateRebuild can fire — never the
+///     AwaitingAck wall-clock fallback.
+///   - The InitiateMdnsReset test exercises the ack-timeout branch itself and needs a
+///     SHORT timeout (200ms) so the timeout actually fires within the test deadline.
 #[allow(clippy::type_complexity)]
-fn make_stream_bridge_with_counting_hooks() -> (
+fn make_stream_bridge_with_counting_hooks(
+    ack_timeout: Duration,
+) -> (
     StreamBridge,
     SyncSender<TransportEvent>,
     Arc<FakeBinaryChannel>,
@@ -149,7 +159,6 @@ fn make_stream_bridge_with_counting_hooks() -> (
     let sup_tx_for_drain = sup_tx.clone();
 
     let policy = fast_policy();
-    let ack_timeout = Duration::from_millis(200);
 
     let (dummy_pkt_tx, dummy_pkt_rx) = sync_channel(1);
     let dummy_pkt_rx_slot: Arc<
@@ -243,10 +252,21 @@ fn make_stream_bridge_with_counting_hooks() -> (
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 /// CRITICAL-2 (stream): InitiateRebuild invokes the initiate_rebuild hook.
+///
+/// De-flake: uses the deterministic PeerRequest-loser drive. The supervisor is a Receiver
+/// and the peer_role sent is Sender (role-differ), so the Receiver always defers →
+/// PublishReconnectAck + InitiateRebuild emitted immediately, signal-driven,
+/// nonce-independent (no ack_timeout dependency, and NO SRR suppression on the stream
+/// `SupervisorOutcome::InitiateRebuild` handling in `handle_supervisor_outcome`).
+/// See `ReconnectSupervisor`'s AwaitingAck `is_active_reconnector` false branch.
 #[test]
 fn coordinator_invokes_builder_on_initiate_rebuild() {
-    let (bridge, ev_tx, ch, rebuild_count, _pr, _pa, _re) =
-        make_stream_bridge_with_counting_hooks();
+    // 2s ack_timeout: generous enough that the deterministic PeerRequest-loser path is the
+    // ONLY way InitiateRebuild can fire — NOT the AwaitingAck wall-clock fallback (which
+    // would also emit InitiateMdnsReset). The publish_ack==1 / reset==0 asserts below pin
+    // that we took the loser path, not the timeout fallback.
+    let (bridge, ev_tx, ch, rebuild_count, _pr, publish_ack_count, reset_count) =
+        make_stream_bridge_with_counting_hooks(Duration::from_secs(2));
 
     start_stream_inner(
         &bridge,
@@ -261,21 +281,21 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
         ch.wait_for_status_containing("\"kind\":\"reconnecting\"", Duration::from_millis(500));
     assert!(got, "expected reconnecting 0x02 after IceFailed");
 
-    let nonce = bridge
-        .restart_cache
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|c| c.session_nonce)
-        .unwrap_or(1);
-
     let sup_tx = wait_for_sup_tx(&bridge, Duration::from_millis(500));
+
+    // De-flake (engram #1171): the stream supervisor has role=Receiver. Sending PeerRequest
+    // with peer_role=Sender creates a role-differ scenario: the Receiver always defers →
+    // supervisor emits PublishReconnectAck AND InitiateRebuild immediately, signal-driven,
+    // nonce-independent (no ack_timeout dependency). The stream coordinator's
+    // `SupervisorOutcome::InitiateRebuild` handling in `handle_supervisor_outcome` has NO
+    // SRR suppression (unlike the sender), so the rebuild hook fires unconditionally.
     sup_tx
-        .try_send(SupervisorSignal::PeerAck {
-            session_nonce: nonce,
+        .send(SupervisorSignal::PeerRequest {
+            peer_nonce: 0,
+            peer_role: sm_domain::signaling::SignalingRole::Sender,
             attempt: 1,
         })
-        .ok();
+        .expect("supervisor signal channel must accept PeerRequest");
 
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while rebuild_count.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
@@ -287,14 +307,32 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
         "stream initiate_rebuild hook must be called on InitiateRebuild outcome"
     );
 
+    // Pin the DETERMINISTIC loser path (not the ack_timeout fallback): the loser path
+    // publishes exactly one ReconnectAck, and the AwaitingAck timeout fallback (which emits
+    // InitiateMdnsReset + InitiateRebuild) did NOT run.
+    assert_eq!(
+        publish_ack_count.load(Ordering::Relaxed),
+        1,
+        "loser path must publish exactly one ReconnectAck (proves the deterministic \
+         PeerRequest-loser path drove InitiateRebuild, not the ack_timeout fallback)"
+    );
+    assert_eq!(
+        reset_count.load(Ordering::Relaxed),
+        0,
+        "initiate_mdns_reset must NOT fire — the AwaitingAck wall-clock timeout fallback \
+         (which emits InitiateMdnsReset) must not have run"
+    );
+
     stop_stream_session(&bridge);
 }
 
 /// CRITICAL-2 (stream): PublishReconnectRequest invokes the hook.
 #[test]
 fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
+    // Generous timeout: the request hook fires on entering AwaitingAck, well before any
+    // ack_timeout would matter.
     let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) =
-        make_stream_bridge_with_counting_hooks();
+        make_stream_bridge_with_counting_hooks(Duration::from_secs(2));
 
     start_stream_inner(
         &bridge,
@@ -322,7 +360,10 @@ fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
 /// CRITICAL-2 (stream): InitiateMdnsReset invokes the hook (ack timeout path).
 #[test]
 fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
-    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) = make_stream_bridge_with_counting_hooks();
+    // Short timeout: this test exercises the ack-timeout branch itself, so the 200ms
+    // AwaitingAck timeout MUST fire within the test deadline.
+    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) =
+        make_stream_bridge_with_counting_hooks(Duration::from_millis(200));
 
     start_stream_inner(
         &bridge,
