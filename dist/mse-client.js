@@ -40,11 +40,11 @@ const PROBE_CODEC = 'video/mp4; codecs="avc1.42E01E"';
 // Snap once currentTime falls more than this many seconds behind the live edge.
 const LIVE_EDGE_MAX_DRIFT_SEC = 0.5;
 // After a snap, sit this far behind the edge (small playable cushion).
-const LIVE_EDGE_TARGET_LEAD_SEC = 0.2;
+const LIVE_EDGE_TARGET_LEAD_SEC = 0.45;
 // Stall-snap path: seat this far behind buffered end when 'waiting' fires.
-// Distinct from LIVE_EDGE_TARGET_LEAD_SEC (0.2) used by normal seekToLiveEdge snaps.
-// 0.3 s provides ~42 ms margin over the observed max feed gap (258 ms, GATE-6).
-const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.3;
+// Equal to LIVE_EDGE_TARGET_LEAD_SEC (single tuning knob, D-PPT10-A).
+// 0.45 s provides ~81 ms margin over GATE-9 p95 feed gap (369 ms).
+const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.45;
 // Minimum required gap between bufEnd and computed snap target (loop-protection
 // on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
 const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
@@ -54,6 +54,10 @@ const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
 // GATE-6 max feed gap (258 ms) fits just under it. Bypassed only on hard
 // starvation (rs<=1, D-PPT8-4); the effectiveness guard still gates that path.
 const LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS = 300;
+// ── rs<=2 hatch 2-strike threshold (Slice 10, D-PPT10-B) ─────────────────────
+// Consecutive rs<=2 'waiting' invocations (post-N1) required before the N2
+// debounce bypass fires. Mirrors WATCHDOG_STUCK_TICKS=2 in naming and value.
+const HARDSTARVE_STRIKE_TICKS = 2;
 // ── Gap-stranding watchdog constants (Slice 9, D-PPT9-CONST) ─────────────────
 // Consecutive 2s-heartbeat ticks with no meaningful ct progress AND data ahead
 // before the watchdog force-rescues. 2 ticks ~= 4s — bounds a stranding far below
@@ -112,6 +116,15 @@ function setWatchdogState({ watchdogLastTickCt: c, watchdogStuckTicks: s }) {
   if (s !== undefined) watchdogStuckTicks = s;
 }
 function getWatchdogState() { return { watchdogLastTickCt, watchdogStuckTicks }; }
+// ── rs<=2 hatch 2-strike streak (Slice 10, D-PPT10-B) ───────────────────────
+// Counts CONSECUTIVE rs<=2 'waiting' invocations (post-N1) so a transient 1-shot
+// rs=2 edge-dip no longer bypasses the N2 debounce. Per-edge-dip TRANSIENT state
+// (NOT a cumulative session counter). Module scope — persists across tearDownMse/
+// setUpMse; self-heals on the first post-reconnect rs>2 heartbeat tick (REV 2).
+let hardStarveStreak = 0;
+function getHardStarveStreak() { return hardStarveStreak; }
+// Test seam: seed/read the streak deterministically (analogous to setWatchdogState).
+function setHardStarveStreak(n) { hardStarveStreak = n; }
 // Auto-retry delay after Dead-state entry (PQ-1). D-RRE-1.
 const AUTO_RETRY_DELAY_MS = 30_000;
 // Silent recovery threshold: duration of Stage 1 before the reconnecting overlay
@@ -922,11 +935,17 @@ function onVideoWaiting() {
   // since the last EXECUTED snap baseline (the 147x dead-position storm, GATE-7).
   const advanced = (ct > lastSnapCt + ADV_EPS) || (bufEnd > lastSnapBufEnd + ADV_EPS);
   if (!advanced) { suppressedGuardCount++; return; }
-  // N2 DEBOUNCE GUARD (escape-hatch-bypassable on rs<=1).
+  // S10 (D-PPT10-B): increment the 2-strike streak AFTER N1, BEFORE N2.
+  // Only increments — no reset here. onVideoWaiting is 'waiting'-only (rs<=2),
+  // so the rs>2 else-branch is dead. Reset is observed in the heartbeat (REV 2).
+  if (hardStarve) { hardStarveStreak++; }
+  // N2 DEBOUNCE GUARD (bypass now requires rs<=2 AND streak>=HARDSTARVE_STRIKE_TICKS).
   // Collapses the 95% back-to-back storm by rate-limiting to one snap per 300 ms.
-  // rs<=1 (HAVE_NOTHING | HAVE_METADATA) = genuine hard starvation: instant recovery
-  // must not be delayed. Bypassing ONLY this guard; N1 already passed above.
-  if (!hardStarve && (now - lastSnapAtMs) < LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS) {
+  // A 1-shot transient rs=2 dip (streak==1) is now coalesced by the debounce.
+  // rs<=2 persisted for 2+ consecutive calls (streak>=2) bypasses — genuine starvation
+  // recovers fast. Bypassing ONLY this guard; N1 already passed above.
+  if (!(hardStarve && hardStarveStreak >= HARDSTARVE_STRIKE_TICKS) &&
+      (now - lastSnapAtMs) < LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS) {
     suppressedDebounceCount++;
     return;
   }
@@ -1236,6 +1255,9 @@ async function main() {
       " suppressed_guard=" + suppressedGuardCount +
       " watchdog_rescues=" + watchdogRescues  // D-PPT9-D2: strictly last field
     );
+    // REV 2 (D-PPT10-B): reset the 2-strike streak on any tick where rs>2 (player recovered).
+    // onVideoWaiting cannot observe rs>2 ('waiting'-only at L1201 — dead code there).
+    if (VIDEO_EL.readyState > 2) { hardStarveStreak = 0; }
     // ── Gap-stranding watchdog (Slice 9, D-PPT9-A). Rescues a no-progress,
     // data-ahead stranding that seekToLiveEdge's sb.updating/seeking guards block. ──
     {
@@ -1428,5 +1450,8 @@ if (globalThis.__SCREEN_MIRROR_TEST_EXPORTS__) {
     getWatchdogRescues,               // S9: GETTER fn for live rescue counter (value-vs-ref trap)
     setWatchdogState,                 // S9: seed watchdog progress state for deterministic RED tests
     getWatchdogState,                 // S9: read watchdog progress state (write-rule assertions)
+    HARDSTARVE_STRIKE_TICKS,          // S10: constant verification (=== 2)
+    getHardStarveStreak,              // S10: GETTER fn for live streak (value-vs-ref trap)
+    setHardStarveStreak,              // S10: seed streak for deterministic 2-strike RED tests
   });
 }

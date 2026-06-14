@@ -72,9 +72,9 @@ describe('stall-snap — constants & exports (T-S7-15..17)', () => {
     delete globalThis.__SCREEN_MIRROR_TEST_EXPORTS__;
   });
 
-  // T-S7-15
-  it('T-S7-15: LIVE_EDGE_STALL_SNAP_LEAD_SEC exported and === 0.3', () => {
-    expect(exports.LIVE_EDGE_STALL_SNAP_LEAD_SEC).toBe(0.3);
+  // T-S7-15 (updated S10: lead raised to 0.45)
+  it('T-S7-15: LIVE_EDGE_STALL_SNAP_LEAD_SEC exported and === 0.45', () => {
+    expect(exports.LIVE_EDGE_STALL_SNAP_LEAD_SEC).toBe(0.45);
   });
 
   // T-S7-16
@@ -156,16 +156,16 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     const lines = getMseLogLines(tauri);
     // S7-4-SC1: mseLog called exactly once (spec "exactly once")
     expect(lines.length).toBe(1);
-    // Same geometry as T-S7-2: bufEnd=10.030, ct=10.016, target=9.730, drift=0.014.
+    // S10: bufEnd=10.030, ct=10.016, target=10.030-0.450=9.580, drift=0.014.
     const snapLine = lines.find((l) => l.includes('result=stall_snap'));
     expect(snapLine).toBeDefined();
     expect(snapLine).toContain('from=10.016');
-    expect(snapLine).toContain('to=9.730');
+    expect(snapLine).toContain('to=9.580');
     expect(snapLine).toContain('drift=0.014');
   });
 
-  // ── T-S7-2: Dominant backward replay-cushion case ─────────────────────────
-  it('T-S7-2: dominant backward case — ct=bufEnd−0.020 → target=bufEnd−0.300; exact log', () => {
+  // ── T-S7-2: Dominant backward replay-cushion case (S10: lead 0.45) ──────────
+  it('T-S7-2: dominant backward case — ct=bufEnd−0.020 → target=bufEnd−0.450; exact log', () => {
     const bufEnd = 10.030;
     const ct = bufEnd - 0.020; // = 10.010
     sb.buffered = makeBuffered(0, bufEnd);
@@ -173,7 +173,7 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
     exports.onVideoWaiting();
 
-    const expectedTarget = bufEnd - 0.300; // = 9.730
+    const expectedTarget = bufEnd - 0.450; // = 9.580
     expect(videoEl.currentTime).toBeCloseTo(expectedTarget, 5);
 
     const lines = getMseLogLines(tauri);
@@ -186,8 +186,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(snapLine).toContain('drift=' + (bufEnd - ct).toFixed(3));
   });
 
-  // ── T-S7-3: Large drift — target = bufEnd−0.300 NOT −0.200 ───────────────
-  it('T-S7-3: large drift (7 s) → target = bufEnd−0.300, not −0.200', () => {
+  // ── T-S7-3: Large drift — target = bufEnd−0.450 NOT −0.200 (S10: lead 0.45) ─
+  it('T-S7-3: large drift (7 s) → target = bufEnd−0.450, not −0.200', () => {
     const bufEnd = 10.000;
     const ct = 3.000; // drift = 7
     sb.buffered = makeBuffered(0, bufEnd);
@@ -195,7 +195,7 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
     exports.onVideoWaiting();
 
-    const expectedTarget = bufEnd - 0.300; // = 9.700
+    const expectedTarget = bufEnd - 0.450; // = 9.550
     // Must NOT be bufEnd−0.200 = 9.800
     expect(videoEl.currentTime).toBeCloseTo(expectedTarget, 5);
     expect(videoEl.currentTime).not.toBeCloseTo(bufEnd - 0.200, 5);
@@ -292,21 +292,21 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(tauri.invoke.mock.calls.filter(([cmd]) => cmd === 'mse_log').length).toBe(0);
   });
 
-  // ── T-S7-10: Multi-range — last-range anchor, forward gap-jump ────────────
-  it('T-S7-10: ranges [0,0.15],[2.5,8.0]; ct=0.15 → target=7.700 (forward gap-jump)', () => {
+  // ── T-S7-10: Multi-range — last-range anchor, forward gap-jump (S10: lead 0.45)
+  it('T-S7-10: ranges [0,0.15],[2.5,8.0]; ct=0.15 → target=7.550 (forward gap-jump, S10 lead 0.45)', () => {
     sb.buffered = makeBufferedMulti([[0, 0.15], [2.5, 8.0]]);
     videoEl.currentTime = 0.150;
 
     exports.onVideoWaiting();
 
-    // lastStart=2.5, bufEnd=8.0, target=Math.max(2.5, 8.0−0.3)=7.700
-    expect(videoEl.currentTime).toBeCloseTo(7.700, 5);
+    // lastStart=2.5, bufEnd=8.0, target=Math.max(2.5, 8.0−0.450)=7.550
+    expect(videoEl.currentTime).toBeCloseTo(7.550, 5);
 
     const lines = getMseLogLines(tauri);
     const snapLine = lines.find((l) => l.includes('result=stall_snap'));
     expect(snapLine).toBeDefined();
     expect(snapLine).toContain('from=0.150');
-    expect(snapLine).toContain('to=7.700');
+    expect(snapLine).toContain('to=7.550');
     expect(snapLine).toContain('drift=7.850');
   });
 
@@ -344,10 +344,10 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
   // ── T-S7-13: currentTime setter throws → result=throw line from locals ─────
   it('T-S7-13: currentTime setter throws → result=throw from locals; no re-reads; no uncaught', () => {
-    // Setup: ct=10.016, bufEnd=10.030, target=9.730, drift=0.014
+    // Setup: ct=10.016, bufEnd=10.030, target=10.030-0.450=9.580, drift=0.014
     const bufEnd = 10.030;
     const ct = 10.016;
-    const expectedTarget = (bufEnd - 0.300).toFixed(3); // 9.730
+    const expectedTarget = (bufEnd - 0.450).toFixed(3); // 9.580
     const expectedDrift  = (bufEnd - ct).toFixed(3);    // 0.014
 
     sb.buffered = makeBuffered(0, bufEnd);
@@ -396,10 +396,10 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
   });
 
   // ── T-S7-14: Idempotency — post-stall-snap seekToLiveEdge no-ops ──────────
-  // After onVideoWaiting() snaps currentTime to bufEnd−0.3, the drift becomes
-  // ~0.3 s which is ≤ LIVE_EDGE_MAX_DRIFT_SEC (0.5). seekToLiveEdge() must not
+  // After onVideoWaiting() snaps currentTime to bufEnd−0.45 (S10 lead), drift becomes
+  // ~0.45 s which is ≤ LIVE_EDGE_MAX_DRIFT_SEC (0.5). seekToLiveEdge() must not
   // emit any additional seek line (heartbeat idempotency, NFR-S7-1-SC2).
-  it('T-S7-14: post-stall-snap: seekToLiveEdge no-ops (drift 0.3 ≤ 0.5)', () => {
+  it('T-S7-14: post-stall-snap: seekToLiveEdge no-ops (drift 0.45 ≤ 0.5)', () => {
     const bufEnd = 10.330;
     sb.buffered = makeBuffered(0, bufEnd);
     // Set currentTime to a value that triggers the snap.
@@ -408,8 +408,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     // First: stall-snap fires.
     exports.onVideoWaiting();
 
-    // After snap: currentTime should now be bufEnd−0.3 = 10.030.
-    const snapTarget = bufEnd - 0.300;
+    // After snap: currentTime should now be bufEnd−0.45 = 9.880.
+    const snapTarget = bufEnd - 0.450;
     // Reflect the post-snap currentTime in the videoEl for seekToLiveEdge to read.
     // The mock videoEl currentTime was set by the handler via assignment.
     // At this point videoEl.currentTime === snapTarget.
@@ -417,7 +417,7 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     // Clear invoke mock calls so we can track only the seekToLiveEdge call.
     tauri.invoke.mockClear();
 
-    // Now call seekToLiveEdge: drift = bufEnd − snapTarget = 0.3 ≤ 0.5 → no snap.
+    // Now call seekToLiveEdge: drift = bufEnd − snapTarget = 0.45 ≤ 0.5 → no snap.
     exports.seekToLiveEdge();
 
     // No mse_log calls should have been made (no result=snap emitted).
@@ -561,16 +561,16 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
     // Fresh module: lastSnapCt=-Inf, lastSnapBufEnd=-Inf, lastSnapAtMs=-Inf
     // N1: ct(10.016) > -Inf + 1e-3 = true → passes
     // N2: now(any) - (-Inf) = +Inf >= 300 → not debounced → passes
-    // N3: target=9.730 != ct=10.016 → passes
-    // G6: 10.030-9.730=0.300 >= 0.1 → passes → snap executes
+    // N3: target=9.580 (10.030-0.450) != ct=10.016 → passes (S10 lead=0.45)
+    // G6: 10.030-9.580=0.450 >= 0.1 → passes → snap executes
     h.perfNow(100); // arbitrary; any value: Inf elapsed from -Inf baseline
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
 
     h.exports.onVideoWaiting();
 
-    // Snap executed: currentTime set to target
-    expect(h.videoEl.currentTime).toBeCloseTo(9.730, 5);
+    // Snap executed: currentTime set to target (S10: bufEnd-0.450=9.580)
+    expect(h.videoEl.currentTime).toBeCloseTo(9.580, 5);
     // Counters: zero (nothing was suppressed)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
@@ -674,9 +674,9 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
 
     h.exports.onVideoWaiting();
 
-    // Snap executes: debounce count unchanged at 0
+    // Snap executes: debounce count unchanged at 0 (S10: target=10.032-0.450)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.450, 5);
   });
 
   // T-S8-5: snap at exactly 300ms boundary → NOT suppressed (S8-3-SC3)
@@ -693,7 +693,7 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.450, 5);
   });
 
   // T-S8-17: 3 consecutive N2 suppressions → debounce count = 3 (S8-6-SC1)
@@ -728,7 +728,9 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
   beforeEach(async () => { h = await makeS8Harness(); });
   afterEach(() => teardownS8Harness(h));
 
-  // T-S8-6: rs=1 inside window, N1 passes → N2 bypassed, snap executes (S8-3-SC4)
+  // T-S8-6: rs=1 inside window, N1 passes → N2 bypassed, snap executes (S8-3-SC4 / S10 2-strike)
+  // S10 update: 2-strike gate requires streak>=2 for bypass. Pre-seed streak=1 so this
+  // second call reaches streak=2 and still bypasses (hatch remediation C1).
   it('T-S8-6: rs=1 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes', () => {
     h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
@@ -740,12 +742,13 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 1, configurable: true });
+    h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed: snap executes, debounce count unchanged at 0
+    // N2 bypassed: snap executes, debounce count unchanged at 0 (S10: target=10.032-0.450)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.450, 5);
   });
 
   // T-S8-7: rs=1 inside window, NO ct/bufEnd progress → N1 fires first (S8-3-SC5)
@@ -768,10 +771,10 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
   });
 
-  // T-S8-8 (UPDATED Slice 9 — T1-B inversion): rs=2 inside window, ct/bufEnd advanced → N2 BYPASSED (rs<=2 escape hatch widened)
-  // Slice 8 had rs<=1; Slice 9 widens to rs<=2 (D-PPT9-C, hardStarve = readyState <= 2).
-  // N1 passes (ct/bufEnd advanced). N2 is now bypassed. Snap executes.
-  it('T-S8-8: rs=2 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes (Slice 9 rs<=2 hatch)', () => {
+  // T-S8-8 (UPDATED S10 — 2-strike hatch): rs=2 inside window, ct/bufEnd advanced → N2 BYPASSED
+  // S10 update: 2-strike gate requires streak>=2. Pre-seed streak=1 so this call
+  // reaches streak=2 and still bypasses (C1 remediation). Lead also updated to 0.45.
+  it('T-S8-8: rs=2 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes (Slice 9 rs<=2 hatch; S10 2-strike pre-seed)', () => {
     h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
     h.videoEl.currentTime = 10.016;
@@ -780,16 +783,19 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.perfNow(50); // inside 300ms
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
-    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 now IS escape hatch (Slice 9)
+    Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 IS escape hatch
+    h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed: snap executes, debounce count unchanged at 0
+    // N2 bypassed: snap executes, debounce count unchanged at 0 (S10: target=10.032-0.450)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.450, 5);
   });
 
-  // T-S8-9: rs=0 inside window, ct/bufEnd advanced → N2 bypassed (rs=0 <= 1) (S8-3-SC7)
+  // T-S8-9: rs=0 inside window, ct/bufEnd advanced → N2 bypassed (rs=0 <= 2 hardStarve) (S8-3-SC7)
+  // S10 update: 2-strike gate requires streak>=2. Pre-seed streak=1 so this call
+  // reaches streak=2 and still bypasses (C1 remediation). Lead also updated to 0.45.
   it('T-S8-9: rs=0 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, snap executes', () => {
     h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
@@ -799,12 +805,13 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.perfNow(50); // inside 300ms
     h.sb.buffered = makeBuffered(0, 10.032);
     h.videoEl.currentTime = 10.018;
-    Object.defineProperty(h.videoEl, 'readyState', { value: 0, configurable: true }); // rs=0 <= 1
+    Object.defineProperty(h.videoEl, 'readyState', { value: 0, configurable: true }); // rs=0 <= 2 hardStarve
+    h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.450, 5);
   });
 
   // T-S8-24: rs=1 inside window, no progress → N1 fires (suppressedGuardCount++), NOT N2 (S8-7-SC3)
@@ -846,30 +853,32 @@ describe('stall-snap — Slice 8 N1 effectiveness guard (T-S8-10..14, T-S8-18)',
   afterEach(() => teardownS8Harness(h));
 
   // T-S8-10: only ct advanced > ADV_EPS → N1 passes, snap executes (S8-4-SC1)
+  // S10: target=5.300-0.450=4.850; G6: 5.300-4.850=0.450 >= 0.1 ✓
   it('T-S8-10: lastSnapCt=5.000, lastSnapBufEnd=5.300; ct=5.002 (advanced), bufEnd=5.300 (unchanged) → N1 passes', () => {
     h.sb.buffered = makeBuffered(0, 5.300); // bufEnd=5.300, unchanged from baseline
     h.videoEl.currentTime = 5.002;          // ct=5.002 > 5.000+0.001=5.001 ✓
-    // Geometry: target=Math.max(0, 5.300-0.300)=5.000; ct=5.002 != target → N3 passes
-    // G6: 5.300-5.000=0.300 >= 0.1 → passes
+    // Geometry: target=Math.max(0, 5.300-0.450)=4.850; ct=5.002 != target → N3 passes
+    // G6: 5.300-4.850=0.450 >= 0.1 → passes
 
     h.exports.onVideoWaiting();
 
     // N1 passed: snap executes; guardCount unchanged at 0
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(5.000, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(4.850, 5);
   });
 
   // T-S8-11: only bufEnd advanced > ADV_EPS → N1 passes, snap executes (S8-4-SC2)
+  // S10: target=5.302-0.450=4.852; G6: 5.302-4.852=0.450 >= 0.1 ✓
   it('T-S8-11: lastSnapCt=5.000, lastSnapBufEnd=5.300; ct=5.000 (unchanged), bufEnd=5.302 (advanced) → N1 passes', () => {
     h.sb.buffered = makeBuffered(0, 5.302); // bufEnd=5.302 > 5.300+0.001=5.301 ✓
     h.videoEl.currentTime = 5.000;          // ct=5.000, unchanged (NOT advanced)
-    // target=Math.max(0, 5.302-0.300)=5.002; ct=5.000 != target → N3 passes
-    // G6: 5.302-5.002=0.300 >= 0.1 → passes
+    // target=Math.max(0, 5.302-0.450)=4.852; ct=5.000 != target → N3 passes
+    // G6: 5.302-4.852=0.450 >= 0.1 → passes
 
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(5.002, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(4.852, 5);
   });
 
   // T-S8-12: neither ct nor bufEnd advanced > ADV_EPS → N1 fires (S8-4-SC3)
@@ -885,16 +894,17 @@ describe('stall-snap — Slice 8 N1 effectiveness guard (T-S8-10..14, T-S8-18)',
   });
 
   // T-S8-13: both ct and bufEnd advanced > ADV_EPS → N1 passes (S8-4-SC4)
+  // S10: target=5.360-0.450=4.910; G6: 5.360-4.910=0.450 >= 0.1 ✓
   it('T-S8-13: ct=5.050 (advanced), bufEnd=5.360 (advanced) → N1 passes, snap executes', () => {
     h.sb.buffered = makeBuffered(0, 5.360); // bufEnd=5.360 > 5.300+0.001 ✓
     h.videoEl.currentTime = 5.050;          // ct=5.050 > 5.000+0.001 ✓
-    // target=Math.max(0, 5.360-0.300)=5.060; ct=5.050 != 5.060 → N3 passes
-    // G6: 5.360-5.060=0.300 >= 0.1 → passes
+    // target=Math.max(0, 5.360-0.450)=4.910; ct=5.050 != 4.910 → N3 passes
+    // G6: 5.360-4.910=0.450 >= 0.1 → passes
 
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(5.060, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(4.910, 5);
   });
 
   // T-S8-14: ct sub-epsilon (0.0005 advance) → N1 fires (S8-4-SC5)
@@ -988,11 +998,11 @@ describe('stall-snap — Slice 8 N3 no-op kill (T-S8-15..16)', () => {
   afterEach(() => teardownS8Harness(h));
 
   // T-S8-15: target === ct → N3 fires (S8-5-SC1)
-  // ct=9.700, bufEnd=10.000, lastRangeStart=0.000
-  // target = Math.max(0.000, 10.000-0.300) = 9.7 === ct (IEEE 754 exact)
-  it('T-S8-15: target === ct (9.700 === 9.700, IEEE 754 exact) → N3 fires; no seek; suppressedGuardCount++', () => {
+  // S10: ct=9.550, bufEnd=10.000, lastRangeStart=0.000
+  // target = Math.max(0.000, 10.000-0.450) = 9.55 === ct (IEEE 754 exact)
+  it('T-S8-15: target === ct (9.550 === 9.550, IEEE 754 exact, S10 lead=0.45) → N3 fires; no seek; suppressedGuardCount++', () => {
     h.sb.buffered = makeBuffered(0, 10.000); // lastRangeStart=0, bufEnd=10.000
-    h.videoEl.currentTime = 9.700;           // ct = 9.7; target = 10.000-0.300 = 9.7 === ct
+    h.videoEl.currentTime = 9.550;           // ct = 9.55; target = 10.000-0.450 = 9.55 === ct
 
     const ctBefore = h.videoEl.currentTime;
     h.exports.onVideoWaiting();
@@ -1004,13 +1014,14 @@ describe('stall-snap — Slice 8 N3 no-op kill (T-S8-15..16)', () => {
   });
 
   // T-S8-16: target !== ct → N3 does not fire, snap executes (S8-5-SC2)
-  it('T-S8-16: target !== ct (10.016 vs 9.730) → N3 does not fire; snap executes', () => {
-    h.sb.buffered = makeBuffered(0, 10.030); // target = 9.730
-    h.videoEl.currentTime = 10.016;          // ct = 10.016 != 9.730
+  // S10: target = 10.030-0.450=9.580, ct=10.016 != 9.580 → N3 does not fire
+  it('T-S8-16: target !== ct (10.016 vs 9.580) → N3 does not fire; snap executes', () => {
+    h.sb.buffered = makeBuffered(0, 10.030); // target = 9.580 (S10: 10.030-0.450)
+    h.videoEl.currentTime = 10.016;          // ct = 10.016 != 9.580
 
     h.exports.onVideoWaiting();
 
-    expect(h.videoEl.currentTime).toBeCloseTo(9.730, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(9.580, 5);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
   });
 });
@@ -1553,8 +1564,9 @@ describe('watchdog — 2-tick stuck threshold (T-S9-W1..W6)', () => {
   //   MUST block the rescue. Pins forward-only and KILLS dropping `wTarget > wCt`.
   // Geometry: substantial range BEHIND ct [0,5.0] plus a trailing sliver [8.0,8.2]; ct=7.0.
   //   dataAhead = bufEnd(8.2) > ct(7.0)+0.5 ✓; pre-armed stuck (no progress) → reaches rescue block.
-  //   wRaw = bufEnd(8.2) - 0.2 = 8.0 → inside the sliver [8.0,8.2] → treated as gap; no forward
-  //   substantial range → last-substantial fallback → start of [0,5.0] = 0.0, which is <= ct(7.0).
+  //   wRaw = bufEnd(8.2) - LIVE_EDGE_TARGET_LEAD_SEC(0.45) = 7.75 → in the gap [5.0,8.0] below the
+  //   sliver [8.0,8.2] (which is < SNAP_SLIVER_MIN_SEC=0.3 anyway) → no forward substantial
+  //   range → last-substantial fallback → start of [0,5.0] = 0.0, which is <= ct(7.0).
   //   Forward-only guard (wTarget > wCt) → 0.0 > 7.0 is false → NO rescue.
   // If `wTarget > wCt` is dropped the watchdog would seek BACKWARD to 0.0 → this test FAILS.
   it('T-S9-W8: clamp resolves <= ct (only-behind substantial range) → forward-only guard blocks rescue (kills dropping wTarget>wCt)', async () => {
@@ -1646,7 +1658,7 @@ describe('watchdog — respects VIDEO_EL.seeking (T-S9-SK1)', () => {
   // Geometry (FAR-BACK landing so the drift gate canNOT mask the seeking guard):
   //   buf [[0,4.0],[8.0,12.0],[19.85,20.0]], wCt=5.0, watchdogLastTickCt=5.0.
   //   Watchdog: dataAhead = bufEnd(20.0) > wCt(5.0)+0.5 ✓; progressed = 5.0 > 5.0+0.5 false →
-  //     stuck 1→2 ✓. wRaw = bufEnd(20.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 19.8 → in gap
+  //     stuck 1→2 ✓. wRaw = bufEnd(20.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.45) = 19.55 → in gap
   //     [12.0, 19.85]; forward range [19.85,20.0] is a sliver (0.15 < 0.3) → step-4 fallback →
   //     last substantial range start = [8.0,12.0].start = 8.0. forward-only 8.0 > 5.0 ✓ → rescue
   //     lands ct=8.0. POST-RESCUE drift = bufEnd(20.0) - 8.0 = 12.0 > LIVE_EDGE_MAX_DRIFT_SEC(0.5),
@@ -1744,33 +1756,39 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
   beforeEach(async () => { h = await makeS8Harness(); });
   afterEach(() => teardownS8Harness(h));
 
-  // ── GEOMETRY NOTE (judgment R2) ───────────────────────────────────────────────
-  // The clamp's step-3 (forward-cross) branch is UNREACHABLE at the integration level
-  // for ALL three paths, because each path computes rawTarget = bufEnd - LEAD with
-  // LEAD ∈ {0.2 (watchdog/seekToLiveEdge), 0.3 (onVideoWaiting)}. For step-3 to fire,
-  // a SUBSTANTIAL forward range (span >= SNAP_SLIVER_MIN_SEC = 0.3) must START after
-  // rawTarget and END at or before bufEnd; that range must therefore fit a >= 0.3 span
-  // into a window of width < LEAD <= 0.3 before bufEnd — impossible. A 2,000,000-sample
-  // brute-force search over random multi-range geometries confirmed ZERO step-3 hits at
-  // integration for either LEAD. The step-3 branch IS pinned directly at unit level by
-  // T-S9-C2/C3/C4 (which pass rawTarget explicitly, bypassing the bufEnd-LEAD coupling).
-  // Therefore H1/H2/H3 pin the only gap-redirecting branch that IS reachable at
-  // integration: step-4 (last-substantial fallback). The geometry below is tightened so
-  // the fallback lands ~2.2 s behind live (NOT the prior ~6.2 s baked-in target), keeping
-  // the clamp load-bearing while removing the artificial far-behind framing.
+  // ── GEOMETRY NOTE (judgment R2; S10 lead-raise update) ────────────────────────
+  // All three paths now compute rawTarget = bufEnd - LEAD with a SINGLE lead value:
+  // LIVE_EDGE_TARGET_LEAD_SEC === LIVE_EDGE_STALL_SNAP_LEAD_SEC === 0.45 (D-PPT10-A).
+  // The clamp's step-3 (forward-cross) branch requires a SUBSTANTIAL forward range
+  // (span >= SNAP_SLIVER_MIN_SEC = 0.3) that STARTs after rawTarget and ENDs at or before
+  // bufEnd. Such a range must fit a >= 0.3 span into a window of width < LEAD before bufEnd:
+  // under the old 0.2/0.3 leads (window < 0.3) that was IMPOSSIBLE; under the 0.45 lead the
+  // window is < 0.45, so a [0.3, 0.45)-span trailing range CAN now trigger step-3 at
+  // integration — it is NO LONGER provably unreachable. The step-3 branch is pinned directly
+  // at unit level by T-S9-C2/C3/C4 (which pass rawTarget explicitly, decoupled from bufEnd-LEAD).
+  // H1/H2/H3 below DELIBERATELY use a trailing sliver (span 0.1 < 0.3) so step-3 is skipped and
+  // the clamp resolves via step-4 (last-substantial fallback). For these gap geometries the
+  // exact landing (start of [9.5,10.0] = 9.500) is LEAD-VERSION-INDEPENDENT: regardless of
+  // whether rawTarget is 11.5 (old 0.2 lead) or 11.25 (0.45 lead), rawTarget lands in the same
+  // gap [10.0, 11.6], the trailing range is a sliver, and step-4 dominates → 9.500. The geometry
+  // keeps the fallback landing ~2.2 s behind live, keeping the clamp load-bearing without the
+  // artificial far-behind framing.
 
   // T-S9-H1: watchdog path — rawTarget MUST land in a GAP so the clamp is load-bearing.
   // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], wCt=5.0.
-  //   wRaw = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   wRaw = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.45) = 11.25 → in gap [10.0, 11.6].
   //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
   //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
   // Preconditions: dataAhead = bufEnd(11.7) > wCt(5.0)+WATCHDOG_DATA_AHEAD_SEC(0.5) ✓;
   //   progressed = wCt(5.0) > watchdogLastTickCt(5.0)+WATCHDOG_PROGRESS_EPS(0.5) false → stuck
   //   1→2 ✓; forward-only 9.5 > 5.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
-  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
-  // If the clamp call is replaced with the raw target the watchdog still fires (11.5 > 5.0) but
-  // lands in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H1: watchdog rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=5.0 → rescue to=9.500 (step-4 clamp redirect, NOT gap 11.500)', async () => {
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
+  //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant fires
+  //   (11.25 > 5.0) and lands in the gap → to=11.250. The negative-guard assertion below pins the
+  //   LIVE reachable clamp-bypass value (11.250) under the 0.45 lead, so it is load-bearing: a
+  //   raw-passthrough mutant emits to=11.250 and the not.toMatch fails. The positive to=9.500 match
+  //   and toBeCloseTo(9.500) pin the real clamped landing — lead-independent.
+  it('T-S9-H1: watchdog rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=5.0 → rescue to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', async () => {
     h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
     h.videoEl.currentTime = 5.0;
     h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
@@ -1782,24 +1800,27 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(watchdogLine).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(watchdogLine).toMatch(/ to=9\.500 /);
-    expect(watchdogLine).not.toMatch(/ to=11\.500 /);
+    expect(watchdogLine).not.toMatch(/ to=11\.250 /);
     const toMatch = watchdogLine.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
 
   // T-S9-H2: seekToLiveEdge path — rawTarget MUST land in a GAP so the clamp is load-bearing.
   // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
-  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 11.5 → in gap [10.0, 11.6].
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_TARGET_LEAD_SEC(0.45) = 11.25 → in gap [10.0, 11.6].
   //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
   //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
   // Preconditions: drift = bufEnd(11.7) - ct(1.0) = 10.7 > LIVE_EDGE_MAX_DRIFT_SEC(0.5) ✓;
   //   forward-only target 9.5 > ct 1.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
-  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.500.
-  // If the clamp call is replaced with the raw target the seek still fires (11.5 > 1.0) but lands
-  // in the gap → to=11.500 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → snap to=9.500 (step-4 clamp redirect, NOT gap 11.500)', () => {
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
+  //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant lands at
+  //   to=11.250. The negative-guard assertion below pins the LIVE reachable clamp-bypass value
+  //   (11.250) under the 0.45 lead, so it is load-bearing: a raw-passthrough mutant emits to=11.250
+  //   and the not.toMatch fails. The positive to=9.500 match and the toBeCloseTo(9.500) check pin
+  //   the real clamped landing, which are lead-independent.
+  it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → snap to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', () => {
     h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
     h.tauri.invoke.mock.calls.length = 0;
@@ -1810,25 +1831,28 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const snapLine = logLines.find(l => l.includes('result=snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(snapLine).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.5) to the substantial range start.
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(snapLine).toMatch(/ to=9\.500 /);
-    expect(snapLine).not.toMatch(/ to=11\.500 /);
+    expect(snapLine).not.toMatch(/ to=11\.250 /);
     const toMatch = snapLine.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
 
   // T-S9-H3: onVideoWaiting path — rawTarget MUST land in a GAP so the clamp is load-bearing.
   // Geometry: [[0,0.5],[9.5,10.0],[11.6,11.7]], ct=1.0.
-  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_STALL_SNAP_LEAD_SEC(0.3) = 11.4 → in gap [10.0, 11.6].
+  //   rawTarget = bufEnd(11.7) - LIVE_EDGE_STALL_SNAP_LEAD_SEC(0.45) = 11.25 → in gap [10.0, 11.6].
   //   clampSnapTarget: forward range [11.6,11.7] is a sliver (0.1 < 0.3) → skipped; no forward
   //   substantial range → last-substantial fallback → start of [9.5,10.0] = 9.500.
   // Preconditions: N1 (fresh lastSnap*=-Infinity → advanced ✓); N2 (lastSnapAtMs=-Infinity →
   //   not debounced ✓); N3 target(9.5) !== ct(1.0) ✓; G6 cushion = bufEnd(11.7)-target(9.5) =
   //   2.2 >= LIVE_EDGE_STALL_MIN_CUSHION_SEC(0.1) ✓. Post-snap drift = 2.2 s (tightened).
-  // Strict no-hole pin: to= must EXACTLY equal 9.500 AND must NOT be the raw gap value 11.400.
-  // If the clamp call is replaced with the raw target the snap still fires but lands in the gap
-  // → to=11.400 → this test FAILS (mutation-killing). Unconditional assert.
-  it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → stall_snap to=9.500 (step-4 clamp redirect, NOT gap 11.400)', () => {
+  // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
+  //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant lands at
+  //   to=11.250. The negative-guard assertion below pins the LIVE reachable clamp-bypass value
+  //   (11.250) under the 0.45 lead, so it is load-bearing: a raw-passthrough mutant emits to=11.250
+  //   and the not.toMatch fails. The load-bearing pins are also the positive to=9.500 match and
+  //   toBeCloseTo(9.500) — lead-independent.
+  it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → stall_snap to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', () => {
     h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
     h.perfNow(0);
@@ -1840,9 +1864,9 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     const stall = logLines.find(l => l.includes('result=stall_snap'));
     // The seek line MUST exist (unconditional — no guard).
     expect(stall).toBeTruthy();
-    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.4) to the substantial range start.
+    // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(stall).toMatch(/ to=9\.500 /);
-    expect(stall).not.toMatch(/ to=11\.400 /);
+    expect(stall).not.toMatch(/ to=11\.250 /);
     const toMatch = stall.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
@@ -1856,6 +1880,8 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
   afterEach(() => teardownS8Harness(h));
 
   // T-S9-R1: rs=2 inside 300ms window WITH progress → executes (was suppressed under Slice 8 rs<=1)
+  // S10 update: 2-strike gate requires streak>=2. Pre-seed streak=1 so this call
+  // reaches streak=2 and still bypasses (C1 remediation). Lead updated to 0.45.
   it('T-S9-R1: rs=2 inside 300ms window, ct/bufEnd advanced > ADV_EPS → N2 bypassed, stall_snap executes', () => {
     h.perfNow(0);
     h.sb.buffered = makeBuffered(0, 10.030);
@@ -1866,12 +1892,13 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
     h.sb.buffered = makeBuffered(0, 10.033);
     h.videoEl.currentTime = 10.019; // advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 escape hatch
+    h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed (rs=2 now IS escape hatch): snap executes
+    // N2 bypassed (rs=2 IS escape hatch with streak>=2): snap executes (S10: target=10.033-0.450)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.033 - 0.300, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.033 - 0.450, 5);
   });
 
   // T-S9-R2: rs=2, NO ct/bufEnd progress → N1 fires (re-storm defense intact)
@@ -1906,10 +1933,16 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
     h.videoEl.currentTime = 10.018;
     // rs=3 is NOT the escape hatch; readyState default is 4, set to 3 explicitly
     Object.defineProperty(h.videoEl, 'readyState', { value: 3, configurable: true });
+    // Seed streak=0 so the next line pins that a hardStarve=false (rs>2) call MUST NOT increment.
+    h.exports.setHardStarveStreak(0);
 
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(1); // N2 still fires
+    // REQ-S10-OW3 (direct pin): the increment is `if (hardStarve)`-guarded, so an rs=3
+    // (hardStarve=false) invocation must NOT accrue a strike. Mutating the guard to
+    // `if (true)` would make this rs=3 call increment → streak 0→1 → this fails.
+    expect(h.exports.getHardStarveStreak()).toBe(0);
   });
 });
 
@@ -1939,12 +1972,12 @@ describe('watchdog telemetry — watchdog_snap signal + watchdog_rescues counter
     expect(parseFloat(toMatch[1])).toBeGreaterThan(5.0);
   });
 
-  // T-S9-T1b (FIX-5): EXACT to=/drift= pin. Single substantial range [0,10], ct=5.0.
-  //   wRaw = bufEnd(10.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.2) = 9.8 → inside [0,10] → pass-through.
+  // T-S9-T1b (FIX-5 / S10 update): EXACT to=/drift= pin. Single substantial range [0,10], ct=5.0.
+  //   wRaw = bufEnd(10.0) - LIVE_EDGE_TARGET_LEAD_SEC(0.45) = 9.55 → inside [0,10] → pass-through.
   //   wDrift = bufEnd(10.0) - ct(5.0) = 5.0.
-  // Pins to=9.800 AND drift=5.000 EXACTLY. Kills a mutated lead in `wRaw = wBufEnd -
-  // LIVE_EDGE_TARGET_LEAD_SEC` (any other lead shifts to= off 9.800) and a mutated drift formula.
-  it('T-S9-T1b: watchdog rescue emits EXACT to=9.800 drift=5.000 for buf [[0,10]] lead 0.2 ct 5.0 (kills mutated lead)', async () => {
+  // Pins to=9.550 AND drift=5.000 EXACTLY. Kills a mutated lead in `wRaw = wBufEnd -
+  // LIVE_EDGE_TARGET_LEAD_SEC` (any other lead shifts to= off 9.550) and a mutated drift formula.
+  it('T-S9-T1b: watchdog rescue emits EXACT to=9.550 drift=5.000 for buf [[0,10]] lead 0.45 ct 5.0 (kills mutated lead; S10)', async () => {
     h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
     h.videoEl.currentTime = 5.0;
     h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
@@ -1955,7 +1988,7 @@ describe('watchdog telemetry — watchdog_snap signal + watchdog_rescues counter
     const logLines = getMseLogLines(h.tauri);
     const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
     expect(watchdogLine).toBeTruthy();
-    expect(watchdogLine).toMatch(/event=seek result=watchdog_snap from=5\.000 to=9\.800 drift=5\.000/);
+    expect(watchdogLine).toMatch(/event=seek result=watchdog_snap from=5\.000 to=9\.550 drift=5\.000/);
   });
 
   // T-S9-T2: monotonic counter — 3 rescues → getWatchdogRescues() === 3
@@ -2089,5 +2122,256 @@ describe('Slice 9 seam exports and constants (T-S9-E1..E8)', () => {
     await vi.advanceTimersByTimeAsync(2000);
 
     expect(h.exports.getWatchdogRescues()).toBe(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLICE 10 — Steady-State Catch-Up Stutter Fix: Lead-Raise 0.45 + rs<=2 2-Strike
+// T-S10-* tests (RED before GREEN per strict TDD; all FAIL until GREEN implementation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── T-S10-const: new constants + seam exports ────────────────────────────────
+describe('S10 constants and seam exports (T-S10-const)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S10-const-1: HARDSTARVE_STRIKE_TICKS exported === 2
+  it('T-S10-const-1: HARDSTARVE_STRIKE_TICKS exported and === 2', () => {
+    expect(h.exports.HARDSTARVE_STRIKE_TICKS).toBe(2);
+  });
+
+  // T-S10-const-2: LIVE_EDGE_TARGET_LEAD_SEC === 0.45
+  it('T-S10-const-2: LIVE_EDGE_TARGET_LEAD_SEC exported and === 0.45', () => {
+    expect(h.exports.LIVE_EDGE_TARGET_LEAD_SEC).toBe(0.45);
+  });
+
+  // T-S10-const-3: LIVE_EDGE_STALL_SNAP_LEAD_SEC === 0.45
+  it('T-S10-const-3: LIVE_EDGE_STALL_SNAP_LEAD_SEC exported and === 0.45', () => {
+    expect(h.exports.LIVE_EDGE_STALL_SNAP_LEAD_SEC).toBe(0.45);
+  });
+
+  // T-S10-const-4: LIVE_EDGE_MAX_DRIFT_SEC === 0.5 (unchanged sanity pin)
+  it('T-S10-const-4: LIVE_EDGE_MAX_DRIFT_SEC unchanged === 0.5', () => {
+    expect(h.exports.LIVE_EDGE_MAX_DRIFT_SEC).toBe(0.5);
+  });
+
+  // T-S10-const-5: getHardStarveStreak is a function (not bare primitive)
+  it('T-S10-const-5: getHardStarveStreak exported as a function (not bare primitive)', () => {
+    expect(typeof h.exports.getHardStarveStreak).toBe('function');
+  });
+
+  // T-S10-const-6: getHardStarveStreak() returns 0 on fresh module load
+  it('T-S10-const-6: getHardStarveStreak() === 0 on fresh module (initialized to 0)', () => {
+    expect(h.exports.getHardStarveStreak()).toBe(0);
+  });
+
+  // T-S10-const-7: setHardStarveStreak is a function
+  it('T-S10-const-7: setHardStarveStreak exported as a function', () => {
+    expect(typeof h.exports.setHardStarveStreak).toBe('function');
+  });
+});
+
+// ── T-S10-STK: 2-strike state machine ────────────────────────────────────────
+describe('S10 2-strike state machine (T-S10-STK-*)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S10-STK-1: single 1-shot rs=2 dip (streak 0→1) → N2 NOT bypassed
+  // Core fix assertion: a transient 1-shot rs=2 edge-dip is now debounced (was bypassed in S9).
+  it('T-S10-STK-1: single rs=2 dip inside 300ms window (streak 0→1) → N2 fires, snap suppressed; streak=1', () => {
+    // snap#1 at perfNow=0 (establishes baseline, streak stays at 0 after snap#1: rs=4 default)
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1; readyState=4 (default) → hardStarve=false, no increment
+
+    // 50ms later (inside 300ms debounce window): ct/bufEnd advance (N1 passes), rs=2
+    h.perfNow(50);
+    h.sb.buffered = makeBuffered(0, 10.032);
+    h.videoEl.currentTime = 10.018; // set ct to 10.018 for N1 to pass
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+    // streak is 0 before this call; this is the 1-shot transient dip
+    const ctBefore2ndCall = h.videoEl.currentTime; // 10.018 — the test manually set it
+
+    h.exports.onVideoWaiting();
+
+    // 2-strike gate: !(true && 1>=2) = !(false) = true AND inside window → N2 fires, snap suppressed
+    expect(h.exports.getSuppressedDebounceCount()).toBe(1);
+    expect(h.videoEl.currentTime).toBe(ctBefore2ndCall); // currentTime unchanged (10.018, not snapped)
+    expect(h.exports.getHardStarveStreak()).toBe(1);   // streak incremented to 1
+  });
+
+  // T-S10-STK-2: persisted rs=2 (streak pre-seeded to 1) → streak=2, N2 bypass fires
+  // Genuine starvation recovers fast: on the 2nd consecutive rs=2 call the bypass fires.
+  it('T-S10-STK-2: seed streak=1, rs=2 inside window, ct/bufEnd advanced → streak=2, N2 bypass, snap at bufEnd-0.45', () => {
+    // snap#1 to set baseline
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1
+
+    // seed streak=1 (simulates one prior rs=2 event having already occurred)
+    h.exports.setHardStarveStreak(1);
+
+    // 50ms later: ct/bufEnd advance (N1 passes), rs=2 again → streak 1→2 → bypass fires
+    h.perfNow(50);
+    const bufEnd2 = 10.032;
+    h.sb.buffered = makeBuffered(0, bufEnd2);
+    h.videoEl.currentTime = 10.018;
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+
+    const debounceBeforeSnap2 = h.exports.getSuppressedDebounceCount();
+    h.exports.onVideoWaiting();
+
+    // 2-strike gate: !(true && 2>=2) = !(true) = false → bypass; snap fires
+    expect(h.exports.getSuppressedDebounceCount()).toBe(debounceBeforeSnap2); // unchanged (bypass, no suppression)
+    expect(h.videoEl.currentTime).toBeCloseTo(bufEnd2 - 0.45, 5);
+    expect(h.exports.getHardStarveStreak()).toBe(2);
+  });
+
+  // T-S10-STK-reset-positive: heartbeat tick at rs=4 resets streak to 0
+  it('T-S10-STK-reset-positive: setHardStarveStreak(2), heartbeat tick with readyState=4 → getHardStarveStreak()===0', async () => {
+    h.exports.setHardStarveStreak(2);
+    // Override readyState to 4 (player recovered) for the heartbeat to observe
+    h.overrideProperty(h.videoEl, 'readyState', { value: 4, configurable: true });
+    h.sb.buffered = makeBuffered(0, 10.030);
+
+    await vi.advanceTimersByTimeAsync(2000); // one heartbeat tick
+
+    expect(h.exports.getHardStarveStreak()).toBe(0);
+  });
+
+  // T-S10-STK-reset-negative: heartbeat tick at rs=2 does NOT reset streak (still starving)
+  it('T-S10-STK-reset-negative: setHardStarveStreak(2), heartbeat tick with readyState=2 → streak stays 2 (pins >2 boundary)', async () => {
+    h.exports.setHardStarveStreak(2);
+    // Override readyState to 2 (still starving)
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+    h.sb.buffered = makeBuffered(0, 10.030);
+
+    await vi.advanceTimersByTimeAsync(2000); // one heartbeat tick
+
+    expect(h.exports.getHardStarveStreak()).toBe(2); // NOT reset: 2 is NOT > 2
+  });
+
+  // T-S10-STK-no-reset-on-snap: snap path does NOT touch the streak
+  it('T-S10-STK-no-reset-on-snap: seed streak=2, fire bypassing rs=2 waiting → snap executes AND streak stays >=2', () => {
+    // snap#1 to set baseline
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1
+
+    // seed streak=2 (already at bypass threshold)
+    h.exports.setHardStarveStreak(2);
+
+    // fire a bypassing rs=2 waiting inside window (N1 passes → bypass fires → snap executes)
+    h.perfNow(50);
+    h.sb.buffered = makeBuffered(0, 10.032);
+    h.videoEl.currentTime = 10.018;
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+
+    h.exports.onVideoWaiting(); // snap executes (streak=2→3 due to increment, but NOT reset)
+
+    // snap path (L946-960) NEVER touches hardStarveStreak. Exact pin: seed 2 + exactly one
+    // post-N1 increment on this bypassing rs=2 snap = 3. Pins BOTH "no reset" AND "exactly
+    // one increment" — a deterministic value, not a loose floor.
+    expect(h.exports.getHardStarveStreak()).toBe(3);
+    // also verify the snap actually executed (currentTime changed to bufEnd-0.45)
+    expect(h.videoEl.currentTime).toBeCloseTo(10.032 - 0.45, 5);
+  });
+
+  // T-S10-STK-after-N1: N1 fires (no progress) → streak NOT incremented
+  // Pins increment-after-N1; kills the increment-before-N1 mutant.
+  it('T-S10-STK-after-N1: rs=2 with no ct/bufEnd progress → N1 fires AND getHardStarveStreak() unchanged at 0', () => {
+    // snap#1 to establish baseline
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1; streak stays 0 (rs=4 default)
+
+    // No progress: same ct and bufEnd as snap#1 baseline
+    h.perfNow(50);
+    h.sb.buffered = makeBuffered(0, 10.030); // bufEnd unchanged
+    h.videoEl.currentTime = 10.016;          // ct unchanged
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+
+    const guardBefore = h.exports.getSuppressedGuardCount();
+    h.exports.onVideoWaiting(); // N1 fires (not advanced)
+
+    // N1 fired: suppressedGuardCount incremented; streak NOT incremented (increment is AFTER N1)
+    expect(h.exports.getSuppressedGuardCount()).toBe(guardBefore + 1);
+    expect(h.exports.getHardStarveStreak()).toBe(0); // unchanged: increment never reached
+  });
+});
+
+// ── T-S10-REG: regression guards ─────────────────────────────────────────────
+describe('S10 regression guards (T-S10-REG-*)', () => {
+  let h;
+
+  beforeEach(async () => { h = await makeS8Harness(); });
+  afterEach(() => teardownS8Harness(h));
+
+  // T-S10-REG-1: persistent rs=2 stall recovers on the 2nd consecutive rs=2 call
+  // Pins Gate-10 criterion K1: no extended stall; 2nd strike → snap executes.
+  it('T-S10-REG-1: persistent rs=2 stall — snap#1 at t=0, 2nd rs=2 call (streak=2) → snap executes at bufEnd-0.45', () => {
+    // snap#1 establishes baseline (streak=0, rs=4 default → no increment on snap#1)
+    h.perfNow(0);
+    h.sb.buffered = makeBuffered(0, 10.030);
+    h.videoEl.currentTime = 10.016;
+    h.exports.onVideoWaiting(); // snap#1
+
+    // 1st rs=2 call inside window: ct/bufEnd advance (N1 passes), streak 0→1, N2 suppresses
+    h.perfNow(50);
+    h.sb.buffered = makeBuffered(0, 10.032);
+    h.videoEl.currentTime = 10.018;
+    h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
+    h.exports.onVideoWaiting(); // streak→1, N2 fires (suppressed)
+
+    // 2nd rs=2 call: ct/bufEnd advance again (N1 passes), streak 1→2 → bypass fires → snap executes
+    h.perfNow(100);
+    h.sb.buffered = makeBuffered(0, 10.035);
+    h.videoEl.currentTime = 10.020;
+
+    h.exports.onVideoWaiting(); // streak→2, bypass, snap
+
+    // Recovery within 1 extra tick; snap at bufEnd-0.45=10.035-0.45=9.585
+    expect(h.videoEl.currentTime).toBeCloseTo(10.035 - 0.45, 5);
+    expect(h.exports.getHardStarveStreak()).toBe(2);
+  });
+
+  // T-S10-REG-2: watchdog backstop with new 0.45 lead — exact to=9.550 for buf[[0,10]], ct=5
+  it('T-S10-REG-2: watchdog snap with lead 0.45 → exact to=9.550 drift=5.000 for buf [[0,10]] ct=5.0 (pins new lead)', async () => {
+    h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
+    h.videoEl.currentTime = 5.0;
+    h.sb.buffered = makeBufferedMulti([[0, 10.0]]);
+
+    h.tauri.invoke.mock.calls.length = 0;
+    await vi.advanceTimersByTimeAsync(2000); // one heartbeat tick → watchdog fires
+
+    const logLines = getMseLogLines(h.tauri);
+    const watchdogLine = logLines.find(l => l.includes('result=watchdog_snap'));
+    expect(watchdogLine).toBeTruthy();
+    // wRaw = 10.0 - 0.45 = 9.55 → inside [0,10] → pass-through → to=9.550
+    expect(watchdogLine).toMatch(/event=seek result=watchdog_snap from=5\.000 to=9\.550 drift=5\.000/);
+  });
+
+  // T-S10-IDP1: post-snap drift < drift gate → immediate re-snap is silent no-op
+  it('T-S10-IDP1: seekToLiveEdge after snap sets ct to bufEnd-0.45 → drift=0.45 < 0.5 → no second snap', () => {
+    const bufEnd = 10.0;
+    h.sb.buffered = makeBuffered(0, bufEnd);
+    h.videoEl.currentTime = 3.0; // drift=7.0 > 0.5 → snap fires
+
+    h.exports.seekToLiveEdge(); // snap#1: ct → 10.0-0.45=9.55
+
+    // drift now = bufEnd - ct = 10.0 - 9.55 = 0.45 < 0.5 → drift gate fires
+    h.tauri.invoke.mockClear();
+    h.exports.seekToLiveEdge(); // must be silent no-op
+
+    const lines = getMseLogLines(h.tauri);
+    expect(lines.some(l => l.includes('result=snap'))).toBe(false); // no second snap
   });
 });
