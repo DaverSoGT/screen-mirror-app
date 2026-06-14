@@ -1784,9 +1784,10 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
   //   1→2 ✓; forward-only 9.5 > 5.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
   // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
   //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant fires
-  //   (11.25 > 5.0) and lands in the gap → to=11.250. NOTE: the negative-guard assertion below still
-  //   checks the OLD 0.2-lead raw value (11.500); it stays GREEN because the real value is 9.500.
-  //   The load-bearing pins are the positive to=9.500 match and toBeCloseTo(9.500) — lead-independent.
+  //   (11.25 > 5.0) and lands in the gap → to=11.250. The negative-guard assertion below pins the
+  //   LIVE reachable clamp-bypass value (11.250) under the 0.45 lead, so it is load-bearing: a
+  //   raw-passthrough mutant emits to=11.250 and the not.toMatch fails. The positive to=9.500 match
+  //   and toBeCloseTo(9.500) pin the real clamped landing — lead-independent.
   it('T-S9-H1: watchdog rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=5.0 → rescue to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', async () => {
     h.exports.setWatchdogState({ watchdogStuckTicks: 1, watchdogLastTickCt: 5.0 });
     h.videoEl.currentTime = 5.0;
@@ -1801,7 +1802,7 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     expect(watchdogLine).toBeTruthy();
     // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(watchdogLine).toMatch(/ to=9\.500 /);
-    expect(watchdogLine).not.toMatch(/ to=11\.500 /);
+    expect(watchdogLine).not.toMatch(/ to=11\.250 /);
     const toMatch = watchdogLine.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
@@ -1815,9 +1816,10 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
   //   forward-only target 9.5 > ct 1.0 ✓. Post-snap drift = 11.7 - 9.5 = 2.2 s (tightened).
   // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
   //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant lands at
-  //   to=11.250. NOTE: the negative-guard assertion below still checks the OLD 0.2-lead raw value
-  //   (11.500); it remains GREEN because the real value is 9.500, but the load-bearing pins here are
-  //   the positive to=9.500 match and the toBeCloseTo(9.500) check, which are lead-independent.
+  //   to=11.250. The negative-guard assertion below pins the LIVE reachable clamp-bypass value
+  //   (11.250) under the 0.45 lead, so it is load-bearing: a raw-passthrough mutant emits to=11.250
+  //   and the not.toMatch fails. The positive to=9.500 match and the toBeCloseTo(9.500) check pin
+  //   the real clamped landing, which are lead-independent.
   it('T-S9-H2: seekToLiveEdge rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → snap to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', () => {
     h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
@@ -1831,7 +1833,7 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     expect(snapLine).toBeTruthy();
     // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(snapLine).toMatch(/ to=9\.500 /);
-    expect(snapLine).not.toMatch(/ to=11\.500 /);
+    expect(snapLine).not.toMatch(/ to=11\.250 /);
     const toMatch = snapLine.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
@@ -1846,9 +1848,10 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
   //   2.2 >= LIVE_EDGE_STALL_MIN_CUSHION_SEC(0.1) ✓. Post-snap drift = 2.2 s (tightened).
   // Strict no-hole pin: to= must EXACTLY equal 9.500 (lead-version-independent: rawTarget lands in
   //   the same gap and step-4 dominates). With the 0.45 lead a raw-passthrough mutant lands at
-  //   to=11.250. NOTE: the negative-guard assertion below still checks the OLD 0.3-lead raw value
-  //   (11.400); it stays GREEN because the real value is 9.500. The load-bearing pins are the
-  //   positive to=9.500 match and toBeCloseTo(9.500) — lead-independent.
+  //   to=11.250. The negative-guard assertion below pins the LIVE reachable clamp-bypass value
+  //   (11.250) under the 0.45 lead, so it is load-bearing: a raw-passthrough mutant emits to=11.250
+  //   and the not.toMatch fails. The load-bearing pins are also the positive to=9.500 match and
+  //   toBeCloseTo(9.500) — lead-independent.
   it('T-S9-H3: onVideoWaiting rawTarget in gap [[0,0.5],[9.5,10.0],[11.6,11.7]] ct=1.0 → stall_snap to=9.500 (step-4 clamp redirect, NOT gap value 11.250)', () => {
     h.sb.buffered = makeBufferedMulti([[0, 0.5], [9.5, 10.0], [11.6, 11.7]]);
     h.videoEl.currentTime = 1.0;
@@ -1863,7 +1866,7 @@ describe('no-hole guarantee — all 3 snap paths (T-S9-H1..H3)', () => {
     expect(stall).toBeTruthy();
     // Exact no-hole pin: clamp redirected the in-gap rawTarget (11.25) to the substantial range start.
     expect(stall).toMatch(/ to=9\.500 /);
-    expect(stall).not.toMatch(/ to=11\.400 /);
+    expect(stall).not.toMatch(/ to=11\.250 /);
     const toMatch = stall.match(/to=(\d+\.\d+)/);
     expect(parseFloat(toMatch[1])).toBeCloseTo(9.500, 5);
   });
