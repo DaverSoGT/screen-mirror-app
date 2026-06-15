@@ -158,8 +158,11 @@ unsafe impl<T> Send for ComSend<T> {}
 /// called BEFORE `ProcessInput`. See P2 evidence #809.
 ///
 /// See explore #803 and design DD5.
+///
+/// `pub(crate)` so [`crate::encode::path_select`] can consume it in the
+/// path-selection gate without widening the public API (PR-2 seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncoderVendor {
+pub(crate) enum EncoderVendor {
     /// Intel Quick Sync Video H.264 MFT — CLSID `{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}`.
     IntelQsv,
     /// NVIDIA NVENC H.264 MFT — CLSID `{60F44560-5A20-4857-BFEF-D29773CB8040}`.
@@ -418,6 +421,8 @@ impl VideoEncoder for WindowsMftH264Encoder {
         })?;
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
+        // Pass vendor so run_encoder_thread can call select_encode_path at init (PR-2 seam).
+        let vendor = self.vendor;
 
         state.stop.store(false, Ordering::Release);
 
@@ -431,7 +436,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
         let handle = std::thread::spawn(move || {
             // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
-            run_encoder_thread(activate_send.into_inner(), config, state, rx, tx);
+            run_encoder_thread(activate_send.into_inner(), config, state, vendor, rx, tx);
         });
 
         self.handle = Some(handle);
@@ -1100,6 +1105,7 @@ fn run_encoder_thread(
     activate: IMFActivate,
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
+    vendor: EncoderVendor,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
@@ -1184,6 +1190,45 @@ fn run_encoder_thread(
         return;
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
+
+    // PR-2 path-selection gate: evaluate ONCE at init; log the decision.
+    // TASK-08 will supply real capture/encode adapter LUIDs obtained from the
+    // capture device and the MFT adapter.  In PR-2 both LUIDs are 0 (placeholder)
+    // so the gate always selects CpuStagedFallback regardless of vendor — which is
+    // correct because the GPU execution path is not yet implemented (PR-3).
+    // BOTH arms route to the existing CPU-staged code below. Production behaviour
+    // is UNCHANGED.
+    {
+        use crate::encode::path_select::{EncodePath, select_encode_path};
+        // Placeholder LUIDs until TASK-08 wires real adapter LUID reads.
+        // Using 0 for both so LUIDs differ-by-vendor-logic is the only gate,
+        // but since 0 == 0 the LUID check passes; vendor floor still applies.
+        // Net result in PR-2: IntelQsv → GpuResident logged but routed CPU (stub);
+        // all other vendors → CpuStagedFallback.
+        let placeholder_capture_luid: i64 = 0;
+        let placeholder_encode_luid: i64 = 0;
+        let selected = select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
+        tracing::info!(
+            target: "sm_infra::encode::windows_mft",
+            path = ?selected,
+            vendor = ?vendor,
+            "encode path selected at init (PR-2: GpuResident routes to CpuStagedFallback until PR-3)"
+        );
+        // In PR-2 BOTH arms use the CPU path. PR-3 will branch on GpuResident.
+        match selected {
+            EncodePath::GpuResident => {
+                // TODO(PR-3): wire GPU-resident path (VideoProcessorBlt + DXGI surface).
+                // For now fall through to the CPU-staged code below.
+                tracing::debug!(
+                    target: "sm_infra::encode::windows_mft",
+                    "GpuResident selected but routing to CpuStagedFallback (PR-3 stub)"
+                );
+            }
+            EncodePath::CpuStagedFallback => {
+                // Existing CPU path — no change required.
+            }
+        }
+    }
 
     // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
     // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
