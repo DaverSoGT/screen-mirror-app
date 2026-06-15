@@ -54,6 +54,14 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_Media_KernelStreaming",
+    # GPU-resident spike (qsv-igpu-pipeline-perf TASK-01): D3D11 device + VideoProcessor
+    # (BGRA→NV12), DXGI adapter LUID enumeration, and shared-surface MFT input. Additive —
+    # no existing windows_mft.rs / capture symbol depends on these; they unlock the
+    # qsv_gpu_spike example only. Production TASK-06/07/08 reuse the same feature set.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
