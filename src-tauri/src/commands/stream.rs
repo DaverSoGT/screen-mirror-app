@@ -995,14 +995,17 @@ fn run_signaling_drain(
                     eprintln!("[sm-signaling-drain] peer found: {host}:{port}");
                 }
                 SignalingEvent::OfferReceived(offer, offer_attempt) => {
-                    // D-RBF-2: race-window guard. The outer stop_flag check (line 892) fires
+                    // Test seam (SC-MLO-1): fire after dequeue, before inner stop_flag guard.
+                    #[cfg(test)]
+                    offer_dequeue_seam::fire();
+                    // D-RBF-2: race-window guard. The outer stop_flag check (the loop-top guard) fires
                     // ONCE per recv_timeout iteration; an offer pulled before the OLD session
                     // teardown started can still race into this arm. The OLD receiver's str0m
                     // Rtc has m-line state that conflicts with a fresh sender Rtc, so we drop
                     // the offer when stop_flag has flipped to true (REQ-MLO-1).
                     //
                     // `break` (not `continue`) — stop_flag=true means this drain must exit.
-                    // Matches the existing Closed arm's pattern at line ~926.
+                    // Matches the existing `SignalingEvent::Closed` arm's pattern.
                     if stop_flag.load(Ordering::Relaxed) {
                         eprintln!(
                             "[sm-signaling-drain] OfferReceived after stop_flag set; dropping (D-RBF-2)"
@@ -1090,6 +1093,33 @@ fn run_signaling_drain(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod offer_dequeue_seam {
+    use std::sync::Mutex;
+
+    /// Test-only seam (SC-MLO-1): invoked in `run_signaling_drain` AFTER an Offer is
+    /// dequeued but BEFORE the inner stop_flag guard. Lets SC-MLO-1 flip stop_flag inside
+    /// the inner-guard race window so the inner guard (NOT the outer check) is the gate
+    /// under test. Fires ONCE (take-out). No-op when unset. Compiles to nothing in release.
+    #[allow(clippy::type_complexity)]
+    pub(super) static HOOK: Mutex<Option<Box<dyn Fn() + Send + 'static>>> = Mutex::new(None);
+
+    pub(super) fn fire() {
+        let cb = HOOK.lock().unwrap().take();
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
+
+    pub(super) fn set(cb: Box<dyn Fn() + Send + 'static>) {
+        *HOOK.lock().unwrap() = Some(cb);
+    }
+
+    pub(super) fn clear() {
+        *HOOK.lock().unwrap() = None;
     }
 }
 
@@ -3169,6 +3199,28 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32; // used in FakeReceiver::pli_count
 
+    // ─── Drain-seam mutual exclusion (test-only) ──────────────────────────────
+    //
+    // `offer_dequeue_seam::HOOK` is a PROCESS-GLOBAL take-on-fire seam fired by
+    // `run_signaling_drain` at the `OfferReceived` arm. Under `cargo test` every
+    // test runs in ONE process concurrently, so a sibling drain that dequeues an
+    // `OfferReceived` while `sc_mlo_1` has its hook installed would `take()` and
+    // run sc_mlo_1's hook on the wrong thread — corrupting/hanging both tests.
+    // (CI uses `cargo nextest` / process-per-test and is shielded; local
+    // `cargo test` is not.) Every test whose live drain can dequeue an
+    // `OfferReceived` MUST hold this guard for the duration of its drain so no
+    // two such tests run their drains at the same time as sc_mlo_1's install
+    // window. Poison-safe: a panic in one holder must not cascade.
+    static DRAIN_SEAM_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Acquire the drain-seam guard, recovering from poisoning so a panicking
+    /// holder does not cascade into unrelated drain-OfferReceived tests.
+    fn lock_drain_seam_guard() -> std::sync::MutexGuard<'static, ()> {
+        DRAIN_SEAM_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // ─── FakeReceiver: minimal VideoReceiver for unit tests ───────────────────
 
     /// Fake receiver that counts PLI calls and never blocks.
@@ -3896,6 +3948,9 @@ mod tests {
     fn signaling_drain_offer_received_calls_apply_and_publish() {
         use sm_domain::signaling::{SdpAnswer, SdpOffer, SignalingEvent};
         use std::sync::mpsc::sync_channel;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         // FakeReceiverForSig: records the offer it received and returns a canned answer.
         struct FakeReceiverForSig {
@@ -5963,6 +6018,10 @@ mod tests {
         use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
         use std::sync::mpsc::TrySendError;
 
+        // The reset hook spawns a live drain that dequeues the injected OfferReceived;
+        // serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
+
         // ── SpySignaling: no longer needs to capture tx (NO-COMPETE M-C1b) ──
         // stop() is a no-op (no real thread). start() is never called by the
         // production hook after the NO-COMPETE seam — the channel_capture cell
@@ -6151,6 +6210,10 @@ mod tests {
             IceCandidate, SdpAnswer, SdpOffer, SignalingConfig, SignalingEvent,
         };
         use std::sync::mpsc::TrySendError;
+
+        // The reset hook spawns a live drain that dequeues the injected OfferReceived;
+        // serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         // ── SpyMdnsSignaling: implements sm_domain::signaling::Signaling ──
         // NO-COMPETE update: start() now panics (the hook must NOT call it after M-C1b).
@@ -6966,48 +7029,59 @@ mod tests {
         }
     }
 
-    /// SC-MLO-1 — Inner stop_flag guard prevents `apply_remote_offer` when stopping.
+    /// SC-MLO-1 — `stop_flag=true` prevents `apply_remote_offer` (inner-guard isolation).
     ///
-    /// This test exposes the race window between the outer stop_flag check at the top
-    /// of the `run_signaling_drain` loop (line 892) and the `apply_remote_offer` call
-    /// inside the OfferReceived arm body. The outer check fires once per iteration;
-    /// an offer dequeued during that iteration can slip through even if stop_flag
-    /// becomes true AFTER the outer check but BEFORE apply_remote_offer executes.
+    /// This test specifically exercises the INNER stop_flag guard inside the
+    /// `SignalingEvent::OfferReceived` arm of `run_signaling_drain` (the D-RBF-2 guard),
+    /// NOT the outer loop-top check. The test seam `offer_dequeue_seam` fires after the
+    /// Offer is dequeued but before that inner guard, letting the test flip stop_flag inside
+    /// that exact race window. This makes the inner guard the exclusive gating mechanism
+    /// under test.
     ///
-    /// Test approach (deterministic via blocking receiver):
+    /// Mutation test: removing ONLY that inner guard (the D-RBF-2 stop_flag check in the
+    /// OfferReceived arm) makes this test FAIL (apply_remote_offer is entered); restoring it
+    /// makes the test PASS.
     ///
-    /// 1. stop_flag=false; drain spawned with a BLOCKING CountingReceiverOps.
-    /// 2. Offer pre-loaded in channel → drain grabs it on first recv_timeout.
-    /// 3. apply_remote_offer is entered; the impl blocks waiting on `release_rx`.
-    ///    WITHOUT inner guard → apply_remote_offer WAS entered (RED).
-    ///    WITH inner guard (WU-2) → apply_remote_offer is NEVER entered.
-    /// 4. Test thread waits 200ms for `entered_rx` notification.
-    ///    In RED state: `entered_rx` fires → drain is inside apply_remote_offer.
-    ///    In GREEN state: `entered_rx` times out → drain exited via inner guard.
-    /// 5. Regardless, release_tx unblocks apply_remote_offer (cleanup).
-    /// 6. Assert: `entered` == false (GREEN) / fails if entered == true (RED).
+    /// Test approach (deterministic via seam hook):
     ///
-    /// RED until WU-2 adds the inner stop_flag guard in the OfferReceived arm.
+    /// 1. Install seam hook: flip stop_flag + signal seam_entered + block on release.
+    /// 2. Pre-load OfferReceived into the channel.
+    /// 3. Spawn the drain thread. Drain dequeues the offer, fires the seam hook:
+    ///    → stop_flag=true set atomically inside the hook
+    ///    → seam_entered signaled to the test
+    ///    → drain blocks on release inside the hook.
+    /// 4. Test waits (blocking recv, 2s timeout) on seam_entered — drain is confirmed
+    ///    past dequeue, inside the seam, with stop_flag already flipped.
+    /// 5. Test releases drain (release_tx.try_send). Drain proceeds to inner guard.
+    /// 6. RED detector window (200ms): if apply_remote_offer fires, inner guard is missing.
+    /// 7. Assert !entered and call_count == 0.
     #[test]
     fn sc_mlo_1_stop_flag_true_prevents_apply_remote_offer() {
         use sm_domain::supervisor::SupervisorSignal;
         use std::sync::mpsc::sync_channel;
 
-        // entered_tx: apply_remote_offer sends here when entered.
-        // release_tx: test sends here to unblock apply_remote_offer after check.
+        // Hold the drain-seam guard for the ENTIRE install window: no sibling
+        // drain-OfferReceived test may run its drain (and steal this hook via the
+        // process-global offer_dequeue_seam) while we have it installed. See DRAIN_SEAM_GUARD.
+        let _drain_seam_guard = lock_drain_seam_guard();
+
+        // entered_tx / entered_rx: apply_remote_offer signals here (RED detector — should NOT fire).
+        // seam_entered_tx / seam_entered_rx: drain signals here after dequeuing offer (seam fired).
+        // release_tx / release_rx: test releases drain to proceed to inner guard after flip.
         let (entered_tx, entered_rx) = sync_channel::<()>(1);
+        let (seam_entered_tx, seam_entered_rx) = sync_channel::<()>(1);
         let (release_tx, release_rx) = sync_channel::<()>(1);
+        let release_rx_m = Mutex::new(release_rx);
 
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // `Receiver<T>` is !Sync, so we need a Mutex wrapper to satisfy SignalingReceiverOps: Sync.
-        struct SyncBlockingReceiverOps {
+        // Mlo1CountingOps: on apply_remote_offer, increment counter + signal RED detector.
+        // Name is unique (Mlo1CountingOps) to avoid collision with file-level CountingReceiverOps.
+        struct Mlo1CountingOps {
             apply_call_count: Arc<std::sync::atomic::AtomicUsize>,
             entered_tx: std::sync::mpsc::SyncSender<()>,
-            release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
         }
-
-        impl SignalingReceiverOps for SyncBlockingReceiverOps {
+        impl SignalingReceiverOps for Mlo1CountingOps {
             fn apply_remote_offer(
                 &self,
                 _offer: sm_domain::signaling::SdpOffer,
@@ -7015,10 +7089,8 @@ mod tests {
                 self.apply_call_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = self.entered_tx.try_send(());
-                let _ = self.release_rx.lock().unwrap().recv();
                 Err(TransportError::NotRunning)
             }
-
             fn add_remote_candidate(
                 &self,
                 _cand: sm_domain::signaling::IceCandidate,
@@ -7027,28 +7099,38 @@ mod tests {
             }
         }
 
-        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(SyncBlockingReceiverOps {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+
+        // Install seam hook: flip stop_flag, signal seam_entered, then block until released.
+        offer_dequeue_seam::set(Box::new({
+            let stop_c = stop_clone.clone();
+            let seam_tx = seam_entered_tx;
+            let rel_rx = Arc::new(release_rx_m);
+            move || {
+                stop_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = seam_tx.try_send(());
+                let _ = rel_rx.lock().unwrap().recv();
+            }
+        }));
+
+        let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(Mlo1CountingOps {
             apply_call_count: call_count.clone(),
             entered_tx,
-            release_rx: Mutex::new(release_rx),
         });
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
 
         let (sig_ev_tx, sig_ev_rx) = sync_channel::<SignalingEvent>(4);
-
         let supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>> =
             Arc::new(Mutex::new(None));
 
-        // stop_flag starts false so the outer check at loop top passes on first iter.
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        // Pre-load the offer. drain grabs it immediately (no 500ms recv_timeout wait).
+        // Pre-load the OfferReceived event BEFORE spawning the drain.
         let fake_offer = sm_domain::signaling::SdpOffer("v=0\r\n".to_string());
         sig_ev_tx
             .send(SignalingEvent::OfferReceived(fake_offer, 1))
-            .expect("SC-MLO-1: pre-load OfferReceived");
+            .expect("SC-MLO-1: send OfferReceived before spawn");
 
-        let stop_clone = stop_flag.clone();
+        // Spawn the drain thread.
         let sup_clone = supervisor_signal_tx.clone();
         let drain_handle = std::thread::Builder::new()
             .name("sc-mlo-1-drain".into())
@@ -7060,27 +7142,29 @@ mod tests {
                     stop_clone,
                     sup_clone,
                     DrainRole::Primary,
-                    Arc::new(AtomicU8::new(1)), // T1.9: default epoch — test doesn't drive stale-guard
+                    Arc::new(AtomicU8::new(1)),
                 );
             })
             .expect("SC-MLO-1: spawn drain thread");
 
-        // Set stop_flag=true now. The drain is racing toward the OfferReceived arm.
-        // In RED state (no inner guard): drain already past the outer check, offer
-        //   dequeued → apply_remote_offer entered → entered_rx fires → call_count=1.
-        // In GREEN state (with inner guard): inner check sees stop_flag=true → break
-        //   → apply_remote_offer NOT entered → entered_rx times out → call_count=0.
-        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Step 6: wait for drain to reach the seam (offer dequeued, stop_flag flipped inside seam).
+        seam_entered_rx
+            .recv_timeout(Duration::from_millis(2000))
+            .expect("SC-MLO-1: seam must be reached within 2s");
 
-        // Wait up to 200ms for the drain to enter apply_remote_offer (RED signal).
+        // Step 7: release the drain — it now proceeds past the seam to the inner stop_flag guard.
+        let _ = release_tx.try_send(());
+
+        // Step 8: RED detector window — if apply_remote_offer is called, inner guard is missing.
         let entered = entered_rx.recv_timeout(Duration::from_millis(200)).is_ok();
 
-        // Unblock apply_remote_offer (cleanup — no-op if drain didn't enter it).
-        let _ = release_tx.try_send(());
         drop(sig_ev_tx);
         drain_handle
             .join()
             .expect("SC-MLO-1: drain thread must not panic");
+
+        // Critical cleanup: clear the seam so other tests are not affected.
+        offer_dequeue_seam::clear();
 
         assert!(
             !entered,
@@ -7108,6 +7192,9 @@ mod tests {
     fn sc_mlo_2_stop_flag_false_allows_apply_remote_offer() {
         use sm_domain::supervisor::SupervisorSignal;
         use std::sync::mpsc::sync_channel;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         let (counting_recv, call_count) = CountingReceiverOps::new();
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
@@ -7446,6 +7533,9 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::sync::mpsc::sync_channel;
 
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
+
         let (counting_recv, call_count) = CountingReceiverOps::new();
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
@@ -7515,6 +7605,9 @@ mod tests {
         use sm_domain::supervisor::SupervisorSignal;
         use std::sync::mpsc::sync_channel;
         use std::time::Duration;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(CountingReceiverOps::new().0);
         let pub_ops: Arc<dyn SignalingPublishOps> = Arc::new(NoOpPublishForMlo);
@@ -8269,6 +8362,9 @@ mod tests {
         use sm_domain::signaling::{SdpOffer, SignalingEvent};
         use std::sync::mpsc::sync_channel;
 
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
+
         let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
         let (counting_recv, call_count) = GeCountingReceiver::new();
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
@@ -8335,6 +8431,9 @@ mod tests {
         use sm_domain::signaling::{SdpOffer, SignalingEvent};
         use std::sync::mpsc::sync_channel;
 
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
+
         let expected_attempt = Arc::new(AtomicU8::new(2)); // expected is 2
         let (counting_recv, call_count) = GeCountingReceiver::new();
         let recv_ops: Arc<dyn SignalingReceiverOps> = Arc::new(counting_recv);
@@ -8394,6 +8493,9 @@ mod tests {
     fn sc_ge_5_newer_offer_accepted_by_drain() {
         use sm_domain::signaling::{SdpOffer, SignalingEvent};
         use std::sync::mpsc::sync_channel;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         let expected_attempt = Arc::new(AtomicU8::new(1)); // expected is 1
         let (counting_recv, call_count) = GeCountingReceiver::new();
@@ -8455,6 +8557,9 @@ mod tests {
     fn sc_ge_6_expected_attempt_advances_on_reconnecting_state_change() {
         use sm_domain::signaling::{SdpOffer, SignalingEvent};
         use std::sync::mpsc::sync_channel;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         // Coordinator writes this Arc on StateChanged(Reconnecting{attempt}).
         let expected_attempt = Arc::new(AtomicU8::new(1));
@@ -8810,6 +8915,9 @@ mod tests {
     fn floor_advances_on_offer_apply() {
         use sm_domain::signaling::SdpOffer;
 
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
+
         let (ev_tx, _sup_rx, expected, stop_flag, handle, _count) =
             spawn_drain_harness_with_apply_tracking(1);
 
@@ -8841,6 +8949,9 @@ mod tests {
     #[test]
     fn stale_bye_dropped_after_offer2_applied() {
         use sm_domain::signaling::SdpOffer;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         let (ev_tx, sup_rx, _expected, stop_flag, handle, _count) =
             spawn_drain_harness_with_apply_tracking(1);
@@ -8880,6 +8991,9 @@ mod tests {
     #[test]
     fn stale_offer_still_rejected_after_floor_advances() {
         use sm_domain::signaling::SdpOffer;
+
+        // Serialize against the process-global offer_dequeue_seam (see DRAIN_SEAM_GUARD).
+        let _drain_seam_guard = lock_drain_seam_guard();
 
         let (ev_tx, _sup_rx, expected, stop_flag, handle, apply_count) =
             spawn_drain_harness_with_apply_tracking(1);
