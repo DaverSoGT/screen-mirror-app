@@ -1207,7 +1207,8 @@ fn run_encoder_thread(
         // all other vendors → CpuStagedFallback.
         let placeholder_capture_luid: i64 = 0;
         let placeholder_encode_luid: i64 = 0;
-        let selected = select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
+        let selected =
+            select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
         tracing::info!(
             target: "sm_infra::encode::windows_mft",
             path = ?selected,
@@ -1215,17 +1216,29 @@ fn run_encoder_thread(
             "encode path selected at init (PR-2: GpuResident routes to CpuStagedFallback until PR-3)"
         );
         // In PR-2 BOTH arms use the CPU path. PR-3 will branch on GpuResident.
+        // Also run the D3D negotiation seam (negotiate_gpu_path) so it is exercised
+        // at production init and is not dead code. In PR-2 no rejection is injected
+        // (None) — the stub returns GpuResident but we fall through to CPU regardless.
+        let negotiated = {
+            use crate::encode::path_select::negotiate_gpu_path;
+            // PR-2: no injection; PR-3 will pass the real MFT + D3D manager result.
+            negotiate_gpu_path(None)
+        };
         match selected {
             EncodePath::GpuResident => {
                 // TODO(PR-3): wire GPU-resident path (VideoProcessorBlt + DXGI surface).
-                // For now fall through to the CPU-staged code below.
+                // negotiate_gpu_path already ran; if it returned CpuStagedFallback that
+                // would supersede GpuResident (handled in PR-3 wiring). In PR-2 both
+                // selected and negotiated are GpuResident → still route to CPU below.
                 tracing::debug!(
                     target: "sm_infra::encode::windows_mft",
-                    "GpuResident selected but routing to CpuStagedFallback (PR-3 stub)"
+                    negotiated = ?negotiated,
+                    "GpuResident selected; routing to CpuStagedFallback until PR-3 GPU path"
                 );
             }
             EncodePath::CpuStagedFallback => {
                 // Existing CPU path — no change required.
+                let _ = negotiated; // suppress unused warning in this arm
             }
         }
     }
@@ -2949,7 +2962,10 @@ mod tests {
     fn nvenc_config_constants_match_pre_change_reference_task04() {
         // GOP_SIZE_FRAMES — CODECAPI_AVEncMPVGOPSize sent to the MFT.
         // Pre-change value: 60 (2-second keyframe interval at 30fps, design §A1).
-        assert_eq!(GOP_SIZE_FRAMES, 60u32, "GOP_SIZE_FRAMES must be 60 (pre-change reference)");
+        assert_eq!(
+            GOP_SIZE_FRAMES, 60u32,
+            "GOP_SIZE_FRAMES must be 60 (pre-change reference)"
+        );
 
         // Default EncoderConfig bitrate — 4 Mbps.
         let cfg = EncoderConfig::default();
@@ -2959,7 +2975,10 @@ mod tests {
         );
 
         // Default framerate — 30fps (sender overrides to 60, but the config default is pinned).
-        assert_eq!(cfg.framerate, 30u32, "default framerate must be 30fps (pre-change reference)");
+        assert_eq!(
+            cfg.framerate, 30u32,
+            "default framerate must be 30fps (pre-change reference)"
+        );
     }
 
     /// T-MFT-NVENC-03 (TASK-04): the CpuStagedFallback path uses MFCreateMemoryBuffer
@@ -2988,8 +3007,8 @@ mod tests {
         // This is a byte-slice → MFCreateMemoryBuffer path, not a texture path.
         // Asserting CpuStagedFallback and that no GpuShared variant is constructed
         // gives the same guarantee without needing COM hardware.
-        use crate::encode::path_select::{EncodePath, select_encode_path};
         use crate::encode::frame_payload::FramePayload;
+        use crate::encode::path_select::{EncodePath, select_encode_path};
         use sm_domain::{CaptureFrame, PixelFormat};
         use std::sync::Arc;
 

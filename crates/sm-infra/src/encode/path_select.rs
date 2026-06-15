@@ -88,11 +88,86 @@ pub(crate) fn select_encode_path(
     }
 }
 
+// ── D3D negotiation-rejection fallback (PR-2 seam; TASK-05) ─────────────────
+
+/// Step name returned by [`negotiate_gpu_path`] on rejection, for log pinning.
+///
+/// The WARN log must name the failed step so operators can diagnose why the
+/// GPU-resident path fell back to CPU-staged (REQ-05).
+///
+/// PR-2: variants are used in tests and in `negotiate_gpu_path`'s `Some` arm.
+/// PR-3 production callers will construct these from the real MFT COM results.
+// WHY #[allow(dead_code)]: the variants SetD3dManager / DxgiInputNegotiation are
+// constructed only inside #[cfg(test)] code in PR-2.  The `dead_code` lint fires
+// on non-test compilation (lib target) but not on test compilation (lib test target),
+// so `#[expect]` cannot be used here (it would fail with "unfulfilled expectation"
+// on the test target).  PR-3 constructs these variants from live COM results;
+// remove this attribute when that production call site is added.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D3dNegotiationStep {
+    /// `ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER)` — i.e. `METransformSetD3DManager`.
+    SetD3dManager,
+    /// `MFCreateDXGISurfaceBuffer` / `SetInputType` with DXGI NV12 surface.
+    DxgiInputNegotiation,
+}
+
+impl std::fmt::Display for D3dNegotiationStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetD3dManager => write!(f, "METransformSetD3DManager"),
+            Self::DxgiInputNegotiation => {
+                write!(f, "MFCreateDXGISurfaceBuffer / SetInputType DXGI")
+            }
+        }
+    }
+}
+
+/// Attempt GPU-path D3D negotiation; degrade to CPU-staged on any rejection.
+///
+/// This is the PR-2 seam for the negotiation-rejection fallback (REQ-05, S-04).
+/// In PR-2 the GPU negotiation is a **no-op stub** — the function always
+/// succeeds (returns `GpuResident`) when `inject_rejection` is `None`.
+/// Production PR-3 will replace the stub with real MFT COM calls.
+///
+/// When `inject_rejection` is `Some((step, error_code))` the function
+/// simulates a negotiation failure:
+/// 1. Emits a `warn` log identifying the failed step and HRESULT.
+/// 2. Returns `EncodePath::CpuStagedFallback`.
+/// 3. Does NOT panic.
+///
+/// # Arguments
+///
+/// * `inject_rejection` — `None` (normal path, no rejection); `Some((step, hr))` to
+///   simulate a driver rejection of `step` with Windows HRESULT `hr`.
+pub(crate) fn negotiate_gpu_path(
+    inject_rejection: Option<(D3dNegotiationStep, u32)>,
+) -> EncodePath {
+    match inject_rejection {
+        None => {
+            // PR-2 stub: GPU negotiation not yet implemented.
+            // TODO(PR-3): replace with real IMFDXGIDeviceManager + METransformSetD3DManager
+            // + SetInputType DXGI NV12 negotiation.  On success return GpuResident;
+            // on failure fall through to the Some(_) arm below.
+            EncodePath::GpuResident
+        }
+        Some((step, hr)) => {
+            tracing::warn!(
+                target: "sm_infra::encode::path_select",
+                step = %step,
+                hresult = format!("0x{:08X}", hr).as_str(),
+                "D3D negotiation rejected — falling back to CpuStagedFallback (REQ-05)"
+            );
+            EncodePath::CpuStagedFallback
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodePath, select_encode_path};
+    use super::{D3dNegotiationStep, EncodePath, negotiate_gpu_path, select_encode_path};
     use crate::encode::windows_mft::EncoderVendor;
 
     // Synthetic LUID constants.  LUIDs are i64 here (signed) because LUID.HighPart
@@ -240,6 +315,92 @@ mod tests {
             path,
             EncodePath::GpuResident,
             "NVENC path must never reach GpuResident (D3D manager seam unreachable)"
+        );
+    }
+
+    // ── TASK-05: D3D negotiation-rejection fallback ───────────────────────────
+    //
+    // Tests for the `negotiate_gpu_path` seam (REQ-05, S-04).
+    // All CI-runnable: error-code injection into the setup seam.
+
+    /// T-NEG-01 (TASK-05, REQ-05): injecting a SetD3dManager rejection selects fallback.
+    ///
+    /// Simulates the MFT rejecting `METransformSetD3DManager` (e.g., driver returns
+    /// MF_E_INVALIDTYPE / 0xC00D36B4).  Asserts CpuStagedFallback is returned.
+    #[test]
+    #[tracing_test::traced_test]
+    fn d3d_set_manager_rejection_selects_cpu_staged_fallback_task05() {
+        // Simulate METransformSetD3DManager rejection: MF_E_INVALIDTYPE = 0xC00D36B4.
+        let path = negotiate_gpu_path(Some((D3dNegotiationStep::SetD3dManager, 0xC00D36B4)));
+
+        assert_eq!(
+            path,
+            EncodePath::CpuStagedFallback,
+            "SetD3dManager rejection must degrade to CpuStagedFallback (REQ-05)"
+        );
+    }
+
+    /// T-NEG-02 (TASK-05, REQ-05): warn log is emitted with the failed step name.
+    ///
+    /// The WARN log must contain the step name so operators can identify which
+    /// negotiation stage failed (REQ-05 "log the rejection reason at warn level").
+    #[test]
+    #[tracing_test::traced_test]
+    fn d3d_rejection_emits_warn_log_with_step_name_task05() {
+        let _ = negotiate_gpu_path(Some((D3dNegotiationStep::SetD3dManager, 0xC00D36B4)));
+
+        // `logs_contain` is injected by tracing_test::traced_test.
+        assert!(
+            logs_contain("METransformSetD3DManager"),
+            "warn log must name the failed negotiation step (METransformSetD3DManager)"
+        );
+        assert!(
+            logs_contain("CpuStagedFallback"),
+            "warn log must mention CpuStagedFallback (operator visibility)"
+        );
+    }
+
+    /// T-NEG-03 (TASK-05, REQ-05): DXGI input negotiation rejection also falls back.
+    ///
+    /// Simulates `SetInputType` with DXGI NV12 surface rejected by the MFT
+    /// (e.g., driver returns MF_E_INVALIDMEDIATYPE / 0xC00D36B6).
+    #[test]
+    #[tracing_test::traced_test]
+    fn dxgi_input_rejection_selects_cpu_staged_fallback_task05() {
+        let path = negotiate_gpu_path(Some((
+            D3dNegotiationStep::DxgiInputNegotiation,
+            0xC00D36B6, // MF_E_INVALIDMEDIATYPE
+        )));
+
+        assert_eq!(
+            path,
+            EncodePath::CpuStagedFallback,
+            "DXGI input negotiation rejection must degrade to CpuStagedFallback (REQ-05)"
+        );
+    }
+
+    /// T-NEG-04 (TASK-05, REQ-05): negotiation rejection does NOT panic.
+    ///
+    /// The pipeline must continue running after a negotiation failure — the warn log
+    /// is the only observable side effect; the function returns normally.
+    #[test]
+    fn d3d_negotiation_rejection_does_not_panic_task05() {
+        // This would catch any unreachable!() / panic!() in the rejection path.
+        let path = negotiate_gpu_path(Some((D3dNegotiationStep::SetD3dManager, 0x80004005)));
+        assert_eq!(path, EncodePath::CpuStagedFallback);
+    }
+
+    /// T-NEG-05 (TASK-05): happy path (no rejection) → negotiate_gpu_path returns GpuResident stub.
+    ///
+    /// Verifies the no-injection branch works correctly (PR-2 stub: always GpuResident
+    /// until PR-3 replaces with real COM calls).
+    #[test]
+    fn no_rejection_returns_gpu_resident_stub_task05() {
+        let path = negotiate_gpu_path(None);
+        assert_eq!(
+            path,
+            EncodePath::GpuResident,
+            "no injection must return GpuResident (PR-2 stub — real COM added in PR-3)"
         );
     }
 }

@@ -98,7 +98,10 @@ mod tests {
 
         match payload {
             FramePayload::Cpu(f) => {
-                assert!(Arc::ptr_eq(&f.data, &data), "data Arc pointer must be identical (no copy)");
+                assert!(
+                    Arc::ptr_eq(&f.data, &data),
+                    "data Arc pointer must be identical (no copy)"
+                );
                 assert_eq!(f.width, 1920);
                 assert_eq!(f.height, 1080);
                 assert_eq!(f.stride, 7680);
