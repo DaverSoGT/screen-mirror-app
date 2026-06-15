@@ -129,11 +129,12 @@ mod tests {
 
         // Wrap in Cpu and extract to verify the Arc isn't copied.
         let payload = FramePayload::Cpu(frame.clone());
-        if let FramePayload::Cpu(inner) = payload {
-            assert!(
-                Arc::ptr_eq(&inner.data, &data),
-                "FramePayload::Cpu must not copy pixel data"
-            );
-        }
+        let FramePayload::Cpu(inner) = payload else {
+            panic!("expected Cpu");
+        };
+        assert!(
+            Arc::ptr_eq(&inner.data, &data),
+            "FramePayload::Cpu must not copy pixel data"
+        );
     }
 }

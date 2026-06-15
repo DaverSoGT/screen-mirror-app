@@ -97,13 +97,14 @@ pub(crate) fn select_encode_path(
 ///
 /// PR-2: variants are used in tests and in `negotiate_gpu_path`'s `Some` arm.
 /// PR-3 production callers will construct these from the real MFT COM results.
-// WHY #[allow(dead_code)]: the variants SetD3dManager / DxgiInputNegotiation are
-// constructed only inside #[cfg(test)] code in PR-2.  The `dead_code` lint fires
-// on non-test compilation (lib target) but not on test compilation (lib test target),
-// so `#[expect]` cannot be used here (it would fail with "unfulfilled expectation"
-// on the test target).  PR-3 constructs these variants from live COM results;
-// remove this attribute when that production call site is added.
-#[allow(dead_code)]
+// WHY #[cfg_attr(not(test), allow(dead_code))]: the variants SetD3dManager /
+// DxgiInputNegotiation are constructed only inside #[cfg(test)] code in PR-2.
+// The `dead_code` lint fires on non-test compilation (lib target) but not on test
+// compilation (lib test target), so the allow is scoped to non-test builds only —
+// `#[expect]` cannot be used here (it would fail with "unfulfilled expectation" on
+// the test target). PR-3 constructs these variants from live COM results; remove
+// this attribute when that production call site is added.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum D3dNegotiationStep {
     /// `ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER)` — i.e. `METransformSetD3DManager`.
