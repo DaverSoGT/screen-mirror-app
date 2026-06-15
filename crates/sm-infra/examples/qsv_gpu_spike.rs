@@ -74,17 +74,17 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform, MEEndOfStream,
-    METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    MEEndOfStream, METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
     MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFStartup,
     MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_REGISTER_TYPE_INFO, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::core::Interface;
@@ -443,7 +443,11 @@ impl GpuPipeline {
                         self.ho_count.set(self.ho_count.get() - 1);
                         self.encoded.set(self.encoded.get() + 1);
                     }
-                    // NEED_MORE_INPUT / stream-change: credit consumed, no packet produced (benign).
+                    // Ok(false) = NEED_MORE_INPUT, or STREAM_CHANGE (output type just renegotiated
+                    // inside collect_output). Either way: this HaveOutput credit produced no
+                    // counted packet — benign, NOT a NO-GO failure. The MFT re-emits
+                    // METransformHaveOutput once the renegotiated packet is ready; the next pump
+                    // iteration pulls it normally.
                     Ok(false) => self.ho_count.set(self.ho_count.get() - 1),
                     Err(e) => return Err(e),
                 }
@@ -477,8 +481,22 @@ impl GpuPipeline {
     /// Pull one encoded H.264 packet via `ProcessOutput`.
     ///
     /// Returns `Ok(true)` when a sample was produced (count it toward encode_fps), `Ok(false)`
-    /// on `MF_E_TRANSFORM_NEED_MORE_INPUT` (benign — the credit is spent but no packet is ready),
-    /// and `Err` on any real ProcessOutput failure (a NO-GO signal).
+    /// on `MF_E_TRANSFORM_NEED_MORE_INPUT` OR `MF_E_TRANSFORM_STREAM_CHANGE` (both benign — the
+    /// credit is spent but no packet is counted), and `Err` on any real ProcessOutput failure
+    /// (a NO-GO signal).
+    ///
+    /// # Stream-change handling (the SECOND spike bug, fixed here)
+    ///
+    /// On the FIRST output, an async HW H.264 MFT signals `MF_E_TRANSFORM_STREAM_CHANGE`
+    /// (`0xC00D6D61`): the output media type just changed and MUST be RENEGOTIATED before any
+    /// packet can be produced. Ignoring it (the original spike) left the MFT wedged → every
+    /// later `ProcessOutput` returned `E_UNEXPECTED` (`0x8000FFFF`) forever, so `encode_fps`
+    /// stayed 0. We mirror production `windows_mft.rs::collect_output` →
+    /// `renegotiate_output_type` EXACTLY: pull the new output type via `GetOutputAvailableType(0, 0)`,
+    /// overlay `FRAME_SIZE` + `FRAME_RATE` + `AVG_BITRATE`, `SetOutputType(0, ...)` it back on
+    /// stream 0, then return `Ok(false)` so the credit loop retries on the next event. Like
+    /// production we do NOT flush and do NOT resend `NOTIFY_BEGIN_STREAMING` (async-MFT spec).
+    /// A stream-change is NOT a failure — it never counts toward the 30-strike NO-GO budget.
     ///
     /// # Safety
     /// Runs on the WGC capture thread that owns the MFT.
@@ -501,8 +519,43 @@ impl GpuPipeline {
                 Ok(true)
             }
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
+            // Stream/format change: renegotiate the output type, then report "no packet" (benign).
+            // Faithful copy of production windows_mft.rs collect_output STREAM_CHANGE arm.
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                tracing::info!(
+                    target: "qsv_gpu_spike",
+                    dw_status = output.dwStatus,
+                    hr = format!("0x{:08X}", e.code().0),
+                    "ProcessOutput STREAM_CHANGE — renegotiating output type"
+                );
+                unsafe { self.renegotiate_output_type() }?;
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
+    }
+
+    /// Re-apply the MFT output type after `MF_E_TRANSFORM_STREAM_CHANGE`.
+    ///
+    /// Faithful mirror of production `windows_mft.rs::renegotiate_output_type`: take the MFT's
+    /// new preferred output type via `GetOutputAvailableType(0, 0)`, overlay our session
+    /// `FRAME_SIZE` / `FRAME_RATE` / `AVG_BITRATE`, then `SetOutputType(0, ...)`. No flush, no
+    /// `NOTIFY_BEGIN_STREAMING` resend (async-MFT spec).
+    ///
+    /// # Safety
+    /// Runs on the WGC capture thread that owns the MFT.
+    unsafe fn renegotiate_output_type(&self) -> windows::core::Result<()> {
+        let out_type: IMFMediaType = unsafe { self.mft.GetOutputAvailableType(0, 0)? };
+        unsafe {
+            out_type.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                ((self.width as u64) << 32) | (self.height as u64),
+            )?;
+            out_type.SetUINT64(&MF_MT_FRAME_RATE, ((TARGET_FRAMERATE as u64) << 32) | 1)?;
+            out_type.SetUINT32(&MF_MT_AVG_BITRATE, TARGET_BITRATE_BPS)?;
+            self.mft.SetOutputType(0, &out_type, 0)?;
+        }
+        Ok(())
     }
 }
 
@@ -751,10 +804,17 @@ impl GraphicsCaptureApiHandler for SpikeHandler {
             self.sample_index += 1;
             // The first 10 samples are warmup — the GATE reads steady-state AFTER these.
             let warmup = self.sample_index <= 10;
+            // `encode_active` makes the DECISIVE metric unambiguous in the log: when this is
+            // true, the iGPU is doing real H.264 encode work this window, so `capture_fps` is
+            // the encode-active capture rate — the number GATE A actually judges (capture must
+            // HOLD near ~60 WHILE the encoder loads the same iGPU). encode_fps>0 confirms the
+            // stream-change fix landed and the MFT is emitting real packets.
+            let encode_active = enc_fps > 0.0;
             tracing::info!(
                 target: "qsv_gpu_spike",
                 sample = self.sample_index,
                 warmup,
+                encode_active,
                 capture_fps = %format!("{cap_fps:.1}"),
                 encode_fps = %format!("{enc_fps:.1}"),
                 encode_errors = self.encode_errors.load(Ordering::Relaxed),
