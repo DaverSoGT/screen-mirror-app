@@ -111,10 +111,19 @@ fn wait_for_sup_tx(bridge: &SenderBridge, timeout: Duration) -> SyncSender<Super
 ///     need a short timeout (200ms) so the timeout actually fires within the
 ///     test deadline.
 ///
+/// `rebuild_result_signal` is the `SupervisorSignal` the counting `initiate_rebuild`
+/// hook feeds back after incrementing its counter. Tests that exercise the retry /
+/// ack-timeout path pass `RebuildFailed` (the supervisor re-enters `AwaitingAck` and
+/// keeps escalating). The InitiateRebuild test passes `RebuildSucceeded` so the
+/// supervisor transitions `Rebuilding` → `Connected` and parks on a blocking
+/// `signal_rx.recv()` with NO second `AwaitingAck` timeout — making its `reset_count==0`
+/// assert structurally guaranteed instead of bounded by the wall-clock `ack_timeout`.
+///
 /// Returns `(bridge, ev_tx, ch, rebuild_count, publish_req_count, publish_ack_count, reset_count)`.
 #[allow(clippy::type_complexity)]
 fn make_bridge_with_counting_hooks(
     ack_timeout: Duration,
+    rebuild_result_signal: SupervisorSignal,
 ) -> (
     SenderBridge,
     std::sync::mpsc::SyncSender<TransportEvent>,
@@ -163,6 +172,7 @@ fn make_bridge_with_counting_hooks(
             let pr = publish_req_count_c.clone();
             let pa = publish_ack_count_c.clone();
             let re = reset_count_c.clone();
+            let rebuild_signal = rebuild_result_signal.clone();
             let hooks = SenderCoordinatorHooks {
                 publish_reconnect_request: Arc::new(move |_attempt, _nonce| {
                     pr.fetch_add(1, Ordering::Relaxed);
@@ -172,8 +182,10 @@ fn make_bridge_with_counting_hooks(
                 }),
                 initiate_rebuild: Arc::new(move |signal_tx| {
                     rb.fetch_add(1, Ordering::Relaxed);
-                    // Immediately signal failure (no real bundle) so supervisor advances.
-                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    // Feed back the parametrized rebuild result (no real bundle) so the
+                    // supervisor advances. RebuildFailed → retry/escalate; RebuildSucceeded
+                    // → Connected (no second AwaitingAck timeout).
+                    let _ = signal_tx.try_send(rebuild_signal.clone());
                 }),
                 initiate_mdns_reset: Arc::new(move || {
                     re.fetch_add(1, Ordering::Relaxed);
@@ -249,8 +261,15 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
     // AwaitingAck wall-clock fallback (which would also emit InitiateMdnsReset). The
     // publish_ack==1 / reset==0 asserts below pin that we took the loser path, not the
     // timeout fallback.
+    // De-flake (wall-clock decoupling): the counting initiate_rebuild hook feeds back
+    // RebuildSucceeded (not RebuildFailed) so the supervisor goes Rebuilding → Connected
+    // and parks on a blocking signal_rx.recv() — it never re-enters a timeout-bearing
+    // AwaitingAck{attempt=2}. That makes the reset_count==0 assert STRUCTURALLY guaranteed
+    // rather than bounded by the 2s ack_timeout (the prior RebuildFailed path re-armed
+    // AwaitingAck and could, under pathological starvation, emit InitiateMdnsReset before
+    // the assert ran). rebuild_count is still incremented inside the hook BEFORE the signal.
     let (bridge, ev_tx, ch, rebuild_count, _pr, publish_ack_count, reset_count) =
-        make_bridge_with_counting_hooks(Duration::from_secs(2));
+        make_bridge_with_counting_hooks(Duration::from_secs(2), SupervisorSignal::RebuildSucceeded);
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -339,8 +358,10 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
 /// The hook should be invoked before any PeerAck arrives.
 #[test]
 fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
-    let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) =
-        make_bridge_with_counting_hooks(Duration::from_millis(200));
+    let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) = make_bridge_with_counting_hooks(
+        Duration::from_millis(200),
+        SupervisorSignal::RebuildFailed,
+    );
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -369,8 +390,10 @@ fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
 /// InitiateMdnsReset (TCP fallback path, ack_timeout = 200ms).
 #[test]
 fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
-    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) =
-        make_bridge_with_counting_hooks(Duration::from_millis(200));
+    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) = make_bridge_with_counting_hooks(
+        Duration::from_millis(200),
+        SupervisorSignal::RebuildFailed,
+    );
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");
@@ -407,7 +430,10 @@ fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
 fn coordinator_calls_publish_reconnect_ack_hook_on_outcome() {
     // ack_timeout = 2s — production value. Setup races below the timeout in <50ms.
     let (bridge, ev_tx, ch, _rb, publish_req_count, publish_ack_count, _re) =
-        make_bridge_with_counting_hooks(Duration::from_millis(2000));
+        make_bridge_with_counting_hooks(
+            Duration::from_millis(2000),
+            SupervisorSignal::RebuildFailed,
+        );
 
     start_sender_inner(&bridge, ch.clone() as Arc<dyn ChannelLike>, None, None)
         .expect("start must succeed");

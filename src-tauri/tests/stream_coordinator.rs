@@ -125,9 +125,18 @@ fn wait_for_sup_tx(bridge: &StreamBridge, timeout: Duration) -> SyncSender<Super
 ///     AwaitingAck wall-clock fallback.
 ///   - The InitiateMdnsReset test exercises the ack-timeout branch itself and needs a
 ///     SHORT timeout (200ms) so the timeout actually fires within the test deadline.
+///
+/// `rebuild_result_signal` is the `SupervisorSignal` the counting `initiate_rebuild`
+/// hook feeds back after incrementing its counter. Tests that exercise the retry /
+/// ack-timeout path pass `RebuildFailed` (the supervisor re-enters `AwaitingAck` and
+/// keeps escalating). The InitiateRebuild test passes `RebuildSucceeded` so the
+/// supervisor transitions `Rebuilding` → `Connected` and parks on a blocking
+/// `signal_rx.recv()` with NO second `AwaitingAck` timeout — making its `reset_count==0`
+/// assert structurally guaranteed instead of bounded by the wall-clock `ack_timeout`.
 #[allow(clippy::type_complexity)]
 fn make_stream_bridge_with_counting_hooks(
     ack_timeout: Duration,
+    rebuild_result_signal: SupervisorSignal,
 ) -> (
     StreamBridge,
     SyncSender<TransportEvent>,
@@ -187,6 +196,7 @@ fn make_stream_bridge_with_counting_hooks(
             let pr = pr_c.clone();
             let pa = pa_c.clone();
             let re = re_c.clone();
+            let rebuild_signal = rebuild_result_signal.clone();
             let hooks = StreamCoordinatorHooks {
                 publish_reconnect_request: Arc::new(move |_attempt, _nonce| {
                     pr.fetch_add(1, Ordering::Relaxed);
@@ -196,7 +206,10 @@ fn make_stream_bridge_with_counting_hooks(
                 }),
                 initiate_rebuild: Arc::new(move |signal_tx| {
                     rb.fetch_add(1, Ordering::Relaxed);
-                    let _ = signal_tx.try_send(SupervisorSignal::RebuildFailed);
+                    // Feed back the parametrized rebuild result (no real bundle) so the
+                    // supervisor advances. RebuildFailed → retry/escalate; RebuildSucceeded
+                    // → Connected (no second AwaitingAck timeout).
+                    let _ = signal_tx.try_send(rebuild_signal.clone());
                 }),
                 initiate_mdns_reset: Arc::new(move || {
                     re.fetch_add(1, Ordering::Relaxed);
@@ -265,8 +278,18 @@ fn coordinator_invokes_builder_on_initiate_rebuild() {
     // ONLY way InitiateRebuild can fire — NOT the AwaitingAck wall-clock fallback (which
     // would also emit InitiateMdnsReset). The publish_ack==1 / reset==0 asserts below pin
     // that we took the loser path, not the timeout fallback.
+    // De-flake (wall-clock decoupling): the counting initiate_rebuild hook feeds back
+    // RebuildSucceeded (not RebuildFailed) so the supervisor goes Rebuilding → Connected
+    // and parks on a blocking signal_rx.recv() — it never re-enters a timeout-bearing
+    // AwaitingAck{attempt=2}. That makes the reset_count==0 assert STRUCTURALLY guaranteed
+    // rather than bounded by the 2s ack_timeout (the prior RebuildFailed path re-armed
+    // AwaitingAck and could, under pathological starvation, emit InitiateMdnsReset before
+    // the assert ran). rebuild_count is still incremented inside the hook BEFORE the signal.
     let (bridge, ev_tx, ch, rebuild_count, _pr, publish_ack_count, reset_count) =
-        make_stream_bridge_with_counting_hooks(Duration::from_secs(2));
+        make_stream_bridge_with_counting_hooks(
+            Duration::from_secs(2),
+            SupervisorSignal::RebuildSucceeded,
+        );
 
     start_stream_inner(
         &bridge,
@@ -332,7 +355,10 @@ fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
     // Generous timeout: the request hook fires on entering AwaitingAck, well before any
     // ack_timeout would matter.
     let (bridge, ev_tx, ch, _rb, publish_req_count, _pa, _re) =
-        make_stream_bridge_with_counting_hooks(Duration::from_secs(2));
+        make_stream_bridge_with_counting_hooks(
+            Duration::from_secs(2),
+            SupervisorSignal::RebuildFailed,
+        );
 
     start_stream_inner(
         &bridge,
@@ -362,8 +388,10 @@ fn coordinator_calls_publish_reconnect_request_hook_on_outcome() {
 fn coordinator_calls_mdns_reset_hook_on_initiate_mdns_reset() {
     // Short timeout: this test exercises the ack-timeout branch itself, so the 200ms
     // AwaitingAck timeout MUST fire within the test deadline.
-    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) =
-        make_stream_bridge_with_counting_hooks(Duration::from_millis(200));
+    let (bridge, ev_tx, ch, _rb, _pr, _pa, reset_count) = make_stream_bridge_with_counting_hooks(
+        Duration::from_millis(200),
+        SupervisorSignal::RebuildFailed,
+    );
 
     start_stream_inner(
         &bridge,

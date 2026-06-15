@@ -1118,8 +1118,33 @@ mod offer_dequeue_seam {
         *HOOK.lock().unwrap() = Some(cb);
     }
 
+    /// Uninstall the hook. Idempotent: clearing an already-empty HOOK is a no-op
+    /// and is always safe (it just stores `None`). Lock poisoning is recovered so
+    /// a panicking holder cannot cascade into the next guarded test.
     pub(super) fn clear() {
-        *HOOK.lock().unwrap() = None;
+        let mut guard = HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+
+    /// RAII drop-guard (SC-MLO-1): installs a seam hook via `set` on construction
+    /// and uninstalls it via `clear` on `Drop` — INCLUDING panic/unwind. This makes
+    /// hook lifetime exception-safe: if any `.expect(...)` in the test panics between
+    /// install and the manual cleanup point, `Drop` still runs and the process-global
+    /// HOOK cannot leak into the next guarded test. Test-only; compiles to nothing in
+    /// release.
+    pub(super) struct HookGuard;
+
+    impl HookGuard {
+        pub(super) fn install(cb: Box<dyn Fn() + Send + 'static>) -> Self {
+            set(cb);
+            HookGuard
+        }
+    }
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            clear();
+        }
     }
 }
 
@@ -7102,8 +7127,12 @@ mod tests {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
 
-        // Install seam hook: flip stop_flag, signal seam_entered, then block until released.
-        offer_dequeue_seam::set(Box::new({
+        // Install seam hook via RAII guard: flip stop_flag, signal seam_entered, then
+        // block until released. The guard's Drop calls offer_dequeue_seam::clear() on
+        // scope exit INCLUDING panic/unwind, so a panicking `.expect(...)` below cannot
+        // leak the process-global HOOK into the next guarded test. The guard is held for
+        // the rest of the test body (kept alive until end of scope).
+        let _seam_guard = offer_dequeue_seam::HookGuard::install(Box::new({
             let stop_c = stop_clone.clone();
             let seam_tx = seam_entered_tx;
             let rel_rx = Arc::new(release_rx_m);
@@ -7163,8 +7192,9 @@ mod tests {
             .join()
             .expect("SC-MLO-1: drain thread must not panic");
 
-        // Critical cleanup: clear the seam so other tests are not affected.
-        offer_dequeue_seam::clear();
+        // Seam cleanup is now RAII: `_seam_guard` (offer_dequeue_seam::HookGuard) clears
+        // the process-global HOOK on scope exit, INCLUDING if any `.expect(...)` above
+        // panics. No manual clear() needed here.
 
         assert!(
             !entered,
