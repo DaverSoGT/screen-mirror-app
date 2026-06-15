@@ -100,6 +100,18 @@ use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder
 // gate) so both the encode and capture production gates call the same tested function.
 use crate::capture::interval_elapsed;
 
+// ── FramePayload dispatch seam (PR-2) ─────────────────────────────────────────
+//
+// The capture→encoder channel still carries `CaptureFrame` at the public
+// VideoEncoder::start() boundary (sm-domain trait is frozen). Inside pump_loop
+// we convert each received frame to `FramePayload` and match on the variant.
+// This introduces the routing seam without changing the external API.
+//
+// In PR-2 the capture side ONLY produces `Cpu` frames; the `GpuShared` arm
+// is a `todo!()` stub that is safe because no such variant can be constructed
+// from production code in this PR.
+use crate::encode::frame_payload::FramePayload;
+
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
 
 /// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
@@ -146,8 +158,11 @@ unsafe impl<T> Send for ComSend<T> {}
 /// called BEFORE `ProcessInput`. See P2 evidence #809.
 ///
 /// See explore #803 and design DD5.
+///
+/// `pub(crate)` so [`crate::encode::path_select`] can consume it in the
+/// path-selection gate without widening the public API (PR-2 seam).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncoderVendor {
+pub(crate) enum EncoderVendor {
     /// Intel Quick Sync Video H.264 MFT — CLSID `{4BE8D3C0-0515-4A37-AD55-E4BAE19AF471}`.
     IntelQsv,
     /// NVIDIA NVENC H.264 MFT — CLSID `{60F44560-5A20-4857-BFEF-D29773CB8040}`.
@@ -406,6 +421,8 @@ impl VideoEncoder for WindowsMftH264Encoder {
         })?;
         let config = self.config.clone();
         let state = Arc::clone(&self.state);
+        // Pass vendor so run_encoder_thread can call select_encode_path at init (PR-2 seam).
+        let vendor = self.vendor;
 
         state.stop.store(false, Ordering::Release);
 
@@ -419,7 +436,7 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
         let handle = std::thread::spawn(move || {
             // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
-            run_encoder_thread(activate_send.into_inner(), config, state, rx, tx);
+            run_encoder_thread(activate_send.into_inner(), config, state, vendor, rx, tx);
         });
 
         self.handle = Some(handle);
@@ -1088,6 +1105,7 @@ fn run_encoder_thread(
     activate: IMFActivate,
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
+    vendor: EncoderVendor,
     rx: Receiver<sm_domain::CaptureFrame>,
     tx: SyncSender<EncodedPacket>,
 ) {
@@ -1172,6 +1190,60 @@ fn run_encoder_thread(
         return;
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
+
+    // PR-2 path-selection gate: evaluate ONCE at init; log the decision.
+    // TASK-08 will supply real capture/encode adapter LUIDs obtained from the
+    // capture device and the MFT adapter.  In PR-2 both LUIDs are 0 (placeholder),
+    // so the LUID-equality check passes (0 == 0) and only the vendor floor decides:
+    // an IntelQsv encoder selects GpuResident (logged), while every other vendor
+    // selects CpuStagedFallback. The GPU execution path is not yet implemented
+    // (PR-3), so the GpuResident arm is routed to the CPU-staged code below as well.
+    // BOTH arms therefore route to the existing CPU-staged code. Production
+    // behaviour is UNCHANGED.
+    {
+        use crate::encode::path_select::{EncodePath, select_encode_path};
+        // Placeholder LUIDs until TASK-08 wires real adapter LUID reads.
+        // Using 0 for both so LUIDs differ-by-vendor-logic is the only gate,
+        // but since 0 == 0 the LUID check passes; vendor floor still applies.
+        // Net result in PR-2: IntelQsv → GpuResident logged but routed CPU (stub);
+        // all other vendors → CpuStagedFallback.
+        let placeholder_capture_luid: i64 = 0;
+        let placeholder_encode_luid: i64 = 0;
+        let selected =
+            select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
+        tracing::info!(
+            target: "sm_infra::encode::windows_mft",
+            path = ?selected,
+            vendor = ?vendor,
+            "encode path selected at init (PR-2: GpuResident routes to CpuStagedFallback until PR-3)"
+        );
+        // In PR-2 BOTH arms use the CPU path. PR-3 will branch on GpuResident.
+        // Also run the D3D negotiation seam (negotiate_gpu_path) so it is exercised
+        // at production init and is not dead code. In PR-2 no rejection is injected
+        // (None) — the stub returns GpuResident but we fall through to CPU regardless.
+        let negotiated = {
+            use crate::encode::path_select::negotiate_gpu_path;
+            // PR-2: no injection; PR-3 will pass the real MFT + D3D manager result.
+            negotiate_gpu_path(None)
+        };
+        match selected {
+            EncodePath::GpuResident => {
+                // TODO(PR-3): wire GPU-resident path (VideoProcessorBlt + DXGI surface).
+                // negotiate_gpu_path already ran; if it returned CpuStagedFallback that
+                // would supersede GpuResident (handled in PR-3 wiring). In PR-2 both
+                // selected and negotiated are GpuResident → still route to CPU below.
+                tracing::debug!(
+                    target: "sm_infra::encode::windows_mft",
+                    negotiated = ?negotiated,
+                    "GpuResident selected; routing to CpuStagedFallback until PR-3 GPU path"
+                );
+            }
+            EncodePath::CpuStagedFallback => {
+                // Existing CPU path — no change required.
+                let _ = negotiated; // suppress unused warning in this arm
+            }
+        }
+    }
 
     // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
     // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
@@ -1811,7 +1883,20 @@ fn pump_loop(
             // and reaches the top-of-loop stop check. Option A (Phase 1 user decision).
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
-                Ok(frame) => {
+                Ok(raw_frame) => {
+                    // PR-2 FramePayload dispatch seam: wrap the received CaptureFrame
+                    // as FramePayload::Cpu so the routing match below is the single
+                    // authoritative dispatch point.  In PR-3 the capture side will
+                    // produce FramePayload::GpuShared; for now only Cpu is reachable.
+                    let payload = FramePayload::Cpu(raw_frame);
+                    let frame = match payload {
+                        FramePayload::Cpu(f) => f,
+                        FramePayload::GpuShared { .. } => {
+                            // PR-3: GPU-resident path (VideoProcessorBlt + DXGI surface
+                            // MFSample).  Not yet reachable — no producer in PR-2.
+                            todo!("PR-3: GPU resident path — GpuShared arm not yet implemented");
+                        }
+                    };
                     if frame.width != cfg_w || frame.height != cfg_h {
                         tracing::warn!(
                             "pump_loop: frame dim mismatch — configured {}x{}, got {}x{}; dropping frame to avoid NVENC driver AV",
@@ -2839,4 +2924,75 @@ mod tests {
             "exactly 1 s elapsed must return true (inclusive boundary)"
         );
     }
+
+    // ── TASK-04: NVENC byte-identical config-pinning regression ──────────────
+    //
+    // These tests pin the NVENC encoder configuration constants and assert that
+    // the CPU-staged sample construction path is selected for NVENC — ensuring
+    // the GPU-resident path (PR-3) cannot inadvertently activate on NVENC machines.
+    //
+    // Satisfies: REQ-02, S-06, design §NVENC-Protection Proof.
+
+    /// T-MFT-NVENC-01 (TASK-04): NVENC selects CpuStagedFallback via path gate.
+    ///
+    /// Asserts the gate returns CpuStagedFallback for NvidiaNvenc regardless
+    /// of LUID equality — the vendor floor takes precedence.
+    #[test]
+    fn nvenc_path_gate_selects_cpu_staged_fallback_task04() {
+        use crate::encode::path_select::{EncodePath, select_encode_path};
+
+        // Simulate NVENC machine with same-adapter LUID (belt-and-suspenders: vendor
+        // floor alone should reject GpuResident even when LUID matches).
+        let luid_nvidia: i64 = 0x0000_10DE_CAFE_0001_u64 as i64;
+        let path = select_encode_path(luid_nvidia, luid_nvidia, EncoderVendor::NvidiaNvenc);
+        assert_eq!(
+            path,
+            EncodePath::CpuStagedFallback,
+            "NvidiaNvenc must always select CpuStagedFallback (REQ-02 vendor floor)"
+        );
+    }
+
+    /// T-MFT-NVENC-02 (TASK-04): default EncoderConfig constants match pre-change reference.
+    ///
+    /// Config-regression guard. Pins the generic encoder defaults that must remain
+    /// stable across this change (REQ-02): GOP_SIZE_FRAMES (60), the default
+    /// bitrate (4 Mbps), and the default framerate (30fps). These are not
+    /// NVENC-specific — they are the shared EncoderConfig defaults used by every
+    /// encode path.
+    ///
+    /// Any refactor that accidentally changes these constants will break this test
+    /// BEFORE the change reaches CI hardware measurement.
+    #[test]
+    fn default_encoder_config_constants_match_pre_change_reference_task04() {
+        // GOP_SIZE_FRAMES — CODECAPI_AVEncMPVGOPSize sent to the MFT.
+        // Pre-change value: 60 frames = a 1-second keyframe interval at the
+        // sender's 60fps (design §A1).
+        assert_eq!(
+            GOP_SIZE_FRAMES, 60u32,
+            "GOP_SIZE_FRAMES must be 60 (pre-change reference)"
+        );
+
+        // Default EncoderConfig bitrate — 4 Mbps.
+        let cfg = EncoderConfig::default();
+        assert_eq!(
+            cfg.bitrate_bps, 4_000_000,
+            "default bitrate_bps must be 4_000_000 bps (pre-change reference)"
+        );
+
+        // Default framerate — 30fps (sender overrides to 60, but the config default is pinned).
+        assert_eq!(
+            cfg.framerate, 30u32,
+            "default framerate must be 30fps (pre-change reference)"
+        );
+    }
+
+    // NOTE: A former T-MFT-NVENC-03 test
+    // (`cpu_staged_path_uses_memory_buffer_not_dxgi_surface_task04`) was removed.
+    // Its docstring promised it pinned `build_imfsample` as MFCreateMemoryBuffer-
+    // backed, but exercising that contract requires MFStartup + COM init (no
+    // unit-test harness has that), and its only real assertion — NVENC →
+    // CpuStagedFallback via `select_encode_path` — duplicated
+    // `nvenc_path_gate_selects_cpu_staged_fallback_task04` above. The remaining
+    // `matches!(payload, FramePayload::Cpu(_))` check was tautological (the value
+    // had just been constructed as Cpu). Removed rather than left misleading.
 }
