@@ -2,6 +2,7 @@
 
 pub mod bgra_to_i420;
 pub mod bgra_to_nv12; // always-on; Linux/macOS CI catches stride bugs
+pub mod frame_payload; // always-on: FramePayload carrier (PR-2 seam)
 
 #[cfg(target_os = "windows")]
 pub mod windows;

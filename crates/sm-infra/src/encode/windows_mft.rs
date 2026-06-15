@@ -100,6 +100,18 @@ use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder
 // gate) so both the encode and capture production gates call the same tested function.
 use crate::capture::interval_elapsed;
 
+// ── FramePayload dispatch seam (PR-2) ─────────────────────────────────────────
+//
+// The capture→encoder channel still carries `CaptureFrame` at the public
+// VideoEncoder::start() boundary (sm-domain trait is frozen). Inside pump_loop
+// we convert each received frame to `FramePayload` and match on the variant.
+// This introduces the routing seam without changing the external API.
+//
+// In PR-2 the capture side ONLY produces `Cpu` frames; the `GpuShared` arm
+// is a `todo!()` stub that is safe because no such variant can be constructed
+// from production code in this PR.
+use crate::encode::frame_payload::FramePayload;
+
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
 
 /// GOP size cap sent to the hardware encoder via `CODECAPI_AVEncMPVGOPSize`.
@@ -1811,7 +1823,20 @@ fn pump_loop(
             // and reaches the top-of-loop stop check. Option A (Phase 1 user decision).
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
-                Ok(frame) => {
+                Ok(raw_frame) => {
+                    // PR-2 FramePayload dispatch seam: wrap the received CaptureFrame
+                    // as FramePayload::Cpu so the routing match below is the single
+                    // authoritative dispatch point.  In PR-3 the capture side will
+                    // produce FramePayload::GpuShared; for now only Cpu is reachable.
+                    let payload = FramePayload::Cpu(raw_frame);
+                    let frame = match payload {
+                        FramePayload::Cpu(f) => f,
+                        FramePayload::GpuShared { .. } => {
+                            // PR-3: GPU-resident path (VideoProcessorBlt + DXGI surface
+                            // MFSample).  Not yet reachable — no producer in PR-2.
+                            todo!("PR-3: GPU resident path — GpuShared arm not yet implemented");
+                        }
+                    };
                     if frame.width != cfg_w || frame.height != cfg_h {
                         tracing::warn!(
                             "pump_loop: frame dim mismatch — configured {}x{}, got {}x{}; dropping frame to avoid NVENC driver AV",
