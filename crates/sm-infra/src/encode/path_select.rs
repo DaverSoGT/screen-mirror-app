@@ -180,4 +180,66 @@ mod tests {
             "same LUID + Unknown must select CpuStagedFallback"
         );
     }
+
+    // ── TASK-04: NVENC byte-identical config-pinning regression ──────────────
+
+    /// T-PS-NVENC-01 (TASK-04, REQ-02, S-06): on a cross-adapter NVENC machine
+    /// (AMD iGPU captures, NVIDIA dGPU encodes) the gate selects CpuStagedFallback.
+    ///
+    /// Synthetic LUID topology mirrors the real NVENC machine: AMD iGPU LUID ≠
+    /// NVIDIA dGPU LUID AND vendor == NvidiaNvenc → both gate conditions fail.
+    #[test]
+    fn nvenc_cross_adapter_selects_cpu_staged_fallback_task04() {
+        // AMD capture adapter LUID (synthetic — mimics the real NVENC machine topology
+        // where the iGPU is AMD and the encoder is on the NVIDIA dGPU).
+        let luid_amd: i64 = 0x0000_1002_0000_0001_u64 as i64;
+        // NVIDIA encode adapter LUID (different from AMD capture LUID).
+        let luid_nvidia: i64 = 0x0000_10DE_0000_0001_u64 as i64;
+
+        let path = select_encode_path(luid_amd, luid_nvidia, EncoderVendor::NvidiaNvenc);
+        assert_eq!(
+            path,
+            EncodePath::CpuStagedFallback,
+            "cross-adapter NVENC (AMD iGPU + NVIDIA dGPU) must select CpuStagedFallback"
+        );
+    }
+
+    /// T-PS-NVENC-02 (TASK-04, REQ-02): same-adapter NVENC also falls back.
+    ///
+    /// The vendor floor (NvidiaNvenc) independently rejects GpuResident even
+    /// when the adapter LUIDs happen to match.
+    #[test]
+    fn nvenc_same_adapter_also_selects_cpu_staged_fallback_task04() {
+        let luid: i64 = 0x0000_10DE_0000_0002_u64 as i64;
+        let path = select_encode_path(luid, luid, EncoderVendor::NvidiaNvenc);
+        assert_eq!(
+            path,
+            EncodePath::CpuStagedFallback,
+            "same-adapter NvidiaNvenc must select CpuStagedFallback (vendor floor)"
+        );
+    }
+
+    /// T-PS-NVENC-03 (TASK-04, REQ-02): when gate selects CpuStagedFallback,
+    /// the result is NOT GpuResident — asserts the DXGI-manager seam is unreachable.
+    ///
+    /// In production code, GpuResident is the only arm that would call
+    /// IMFDXGIDeviceManager / METransformSetD3DManager.  Since NVENC always yields
+    /// CpuStagedFallback, those COM calls are structurally unreachable on NVENC.
+    /// This test pins that contract: any future refactor that returns GpuResident
+    /// for NVENC would break this assertion before reaching the COM layer.
+    #[test]
+    fn nvenc_path_result_is_never_gpu_resident_so_d3d_manager_is_unreachable_task04() {
+        let luid_amd: i64 = 0x0000_1002_ABCD_0001_u64 as i64;
+        let luid_nvidia: i64 = 0x0000_10DE_ABCD_0002_u64 as i64;
+
+        let path = select_encode_path(luid_amd, luid_nvidia, EncoderVendor::NvidiaNvenc);
+
+        // Not GpuResident ⟹ no IMFDXGIDeviceManager / METransformSetD3DManager call
+        // is reachable on the NVENC code path (design §NVENC-Protection Proof, REQ-02).
+        assert_ne!(
+            path,
+            EncodePath::GpuResident,
+            "NVENC path must never reach GpuResident (D3D manager seam unreachable)"
+        );
+    }
 }
