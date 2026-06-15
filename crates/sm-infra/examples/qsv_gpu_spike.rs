@@ -74,15 +74,17 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFTransform, MFCreateDXGIDeviceManager,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform, MEEndOfStream,
+    METransformHaveOutput, METransformNeedInput, MFCreateDXGIDeviceManager,
     MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFStartup,
     MFTEnumEx, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
+    MFT_REGISTER_TYPE_INFO, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::core::Interface;
@@ -153,10 +155,21 @@ struct GpuPipeline {
     nv12_out_view: ID3D11VideoProcessorOutputView,
     // Media Foundation transform (HW H.264 encoder) + its event generator.
     mft: IMFTransform,
-    // Held to keep the async-MFT event model alive for the MFT's lifetime. The spike drains
-    // ProcessOutput synchronously (best-effort) rather than waiting on METransformHaveOutput,
-    // so it is not polled here — production (TASK-08) uses it via the windows_mft.rs pump loop.
-    _event_gen: IMFMediaEventGenerator,
+    // Async-MFT event generator. Because the MFT is unlocked async (MF_TRANSFORM_ASYNC_UNLOCK=1),
+    // it ONLY accepts ProcessInput after emitting METransformNeedInput, and ProcessOutput only
+    // after METransformHaveOutput. We poll this with GetEvent(MF_EVENT_FLAG_NO_WAIT) and drive a
+    // credit loop — the SAME model as production windows_mft.rs::pump_loop. Calling ProcessInput
+    // unsolicited (the original spike bug) returns MF_E_NOTACCEPTING (0xC00D36B5) every frame.
+    event_gen: IMFMediaEventGenerator,
+    // Async credit counters (interior-mutable so the per-frame pump runs on `&self`, matching the
+    // handler's `&self.pipeline` borrow). `ni_count` = pending METransformNeedInput credits (we may
+    // call ProcessInput that many times); `ho_count` = pending METransformHaveOutput credits (we may
+    // call ProcessOutput that many times). Mirrors pump_loop's `ni_count`/`ho_count` stack locals.
+    ni_count: std::cell::Cell<u32>,
+    ho_count: std::cell::Cell<u32>,
+    // Count of encoded H.264 frames pulled via ProcessOutput (drives encode_fps). Interior-mutable
+    // for the same reason as the credit counters.
+    encoded: std::cell::Cell<u64>,
     // Kept alive for the MFT's lifetime (ResetDevice'd onto the shared device).
     _device_manager: IMFDXGIDeviceManager,
 }
@@ -296,7 +309,10 @@ impl GpuPipeline {
                 nv12_tex,
                 nv12_out_view,
                 mft,
-                _event_gen: event_gen,
+                event_gen,
+                ni_count: std::cell::Cell::new(0),
+                ho_count: std::cell::Cell::new(0),
+                encoded: std::cell::Cell::new(0),
                 _device_manager: device_manager,
             },
             set_d3d_manager_accepted,
@@ -304,8 +320,24 @@ impl GpuPipeline {
         ))
     }
 
-    /// Run one frame: VideoProcessorBlt BGRA→NV12, wrap NV12 in a DXGI-surface MFSample,
-    /// ProcessInput, then best-effort drain ProcessOutput. Returns `Ok(())` on success.
+    /// Run one captured frame end-to-end through the async HW MFT.
+    ///
+    /// Step 1 (always): VideoProcessorBlt the live WGC BGRA texture into the reusable NV12
+    /// texture and wrap it in a fresh DXGI-surface-backed `IMFSample`. This is pure GPU work
+    /// and is always legal.
+    ///
+    /// Step 2 (credit-gated): pump the async-MFT event loop with `GetEvent(MF_EVENT_FLAG_NO_WAIT)`,
+    /// exactly like production `windows_mft.rs::pump_loop`. `METransformNeedInput` events grant
+    /// input credits and `METransformHaveOutput` events grant output credits. We drain HaveOutput
+    /// first (count an encoded frame per `ProcessOutput`), then submit THIS frame's sample via
+    /// `ProcessInput` ONLY when a NeedInput credit is available. Submitting unsolicited is the
+    /// original spike bug — an async MFT returns `MF_E_NOTACCEPTING` (0xC00D36B5) for every such
+    /// call, which is exactly what produced `encode_fps=0`.
+    ///
+    /// Returns the number of H.264 frames that were pulled out this call (added to `encode_fps`).
+    /// A `ProcessInput`/`ProcessOutput` error is a REAL failure and is surfaced to the caller as
+    /// a NO-GO signal; the benign async states (`MF_E_NO_EVENTS_AVAILABLE`,
+    /// `MF_E_TRANSFORM_NEED_MORE_INPUT`) are NOT errors and never count against the NO-GO budget.
     ///
     /// # Safety
     /// Runs on the WGC capture thread that owns all the COM objects + `bgra_tex`.
@@ -313,8 +345,9 @@ impl GpuPipeline {
         &self,
         bgra_tex: &ID3D11Texture2D,
         timestamp: Duration,
-    ) -> windows::core::Result<()> {
-        // 1. Input view over the live WGC BGRA texture.
+    ) -> windows::core::Result<u64> {
+        // ── Step 1: BGRA → NV12 on the GPU, wrapped in a DXGI-surface IMFSample ──
+        // 1a. Input view over the live WGC BGRA texture.
         let in_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0, // 0 → use the texture's own format (BGRA8).
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
@@ -336,7 +369,7 @@ impl GpuPipeline {
         };
         let in_view = in_view.expect("CreateVideoProcessorInputView returned null");
 
-        // 2. VideoProcessorBlt: BGRA → NV12 on the GPU.
+        // 1b. VideoProcessorBlt: BGRA → NV12 on the GPU.
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
@@ -359,7 +392,7 @@ impl GpuPipeline {
             )?
         };
 
-        // 3. Wrap the NV12 texture in a DXGI-surface-backed IMFSample.
+        // 1c. Wrap the freshly-converted NV12 texture in a DXGI-surface-backed IMFSample.
         let buffer = unsafe {
             MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &self.nv12_tex, 0, false)?
         };
@@ -371,19 +404,85 @@ impl GpuPipeline {
             sample.SetSampleDuration(10_000_000 / TARGET_FRAMERATE as i64)?;
         }
 
-        // 4. ProcessInput into the HW MFT (the GPU-resident input the spike must prove).
-        unsafe { self.mft.ProcessInput(0, &sample, 0)? };
+        // ── Step 2: drive the async credit loop (mirrors windows_mft.rs::pump_loop) ──
+        // `pending` holds this frame's GPU NV12 sample until a NeedInput credit lets us submit it.
+        // We loop in NO_WAIT mode draining whatever events the MFT has queued so far this frame:
+        // consume HaveOutput (pull encoded packets), then spend ONE NeedInput credit on `pending`.
+        let mut pending: Option<IMFSample> = Some(sample);
+        let frames_before = self.encoded.get();
 
-        // 5. Best-effort drain. NEED_MORE_INPUT is expected/benign on an async MFT.
-        let _ = unsafe { self.drain_output() };
-        Ok(())
+        loop {
+            // 2a. Non-blocking event poll. MF_E_NO_EVENTS_AVAILABLE = benign idle (not an error).
+            let got_event = match unsafe { self.event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let event_type = unsafe { event.GetType()? };
+                    if event_type == METransformNeedInput.0 as u32 {
+                        self.ni_count.set(self.ni_count.get().saturating_add(1));
+                    } else if event_type == METransformHaveOutput.0 as u32 {
+                        self.ho_count.set(self.ho_count.get().saturating_add(1));
+                    } else if event_type == MEEndOfStream.0 as u32 {
+                        // Not expected in the spike's continuous run; log and stop pumping.
+                        tracing::warn!(
+                            target: "qsv_gpu_spike",
+                            "MEEndOfStream received during spike run"
+                        );
+                        break;
+                    }
+                    // Other event types (format change, etc.) are ignored for the spike.
+                    true
+                }
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => false,
+                Err(e) => return Err(e),
+            };
+
+            // 2b. Drain HaveOutput FIRST (vendor priming requirement, mirrors pump_loop R3).
+            // Each successful ProcessOutput is one encoded H.264 frame → encode_fps.
+            while self.ho_count.get() > 0 {
+                match unsafe { self.collect_output() } {
+                    Ok(true) => {
+                        self.ho_count.set(self.ho_count.get() - 1);
+                        self.encoded.set(self.encoded.get() + 1);
+                    }
+                    // NEED_MORE_INPUT / stream-change: credit consumed, no packet produced (benign).
+                    Ok(false) => self.ho_count.set(self.ho_count.get() - 1),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // 2c. Spend ONE NeedInput credit on this frame's sample, if both are available.
+            // ProcessInput is ONLY legal here — when the MFT has granted a credit. THIS IS THE FIX:
+            // the original spike called ProcessInput unconditionally, which an async MFT rejects
+            // with MF_E_NOTACCEPTING (0xC00D36B5) for every unsolicited call.
+            if self.ni_count.get() > 0 {
+                if let Some(s) = pending.take() {
+                    unsafe { self.mft.ProcessInput(0, &s, 0)? };
+                    self.ni_count.set(self.ni_count.get() - 1);
+                }
+                // If pending was already None we hold the extra credit for the next on_frame_arrived.
+            }
+
+            // Stop pumping for this frame once the MFT's event queue is drained. At that point this
+            // frame's sample is either submitted (pending == None) or held back because no NeedInput
+            // credit was available (the reused NV12 texture means the next frame's blt overwrites it,
+            // so a skipped spike frame is benign — it just isn't counted in encode_fps). The next
+            // on_frame_arrived resumes the loop with whatever fresh events the MFT has emitted.
+            if !got_event {
+                break;
+            }
+        }
+
+        Ok(self.encoded.get() - frames_before)
     }
 
-    /// Best-effort single ProcessOutput drain. Ignores NEED_MORE_INPUT.
+    /// Pull one encoded H.264 packet via `ProcessOutput`.
+    ///
+    /// Returns `Ok(true)` when a sample was produced (count it toward encode_fps), `Ok(false)`
+    /// on `MF_E_TRANSFORM_NEED_MORE_INPUT` (benign — the credit is spent but no packet is ready),
+    /// and `Err` on any real ProcessOutput failure (a NO-GO signal).
     ///
     /// # Safety
     /// Runs on the WGC capture thread that owns the MFT.
-    unsafe fn drain_output(&self) -> windows::core::Result<()> {
+    unsafe fn collect_output(&self) -> windows::core::Result<bool> {
         let mut output = MFT_OUTPUT_DATA_BUFFER {
             dwStreamID: 0,
             pSample: std::mem::ManuallyDrop::new(None),
@@ -395,8 +494,13 @@ impl GpuPipeline {
             self.mft
                 .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status)
         } {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(()),
+            Ok(()) => {
+                // Drop the produced sample — the spike only measures throughput, not bitstream.
+                // ManuallyDrop must be explicitly dropped to release the COM ref.
+                unsafe { std::mem::ManuallyDrop::drop(&mut output.pSample) };
+                Ok(true)
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -605,14 +709,20 @@ impl GraphicsCaptureApiHandler for SpikeHandler {
                 }
             }
 
-            // Run the GPU chain for this frame.
+            // Run the GPU chain for this frame: blt BGRA→NV12, then drive the async MFT credit
+            // loop. encode_fps counts the H.264 frames the MFT actually emitted this call (via
+            // METransformHaveOutput → ProcessOutput), NOT the inputs submitted — so it tracks
+            // true encoder throughput. With the credit loop in place, MF_E_NOTACCEPTING can no
+            // longer occur, so any Err here is a GENUINE ProcessInput/ProcessOutput/GPU failure.
             if let Some(pipe) = &self.pipeline {
                 debug_assert_eq!((pipe.width, pipe.height), (w, h));
                 match unsafe { pipe.process_frame(bgra_tex, timestamp) } {
-                    Ok(()) => self.encode_frames += 1,
+                    Ok(encoded_this_frame) => {
+                        self.encode_frames += encoded_this_frame as u32;
+                    }
                     Err(e) => {
                         let n = self.encode_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        // Log the first few then go quiet; a sustained failure is a NO-GO.
+                        // Log the first few then go quiet; a sustained REAL failure is a NO-GO.
                         if n <= 5 {
                             tracing::error!(
                                 target: "qsv_gpu_spike",
