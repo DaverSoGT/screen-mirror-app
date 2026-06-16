@@ -97,6 +97,17 @@ pub enum FramePayload {
         stride: u32,
         /// Monotonic capture timestamp (same semantics as `CaptureFrame::timestamp`).
         timestamp: Duration,
+        /// Producer generation stamped at queue time (interim missing-fence confirm).
+        ///
+        /// A strictly-increasing value minted once per QUEUED GPU frame on the capture
+        /// thread. The consumer compares it against the producer's latest queued
+        /// generation to compute its lag — `lag == 0` means it is reading the freshest
+        /// queued generation; `lag >= 1` means it dequeued an OLDER queued generation
+        /// (ring-wrap / backlog staleness). This proves whether the consumer reads a
+        /// stale GENERATION, distinct from the in-flight-copy staleness the producer
+        /// `Flush` targets. `gen` is a reserved keyword in edition 2024, so the field is
+        /// spelled `r#gen` at every use site.
+        r#gen: u64,
     },
 }
 

@@ -1840,6 +1840,10 @@ fn pump_loop(
     // encode_fps window so it resets at the same tick. Only the GPU arm records into it; on
     // the CPU-staged path it stays empty and logs zero.
     let mut blt_hold_stats = BltHoldStats::default();
+    // Interim missing-fence confirm: per-second consumer generation-lag accumulator. Shares
+    // the encode_fps window so it resets at the same tick. Only the GPU arm records into it;
+    // on the CPU-staged path it stays empty and logs zero.
+    let mut gen_lag_stats = GenLagStats::default();
     // I3 (D-PPT-3): snapshot of state.dropped at the last encode window boundary, used
     // to compute per-interval drop delta for the enc_to_sender channel.
     let mut last_dropped_enc_snapshot: u64 = 0;
@@ -2007,6 +2011,19 @@ fn pump_loop(
                             "consumer blt-hold"
                         );
 
+                        // Interim missing-fence confirm: consumer generation lag. `gpu_gen_lag_max
+                        // == 0` every window ⇒ the consumer always dequeues the freshest queued
+                        // generation (the ring is not behind). `>= 1` ⇒ it is reading an OLDER
+                        // queued generation (ring-wrap/backlog staleness, distinct from the
+                        // in-flight-copy staleness the producer Flush targets).
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            gpu_gen_lag_max = gen_lag_stats.max_lag(),
+                            gpu_gen_lag_mean = gen_lag_stats.mean_lag(),
+                            frames = gen_lag_stats.frames,
+                            "consumer gen-lag"
+                        );
+
                         // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
                         // state.dropped accumulates both drops from the TrySendError::Full arm
                         // above and dimension-mismatch drops from the drop site in the NeedInput
@@ -2028,6 +2045,7 @@ fn pump_loop(
                         // Reset all window-shared accumulators at the same boundary.
                         convert_stats.reset();
                         blt_hold_stats.reset();
+                        gen_lag_stats.reset();
                         fps_frame_count = 0;
                         fps_window_start = std::time::Instant::now();
                     }
@@ -2110,7 +2128,19 @@ fn pump_loop(
                             height,
                             stride: _,
                             timestamp,
+                            r#gen: frame_gen,
                         } => {
+                            // Interim missing-fence confirm: measure how far behind the
+                            // producer's newest QUEUED generation this dequeued frame is. We
+                            // sample it for EVERY dequeued GpuShared frame (before the pipeline
+                            // / dim checks below) so a dropped frame still contributes its lag.
+                            // `lag == 0` ⇒ consumer is current (ring not behind); `lag >= 1` ⇒
+                            // it is reading an older queued generation (ring-wrap/backlog
+                            // staleness — distinct from the in-flight-copy staleness the
+                            // producer Flush targets).
+                            if let Some(handoff) = gpu_handoff.as_ref() {
+                                gen_lag_stats.record(gen_lag(handoff.latest_gen(), frame_gen));
+                            }
                             // GPU-resident path (TASK-06/07/08): acquire the shared
                             // keyed-mutex BGRA texture, convert to NV12 on the GPU, and
                             // feed the MFT a DXGI-surface sample — no readback, no CPU
@@ -2808,6 +2838,72 @@ fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
     (current.saturating_sub(last), current)
 }
 
+/// Consumer generation lag for one dequeued GPU frame (interim missing-fence confirm).
+///
+/// `latest_gen` is the newest generation the producer has QUEUED; `frame_gen` is the
+/// generation stamped into the frame the consumer just dequeued. The lag is
+/// `latest_gen - frame_gen`, saturating at 0 so a benign reordering (or the producer
+/// publishing `latest_gen` a hair after the consumer read it) can never underflow into a
+/// huge value. `lag == 0` ⇒ the consumer is reading the freshest queued generation (ring
+/// not behind); `lag >= 1` ⇒ it is reading an OLDER queued generation (ring-wrap/backlog
+/// staleness — distinct from the in-flight-copy staleness the producer `Flush` targets).
+#[inline]
+fn gen_lag(latest_gen: u64, frame_gen: u64) -> u64 {
+    latest_gen.saturating_sub(frame_gen)
+}
+
+/// Per-second consumer generation-lag accumulator (interim missing-fence confirm metric).
+///
+/// Mirrors [`BltHoldStats`]: tracks frame count, cumulative lag (for the mean), and the
+/// exact max lag this window. Emitted once per second as `gpu_gen_lag_max` /
+/// `gpu_gen_lag_mean` alongside the other GATE B encoder-thread metrics, and reset at the
+/// same window boundary. `max == 0` every window ⇒ the consumer is always current.
+#[derive(Default)]
+struct GenLagStats {
+    /// Number of GPU frames whose lag was recorded this window.
+    frames: u32,
+    /// Cumulative lag (in generations) of all recorded frames this window.
+    total_lag: u64,
+    /// Exact maximum single-frame lag this window (in generations).
+    max_lag: u64,
+}
+
+impl GenLagStats {
+    /// Record one frame's generation lag into the current window.
+    #[inline]
+    fn record(&mut self, lag: u64) {
+        self.frames += 1;
+        self.total_lag += lag;
+        if lag > self.max_lag {
+            self.max_lag = lag;
+        }
+    }
+
+    /// Mean per-frame lag over the current window (0 when empty).
+    #[inline]
+    fn mean_lag(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_lag / self.frames as u64
+        }
+    }
+
+    /// Exact max single-frame lag over the current window.
+    #[inline]
+    fn max_lag(&self) -> u64 {
+        self.max_lag
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_lag = 0;
+        self.max_lag = 0;
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 // ── Test-only helpers ────────────────────────────────────────────────────────
@@ -3317,6 +3413,45 @@ mod tests {
             0.0,
             "fps() must return 0.0 when frames == 0 (divide-by-zero guard)"
         );
+    }
+
+    /// Interim missing-fence confirm: gen_lag is a saturating `latest - frame` difference.
+    #[test]
+    fn gen_lag_is_saturating_difference() {
+        // Consumer current: it dequeued the newest queued generation → lag 0.
+        assert_eq!(gen_lag(10, 10), 0, "reading the freshest queued gen ⇒ lag 0");
+        // Consumer behind by 3 queued generations (backlog/ring-wrap staleness).
+        assert_eq!(gen_lag(10, 7), 3, "lag = latest - frame_gen");
+        // frame_gen ahead of latest (benign reorder / publish race) must saturate, not wrap.
+        assert_eq!(
+            gen_lag(7, 10),
+            0,
+            "frame_gen > latest must saturate to 0, never underflow"
+        );
+    }
+
+    /// Interim missing-fence confirm: GenLagStats accumulates max + mean and resets.
+    #[test]
+    fn gen_lag_stats_record_max_mean_and_reset() {
+        let mut stats = GenLagStats::default();
+        // Empty window: divide-by-zero guard returns 0 for both.
+        assert_eq!(stats.mean_lag(), 0, "empty window mean is 0");
+        assert_eq!(stats.max_lag(), 0, "empty window max is 0");
+
+        // Record lags 0, 2, 4 → total 6, mean 2, max 4.
+        stats.record(0);
+        stats.record(2);
+        stats.record(4);
+        assert_eq!(stats.mean_lag(), 2, "mean_lag = total_lag / frames");
+        assert_eq!(stats.max_lag(), 4, "max_lag is the exact window max");
+        assert_eq!(stats.frames, 3);
+
+        // Reset zeroes every accumulator so the next 1-second window starts clean.
+        stats.reset();
+        assert_eq!(stats.frames, 0, "frames must be 0 after reset");
+        assert_eq!(stats.total_lag, 0, "total_lag must be 0 after reset");
+        assert_eq!(stats.max_lag, 0, "max_lag must be 0 after reset");
+        assert_eq!(stats.mean_lag(), 0, "mean is 0 again after reset");
     }
 
     /// Task 1.3 [RED]: interval_elapsed returns false below threshold and true at/above threshold.

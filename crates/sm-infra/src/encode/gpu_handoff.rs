@@ -21,7 +21,7 @@
 //! objects thread-local (REQ-07).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 use crate::encode::path_select::EncodePath;
 use crate::encode::windows_mft::EncoderVendor;
@@ -50,6 +50,20 @@ pub struct GpuHandoff {
     /// The resolved [`EncodePath`], decided ONCE by the capture thread on its first
     /// frame. `PATH_UNRESOLVED` until resolved.
     resolved_path: AtomicU8,
+    /// Producer-private monotonic generation counter (interim missing-fence confirm).
+    ///
+    /// The producer calls [`Self::next_gen`] once per frame it is about to hand to the
+    /// consumer to mint a strictly-increasing generation it stamps into the
+    /// `FramePayload::GpuShared { gen, .. }`. It is NOT published as `latest_gen` until
+    /// the frame is actually QUEUED ([`Self::publish_gen`]) — a dropped frame therefore
+    /// burns a generation without advancing `latest_gen`, which is exactly the gap the
+    /// consumer lag metric should attribute to backlog/ring-wrap staleness.
+    gen_seq: AtomicU64,
+    /// Most recent generation the producer has actually QUEUED, published via
+    /// [`Self::publish_gen`]. The consumer reads it with [`Self::latest_gen`] and
+    /// computes `lag = latest_gen - dequeued_gen` (saturating) to detect whether it is
+    /// reading an older queued generation than the newest one already in the channel.
+    latest_gen: AtomicU64,
 }
 
 impl Default for GpuHandoff {
@@ -59,6 +73,8 @@ impl Default for GpuHandoff {
             vendor_tag: AtomicU8::new(0),
             encode_published: AtomicBool::new(false),
             resolved_path: AtomicU8::new(PATH_UNRESOLVED),
+            gen_seq: AtomicU64::new(0),
+            latest_gen: AtomicU64::new(0),
         }
     }
 }
@@ -152,6 +168,34 @@ impl GpuHandoff {
     /// thread on a producer/copy error — and remains correct under concurrent races.
     pub fn degrade_to_cpu(&self) {
         self.resolved_path.store(PATH_CPU, Ordering::Release);
+    }
+
+    /// Producer: mint the next strictly-increasing generation to stamp into the frame it
+    /// is about to hand the consumer (interim missing-fence confirm instrumentation).
+    ///
+    /// Returns a fresh, monotonically increasing value (1, 2, 3, …). This does NOT touch
+    /// `latest_gen`: the producer commits the value via [`Self::publish_gen`] ONLY once the
+    /// frame is actually queued, so a dropped frame burns a generation without inflating
+    /// `latest_gen`. Called once per produced frame on the capture thread.
+    pub(crate) fn next_gen(&self) -> u64 {
+        // fetch_add returns the PREVIOUS value; +1 yields the new generation, so the first
+        // minted generation is 1 (0 stays the "nothing queued yet" sentinel for latest_gen).
+        self.gen_seq.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Producer: publish `gen` as the latest QUEUED generation, after a confirmed enqueue.
+    ///
+    /// Stores monotonically (last write wins; generations are produced in order on the
+    /// single capture thread). The consumer reads this with [`Self::latest_gen`] to compute
+    /// its lag against the generation it just dequeued.
+    pub(crate) fn publish_gen(&self, queued_gen: u64) {
+        self.latest_gen.store(queued_gen, Ordering::Release);
+    }
+
+    /// Consumer: the most recent generation the producer has QUEUED (0 until the first
+    /// frame is queued). `latest_gen - dequeued_gen` (saturating) is the consumer lag.
+    pub(crate) fn latest_gen(&self) -> u64 {
+        self.latest_gen.load(Ordering::Acquire)
     }
 }
 
@@ -251,6 +295,45 @@ mod tests {
         assert_eq!(h.resolved_path(), None);
         h.resolve_path(EncodePath::GpuResident);
         assert_eq!(h.resolved_path(), Some(EncodePath::GpuResident));
+    }
+
+    #[test]
+    fn next_gen_is_strictly_increasing_from_one() {
+        // The generation counter mints 1, 2, 3, … (0 is the "nothing queued yet" sentinel
+        // for latest_gen). next_gen never touches latest_gen.
+        let h = GpuHandoff::new();
+        assert_eq!(h.latest_gen(), 0, "no frame queued yet");
+        assert_eq!(h.next_gen(), 1);
+        assert_eq!(h.next_gen(), 2);
+        assert_eq!(h.next_gen(), 3);
+        assert_eq!(
+            h.latest_gen(),
+            0,
+            "minting generations must NOT advance latest_gen — only publish_gen does"
+        );
+    }
+
+    #[test]
+    fn publish_gen_advances_latest_only_on_queue() {
+        // Mirrors the producer: mint a gen per frame, but publish ONLY the ones actually
+        // queued. A dropped frame (minted but not published) leaves latest_gen behind, which
+        // is the backlog gap the consumer lag metric must surface.
+        let h = GpuHandoff::new();
+        let g1 = h.next_gen(); // queued
+        h.publish_gen(g1);
+        assert_eq!(h.latest_gen(), 1);
+
+        let _g2_dropped = h.next_gen(); // minted but NOT queued (channel full)
+        // latest_gen unchanged because the dropped frame was never published.
+        assert_eq!(
+            h.latest_gen(),
+            1,
+            "a dropped (un-published) generation must not advance latest_gen"
+        );
+
+        let g3 = h.next_gen(); // queued
+        h.publish_gen(g3);
+        assert_eq!(h.latest_gen(), 3, "latest_gen tracks the newest QUEUED gen");
     }
 
     #[test]

@@ -728,6 +728,11 @@ impl WgcHandler {
         let Some(handoff) = self.gpu_handoff.as_ref() else {
             return GpuFrameOutcome::NotHandled;
         };
+        // Owned hand-off clone for the per-frame generation stamp (interim missing-fence
+        // confirm). Taken here so the gen mint/publish near the `try_send` do NOT extend an
+        // immutable borrow of `self.gpu_handoff` across the `&mut self` calls in between
+        // (hash sampling, ring-cursor advance). Cheap refcount bump; `GpuHandoff` is `&self`.
+        let gen_handoff = std::sync::Arc::clone(handoff);
         if self.gpu_degraded {
             return GpuFrameOutcome::NotHandled;
         }
@@ -995,12 +1000,20 @@ impl WgcHandler {
             }
         }
 
+        // Interim missing-fence confirm: mint a strictly-increasing generation for THIS
+        // frame and stamp it into the payload. We publish it as `latest_gen` only after a
+        // confirmed enqueue (the Ok arm), so a dropped frame burns a generation without
+        // advancing `latest_gen` — exactly the backlog gap the consumer lag metric reports.
+        // `gen_handoff` is an owned `Arc` clone taken at the top of this method, so the gen
+        // mint/publish do NOT keep `self` borrowed across the `&mut self` calls below.
+        let frame_gen = gen_handoff.next_gen();
         let outcome = match self.tx.try_send(FramePayload::GpuShared {
             handle,
             width,
             height,
             stride,
             timestamp,
+            r#gen: frame_gen,
         }) {
             Ok(()) => {
                 // Fix 6: the frame is now QUEUED, so this slot is live. Advance the ring
@@ -1010,6 +1023,9 @@ impl WgcHandler {
                 if let Some(producer) = self.gpu_producer.as_mut() {
                     producer.advance_after_send();
                 }
+                // Publish the queued generation so the consumer can measure its lag against
+                // the newest generation that actually reached the channel.
+                gen_handoff.publish_gen(frame_gen);
                 self.fps_frame_count += 1;
                 GpuFrameOutcome::Handled
             }

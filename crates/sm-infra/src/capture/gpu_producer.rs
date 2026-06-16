@@ -352,6 +352,20 @@ impl GpuProducer {
         }
 
         let copy_result = self.run_copy(slot_idx, wgc_tex);
+        // Candidate fix (interim missing-fence confirm): submit the CopyResource to the
+        // producer's GPU queue BEFORE releasing the keyed mutex. The keyed mutex orders
+        // ACCESS, not GPU COMPLETION, across the producer's and consumer's SEPARATE D3D11
+        // devices, and there is no shared fence here — so without this, the consumer can
+        // AcquireSync and blt the slot while this CopyResource is still in flight, reading
+        // previous-generation pixels (the repeating stale-frame sequence). Flush submits the
+        // copy to the producer queue before ReleaseSync hands the key over. This does NOT
+        // wait for completion (that is the durable fence fix), but it removes the window
+        // where the copy is not even submitted yet; it is the cheap confirmation probe for
+        // the missing-fence diagnosis. GPU-path-only — the NVENC CPU-staged path never runs
+        // here.
+        // SAFETY: `context` is WGC's live immediate context for this capture thread; Flush
+        // takes no args and only submits queued commands.
+        unsafe { self.context.Flush() };
         // SAFETY: paired ReleaseSync on both Ok and Err copy paths (mutex IS held here —
         // AcquireSync returned S_OK above).
         let release = unsafe { self.ring[slot_idx].keyed.ReleaseSync(KEYED_MUTEX_KEY) };

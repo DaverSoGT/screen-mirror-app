@@ -12,7 +12,7 @@
 //! - `Cpu(CaptureFrame)` — today's code path: BGRA8 pixels already read back to
 //!   CPU memory as an `Arc<[u8]>`. The encoder dispatches this to the existing
 //!   `nv12_convert` + `submit_frame` path VERBATIM. No behaviour change.
-//! - `GpuShared { handle, width, height, stride, timestamp }` — GPU-resident
+//! - `GpuShared { handle, width, height, stride, timestamp, gen }` — GPU-resident
 //!   path: the Windows capture thread copies the WGC texture into a keyed-mutex
 //!   shared `ID3D11Texture2D` and passes its share `HANDLE` (as `isize`). The
 //!   encoder thread acquires the keyed mutex, runs `VideoProcessorBlt` BGRA→NV12
@@ -101,6 +101,7 @@ mod tests {
             height: 1440,
             stride: 2560 * 4,
             timestamp: Duration::from_millis(99),
+            r#gen: 7,
         };
         assert_eq!(payload.timestamp(), Duration::from_millis(99));
     }
