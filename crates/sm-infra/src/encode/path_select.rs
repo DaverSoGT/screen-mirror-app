@@ -95,16 +95,10 @@ pub(crate) fn select_encode_path(
 /// The WARN log must name the failed step so operators can diagnose why the
 /// GPU-resident path fell back to CPU-staged (REQ-05).
 ///
-/// PR-2: variants are used in tests and in `negotiate_gpu_path`'s `Some` arm.
-/// PR-3 production callers will construct these from the real MFT COM results.
-// WHY #[cfg_attr(not(test), allow(dead_code))]: the variants SetD3dManager /
-// DxgiInputNegotiation are constructed only inside #[cfg(test)] code in PR-2.
-// The `dead_code` lint fires on non-test compilation (lib target) but not on test
-// compilation (lib test target), so the allow is scoped to non-test builds only —
-// `#[expect]` cannot be used here (it would fail with "unfulfilled expectation" on
-// the test target). PR-3 constructs these variants from live COM results; remove
-// this attribute when that production call site is added.
-#[cfg_attr(not(test), allow(dead_code))]
+/// PR-3: the variants are now constructed from live MFT COM results in
+/// [`crate::encode::gpu_path`] (`set_d3d_manager` → `SetD3dManager`,
+/// `setup_mft_input_dxgi` → `DxgiInputNegotiation`), so they are no longer
+/// dead code on the non-test lib target — the PR-2 `allow(dead_code)` is removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum D3dNegotiationStep {
     /// `ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER)` — i.e. `METransformSetD3DManager`.
@@ -124,32 +118,32 @@ impl std::fmt::Display for D3dNegotiationStep {
     }
 }
 
-/// Attempt GPU-path D3D negotiation; degrade to CPU-staged on any rejection.
+/// Emit the canonical negotiation-rejection WARN and resolve the fallback path
+/// (REQ-05, S-04).
 ///
-/// This is the PR-2 seam for the negotiation-rejection fallback (REQ-05, S-04).
-/// In PR-2 the GPU negotiation is a **no-op stub** — the function always
-/// succeeds (returns `GpuResident`) when `inject_rejection` is `None`.
-/// Production PR-3 will replace the stub with real MFT COM calls.
-///
-/// When `inject_rejection` is `Some((step, error_code))` the function
-/// simulates a negotiation failure:
-/// 1. Emits a `warn` log identifying the failed step and HRESULT.
-/// 2. Returns `EncodePath::CpuStagedFallback`.
-/// 3. Does NOT panic.
+/// This is the single source of truth for the negotiation-fallback log + result:
+/// * `Some((step, hr))` — a driver rejected `step` with HRESULT `hr`. Emits a
+///   `warn` log naming the step + HRESULT and returns `CpuStagedFallback`. Never
+///   panics. The live production caller is
+///   [`crate::encode::gpu_path::negotiate_gpu_path_runtime`], which passes the real
+///   `(step, hr)` from `set_d3d_manager` / `setup_mft_input_dxgi`.
+/// * `None` — no rejection. Returns `GpuResident`. This arm is the success sentinel
+///   used by the TASK-05 unit tests; production code reaches the success case
+///   through `negotiate_gpu_path_runtime` (which returns the built pipeline), so it
+///   does not call this with `None`.
 ///
 /// # Arguments
 ///
-/// * `inject_rejection` — `None` (normal path, no rejection); `Some((step, hr))` to
-///   simulate a driver rejection of `step` with Windows HRESULT `hr`.
+/// * `inject_rejection` — `None` (no rejection → `GpuResident`); `Some((step, hr))`
+///   for a real or simulated driver rejection of `step` with Windows HRESULT `hr`.
 pub(crate) fn negotiate_gpu_path(
     inject_rejection: Option<(D3dNegotiationStep, u32)>,
 ) -> EncodePath {
     match inject_rejection {
         None => {
-            // PR-2 stub: GPU negotiation not yet implemented.
-            // TODO(PR-3): replace with real IMFDXGIDeviceManager + METransformSetD3DManager
-            // + SetInputType DXGI NV12 negotiation.  On success return GpuResident;
-            // on failure fall through to the Some(_) arm below.
+            // Success sentinel: no rejection was reported. Production reaches the
+            // success path via negotiate_gpu_path_runtime (which returns the built
+            // pipeline); this branch backs the TASK-05 no-rejection unit test.
             EncodePath::GpuResident
         }
         Some((step, hr)) => {

@@ -54,6 +54,15 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
     "Win32_Media_KernelStreaming",
+    # GPU-resident encode path (qsv-igpu-pipeline-perf TASK-06/07): D3D11 video
+    # device + VideoProcessor (BGRA→NV12), DXGI adapter LUID enumeration, and
+    # shared-surface MFT input via MFCreateDXGISurfaceBuffer. Additive — no
+    # existing windows_mft.rs / capture symbol depends on these; they unlock the
+    # encoder-thread GPU path in gpu_path.rs. The CPU-staged fallback is unaffected.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
