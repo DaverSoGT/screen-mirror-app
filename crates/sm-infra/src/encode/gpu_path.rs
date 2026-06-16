@@ -40,19 +40,23 @@
 
 use std::time::Duration;
 
+use windows::Win32::Foundation::LUID;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_RESOURCE_MISC_SHARED, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_BIND_RENDER_TARGET, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_RESOURCE_MISC_SHARED, D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
-    ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
-    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice,
+    ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIKeyedMutex};
 use windows::Win32::Media::MediaFoundation::{
     IMFDXGIDeviceManager, IMFMediaType, IMFSample, IMFTransform, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
@@ -65,6 +69,68 @@ use windows::core::Interface;
 use sm_domain::encode::{EncoderConfig, EncoderError};
 
 use crate::encode::path_select::{D3dNegotiationStep, EncodePath, negotiate_gpu_path};
+
+/// Keyed-mutex acquire/release key (design D1). The producer (capture thread)
+/// releases with this key after `CopyResource`; the consumer (encoder thread)
+/// acquires with the same key before reading. A single shared key is sufficient
+/// for the strictly-alternating one-frame-at-a-time hand-off.
+pub(crate) const KEYED_MUTEX_KEY: u64 = 0;
+
+/// Create a hardware `ID3D11Device` (BGRA + video support) and return it alongside
+/// its adapter LUID packed as `i64` (matching `select_encode_path`'s signature).
+///
+/// Used by the encoder thread to build the shared device the GPU pipeline and the
+/// keyed-mutex consumer run on. The LUID is the encode-adapter LUID published into
+/// the [`crate::encode::gpu_handoff::GpuHandoff`] so the capture thread can run the
+/// path-selection gate.
+///
+/// Returns `EncodeFailed` on any creation/LUID-read failure (never panics).
+pub(crate) fn create_shared_d3d_device() -> Result<(ID3D11Device, i64), EncoderError> {
+    let mut device: Option<ID3D11Device> = None;
+    // SAFETY: D3D11CreateDevice with a null adapter selects the default hardware
+    // adapter. BGRA + VIDEO support flags are required for the video processor +
+    // DXGI-surface MFT input. Out-param `device` is written on Ok.
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            windows::Win32::Foundation::HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+    }
+    .map_err(|e| EncoderError::InitFailed(format!("D3D11CreateDevice: 0x{:08X}", e.code().0)))?;
+    let device = device
+        .ok_or_else(|| EncoderError::InitFailed("D3D11CreateDevice returned null device".into()))?;
+    let luid = adapter_luid_i64(&device)?;
+    Ok((device, luid))
+}
+
+/// Read the adapter LUID backing an `ID3D11Device`, packed as `i64`.
+///
+/// Mirrors the spike's `adapter_luid_i64` helper so capture and encode LUIDs share
+/// one packing convention (`(HighPart << 32) | LowPart`).
+pub(crate) fn adapter_luid_i64(device: &ID3D11Device) -> Result<i64, EncoderError> {
+    // SAFETY: ID3D11Device always implements IDXGIDevice; GetAdapter/GetDesc are
+    // read-only and the returned adapter is released when it drops.
+    unsafe {
+        let dxgi: IDXGIDevice = device.cast().map_err(|e| {
+            EncoderError::InitFailed(format!("cast IDXGIDevice: 0x{:08X}", e.code().0))
+        })?;
+        let adapter = dxgi.GetAdapter().map_err(|e| {
+            EncoderError::InitFailed(format!("IDXGIDevice::GetAdapter: 0x{:08X}", e.code().0))
+        })?;
+        let desc = adapter.GetDesc().map_err(|e| {
+            EncoderError::InitFailed(format!("IDXGIAdapter::GetDesc: 0x{:08X}", e.code().0))
+        })?;
+        let LUID { LowPart, HighPart } = desc.AdapterLuid;
+        Ok(((HighPart as i64) << 32) | (i64::from(LowPart)))
+    }
+}
 
 /// Run the live encoder-thread D3D negotiation and build the GPU pipeline.
 ///
@@ -304,7 +370,19 @@ impl GpuEncodePipeline {
         // The MFT output type (H.264) is already negotiated by setup_mft before
         // this is called; here we (re)assert the NV12 input type so the MFT will
         // accept DXGI-surface samples. Rejection is the DxgiInputNegotiation step.
-        setup_mft_input_dxgi(mft, width, height, framerate)?;
+        //
+        // Carry-forward #5 (partial-negotiation rollback): SET_D3D_MANAGER already
+        // armed the IMFDXGIDeviceManager on the MFT. If the DXGI input type is now
+        // rejected and we just returned Err, the caller would fall back to the
+        // CPU-staged path while the MFT is still in a hybrid state (D3D manager armed
+        // + possibly a mutated input type) and would feed it system-memory
+        // MFCreateMemoryBuffer samples. So on rejection we UNDO SET_D3D_MANAGER (null
+        // manager) and re-assert the system-memory NV12 input type before returning
+        // the error — leaving the MFT clean for the CPU path.
+        if let Err(rejection) = setup_mft_input_dxgi(mft, width, height, framerate) {
+            rollback_d3d_negotiation(mft, width, height, framerate);
+            return Err(rejection);
+        }
 
         Ok(Self {
             width,
@@ -320,46 +398,94 @@ impl GpuEncodePipeline {
         })
     }
 
-    /// Open a cross-thread shared BGRA texture by its share handle on this
-    /// pipeline's device (PR-3 shared-texture hand-off consumer).
+    /// Open a cross-thread shared keyed-mutex BGRA texture by its NT share handle on
+    /// this pipeline's device (PR-4 keyed-mutex hand-off consumer, design D1).
     ///
-    /// The handle comes from `FramePayload::GpuShared`. In PR-3 this opens the
-    /// shared texture as an `ID3D11Texture2D` on the encoder-thread device via the
-    /// plain legacy `OpenSharedResource` API — there is NO keyed-mutex acquire here;
-    /// the texture is opened so [`Self::gpu_bgra_to_nv12`] can blt it. Returns an
-    /// `EncodeFailed` error on an invalid handle rather than panicking.
+    /// The handle comes from `FramePayload::GpuShared`. The producer (capture thread)
+    /// created the texture with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` and a NT
+    /// handle (`CreateSharedHandle`), so it is opened with `OpenSharedResource1`
+    /// (NOT the legacy `OpenSharedResource`, which only accepts non-NT
+    /// `SHARED`-flag handles). The opened texture exposes an `IDXGIKeyedMutex`;
+    /// [`Self::convert_shared_bgra_to_nv12`] acquires/releases it around the blt.
     ///
-    /// TODO(PR-4): switch to `OpenSharedResource1` + `IDXGIKeyedMutex::AcquireSync`/
-    /// `ReleaseSync` around the blt, per design D1. PR-4 produces the texture with
-    /// `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` and synchronizes the cross-thread
-    /// hand-off; PR-3 only opens a plain shared resource.
+    /// Returns `EncodeFailed` on an invalid handle rather than panicking.
     ///
     /// # Safety
-    /// `handle` MUST be a live D3D11 shared-resource handle produced on a device
+    /// `handle` MUST be a live D3D11 keyed-mutex NT share handle produced on a device
     /// that shares the same adapter LUID as this pipeline's device (the gate
     /// guarantees same-adapter). Passing an arbitrary handle is undefined.
-    pub(crate) unsafe fn open_shared_bgra(
-        &self,
-        handle: isize,
-    ) -> Result<ID3D11Texture2D, EncoderError> {
-        // SAFETY: OpenSharedResource<T> (the legacy, non-keyed-mutex open API) takes
-        // a raw HANDLE and writes an owned T (here ID3D11Texture2D, the IID inferred
-        // from the type) on Ok. The caller's safety contract guarantees a live,
-        // same-adapter share handle. No IDXGIKeyedMutex::AcquireSync is performed in
-        // PR-3 (see the TODO(PR-4) above).
-        let mut tex: Option<ID3D11Texture2D> = None;
-        unsafe {
-            self.device.OpenSharedResource(
-                windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),
-                &mut tex,
-            )
+    unsafe fn open_shared_bgra(&self, handle: isize) -> Result<ID3D11Texture2D, EncoderError> {
+        // ID3D11Device1 exposes OpenSharedResource1 for NT keyed-mutex handles.
+        let device1: ID3D11Device1 = self.device.cast().map_err(|e| {
+            EncoderError::EncodeFailed(format!("cast ID3D11Device1: 0x{:08X}", e.code().0))
+        })?;
+        // SAFETY: OpenSharedResource1<T> takes a NT HANDLE and writes an owned T
+        // (ID3D11Texture2D, IID inferred from the type) on Ok. The caller's safety
+        // contract guarantees a live, same-adapter keyed-mutex NT share handle.
+        let tex: ID3D11Texture2D = unsafe {
+            device1.OpenSharedResource1(windows::Win32::Foundation::HANDLE(
+                handle as *mut core::ffi::c_void,
+            ))
         }
         .map_err(|e| {
-            EncoderError::EncodeFailed(format!("OpenSharedResource(bgra): 0x{:08X}", e.code().0))
+            EncoderError::EncodeFailed(format!("OpenSharedResource1(bgra): 0x{:08X}", e.code().0))
         })?;
-        tex.ok_or_else(|| {
-            EncoderError::EncodeFailed("OpenSharedResource returned null texture".into())
+        Ok(tex)
+    }
+
+    /// Acquire the keyed mutex on the shared BGRA texture, run `VideoProcessorBlt`
+    /// BGRA→NV12, and release the keyed mutex — the full consumer side of the D1
+    /// keyed-mutex hand-off.
+    ///
+    /// The `AcquireSync`/`ReleaseSync` pair is balanced on BOTH the success and the
+    /// error path (no leaked lock that would deadlock the producer's next acquire).
+    ///
+    /// # Safety
+    /// `bgra_tex` MUST be a texture opened via [`Self::open_shared_bgra`] that
+    /// exposes an `IDXGIKeyedMutex` (created with `SHARED_KEYEDMUTEX`).
+    unsafe fn convert_shared_bgra_to_nv12(
+        &self,
+        bgra_tex: &ID3D11Texture2D,
+    ) -> Result<(), EncoderError> {
+        let keyed: IDXGIKeyedMutex = bgra_tex.cast().map_err(|e| {
+            EncoderError::EncodeFailed(format!("cast IDXGIKeyedMutex: 0x{:08X}", e.code().0))
+        })?;
+        // SAFETY: AcquireSync blocks until the producer's ReleaseSync; INFINITE wait
+        // is acceptable because the producer releases immediately after CopyResource.
+        unsafe { keyed.AcquireSync(KEYED_MUTEX_KEY, u32::MAX) }.map_err(|e| {
+            EncoderError::EncodeFailed(format!("KeyedMutex AcquireSync: 0x{:08X}", e.code().0))
+        })?;
+        let blt = self.gpu_bgra_to_nv12(bgra_tex);
+        // SAFETY: ReleaseSync is paired with the AcquireSync above; it MUST run on
+        // both the Ok and Err blt paths so the producer's next AcquireSync does not
+        // deadlock. We use the same key so the texture returns to the unlocked state.
+        let release = unsafe { keyed.ReleaseSync(KEYED_MUTEX_KEY) };
+        blt?;
+        release.map_err(|e| {
+            EncoderError::EncodeFailed(format!("KeyedMutex ReleaseSync: 0x{:08X}", e.code().0))
         })
+    }
+
+    /// Consume one cross-thread shared keyed-mutex BGRA frame end-to-end: open the
+    /// share handle on the encoder device, acquire the keyed mutex, run
+    /// `VideoProcessorBlt` BGRA→NV12 on the GPU, and release the keyed mutex.
+    ///
+    /// This is the single PR-4 entry point the encoder pump calls per `GpuShared`
+    /// frame. The opened `ID3D11Texture2D` (one COM ref per frame) is released when
+    /// it drops at the end of this function — no per-frame COM leak (design D1; the
+    /// PR-3 `ManuallyDrop` input-view leak is NOT reintroduced because
+    /// `gpu_bgra_to_nv12` drops its input view internally).
+    ///
+    /// # Safety
+    /// `handle` MUST be a live keyed-mutex NT share handle for a BGRA texture on a
+    /// device sharing this pipeline's adapter LUID (gate-guaranteed same-adapter).
+    pub(crate) unsafe fn consume_shared_bgra(&self, handle: isize) -> Result<(), EncoderError> {
+        // SAFETY: handle contract forwarded from the caller (FramePayload::GpuShared).
+        let bgra_tex = unsafe { self.open_shared_bgra(handle) }?;
+        // SAFETY: bgra_tex was opened above with SHARED_KEYEDMUTEX, so it exposes an
+        // IDXGIKeyedMutex. AcquireSync/ReleaseSync are balanced inside.
+        unsafe { self.convert_shared_bgra_to_nv12(&bgra_tex) }
+        // bgra_tex (and its keyed mutex cast) drop here → COM Release, no leak.
     }
 
     /// Convert a BGRA texture to NV12 on the GPU via `VideoProcessorBlt`, writing
@@ -518,6 +644,36 @@ pub(crate) fn set_d3d_manager(
         )
     }
     .map_err(|e| (D3dNegotiationStep::SetD3dManager, e.code().0 as u32))
+}
+
+/// Roll back a partial GPU negotiation so the MFT is clean for the CPU-staged path
+/// (PR-4 carry-forward #5).
+///
+/// Called when `SET_D3D_MANAGER` succeeded but the subsequent DXGI input
+/// negotiation was rejected. Sends `SET_D3D_MANAGER` with a NULL manager pointer to
+/// disarm the `IMFDXGIDeviceManager`, then re-asserts the system-memory NV12 input
+/// type so the CPU path's `MFCreateMemoryBuffer` samples are accepted. Both calls
+/// are best-effort: any failure is logged at `warn` but does not change the outcome
+/// (the caller is already falling back to CPU and will surface its own degradation).
+fn rollback_d3d_negotiation(mft: &IMFTransform, w: u32, h: u32, framerate: u32) {
+    // Disarm the D3D manager (NULL pointer param).
+    // SAFETY: SET_D3D_MANAGER with a 0 ULONG_PTR clears the device manager per the
+    // MF contract; it is the documented way to detach a previously-set manager.
+    if let Err(e) = unsafe { mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0) } {
+        tracing::warn!(
+            target: "sm_infra::encode::gpu_path",
+            "rollback: clearing SET_D3D_MANAGER (null) failed: 0x{:08X} (continuing CPU fallback)",
+            e.code().0
+        );
+    }
+    // Re-assert the system-memory NV12 input type (same attributes as setup_mft's
+    // CPU input type) so the CPU path is accepted on a clean MFT.
+    if let Err((step, hr)) = setup_mft_input_dxgi(mft, w, h, framerate) {
+        tracing::warn!(
+            target: "sm_infra::encode::gpu_path",
+            "rollback: re-asserting CPU NV12 input type failed at {step}: 0x{hr:08X} (continuing CPU fallback)"
+        );
+    }
 }
 
 /// Negotiate the NV12 input type so the MFT accepts DXGI-surface NV12 samples.

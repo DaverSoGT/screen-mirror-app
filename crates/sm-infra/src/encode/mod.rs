@@ -5,6 +5,9 @@ pub mod bgra_to_nv12; // always-on; Linux/macOS CI catches stride bugs
 pub mod frame_payload; // always-on: FramePayload carrier (PR-2 seam)
 
 #[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+pub mod gpu_handoff; // capture↔encoder cross-thread gate coordination (PR-4)
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
 pub mod gpu_path; // encoder-thread GPU BGRA→NV12 + DXGI-surface MFT input (PR-3)
 
 #[cfg(all(target_os = "windows", feature = "hw-encoder"))]
@@ -23,7 +26,13 @@ pub mod factory;
 pub use windows::{ENCODE_CHANNEL_CAPACITY, WindowsOpenH264Encoder};
 
 #[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+pub use gpu_handoff::GpuHandoff;
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
 pub use windows_mft::WindowsMftH264Encoder;
 
 #[cfg(target_os = "windows")]
 pub use factory::build_video_encoder;
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+pub use factory::build_video_encoder_with_gpu_handoff;

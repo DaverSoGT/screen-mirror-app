@@ -111,13 +111,17 @@ impl VideoReceiver for CountingReceiver {
 fn produce_real_idr(width: u32, height: u32) -> Option<EncodedPacket> {
     let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default())
         .expect("encoder construction should succeed");
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<sm_domain::CaptureFrame>(8);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<sm_domain::encode::FramePayload>(8);
     let (pkt_tx, pkt_rx) = mpsc::sync_channel::<EncodedPacket>(8);
     encoder.start(frame_rx, pkt_tx).unwrap();
 
     // Feed several frames to get past openh264 warmup.
     for i in 0..8u64 {
-        let _ = frame_tx.try_send(make_synthetic_frame(width, height, i * 33));
+        let _ = frame_tx.try_send(sm_domain::encode::FramePayload::Cpu(make_synthetic_frame(
+            width,
+            height,
+            i * 33,
+        )));
         std::thread::sleep(Duration::from_millis(30));
     }
 
@@ -342,14 +346,14 @@ fn windows_decoder_handles_p_frames_after_idr() {
 
     let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default())
         .expect("encoder construction should succeed");
-    let (frame_tx_enc, frame_rx_enc) = mpsc::sync_channel::<sm_domain::CaptureFrame>(16);
+    let (frame_tx_enc, frame_rx_enc) = mpsc::sync_channel::<sm_domain::encode::FramePayload>(16);
     let (pkt_tx_enc, pkt_rx_enc) = mpsc::sync_channel::<EncodedPacket>(32);
     encoder.start(frame_rx_enc, pkt_tx_enc).unwrap();
 
     // Feed frames and collect encoded packets (IDR + P-frames).
     let producer = std::thread::spawn(move || {
         for i in 0..N_FRAMES {
-            let frame = make_synthetic_frame(w, h, i * 33);
+            let frame = sm_domain::encode::FramePayload::Cpu(make_synthetic_frame(w, h, i * 33));
             if frame_tx_enc.send(frame).is_err() {
                 break;
             }

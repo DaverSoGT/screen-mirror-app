@@ -100,16 +100,13 @@ use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder
 // gate) so both the encode and capture production gates call the same tested function.
 use crate::capture::interval_elapsed;
 
-// ── FramePayload dispatch seam (PR-2) ─────────────────────────────────────────
+// ── FramePayload dispatch seam (PR-4 / TASK-08) ───────────────────────────────
 //
-// The capture→encoder channel still carries `CaptureFrame` at the public
-// VideoEncoder::start() boundary (sm-domain trait is frozen). Inside pump_loop
-// we convert each received frame to `FramePayload` and match on the variant.
-// This introduces the routing seam without changing the external API.
-//
-// In PR-2 the capture side ONLY produces `Cpu` frames; the `GpuShared` arm
-// is a `todo!()` stub that is safe because no such variant can be constructed
-// from production code in this PR.
+// The capture→encoder channel carries `FramePayload` end-to-end (design D7): the
+// `VideoEncoder::start()` boundary now takes `Receiver<FramePayload>`. The capture
+// thread emits `Cpu` for the CPU-staged path and `GpuShared` when the gate
+// selected the GPU-resident path. pump_loop matches on the received variant — no
+// per-frame wrapping. The `Cpu` arm is byte-identical to the pre-GPU CPU path.
 use crate::encode::frame_payload::FramePayload;
 
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
@@ -344,6 +341,11 @@ pub struct WindowsMftH264Encoder {
     mft_activate_factory: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
+    /// Cross-thread GPU-resident path coordination (PR-4 / TASK-08), shared with the
+    /// capture source. `None` when the GPU path is not wired (no `hw-encoder` GPU
+    /// hand-off, or the caller did not call `set_gpu_handoff`) — the encoder then runs
+    /// the CPU-staged path with placeholder gate logging, exactly as PR-3.
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 }
 
 impl std::fmt::Debug for WindowsMftH264Encoder {
@@ -408,12 +410,13 @@ impl VideoEncoder for WindowsMftH264Encoder {
             vendor,
             mft_activate_factory: Some(activate),
             handle: None,
+            gpu_handoff: None,
         })
     }
 
     fn start(
         &mut self,
-        rx: Receiver<sm_domain::CaptureFrame>,
+        rx: Receiver<FramePayload>,
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
         let activate = self.mft_activate_factory.take().ok_or_else(|| {
@@ -423,6 +426,8 @@ impl VideoEncoder for WindowsMftH264Encoder {
         let state = Arc::clone(&self.state);
         // Pass vendor so run_encoder_thread can call select_encode_path at init (PR-2 seam).
         let vendor = self.vendor;
+        // GPU-resident hand-off (PR-4). `None` runs the CPU-staged path unchanged.
+        let gpu_handoff = self.gpu_handoff.clone();
 
         state.stop.store(false, Ordering::Release);
 
@@ -436,7 +441,15 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
         let handle = std::thread::spawn(move || {
             // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
-            run_encoder_thread(activate_send.into_inner(), config, state, vendor, rx, tx);
+            run_encoder_thread(
+                activate_send.into_inner(),
+                config,
+                state,
+                vendor,
+                rx,
+                tx,
+                gpu_handoff,
+            );
         });
 
         self.handle = Some(handle);
@@ -490,6 +503,18 @@ impl VideoEncoder for WindowsMftH264Encoder {
             EncoderVendor::Amd => "hw_amd",
             EncoderVendor::Unknown => "hw_unknown",
         }
+    }
+}
+
+impl WindowsMftH264Encoder {
+    /// Attach the GPU-resident path hand-off shared with the capture source
+    /// (PR-4 / TASK-08). MUST be called BEFORE [`VideoEncoder::start`] so the
+    /// encoder thread can publish its encode-adapter LUID + vendor into the
+    /// hand-off and negotiate the GPU pipeline at init.
+    ///
+    /// When this is never called the encoder runs the CPU-staged path unchanged.
+    pub fn set_gpu_handoff(&mut self, handoff: Arc<crate::encode::gpu_handoff::GpuHandoff>) {
+        self.gpu_handoff = Some(handoff);
     }
 }
 
@@ -1106,8 +1131,9 @@ fn run_encoder_thread(
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
     vendor: EncoderVendor,
-    rx: Receiver<sm_domain::CaptureFrame>,
+    rx: Receiver<FramePayload>,
     tx: SyncSender<EncodedPacket>,
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 ) {
     // Step 1: CoInitializeEx on the encoder thread (MTA).
     // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
@@ -1181,71 +1207,114 @@ fn run_encoder_thread(
         return;
     }
 
-    // Steps 4–6 (via setup_mft): output-type negotiation, input type, streaming messages.
-    // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
+    // Step 4–5 (via setup_mft): output-type + system-memory NV12 input negotiation.
+    // setup_mft NO LONGER sends the streaming-start messages — those are deferred to
+    // `start_mft_streaming` below, AFTER the GPU path-selection gate runs SET_D3D_MANAGER
+    // + DXGI input negotiation (PR-4 carry-forward #4; matches the validated spike order).
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
         // MFShutdown is handled by MfShutdownGuard; CoUninitialize by CoUninitGuard.
         // Both guards drop automatically when this function returns.
         return;
     }
-    tracing::debug!("setup_mft OK; entering pump_loop");
+    tracing::debug!("setup_mft OK; running path-selection gate before streaming start");
 
-    // Path-selection gate + live D3D negotiation: evaluate ONCE at init.
+    // Path-selection gate + live D3D negotiation: evaluate ONCE at init, with REAL
+    // adapter LUIDs (PR-4 / TASK-08). The encoder thread creates its own hardware
+    // D3D11 device (the shared device the GPU pipeline + keyed-mutex consumer run on),
+    // reads its encode-adapter LUID, and publishes it + the vendor into the GpuHandoff
+    // so the capture thread can resolve the same gate from its WGC-device LUID.
     //
-    // TASK-08/PR-4 will supply the real capture/encode adapter LUIDs (from the
-    // capture device and the MFT adapter) and the shared keyed-mutex D3D11 device
-    // produced by the capture-thread CopyResource hand-off. In PR-3 there is no
-    // GPU producer yet, so:
-    //   1. The gate still runs and logs the selected path (placeholder LUIDs).
-    //   2. negotiate_gpu_path_runtime receives `None` for the shared device and
-    //      therefore returns CpuStagedFallback + no pipeline — the session runs on
-    //      the CPU-staged path exactly as before. Production behaviour is UNCHANGED.
-    //
-    // The returned `gpu_pipeline: Option<GpuEncodePipeline>` is threaded into
-    // pump_loop. The FramePayload::GpuShared arm routes through it (TASK-06/07
-    // GPU code) instead of `todo!()`; the arm is unreachable at runtime until a
-    // producer exists (PR-4), but it compiles and links the real GPU path.
+    // The gate uses the encode LUID for BOTH the capture and encode operands: on a
+    // single-adapter QSV box the capture and encode adapter are the same physical GPU
+    // (LUID equality trivially holds) and the vendor floor (`vendor == IntelQsv`) is the
+    // operative guard; on the NVENC box the vendor floor rejects regardless. The capture
+    // thread independently cross-checks WGC LUID == encode LUID and downgrades to Cpu if
+    // they differ. When no GpuHandoff is wired the session runs CPU-staged unchanged.
     let gpu_pipeline = {
-        use crate::encode::gpu_path::negotiate_gpu_path_runtime;
+        use crate::encode::gpu_path::{create_shared_d3d_device, negotiate_gpu_path_runtime};
         use crate::encode::path_select::{EncodePath, select_encode_path};
 
-        // Placeholder LUIDs until PR-4 wires real adapter LUID reads. With both 0
-        // the LUID-equality check passes (0 == 0); the vendor floor still applies,
-        // so only an IntelQsv encoder selects GpuResident here.
-        let placeholder_capture_luid: i64 = 0;
-        let placeholder_encode_luid: i64 = 0;
-        let selected =
-            select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
-        tracing::info!(
-            target: "sm_infra::encode::windows_mft",
-            path = ?selected,
-            vendor = ?vendor,
-            "encode path selected at init"
-        );
-
-        let (w, h) = effective_dimensions(&config);
-        match selected {
-            EncodePath::GpuResident => {
-                // Run the live encoder-thread D3D negotiation. In PR-3 the shared
-                // device is None (no producer), so this returns CpuStagedFallback
-                // with no pipeline; in PR-4 it builds the real GPU pipeline or
-                // degrades via the TASK-05 fallback branch (WARN + CpuStagedFallback).
-                let (negotiated, pipeline) = negotiate_gpu_path_runtime(None, &mft, w, h, &config);
-                tracing::debug!(
+        match gpu_handoff.as_ref() {
+            None => {
+                // No GPU hand-off wired — CPU-staged path. Log a placeholder gate for
+                // observability parity with the GPU path.
+                tracing::info!(
                     target: "sm_infra::encode::windows_mft",
-                    negotiated = ?negotiated,
-                    gpu_pipeline_active = pipeline.is_some(),
-                    "GpuResident selected; live negotiation complete"
+                    vendor = ?vendor,
+                    "no GPU hand-off wired — CPU-staged path"
                 );
-                pipeline
-            }
-            EncodePath::CpuStagedFallback => {
-                // Existing CPU path — the GPU pipeline is never built.
                 None
+            }
+            Some(handoff) => {
+                // Create the encoder's shared D3D11 device + read its encode LUID.
+                match create_shared_d3d_device() {
+                    Ok((shared_device, encode_luid)) => {
+                        handoff.publish_encode_luid(encode_luid, vendor);
+                        let selected = select_encode_path(encode_luid, encode_luid, vendor);
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            path = ?selected,
+                            vendor = ?vendor,
+                            encode_luid,
+                            "encode path selected at init"
+                        );
+                        let (w, h) = effective_dimensions(&config);
+                        match selected {
+                            EncodePath::GpuResident => {
+                                // Live encoder-thread D3D negotiation: SET_D3D_MANAGER +
+                                // DXGI NV12 input. On rejection negotiate_gpu_path_runtime
+                                // emits the TASK-05 WARN, rolls back the MFT to a clean CPU
+                                // state (carry-forward #5), and returns no pipeline.
+                                let (negotiated, pipeline) = negotiate_gpu_path_runtime(
+                                    Some(&shared_device),
+                                    &mft,
+                                    w,
+                                    h,
+                                    &config,
+                                );
+                                tracing::debug!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    negotiated = ?negotiated,
+                                    gpu_pipeline_active = pipeline.is_some(),
+                                    "GpuResident selected; live negotiation complete"
+                                );
+                                if pipeline.is_none() {
+                                    // Negotiation failed → force the producer onto CPU.
+                                    handoff.degrade_to_cpu();
+                                }
+                                pipeline
+                            }
+                            EncodePath::CpuStagedFallback => {
+                                handoff.degrade_to_cpu();
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Could not create the shared device — degrade to CPU (REQ-05).
+                        tracing::warn!(
+                            target: "sm_infra::encode::windows_mft",
+                            "shared D3D11 device creation failed ({e}); using CPU-staged path"
+                        );
+                        handoff.degrade_to_cpu();
+                        None
+                    }
+                }
             }
         }
     };
+
+    // Carry-forward #4: send the streaming-start messages NOW — AFTER the GPU gate
+    // ran SET_D3D_MANAGER + DXGI input negotiation. This matches the validated spike
+    // order (SET_D3D_MANAGER → output → input → BEGIN_STREAMING → START_OF_STREAM) and
+    // avoids re-negotiating an already-streaming async HW MFT (which REQ-05 would
+    // reject). For the CPU path this preserves the pre-change message sequence.
+    if let Err(e) = start_mft_streaming(&mft) {
+        tracing::error!("MFT streaming start failed: {e}");
+        return;
+    }
+    tracing::debug!("streaming started; entering pump_loop");
 
     // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
     // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
@@ -1398,8 +1467,23 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
             .map_err(|e| EncoderError::InitFailed(format!("SetInputType: 0x{:08X}", e.code().0)))?;
     }
 
-    // Steps 7f–7h: Send streaming messages.
-    // (Async unlock was set by run_encoder_thread before calling this function — not repeated here.)
+    // NOTE: the streaming-start messages (FLUSH / BEGIN_STREAMING / START_OF_STREAM)
+    // are NOT sent here. They are deferred to `start_mft_streaming`, called by
+    // run_encoder_thread AFTER the GPU path-selection gate runs (PR-4 carry-forward
+    // #4). The validated spike order is SET_D3D_MANAGER → output → input(NV12) →
+    // BEGIN_STREAMING → START_OF_STREAM; sending SET_D3D_MANAGER / re-SetInputType to
+    // an already-streaming async HW MFT is exactly what REQ-05 expects to reject.
+    Ok(())
+}
+
+/// Send the MFT streaming-start messages (FLUSH → BEGIN_STREAMING → START_OF_STREAM).
+///
+/// Split out of `setup_mft` (PR-4 carry-forward #4) so that the GPU path-selection
+/// gate can run `SET_D3D_MANAGER` + DXGI `SetInputType` negotiation BEFORE the MFT
+/// begins streaming — matching the validated spike order. For the CPU path this is
+/// called immediately after `setup_mft`, preserving the pre-change message sequence.
+fn start_mft_streaming(mft: &IMFTransform) -> Result<(), EncoderError> {
+    // (Async unlock was set by run_encoder_thread before setup_mft — not repeated.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
@@ -1414,7 +1498,6 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
                 EncoderError::InitFailed(format!("START_OF_STREAM: 0x{:08X}", e.code().0))
             })?;
     }
-
     Ok(())
 }
 
@@ -1565,6 +1648,41 @@ fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
     );
 }
 
+/// Consume a pending force-keyframe request and issue
+/// `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` BEFORE
+/// `ProcessInput` (canonical Chromium/FFmpeg ordering; research #808). Shared by
+/// the CPU and GPU submission arms so a forced IDR (e.g. receiver reconnect) is
+/// honored on BOTH paths — the GPU arm previously dropped it (PR-4 carry-forward
+/// #1). Vendor-uniform (NVENC IDR idx 0, Intel QSV idx 1); the property auto-resets
+/// to 0 after the next `ProcessInput` per MS docs. SetValue rejection is non-fatal
+/// (warn + continue) per DD13.
+fn consume_force_keyframe(state: &MftEncoderShared, codec_api: &ICodecAPI) {
+    if state
+        .force_keyframe_icodecapi_pending
+        .swap(false, Ordering::AcqRel)
+    {
+        let v = make_variant_u32(1);
+        // SAFETY: SetValue on a valid ICodecAPI is always safe; the VARIANT is
+        // stack-allocated and correctly typed VT_UI4.
+        unsafe {
+            if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v) {
+                tracing::warn!(
+                    target: "sm_infra::encode::windows_mft",
+                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
+                     rejected: 0x{:08X} (non-fatal, encoding continues)",
+                    e.code().0
+                );
+            } else {
+                tracing::debug!(
+                    target: "sm_infra::encode::windows_mft",
+                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
+                     VT_UI4=1) issued BEFORE ProcessInput"
+                );
+            }
+        }
+    }
+}
+
 /// RESTORE step (DD3): re-arm pending codec atomics on early-return paths where
 /// `ProcessInput` was NOT called (frame dropped, timeout, disconnect-without-drain).
 ///
@@ -1595,7 +1713,7 @@ fn pump_loop(
     initial_codec_api: ICodecAPI,
     initial_event_gen: IMFMediaEventGenerator,
     state: &MftEncoderShared,
-    rx: Receiver<sm_domain::CaptureFrame>,
+    rx: Receiver<FramePayload>,
     tx: SyncSender<EncodedPacket>,
     output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
@@ -1893,14 +2011,14 @@ fn pump_loop(
             // and reaches the top-of-loop stop check. Option A (Phase 1 user decision).
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
-                Ok(raw_frame) => {
-                    // FramePayload dispatch seam: wrap the received CaptureFrame as
-                    // FramePayload::Cpu so the routing match below is the single
-                    // authoritative dispatch point. The channel carries CaptureFrame
-                    // at the frozen VideoEncoder::start() boundary, so only the Cpu
-                    // variant can be produced here today; PR-4 adds a GpuShared producer
-                    // on the capture side via the keyed-mutex texture hand-off.
-                    let payload = FramePayload::Cpu(raw_frame);
+                Ok(payload) => {
+                    // FramePayload dispatch (design D7): the channel carries the
+                    // variant the capture thread produced. `GpuShared` is the
+                    // GPU-resident path (only emitted when the gate selected it);
+                    // `Cpu` is the byte-identical CPU-staged path. The `Cpu` arm
+                    // falls through below to the existing nv12_convert + submit_frame
+                    // path VERBATIM; the `GpuShared` arm fully services the frame and
+                    // `continue`s the credit loop.
                     let frame = match payload {
                         FramePayload::Cpu(f) => f,
                         FramePayload::GpuShared {
@@ -1910,20 +2028,34 @@ fn pump_loop(
                             stride: _,
                             timestamp,
                         } => {
-                            // GPU-resident path (TASK-06/07): convert the shared BGRA
-                            // texture to NV12 on the GPU and feed the MFT a DXGI-surface
-                            // sample — no readback, no CPU convert, no MFCreateMemoryBuffer.
-                            //
-                            // Reachable only when a GpuEncodePipeline was negotiated AND a
-                            // producer constructed GpuShared. In PR-3 neither holds, so this
-                            // arm does not run at runtime; it compiles and links the real GPU
-                            // code path (gpu_path::GpuEncodePipeline) instead of `todo!()`.
+                            // GPU-resident path (TASK-06/07/08): acquire the shared
+                            // keyed-mutex BGRA texture, convert to NV12 on the GPU, and
+                            // feed the MFT a DXGI-surface sample — no readback, no CPU
+                            // convert, no MFCreateMemoryBuffer.
                             if let Some(pipe) = gpu_pipeline.as_ref() {
-                                debug_assert_eq!(
-                                    pipe.dimensions(),
-                                    (width, height),
-                                    "GpuShared frame dims must match the negotiated pipeline"
-                                );
+                                // Carry-forward #2: runtime dim-mismatch guard (NOT a
+                                // release-stripped debug_assert). A smaller-than-expected
+                                // texture causes an out-of-bounds read inside the driver
+                                // → 0xC0000005 AV; DROP the frame and skip, mirroring the
+                                // CPU arm's `state.dropped` + skip below.
+                                if pipe.dimensions() != (width, height) {
+                                    let (pw, ph) = pipe.dimensions();
+                                    tracing::warn!(
+                                        target: "sm_infra::encode::windows_mft",
+                                        "pump_loop: GPU frame dim mismatch — pipeline {}x{}, got {}x{}; dropping frame to avoid driver AV",
+                                        pw, ph, width, height
+                                    );
+                                    state.dropped.fetch_add(1, Ordering::Relaxed);
+                                    // Re-arm pending codec atomics (DD3): ProcessInput was
+                                    // not called, so the IDR hint + bitrate must survive.
+                                    restore_pending_codec(state, &swap);
+                                    continue;
+                                }
+                                // Carry-forward #1: consume the force-keyframe request and
+                                // issue SetValue(CODECAPI_AVEncVideoForceKeyFrame) BEFORE
+                                // submit, matching the CPU arm ordering — a forced IDR must
+                                // not be dropped on the GPU path.
+                                consume_force_keyframe(state, &codec_api);
                                 match submit_gpu_frame(
                                     &mft,
                                     pipe,
@@ -1937,10 +2069,34 @@ fn pump_loop(
                                         fire_pending_codec_settings(&codec_api, &swap);
                                     }
                                     Err(e) => {
+                                        // Carry-forward #3a: mirror the CPU arm's
+                                        // MF_E_NOTACCEPTING counter-desync guard. Under
+                                        // DD1+DD14 this must never fire on a serviced
+                                        // NeedInput credit; treat it as a fatal counter bug.
+                                        let reason = e.to_string();
+                                        if reason.contains("0xC00D36B5") {
+                                            debug_assert!(
+                                                false,
+                                                "MF_E_NOTACCEPTING on serviced GPU NeedInput credit — counter logic wrong"
+                                            );
+                                            tracing::error!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU MF_E_NOTACCEPTING — counter desync (should be unreachable): {e}"
+                                            );
+                                            // Re-arm codec atomics before the fatal return so
+                                            // a pending bitrate/IDR is not silently lost.
+                                            restore_pending_codec(state, &swap);
+                                            return mft;
+                                        }
                                         tracing::warn!(
                                             target: "sm_infra::encode::windows_mft",
                                             "pump_loop: GPU ProcessInput failed (skipping frame): {e}"
                                         );
+                                        // Carry-forward #3b: ProcessInput did not consume the
+                                        // pending bitrate (swap_pending_codec_settings already
+                                        // cleared it), so restore it — otherwise a set_bitrate()
+                                        // request is lost on the GPU error branch.
+                                        restore_pending_codec(state, &swap);
                                         ni_count -= 1;
                                     }
                                 }
@@ -1986,34 +2142,9 @@ fn pump_loop(
                     // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).
                     // Vendor-uniform: both NVENC (IDR idx 0) and Intel QSV (IDR idx 1) honor
                     // this property BEFORE ProcessInput; P2 evidence in engram #809.
-                    // The property auto-resets to 0 after ProcessInput per MS docs.
-                    if state
-                        .force_keyframe_icodecapi_pending
-                        .swap(false, Ordering::AcqRel)
-                    {
-                        let v = make_variant_u32(1);
-                        // SAFETY: SetValue on a valid ICodecAPI is always safe;
-                        // the VARIANT is stack-allocated and correctly typed VT_UI4.
-                        unsafe {
-                            if let Err(e) =
-                                codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v)
-                            {
-                                // Non-fatal — driver rejection is acceptable (DD13 convention).
-                                tracing::warn!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
-                                     rejected: 0x{:08X} (non-fatal, encoding continues)",
-                                    e.code().0
-                                );
-                            } else {
-                                tracing::debug!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
-                                     VT_UI4=1) issued BEFORE ProcessInput"
-                                );
-                            }
-                        }
-                    }
+                    // The property auto-resets to 0 after ProcessInput per MS docs. Shared
+                    // with the GPU arm via `consume_force_keyframe` (PR-4 carry-forward #1).
+                    consume_force_keyframe(state, &codec_api);
 
                     match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
                         Ok(()) => {
@@ -2147,22 +2278,17 @@ fn submit_frame(
     }
 }
 
-/// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07 GPU path).
+/// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07/08 GPU path).
 ///
-/// Opens the cross-thread shared BGRA texture by its handle on the encoder-thread
-/// device (PR-3: plain `OpenSharedResource`, no keyed-mutex acquire), runs
-/// `VideoProcessorBlt` BGRA→NV12 on the GPU, wraps the NV12 texture in an
+/// Opens the cross-thread shared keyed-mutex BGRA texture by its NT handle on the
+/// encoder-thread device, acquires the keyed mutex, runs `VideoProcessorBlt`
+/// BGRA→NV12 on the GPU, releases the keyed mutex, wraps the NV12 texture in an
 /// `MFCreateDXGISurfaceBuffer` sample, and feeds it to the MFT — no GPU→CPU
 /// readback, no rayon convert, no `MFCreateMemoryBuffer`. The CPU `submit_frame`
 /// path above is untouched and remains the byte-identical fallback (REQ-08).
 ///
-/// Reachable only when a `GpuEncodePipeline` was negotiated and a producer emitted
-/// `FramePayload::GpuShared`; in PR-3 there is no producer, so this is compiled and
-/// linked but not exercised at runtime (the keyed-mutex producer lands in PR-4).
-///
-/// TODO(PR-4): switch to `OpenSharedResource1` + `IDXGIKeyedMutex::AcquireSync`/
-/// `ReleaseSync` around the blt, per design D1 (PR-3 opens a plain shared texture
-/// without any keyed-mutex synchronization).
+/// Reachable only when a `GpuEncodePipeline` was negotiated and the capture thread
+/// emitted `FramePayload::GpuShared` (gate = GpuResident).
 fn submit_gpu_frame(
     mft: &IMFTransform,
     pipe: &crate::encode::gpu_path::GpuEncodePipeline,
@@ -2170,12 +2296,12 @@ fn submit_gpu_frame(
     timestamp: std::time::Duration,
     duration_100ns: i64,
 ) -> Result<(), EncoderError> {
-    // SAFETY: shared_handle is a live, same-adapter D3D11 share handle per the
-    // FramePayload::GpuShared contract (the capture thread produced it on a device
+    // SAFETY: shared_handle is a live, same-adapter keyed-mutex NT share handle per
+    // the FramePayload::GpuShared contract (the capture thread produced it on a device
     // that shares this pipeline's adapter LUID — enforced by the path-selection gate).
-    // PR-3 opens it via plain OpenSharedResource (no IDXGIKeyedMutex::AcquireSync).
-    let bgra_tex = unsafe { pipe.open_shared_bgra(shared_handle) }?;
-    pipe.gpu_bgra_to_nv12(&bgra_tex)?;
+    // consume_shared_bgra opens it, AcquireSync → blt → ReleaseSync (balanced on all
+    // paths), and releases the opened texture before returning (no per-frame leak).
+    unsafe { pipe.consume_shared_bgra(shared_handle) }?;
     let sample = pipe.build_dxgi_imfsample(timestamp, duration_100ns)?;
     unsafe {
         mft.ProcessInput(0, &sample, 0).map_err(|e| {
@@ -2513,6 +2639,7 @@ impl WindowsMftH264Encoder {
             vendor: EncoderVendor::Unknown,
             mft_activate_factory: None,
             handle: None,
+            gpu_handoff: None,
         }
     }
 }

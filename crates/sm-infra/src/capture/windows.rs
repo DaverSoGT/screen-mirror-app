@@ -20,6 +20,7 @@ use windows_capture::settings::{
 
 use std::sync::OnceLock;
 
+use sm_domain::encode::FramePayload;
 use sm_domain::{
     BorderPolicy, CaptureConfig, CaptureError, CaptureFrame, CaptureSource, MonitorId, MonitorInfo,
     MonitorSelector, PixelFormat,
@@ -150,17 +151,75 @@ fn monitor_info_from(m: &Monitor, is_primary: bool) -> Result<MonitorInfo, Captu
 // Internal capture handler (lives on the WGC OS thread)
 // ---------------------------------------------------------------------------
 
-/// Shared snapshot of the most recent CaptureFrame + the instant it was observed.
+/// The most-recent frame's heartbeat descriptor.
+///
+/// On the CPU-staged path this carries the last `CaptureFrame` (Arc refcount clone,
+/// no data copy). On the GPU-resident path it carries the last `GpuShared` descriptor
+/// (share handle + geometry) so the heartbeat can re-emit the same keyed-mutex texture
+/// (still holding the last frame's pixels — the producer does not overwrite it between
+/// heartbeats). The variant tracks whichever path the gate selected.
+#[derive(Clone)]
+enum HeartbeatFrame {
+    /// CPU-staged: clone the last `CaptureFrame` (cheap Arc bump).
+    Cpu(CaptureFrame),
+    /// GPU-resident: re-emit the last shared keyed-mutex texture handle + geometry.
+    #[cfg(feature = "hw-encoder")]
+    Gpu {
+        handle: isize,
+        width: u32,
+        height: u32,
+        stride: u32,
+        timestamp: std::time::Duration,
+    },
+}
+
+impl HeartbeatFrame {
+    /// Advance the timestamp by `delta` (heartbeat cadence) and return a `FramePayload`
+    /// to inject.
+    fn into_payload_advanced(self, delta: std::time::Duration) -> FramePayload {
+        match self {
+            HeartbeatFrame::Cpu(mut f) => {
+                f.timestamp = f.timestamp.saturating_add(delta);
+                FramePayload::Cpu(f)
+            }
+            #[cfg(feature = "hw-encoder")]
+            HeartbeatFrame::Gpu {
+                handle,
+                width,
+                height,
+                stride,
+                timestamp,
+            } => FramePayload::GpuShared {
+                handle,
+                width,
+                height,
+                stride,
+                timestamp: timestamp.saturating_add(delta),
+            },
+        }
+    }
+}
+
+/// Shared snapshot of the most recent frame descriptor + the instant it was observed.
 /// Owned by both `WgcHandler` (writer on the WGC thread) and the heartbeat thread (reader).
-/// `CaptureFrame::clone` is cheap (Arc refcount on the pixel buffer, no data copy).
-type LastFrameSlot = Arc<std::sync::Mutex<Option<(CaptureFrame, std::time::Instant)>>>;
+type LastFrameSlot = Arc<std::sync::Mutex<Option<(HeartbeatFrame, std::time::Instant)>>>;
 
 /// Internal state carried on the WGC capture thread.
 ///
 /// This type implements [`GraphicsCaptureApiHandler`] and forwards frames
 /// to the caller via a bounded `SyncSender`. It is NOT part of the public API.
+/// Flags passed to [`WgcHandler::new`] via `start_free_threaded`. A named struct
+/// (rather than a tuple) so the GPU hand-off field can be cfg-gated cleanly.
+struct WgcHandlerFlags {
+    dropped: Arc<AtomicU64>,
+    tx: std::sync::mpsc::SyncSender<FramePayload>,
+    last_frame: LastFrameSlot,
+    #[cfg(feature = "hw-encoder")]
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
+}
+
 struct WgcHandler {
-    tx: std::sync::mpsc::SyncSender<CaptureFrame>,
+    tx: std::sync::mpsc::SyncSender<FramePayload>,
     dropped: Arc<AtomicU64>,
     /// Shared with the heartbeat thread; updated on every real frame delivery so the
     /// heartbeat can detect "no real frame in HEARTBEAT_INTERVAL" and inject a duplicate.
@@ -173,18 +232,34 @@ struct WgcHandler {
     /// Snapshot of `dropped` at the end of the last 1-second window, used to compute
     /// per-interval drop delta (I1, D-PPT-3).
     last_dropped_snapshot: u64,
+    /// GPU-resident hand-off shared with the encoder thread (PR-4 / TASK-08).
+    /// `None` when the GPU path is not wired — the handler then always produces
+    /// `FramePayload::Cpu`, byte-identical to the pre-GPU path.
+    #[cfg(feature = "hw-encoder")]
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
+    /// Lazily-built capture-thread GPU producer (keyed-mutex shared texture on WGC's
+    /// device). Built on the first GPU frame once the device + real dims are known.
+    #[cfg(feature = "hw-encoder")]
+    gpu_producer: Option<crate::capture::gpu_producer::GpuProducer>,
+    /// Once a GPU frame hits an unrecoverable error, this latches and the handler
+    /// produces only `Cpu` frames for the rest of the session (REQ-05 device-lost
+    /// degradation; no per-frame retry).
+    #[cfg(feature = "hw-encoder")]
+    gpu_degraded: bool,
 }
 
 impl GraphicsCaptureApiHandler for WgcHandler {
-    type Flags = (
-        Arc<AtomicU64>,
-        std::sync::mpsc::SyncSender<CaptureFrame>,
-        LastFrameSlot,
-    );
+    type Flags = WgcHandlerFlags;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (dropped, tx, last_frame) = ctx.flags;
+        let WgcHandlerFlags {
+            dropped,
+            tx,
+            last_frame,
+            #[cfg(feature = "hw-encoder")]
+            gpu_handoff,
+        } = ctx.flags;
         Ok(Self {
             tx,
             dropped,
@@ -192,6 +267,12 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             fps_frame_count: 0,
             fps_window_start: std::time::Instant::now(),
             last_dropped_snapshot: 0,
+            #[cfg(feature = "hw-encoder")]
+            gpu_handoff,
+            #[cfg(feature = "hw-encoder")]
+            gpu_producer: None,
+            #[cfg(feature = "hw-encoder")]
+            gpu_degraded: false,
         })
     }
 
@@ -214,6 +295,25 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             .map(|d| std::time::Duration::from_nanos(d * 100))
             .unwrap_or(std::time::Duration::ZERO);
 
+        // ── GPU-resident path (PR-4 / TASK-08) ────────────────────────────────
+        // When the gate resolved GpuResident and the producer has not degraded,
+        // CopyResource the WGC texture into a shared keyed-mutex texture and send a
+        // `GpuShared` payload — no CPU readback, no Arc copy. On any GPU error the
+        // path latches to CPU for the rest of the session (REQ-05). `Handled` means
+        // the frame was fully serviced on the GPU path; `HandledStop` additionally
+        // requests session teardown (consumer disconnected); `NotHandled` falls through
+        // to the CPU-staged path below.
+        #[cfg(feature = "hw-encoder")]
+        match self.try_gpu_frame(frame, width, height, timestamp) {
+            GpuFrameOutcome::Handled => return Ok(()),
+            GpuFrameOutcome::HandledStop => {
+                capture_control.stop();
+                return Ok(());
+            }
+            GpuFrameOutcome::NotHandled => {}
+        }
+
+        // ── CPU-staged path (byte-identical to pre-GPU behaviour) ─────────────
         let mut buf = match frame.buffer() {
             Ok(b) => b,
             Err(e) => {
@@ -244,10 +344,13 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         // representative frame to duplicate. Cloning `capture_frame` is cheap — the
         // `data` field is `Arc<[u8]>`, so the clone is a refcount bump, not a memcpy.
         if let Ok(mut guard) = self.last_frame.lock() {
-            *guard = Some((capture_frame.clone(), std::time::Instant::now()));
+            *guard = Some((
+                HeartbeatFrame::Cpu(capture_frame.clone()),
+                std::time::Instant::now(),
+            ));
         }
 
-        match self.tx.try_send(capture_frame) {
+        match self.tx.try_send(FramePayload::Cpu(capture_frame)) {
             Ok(()) => {
                 // Count only frames that were actually delivered to the encoder channel.
                 // Heartbeat-injected frames go through heartbeat_loop's own try_send,
@@ -264,6 +367,203 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             }
         }
 
+        self.emit_capture_throughput_window();
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        // Session closed externally (monitor unplugged, session ended). No action needed —
+        // the WGC thread will exit naturally and the channel will be disconnected.
+        Ok(())
+    }
+}
+
+/// Outcome of the GPU-resident frame attempt (PR-4 / TASK-08).
+#[cfg(feature = "hw-encoder")]
+enum GpuFrameOutcome {
+    /// Frame fully serviced on the GPU path; caller returns without CPU fallback.
+    Handled,
+    /// Frame serviced, but the consumer disconnected — caller must stop the session.
+    HandledStop,
+    /// GPU path not active for this frame — caller runs the CPU-staged path.
+    NotHandled,
+}
+
+impl WgcHandler {
+    /// Try to handle this frame on the GPU-resident path (PR-4 / TASK-08).
+    ///
+    /// Returns `true` if the frame was fully handled on the GPU path (the caller must
+    /// NOT fall through to the CPU path). Returns `false` when the GPU path is not
+    /// active for this frame (no hand-off, gate not GpuResident, gate degraded, or a
+    /// recoverable build/copy error already latched the producer to CPU) — the caller
+    /// then runs the CPU-staged path.
+    ///
+    /// On the first frame it resolves the path-selection gate from WGC's device LUID
+    /// (capture LUID) + the encoder-published encode LUID/vendor, builds the
+    /// keyed-mutex producer, and records the result in the hand-off. Any unrecoverable
+    /// GPU error latches `gpu_degraded` so the session runs CPU-only for the rest of
+    /// its lifetime (REQ-05, no per-frame retry).
+    #[cfg(feature = "hw-encoder")]
+    fn try_gpu_frame(
+        &mut self,
+        frame: &mut Frame,
+        width: u32,
+        height: u32,
+        timestamp: std::time::Duration,
+    ) -> GpuFrameOutcome {
+        use crate::capture::gpu_producer::{GpuProducer, capture_adapter_luid};
+        use crate::encode::path_select::{EncodePath, select_encode_path};
+
+        // No hand-off wired, or already degraded → CPU path.
+        let Some(handoff) = self.gpu_handoff.as_ref() else {
+            return GpuFrameOutcome::NotHandled;
+        };
+        if self.gpu_degraded {
+            return GpuFrameOutcome::NotHandled;
+        }
+
+        // Resolve the gate ONCE (first GPU-eligible frame). The handoff caches the
+        // decision; after this the producer is either built (GpuResident) or we latch
+        // to CPU.
+        if self.gpu_producer.is_none() && handoff.resolved_path().is_none() {
+            // The encoder thread must have published its encode LUID + vendor first.
+            // If it has not yet, run CPU this frame and retry the resolution next frame.
+            let Some((encode_luid, vendor)) = handoff.encode_luid() else {
+                return GpuFrameOutcome::NotHandled;
+            };
+            // SAFETY: frame.device() is WGC's live device on this capture thread.
+            let device = frame.device();
+            let capture_luid = match unsafe { capture_adapter_luid(device) } {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "sm_infra::capture::windows",
+                        "could not read capture adapter LUID ({e}); using CPU-staged path"
+                    );
+                    handoff.degrade_to_cpu();
+                    self.gpu_degraded = true;
+                    return GpuFrameOutcome::NotHandled;
+                }
+            };
+            let path = select_encode_path(capture_luid, encode_luid, vendor);
+            tracing::info!(
+                target: "sm_infra::capture::windows",
+                ?path,
+                ?vendor,
+                capture_luid,
+                encode_luid,
+                "capture-side path-selection gate resolved"
+            );
+            handoff.resolve_path(path);
+            if path == EncodePath::CpuStagedFallback {
+                self.gpu_degraded = true;
+                return GpuFrameOutcome::NotHandled;
+            }
+        }
+
+        // If the encoder degraded the path after negotiation, honor it.
+        if handoff.resolved_path() != Some(EncodePath::GpuResident) {
+            self.gpu_degraded = true;
+            return GpuFrameOutcome::NotHandled;
+        }
+
+        // Build the keyed-mutex producer lazily on WGC's device (first GPU frame).
+        if self.gpu_producer.is_none() {
+            // SAFETY: device/context are WGC's live device + immediate context.
+            let device = frame.device();
+            let context = frame.device_context();
+            match unsafe { GpuProducer::build(device, context, width, height) } {
+                Ok(p) => self.gpu_producer = Some(p),
+                Err(e) => {
+                    tracing::error!(
+                        target: "sm_infra::capture::windows",
+                        "GPU producer build failed ({e}); degrading to CPU-staged for the session"
+                    );
+                    handoff.degrade_to_cpu();
+                    self.gpu_degraded = true;
+                    return GpuFrameOutcome::NotHandled;
+                }
+            }
+        }
+
+        let producer = self.gpu_producer.as_ref().expect("producer built above");
+
+        // Dimension guard: a resize would invalidate the shared texture. Degrade to
+        // CPU (the encoder pipeline was negotiated at the original dims; rebuilding the
+        // whole GPU chain mid-session is out of scope — REQ-05 graceful fallback).
+        if producer.dimensions() != (width, height) {
+            tracing::warn!(
+                target: "sm_infra::capture::windows",
+                "capture dims changed; degrading GPU path to CPU-staged for the session"
+            );
+            handoff.degrade_to_cpu();
+            self.gpu_degraded = true;
+            return GpuFrameOutcome::NotHandled;
+        }
+
+        // CopyResource the live WGC texture into the shared keyed-mutex texture.
+        // SAFETY: as_raw_texture() is WGC's live BGRA texture for this frame.
+        let wgc_tex = frame.as_raw_texture();
+        if let Err(e) = unsafe { producer.copy_frame(wgc_tex) } {
+            // Device-removed / copy failure → degrade to CPU for the session (REQ-05;
+            // no per-frame retry). The encoder side independently degrades on its own
+            // device-removed error.
+            tracing::error!(
+                target: "sm_infra::capture::windows",
+                "GPU CopyResource failed ({e}); degrading to CPU-staged for the session"
+            );
+            handoff.degrade_to_cpu();
+            self.gpu_degraded = true;
+            return GpuFrameOutcome::NotHandled;
+        }
+
+        let stride = width * 4; // BGRA8 shared texture stride (informational).
+        let handle = producer.share_handle();
+
+        // Update the heartbeat snapshot with the GPU descriptor so static-content
+        // heartbeats re-emit the same shared texture (it still holds this frame).
+        if let Ok(mut guard) = self.last_frame.lock() {
+            *guard = Some((
+                HeartbeatFrame::Gpu {
+                    handle,
+                    width,
+                    height,
+                    stride,
+                    timestamp,
+                },
+                std::time::Instant::now(),
+            ));
+        }
+
+        let outcome = match self.tx.try_send(FramePayload::GpuShared {
+            handle,
+            width,
+            height,
+            stride,
+            timestamp,
+        }) {
+            Ok(()) => {
+                self.fps_frame_count += 1;
+                GpuFrameOutcome::Handled
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                GpuFrameOutcome::Handled
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                // Consumer dropped the receiver — request session teardown (the caller
+                // owns `capture_control` and stops it).
+                GpuFrameOutcome::HandledStop
+            }
+        };
+
+        self.emit_capture_throughput_window();
+        outcome
+    }
+
+    /// Per-second observability window: emit capture_fps and capture drop-delta
+    /// (I1, D-PPT-1/3). Shared by the CPU and GPU producer paths.
+    fn emit_capture_throughput_window(&mut self) {
         // Per-second observability window: emit capture_fps and capture drop-delta (I1, D-PPT-1/3).
         // Checked unconditionally after the match so both delivered and dropped frames advance
         // the window clock, keeping the log cadence stable even under backpressure.
@@ -299,14 +599,6 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             self.fps_window_start = std::time::Instant::now();
             self.last_dropped_snapshot = new_last;
         }
-
-        Ok(())
-    }
-
-    fn on_closed(&mut self) -> Result<(), Self::Error> {
-        // Session closed externally (monitor unplugged, session ended). No action needed —
-        // the WGC thread will exit naturally and the channel will be disconnected.
-        Ok(())
     }
 }
 
@@ -325,7 +617,7 @@ impl GraphicsCaptureApiHandler for WgcHandler {
 /// Exits when `stop_flag` is set OR the consumer drops the channel (Disconnected). A
 /// `Full` send result is silently ignored — real-frame backpressure already handles this.
 fn heartbeat_loop(
-    tx: std::sync::mpsc::SyncSender<CaptureFrame>,
+    tx: std::sync::mpsc::SyncSender<FramePayload>,
     last_frame: LastFrameSlot,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -342,7 +634,7 @@ fn heartbeat_loop(
             Err(_) => return, // mutex poisoned — capture thread panicked; exit gracefully
         };
 
-        let Some((mut frame, last_update)) = snapshot else {
+        let Some((frame, last_update)) = snapshot else {
             continue; // no real frame has arrived yet — nothing to duplicate
         };
 
@@ -351,9 +643,11 @@ fn heartbeat_loop(
         }
 
         // Advance timestamp monotonically so the encoder + downstream RTP timestamps
-        // see a regular cadence. `saturating_add` guards against u128 overflow at the
-        // far end of a session lifetime.
-        frame.timestamp = frame.timestamp.saturating_add(HEARTBEAT_INTERVAL);
+        // see a regular cadence. `saturating_add` (inside into_payload_advanced) guards
+        // against overflow at the far end of a session lifetime. For the GPU variant this
+        // re-emits the same shared keyed-mutex texture handle (still holding the last
+        // frame's pixels — the producer does not overwrite it between heartbeats).
+        let payload = frame.into_payload_advanced(HEARTBEAT_INTERVAL);
 
         // Reset the "last observed" instant so we don't immediately re-fire on the next
         // tick. Real frames continue to overwrite this when they arrive. Nested `if let`
@@ -364,7 +658,7 @@ fn heartbeat_loop(
             }
         }
 
-        match tx.try_send(frame) {
+        match tx.try_send(payload) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 // Channel saturated — encoder will catch up on real frames. Skip silently;
@@ -411,6 +705,12 @@ pub struct WindowsCaptureSource {
     /// Stop signal for the heartbeat thread spawned by `start()`.
     /// `None` before `start()` or after `stop()`; `Some` during an active session.
     heartbeat_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+
+    /// GPU-resident hand-off shared with the encoder thread (PR-4 / TASK-08).
+    /// `None` until `set_gpu_handoff` is called — the capture handler then always
+    /// produces `FramePayload::Cpu`, byte-identical to the pre-GPU path.
+    #[cfg(feature = "hw-encoder")]
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 }
 
 // SAFETY: Monitor wraps an HMONITOR handle. windows-capture declares Monitor as Send.
@@ -493,10 +793,12 @@ impl CaptureSource for WindowsCaptureSource {
             dropped: Arc::new(AtomicU64::new(0)),
             control: None,
             heartbeat_stop: None,
+            #[cfg(feature = "hw-encoder")]
+            gpu_handoff: None,
         })
     }
 
-    fn start(&mut self, tx: std::sync::mpsc::SyncSender<CaptureFrame>) -> Result<(), CaptureError> {
+    fn start(&mut self, tx: std::sync::mpsc::SyncSender<FramePayload>) -> Result<(), CaptureError> {
         // R8.1 — runtime WGC support check.
         let supported = GraphicsCaptureApi::is_supported()
             .map_err(|e| CaptureError::Internal(format!("WGC IsSupported probe failed: {e}")))?;
@@ -536,6 +838,13 @@ impl CaptureSource for WindowsCaptureSource {
         let hb_last_frame = Arc::clone(&last_frame);
         let hb_stop = Arc::clone(&stop_flag);
 
+        let flags = WgcHandlerFlags {
+            dropped: Arc::clone(&self.dropped),
+            tx,
+            last_frame,
+            #[cfg(feature = "hw-encoder")]
+            gpu_handoff: self.gpu_handoff.clone(),
+        };
         let settings = Settings::new(
             self.monitor,
             cursor,
@@ -544,7 +853,7 @@ impl CaptureSource for WindowsCaptureSource {
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            (Arc::clone(&self.dropped), tx, last_frame),
+            flags,
         );
 
         let control = WgcHandler::start_free_threaded(settings)
@@ -585,6 +894,15 @@ impl CaptureSource for WindowsCaptureSource {
 // ---------------------------------------------------------------------------
 
 impl WindowsCaptureSource {
+    /// Attach the GPU-resident path hand-off shared with the encoder (PR-4 /
+    /// TASK-08). MUST be called BEFORE [`CaptureSource::start`] so the capture
+    /// handler thread receives it. When never called the capture source produces
+    /// only `FramePayload::Cpu`, byte-identical to the pre-GPU path.
+    #[cfg(feature = "hw-encoder")]
+    pub fn set_gpu_handoff(&mut self, handoff: Arc<crate::encode::gpu_handoff::GpuHandoff>) {
+        self.gpu_handoff = Some(handoff);
+    }
+
     /// Returns the resolved monitor's pixel dimensions as `(width, height)`.
     ///
     /// The monitor is resolved at `new()` time (see `CaptureSource::new`). This method

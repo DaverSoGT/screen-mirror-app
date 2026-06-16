@@ -960,7 +960,7 @@ mod tests {
 
         fn start(
             &mut self,
-            _rx: std::sync::mpsc::Receiver<sm_domain::CaptureFrame>,
+            _rx: std::sync::mpsc::Receiver<sm_domain::encode::FramePayload>,
             _tx: std::sync::mpsc::SyncSender<sm_domain::encode::EncodedPacket>,
         ) -> Result<(), sm_domain::encode::EncoderError> {
             Ok(())

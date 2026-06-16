@@ -2138,7 +2138,7 @@ fn build_production_sender_bundle(
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
-    use sm_infra::encode::build_video_encoder;
+    use sm_infra::encode::{GpuHandoff, build_video_encoder_with_gpu_handoff};
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{
         CANDIDATE_RETRY_ATTEMPTS, Str0mVideoSender, publish_host_candidate,
@@ -2179,8 +2179,16 @@ fn build_production_sender_bundle(
     // supplies real screen dimensions so the HW MFT is configured at matching resolution.
     let (cap_w, cap_h) = capture.dimensions();
     let encoder_config = sender_encoder_config(cap_w, cap_h);
+
+    // GPU-resident capture→encode hand-off (PR-4 / TASK-08). Created here and shared
+    // with BOTH the capture source and the MFT encoder so the path-selection gate is
+    // coordinated across the two threads. On a non-QSV or non-same-adapter machine the
+    // gate resolves CpuStagedFallback and both sides run the CPU-staged path unchanged.
+    let gpu_handoff = GpuHandoff::new();
+    capture.set_gpu_handoff(std::sync::Arc::clone(&gpu_handoff));
     let mut encoder =
-        build_video_encoder(encoder_config).map_err(|e| BundleError::Other(e.to_string()))?;
+        build_video_encoder_with_gpu_handoff(encoder_config, std::sync::Arc::clone(&gpu_handoff))
+            .map_err(|e| BundleError::Other(e.to_string()))?;
 
     let transport_config = TransportConfig {
         udp_port,
@@ -2912,7 +2920,7 @@ mod tests {
             }
             fn start(
                 &mut self,
-                _rx: std::sync::mpsc::Receiver<sm_domain::CaptureFrame>,
+                _rx: std::sync::mpsc::Receiver<sm_domain::encode::FramePayload>,
                 _tx: std::sync::mpsc::SyncSender<EncodedPacket>,
             ) -> Result<(), EncoderError> {
                 Ok(())

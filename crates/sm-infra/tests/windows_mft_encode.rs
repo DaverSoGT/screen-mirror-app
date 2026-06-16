@@ -80,7 +80,7 @@ fn init_tracing() {
 /// The gradient (B=row%256, G=col%256, R=128, A=255) gives the codec meaningful
 /// content to encode. All-black frames produce trivially small IDR packets that
 /// exercise almost no rate-control or P-frame logic.
-fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::CaptureFrame {
+fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::encode::FramePayload {
     let stride = width * 4;
     let total = (stride * height) as usize;
     let mut data = vec![0u8; total];
@@ -96,14 +96,14 @@ fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::Captu
         }
     }
 
-    sm_domain::CaptureFrame {
+    sm_domain::encode::FramePayload::Cpu(sm_domain::CaptureFrame {
         data: Arc::from(data.as_slice()),
         width,
         height,
         stride,
         format: PixelFormat::Bgra8,
         timestamp: Duration::from_millis(ts_ms),
-    }
+    })
 }
 
 /// Assert that AT LEAST ONE packet in `packets` has `is_keyframe == true`, returning

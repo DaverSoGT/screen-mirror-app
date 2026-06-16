@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default())?;
 
     let (frame_tx, frame_rx) =
-        mpsc::sync_channel::<sm_domain::CaptureFrame>(ENCODE_CHANNEL_CAPACITY);
+        mpsc::sync_channel::<sm_domain::encode::FramePayload>(ENCODE_CHANNEL_CAPACITY);
     let (pkt_tx, pkt_rx) =
         mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(ENCODE_CHANNEL_CAPACITY);
 
@@ -175,7 +175,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format: PixelFormat::Bgra8,
                     timestamp: Duration::from_millis(i * 33),
                 };
-                if frame_tx.send(capture_frame).is_err() {
+                if frame_tx
+                    .send(sm_domain::encode::FramePayload::Cpu(capture_frame))
+                    .is_err()
+                {
                     break; // encoder stopped
                 }
                 std::thread::sleep(FPS_INTERVAL);

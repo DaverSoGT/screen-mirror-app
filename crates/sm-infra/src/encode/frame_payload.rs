@@ -1,70 +1,24 @@
 //! `FramePayload` — capture→encoder channel carrier.
 //!
-//! This enum is the typed envelope that flows through the
-//! `capture_to_enc_{tx,rx}` bounded channel between the WGC capture thread
-//! and the encoder thread.
+//! The type itself now lives in `sm-domain` ([`sm_domain::FramePayload`]) so the
+//! frozen `CaptureSource::start` / `VideoEncoder::start` channel signatures can
+//! carry it without `sm-domain` depending on `windows` (PR-4 / TASK-08, design
+//! D7). This module re-exports it under the original `sm_infra::encode::frame_payload`
+//! path so existing `use crate::encode::frame_payload::FramePayload` imports keep
+//! working, and retains the PR-2 round-trip unit tests as the regression net.
 //!
-//! # Variants
+//! # Variants (see [`sm_domain::FramePayload`])
 //!
 //! - `Cpu(CaptureFrame)` — today's code path: BGRA8 pixels already read back to
 //!   CPU memory as an `Arc<[u8]>`. The encoder dispatches this to the existing
 //!   `nv12_convert` + `submit_frame` path VERBATIM. No behaviour change.
-//!
-//! - `GpuShared { handle, width, height, stride, timestamp }` — future GPU-resident
-//!   path (PR-3): the capture thread passes a cross-process shared HANDLE for an
-//!   `ID3D11Texture2D` BGRA surface along with its dimensions and timestamp. The
+//! - `GpuShared { handle, width, height, stride, timestamp }` — GPU-resident
+//!   path: the Windows capture thread copies the WGC texture into a keyed-mutex
+//!   shared `ID3D11Texture2D` and passes its share `HANDLE` (as `isize`). The
 //!   encoder thread acquires the keyed mutex, runs `VideoProcessorBlt` BGRA→NV12
-//!   entirely on the GPU, and feeds `MFCreateDXGISurfaceBuffer` to the MFT.
-//!
-//!   **Not yet produced in PR-2**: the capture side still sends `Cpu` only.
-//!   The encoder `GpuShared` match arm is marked `todo!()` with an explicit PR-3
-//!   comment; it is safe because no `GpuShared` value can be constructed from
-//!   production code in this PR.
-//!
-//! # PR-2 invariant
-//!
-//! `GpuShared` is syntactically complete so `select_encode_path` and the enum
-//! itself can be unit-tested, but the variant is NEVER CONSTRUCTED in PR-2
-//! production code.  The capture side always sends `Cpu`; the encoder pump_loop
-//! `GpuShared` arm is `todo!("PR-3: GPU resident path")`.  CI is green because
-//! `todo!()` only panics at runtime on a reachable code path.
+//!   on the GPU, and feeds `MFCreateDXGISurfaceBuffer` to the MFT.
 
-use sm_domain::CaptureFrame;
-
-/// Cross-thread frame carrier for the capture→encoder channel.
-///
-/// See module-level documentation for the PR-2 / PR-3 split invariant.
-#[derive(Debug)]
-pub enum FramePayload {
-    /// CPU-staged path: pixel data already in `Arc<[u8]>` (today's code, zero change).
-    Cpu(CaptureFrame),
-
-    /// GPU-resident path: shared DXGI texture handle + geometry + timestamp.
-    ///
-    /// **PR-2**: this variant is defined but NEVER CONSTRUCTED by production code.
-    /// The encoder match arm is `todo!("PR-3: GPU resident path")`.
-    GpuShared {
-        /// Cross-process shared handle for the keyed-mutex `ID3D11Texture2D` BGRA surface.
-        ///
-        /// # Safety (for future PR-3 implementor)
-        ///
-        /// The handle is valid only while the encoder thread holds the keyed mutex
-        /// (`IDXGIKeyedMutex::AcquireSync`). Release via `ReleaseSync` before the
-        /// next `CopyResource` on the capture side. The handle itself is not `Clone`
-        /// — ownership transfers through the channel; the capture side must not
-        /// re-use the HANDLE after the `FramePayload` is sent.
-        handle: isize, // raw HANDLE as isize for Send+Sync without unsafe marker
-
-        /// Surface width in pixels.
-        width: u32,
-        /// Surface height in pixels.
-        height: u32,
-        /// Row stride in bytes (BGRA8 source surface).
-        stride: u32,
-        /// Monotonic capture timestamp (same semantics as `CaptureFrame::timestamp`).
-        timestamp: std::time::Duration,
-    },
-}
+pub use sm_domain::FramePayload;
 
 #[cfg(test)]
 mod tests {
@@ -136,5 +90,18 @@ mod tests {
             Arc::ptr_eq(&inner.data, &data),
             "FramePayload::Cpu must not copy pixel data"
         );
+    }
+
+    /// T-FP-03: `GpuShared::timestamp()` accessor returns the variant's timestamp.
+    #[test]
+    fn gpu_shared_timestamp_accessor_returns_timestamp() {
+        let payload = FramePayload::GpuShared {
+            handle: 0x1234,
+            width: 2560,
+            height: 1440,
+            stride: 2560 * 4,
+            timestamp: Duration::from_millis(99),
+        };
+        assert_eq!(payload.timestamp(), Duration::from_millis(99));
     }
 }

@@ -54,6 +54,40 @@ pub fn build_video_encoder(
     build_video_encoder_with(config, hw_constructor, sw_constructor)
 }
 
+/// Build the best available encoder and, on the hardware (MFT) path, attach the
+/// GPU-resident capture↔encode hand-off (PR-4 / TASK-08) BEFORE the encoder is
+/// boxed/started.
+///
+/// The hand-off is set ONLY on the `WindowsMftH264Encoder` (the GPU-resident path is
+/// MFT-only). When the factory falls back to the software encoder (no HW MFT) the
+/// hand-off is dropped — the SW path never engages the GPU pipeline, so the capture
+/// side, seeing no encode LUID published, stays on the CPU-staged path.
+///
+/// Returns the boxed encoder. The caller passes the SAME `handoff` `Arc` to
+/// `WindowsCaptureSource::set_gpu_handoff` so both threads coordinate the gate.
+#[cfg(feature = "hw-encoder")]
+pub fn build_video_encoder_with_gpu_handoff(
+    config: EncoderConfig,
+    handoff: std::sync::Arc<crate::encode::gpu_handoff::GpuHandoff>,
+) -> Result<Box<dyn VideoEncoder + Send + Sync>, EncoderError> {
+    // env-var override: software encoder forced → no GPU path.
+    let force_sw = std::env::var("SCREEN_MIRROR_FORCE_SOFTWARE_ENCODER").as_deref() == Ok("1");
+    if !force_sw {
+        match WindowsMftH264Encoder::new(config.clone()) {
+            Ok(mut enc) => {
+                enc.set_gpu_handoff(handoff);
+                return Ok(Box::new(enc) as Box<dyn VideoEncoder + Send + Sync>);
+            }
+            Err(EncoderError::InitFailed(reason)) => {
+                log_sw_fallback_once(&reason);
+                // Fall through to SW (no GPU hand-off).
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    sw_constructor(config)
+}
+
 // ── Constructor type aliases (enable unit-test injection) ─────────────────────
 
 type HwResult = Result<Box<dyn VideoEncoder + Send + Sync>, EncoderError>;

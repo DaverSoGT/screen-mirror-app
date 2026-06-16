@@ -36,6 +36,7 @@ pub mod encode;
 pub use encode::EncodedPacket;
 pub use encode::EncoderConfig;
 pub use encode::EncoderError;
+pub use encode::FramePayload;
 pub use encode::RateControlMode;
 pub use encode::VideoEncoder;
 pub mod decode;
