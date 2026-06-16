@@ -68,6 +68,18 @@ pub const CAPTURE_CHANNEL_CAPACITY: usize = 4;
 /// frames arriving from WGC reset the heartbeat — no duplicates injected during motion.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Bounded keyed-mutex acquire timeout for the GPU producer on the WGC callback thread
+/// (Fix 5).
+///
+/// `GpuProducer::copy_frame_bounded` runs on the WGC `on_frame_arrived` thread. If the
+/// encoder (consumer) stalls or dies while holding a ring slot's keyed mutex, an INFINITE
+/// wait would hang the capture callback forever — no fallback, no teardown. A bounded wait of
+/// a few 60 fps frame intervals (~50ms) lets the producer detect the stall, degrade to
+/// CPU for the session, and keep the callback responsive. Mirrors the encoder side's
+/// ≤50ms `FRAME_RECV_TIMEOUT` philosophy.
+#[cfg(feature = "hw-encoder")]
+const GPU_ACQUIRE_TIMEOUT_MS: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // Phase 6 — Border detection (R9.1–R9.5)
 // ---------------------------------------------------------------------------
@@ -153,24 +165,15 @@ fn monitor_info_from(m: &Monitor, is_primary: bool) -> Result<MonitorInfo, Captu
 
 /// The most-recent frame's heartbeat descriptor.
 ///
-/// On the CPU-staged path this carries the last `CaptureFrame` (Arc refcount clone,
-/// no data copy). On the GPU-resident path it carries the last `GpuShared` descriptor
-/// (share handle + geometry) so the heartbeat can re-emit the same keyed-mutex texture
-/// (still holding the last frame's pixels — the producer does not overwrite it between
-/// heartbeats). The variant tracks whichever path the gate selected.
+/// Carries the last `CaptureFrame` (Arc refcount clone, no data copy). This is true on
+/// BOTH paths: the CPU-staged path snapshots the delivered frame directly, and the
+/// GPU-resident path snapshots a one-time CPU readback of the frame (Fix 3) so the
+/// static-content heartbeat NEVER re-emits a live shared-texture handle that another
+/// thread could overwrite. The heartbeat therefore always injects a stable `Cpu` frame.
 #[derive(Clone)]
 enum HeartbeatFrame {
-    /// CPU-staged: clone the last `CaptureFrame` (cheap Arc bump).
+    /// Re-inject the last `CaptureFrame` (cheap Arc bump) with an advanced timestamp.
     Cpu(CaptureFrame),
-    /// GPU-resident: re-emit the last shared keyed-mutex texture handle + geometry.
-    #[cfg(feature = "hw-encoder")]
-    Gpu {
-        handle: isize,
-        width: u32,
-        height: u32,
-        stride: u32,
-        timestamp: std::time::Duration,
-    },
 }
 
 impl HeartbeatFrame {
@@ -182,20 +185,6 @@ impl HeartbeatFrame {
                 f.timestamp = f.timestamp.saturating_add(delta);
                 FramePayload::Cpu(f)
             }
-            #[cfg(feature = "hw-encoder")]
-            HeartbeatFrame::Gpu {
-                handle,
-                width,
-                height,
-                stride,
-                timestamp,
-            } => FramePayload::GpuShared {
-                handle,
-                width,
-                height,
-                stride,
-                timestamp: timestamp.saturating_add(delta),
-            },
         }
     }
 }
@@ -486,53 +475,72 @@ impl WgcHandler {
             }
         }
 
-        let producer = self.gpu_producer.as_ref().expect("producer built above");
-
-        // Dimension guard: a resize would invalidate the shared texture. Degrade to
+        // Dimension guard: a resize would invalidate the shared textures. Degrade to
         // CPU (the encoder pipeline was negotiated at the original dims; rebuilding the
         // whole GPU chain mid-session is out of scope — REQ-05 graceful fallback).
-        if producer.dimensions() != (width, height) {
-            tracing::warn!(
-                target: "sm_infra::capture::windows",
-                "capture dims changed; degrading GPU path to CPU-staged for the session"
-            );
-            handoff.degrade_to_cpu();
-            self.gpu_degraded = true;
-            return GpuFrameOutcome::NotHandled;
+        {
+            let producer = self.gpu_producer.as_ref().expect("producer built above");
+            if producer.dimensions() != (width, height) {
+                tracing::warn!(
+                    target: "sm_infra::capture::windows",
+                    "capture dims changed; degrading GPU path to CPU-staged for the session"
+                );
+                handoff.degrade_to_cpu();
+                self.gpu_degraded = true;
+                return GpuFrameOutcome::NotHandled;
+            }
         }
 
-        // CopyResource the live WGC texture into the shared keyed-mutex texture.
+        // Fix 3: build the heartbeat snapshot as a CPU readback BEFORE the GPU copy,
+        // while the WGC frame's CPU buffer is still borrowable. GPU-mode heartbeats must
+        // NEVER re-emit a live shared-texture handle (another thread may overwrite it);
+        // instead, the static-content heartbeat re-injects this CPU copy of the last
+        // frame. The readback feeds ONLY the heartbeat snapshot — the real-time path
+        // below still sends `GpuShared` with no readback. On a busy screen heartbeats
+        // never fire, so this copy is wasted but cheap relative to the encode; on a
+        // static screen (where heartbeats matter) WGC delivers frames only rarely.
+        let heartbeat_snapshot = self.gpu_heartbeat_snapshot(frame, width, height, timestamp);
+
+        // CopyResource the live WGC texture into the NEXT ring slot (Fix 2: per-frame
+        // texture, no aliasing) with a BOUNDED keyed-mutex acquire (Fix 5: a stalled or
+        // dead consumer must not hang the WGC callback forever).
         // SAFETY: as_raw_texture() is WGC's live BGRA texture for this frame.
         let wgc_tex = frame.as_raw_texture();
-        if let Err(e) = unsafe { producer.copy_frame(wgc_tex) } {
-            // Device-removed / copy failure → degrade to CPU for the session (REQ-05;
-            // no per-frame retry). The encoder side independently degrades on its own
-            // device-removed error.
-            tracing::error!(
-                target: "sm_infra::capture::windows",
-                "GPU CopyResource failed ({e}); degrading to CPU-staged for the session"
-            );
-            handoff.degrade_to_cpu();
-            self.gpu_degraded = true;
-            return GpuFrameOutcome::NotHandled;
-        }
+        let producer = self.gpu_producer.as_mut().expect("producer built above");
+        let handle = match unsafe { producer.copy_frame_bounded(wgc_tex, GPU_ACQUIRE_TIMEOUT_MS) } {
+            Ok(h) => h,
+            Err(copy_err) => {
+                // Timeout / abandoned-mutex / device-removed / copy failure → degrade to
+                // CPU for the session (REQ-05; no per-frame retry). Do NOT block the WGC
+                // callback. The encoder side independently degrades on its own error.
+                match copy_err {
+                    crate::capture::gpu_producer::CopyError::Timeout => tracing::error!(
+                        target: "sm_infra::capture::windows",
+                        "GPU copy_frame keyed-mutex acquire timed out ({GPU_ACQUIRE_TIMEOUT_MS}ms) — consumer stalled; degrading to CPU for the session"
+                    ),
+                    crate::capture::gpu_producer::CopyError::Abandoned => tracing::error!(
+                        target: "sm_infra::capture::windows",
+                        "GPU copy_frame keyed mutex abandoned (consumer died holding it); degrading to CPU for the session"
+                    ),
+                    crate::capture::gpu_producer::CopyError::Encoder(e) => tracing::error!(
+                        target: "sm_infra::capture::windows",
+                        "GPU CopyResource failed ({e}); degrading to CPU-staged for the session"
+                    ),
+                }
+                handoff.degrade_to_cpu();
+                self.gpu_degraded = true;
+                return GpuFrameOutcome::NotHandled;
+            }
+        };
 
         let stride = width * 4; // BGRA8 shared texture stride (informational).
-        let handle = producer.share_handle();
 
-        // Update the heartbeat snapshot with the GPU descriptor so static-content
-        // heartbeats re-emit the same shared texture (it still holds this frame).
-        if let Ok(mut guard) = self.last_frame.lock() {
-            *guard = Some((
-                HeartbeatFrame::Gpu {
-                    handle,
-                    width,
-                    height,
-                    stride,
-                    timestamp,
-                },
-                std::time::Instant::now(),
-            ));
+        // Store the CPU heartbeat snapshot built above. The heartbeat thread re-emits a
+        // CPU frame — never the live shared-texture handle (Fix 3).
+        if let Some(hb_frame) = heartbeat_snapshot {
+            if let Ok(mut guard) = self.last_frame.lock() {
+                *guard = Some((hb_frame, std::time::Instant::now()));
+            }
         }
 
         let outcome = match self.tx.try_send(FramePayload::GpuShared {
@@ -559,6 +567,43 @@ impl WgcHandler {
 
         self.emit_capture_throughput_window();
         outcome
+    }
+
+    /// Build a CPU-backed heartbeat snapshot for a GPU frame (Fix 3).
+    ///
+    /// Reads the WGC frame's CPU buffer ONCE and wraps it in a `HeartbeatFrame::Cpu`
+    /// so the static-content heartbeat re-injects this stable copy instead of a live
+    /// shared-texture handle (which another thread could overwrite, aliasing pixels and
+    /// timestamps). Returns `None` if the buffer is momentarily unavailable — the caller
+    /// then leaves the previous snapshot in place rather than emitting a GPU handle.
+    ///
+    /// This is the only GPU-path CPU readback; the real-time `GpuShared` send stays
+    /// readback-free.
+    #[cfg(feature = "hw-encoder")]
+    fn gpu_heartbeat_snapshot(
+        &self,
+        frame: &mut Frame,
+        width: u32,
+        height: u32,
+        timestamp: std::time::Duration,
+    ) -> Option<HeartbeatFrame> {
+        let mut buf = match frame.buffer() {
+            Ok(b) => b,
+            Err(_) => return None, // buffer unavailable this frame — keep prior snapshot
+        };
+        let bytes: &[u8] = buf.as_raw_buffer();
+        let stride = (bytes.len() as u32)
+            .checked_div(height)
+            .unwrap_or(width * 4);
+        let data: Arc<[u8]> = Arc::from(bytes);
+        Some(HeartbeatFrame::Cpu(CaptureFrame {
+            data,
+            width,
+            height,
+            stride,
+            format: PixelFormat::Bgra8,
+            timestamp,
+        }))
     }
 
     /// Per-second observability window: emit capture_fps and capture drop-delta
@@ -644,9 +689,9 @@ fn heartbeat_loop(
 
         // Advance timestamp monotonically so the encoder + downstream RTP timestamps
         // see a regular cadence. `saturating_add` (inside into_payload_advanced) guards
-        // against overflow at the far end of a session lifetime. For the GPU variant this
-        // re-emits the same shared keyed-mutex texture handle (still holding the last
-        // frame's pixels — the producer does not overwrite it between heartbeats).
+        // against overflow at the far end of a session lifetime. The snapshot is always a
+        // CPU frame (Fix 3) — on the GPU path it is a one-time CPU readback taken when the
+        // frame was produced — so the heartbeat never references a live shared texture.
         let payload = frame.into_payload_advanced(HEARTBEAT_INTERVAL);
 
         // Reset the "last observed" instant so we don't immediately re-fire on the next

@@ -2138,6 +2138,9 @@ fn build_production_sender_bundle(
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
+    // GpuHandoff / build_video_encoder_with_gpu_handoff are gated behind sm-infra's
+    // `hw-encoder` feature, which is ON by default and LOAD-BEARING for this crate
+    // (see src-tauri/Cargo.toml). The production sender always wires the GPU hand-off.
     use sm_infra::encode::{GpuHandoff, build_video_encoder_with_gpu_handoff};
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{
@@ -2184,6 +2187,8 @@ fn build_production_sender_bundle(
     // with BOTH the capture source and the MFT encoder so the path-selection gate is
     // coordinated across the two threads. On a non-QSV or non-same-adapter machine the
     // gate resolves CpuStagedFallback and both sides run the CPU-staged path unchanged.
+    // hw-encoder is a load-bearing default of sm-infra (see src-tauri/Cargo.toml), so
+    // these symbols are always available in the production build.
     let gpu_handoff = GpuHandoff::new();
     capture.set_gpu_handoff(std::sync::Arc::clone(&gpu_handoff));
     let mut encoder =

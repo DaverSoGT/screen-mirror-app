@@ -97,12 +97,36 @@ impl GpuHandoff {
 
     /// Capture thread: record the path decided by `select_encode_path`. Called once
     /// after the capture LUID is known on the first frame.
+    ///
+    /// **CPU is sticky.** A `CpuStagedFallback` resolution — whether it originates
+    /// here or from [`Self::degrade_to_cpu`] — is FINAL for the session: a later
+    /// `resolve_path(GpuResident)` MUST NOT override it. This closes the TOCTOU where
+    /// a capture frame arriving between the encoder's `publish_encode_luid` and its
+    /// `degrade_to_cpu` could otherwise write `GpuResident` AFTER the encoder forced
+    /// CPU, stranding the session (producer emits `GpuShared` forever while the
+    /// consumer has no pipeline). We use compare-exchange so the CPU latch always wins:
+    ///
+    /// * resolving `GpuResident` succeeds only while the slot is still `UNRESOLVED`;
+    /// * resolving `CpuStagedFallback` always lands (it is the terminal state).
     pub(crate) fn resolve_path(&self, path: EncodePath) {
-        let tag = match path {
-            EncodePath::GpuResident => PATH_GPU,
-            EncodePath::CpuStagedFallback => PATH_CPU,
-        };
-        self.resolved_path.store(tag, Ordering::Release);
+        match path {
+            // GpuResident may only be written when nobody has resolved yet. If a CPU
+            // decision (resolve_path or degrade_to_cpu) already landed, the CAS fails
+            // and the CPU latch stands — no GPU write can clobber a CPU degrade.
+            EncodePath::GpuResident => {
+                let _ = self.resolved_path.compare_exchange(
+                    PATH_UNRESOLVED,
+                    PATH_GPU,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            // CpuStagedFallback is the terminal state: store unconditionally so it
+            // overrides a prior GpuResident as well as an unresolved slot.
+            EncodePath::CpuStagedFallback => {
+                self.resolved_path.store(PATH_CPU, Ordering::Release);
+            }
+        }
     }
 
     /// Read the resolved path: `None` until the capture thread has resolved it.
@@ -120,6 +144,12 @@ impl GpuHandoff {
     /// the GPU arm hits an unrecoverable device-removed error, the producer must stop
     /// emitting `GpuShared` and feed CPU frames for the rest of the session (no
     /// per-frame retry).
+    ///
+    /// This is the terminal CPU latch: it stores `PATH_CPU` unconditionally, and
+    /// [`Self::resolve_path`] guarantees no later `GpuResident` write can override it
+    /// (GPU resolution only succeeds from the `UNRESOLVED` state). Callable from EITHER
+    /// thread — the encoder thread on a device-lost / negotiation failure, the capture
+    /// thread on a producer/copy error — and remains correct under concurrent races.
     pub fn degrade_to_cpu(&self) {
         self.resolved_path.store(PATH_CPU, Ordering::Release);
     }
@@ -166,7 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_round_trips_gpu_and_cpu() {
+    fn resolve_path_round_trips_gpu_then_cpu_terminal() {
+        // From UNRESOLVED, GpuResident lands; CpuStagedFallback then overrides it
+        // (CPU is the terminal state).
         let h = GpuHandoff::new();
         h.resolve_path(EncodePath::GpuResident);
         assert_eq!(h.resolved_path(), Some(EncodePath::GpuResident));
@@ -184,6 +216,41 @@ mod tests {
             Some(EncodePath::CpuStagedFallback),
             "device-lost degradation must force CPU for the rest of the session"
         );
+    }
+
+    #[test]
+    fn cpu_is_sticky_against_a_later_gpu_resolve() {
+        // The TOCTOU guard (Fix 4): once any party resolves CPU, a late GpuResident
+        // write from the other thread must NOT override it. This is the exact race
+        // where capture's resolve_path(GpuResident) could otherwise land AFTER the
+        // encoder's degrade_to_cpu and strand the session.
+        let h = GpuHandoff::new();
+        h.degrade_to_cpu();
+        h.resolve_path(EncodePath::GpuResident);
+        assert_eq!(
+            h.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "a late GpuResident write must not clobber a prior CPU degrade"
+        );
+
+        // Same invariant when the CPU decision came via resolve_path, not degrade.
+        let h2 = GpuHandoff::new();
+        h2.resolve_path(EncodePath::CpuStagedFallback);
+        h2.resolve_path(EncodePath::GpuResident);
+        assert_eq!(
+            h2.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "CPU resolved via resolve_path is just as sticky as degrade_to_cpu"
+        );
+    }
+
+    #[test]
+    fn gpu_resolve_lands_only_from_unresolved() {
+        // Positive case: from UNRESOLVED, a GpuResident resolution succeeds.
+        let h = GpuHandoff::new();
+        assert_eq!(h.resolved_path(), None);
+        h.resolve_path(EncodePath::GpuResident);
+        assert_eq!(h.resolved_path(), Some(EncodePath::GpuResident));
     }
 
     #[test]

@@ -77,10 +77,17 @@ pub enum FramePayload {
         /// surface, stored as `isize` (the raw `HANDLE` value) so the domain crate
         /// names no platform type.
         ///
-        /// Ownership transfers through the channel: the producer must not reuse the
-        /// handle after sending. The consumer acquires the keyed mutex
-        /// (`IDXGIKeyedMutex::AcquireSync`) before reading and releases it
-        /// (`ReleaseSync`) afterwards.
+        /// This is a BORROW, not an ownership transfer: the producer retains ownership
+        /// of the underlying NT handle (closed only when the producer is dropped) and
+        /// the consumer opens its OWN reference via `OpenSharedResource1`. To avoid
+        /// pixel/timestamp aliasing, the producer cycles a small RING of distinct shared
+        /// textures (one keyed mutex each) and sends a DIFFERENT slot's handle per frame,
+        /// so the handle in each in-flight payload references that frame's own pixels —
+        /// the producer never overwrites a texture whose handle is still queued. The
+        /// consumer acquires the keyed mutex (`IDXGIKeyedMutex::AcquireSync`) before
+        /// reading and releases it (`ReleaseSync`) afterwards; the producer uses a
+        /// BOUNDED acquire on its side so a stalled consumer cannot hang the capture
+        /// callback.
         handle: isize,
         /// Surface width in pixels.
         width: u32,

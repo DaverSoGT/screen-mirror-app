@@ -182,6 +182,9 @@ impl VideoEncoder for WindowsOpenH264Encoder {
 
             let mut scratch = I420::new(1, 1); // resized on first frame
             let mut seq: u64 = 0;
+            // One-time observability flag: the SW encoder must never see GpuShared. If it
+            // does (a wiring bug), warn ONCE rather than spamming the log every frame.
+            let mut warned_unexpected_gpu_shared = false;
 
             loop {
                 // ── Stop check ────────────────────────────────────────────────
@@ -197,7 +200,17 @@ impl VideoEncoder for WindowsOpenH264Encoder {
                         // CPU-staged path; the path-selection gate never routes the
                         // GPU-resident `GpuShared` variant here. If one arrives it is
                         // a wiring bug — skip it rather than panic so the session
-                        // keeps running on subsequent CPU frames.
+                        // keeps running on subsequent CPU frames. Warn once for
+                        // observability (functionally a no-op skip otherwise).
+                        if !warned_unexpected_gpu_shared {
+                            warned_unexpected_gpu_shared = true;
+                            tracing::warn!(
+                                target: "sm_infra::encode::windows",
+                                "software encoder received an unexpected GpuShared frame — \
+                                 skipping (path-selection gate should never route GPU frames \
+                                 to the SW encoder; this indicates a wiring bug)"
+                            );
+                        }
                         continue;
                     }
                     Err(_) => break, // upstream sender dropped — normal shutdown

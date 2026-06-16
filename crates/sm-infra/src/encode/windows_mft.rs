@@ -1368,6 +1368,7 @@ fn run_encoder_thread(
         &mut output_format_known,
         &config,
         gpu_pipeline,
+        gpu_handoff.as_ref(),
     );
 
     // Steps 9a–9e: Notify end of stream and release.
@@ -1702,11 +1703,58 @@ fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
     );
 }
 
+/// `DXGI_ERROR_DEVICE_REMOVED` — the GPU device was lost (driver TDR, GPU reset,
+/// adapter removed). The whole D3D device + every resource derived from it is dead.
+const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+/// `DXGI_ERROR_DEVICE_RESET` — the device was reset (e.g. by a hung app); same
+/// consequence for us: the GPU pipeline must be abandoned for the session.
+const DXGI_ERROR_DEVICE_RESET: u32 = 0x887A_0007;
+
+/// Format the two device-lost HRESULTs for log clarity; returns `Some(name)` when the
+/// reason string contains a recognized device-removed/reset code, else `None`.
+///
+/// Policy note: on the GPU arm we degrade to CPU on ANY hard error (not only these two
+/// codes) to honor REQ-05's "no per-frame retry" — re-arming a possibly-dead GPU
+/// pipeline every frame would spin the device-lost error forever. This label only
+/// enriches the log when the error is a recognized device-lost code.
+fn device_lost_label(reason: &str) -> Option<&'static str> {
+    if reason.contains(&format!("0x{DXGI_ERROR_DEVICE_REMOVED:08X}")) {
+        Some("DXGI_ERROR_DEVICE_REMOVED")
+    } else if reason.contains(&format!("0x{DXGI_ERROR_DEVICE_RESET:08X}")) {
+        Some("DXGI_ERROR_DEVICE_RESET")
+    } else {
+        None
+    }
+}
+
+/// Permanently degrade the GPU path to CPU for the rest of the session (REQ-05, Fix 1).
+///
+/// Drops the local `gpu_pipeline` to `None` (so the consumer stops attempting the GPU
+/// arm and the "GpuShared but no pipeline" skip cannot loop) AND latches the shared
+/// `GpuHandoff` to CPU (so the capture thread stops emitting `GpuShared`; it already
+/// reverts when `resolved_path() != GpuResident`). Idempotent and safe to call once.
+fn degrade_gpu_to_cpu(
+    gpu_pipeline: &mut Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    gpu_handoff: Option<&Arc<crate::encode::gpu_handoff::GpuHandoff>>,
+    context: &str,
+) {
+    if gpu_pipeline.is_some() {
+        tracing::warn!(
+            target: "sm_infra::encode::windows_mft",
+            "pump_loop: degrading GPU path to CPU-staged for the session ({context})"
+        );
+    }
+    *gpu_pipeline = None;
+    if let Some(handoff) = gpu_handoff {
+        handoff.degrade_to_cpu();
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx, format state \
-              and the optional GPU pipeline — design §5a one-function pump shape; 9 args accepted \
-              over struct decomposition for clarity"
+    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx, format state, \
+              the optional GPU pipeline and the GPU hand-off latch — design §5a one-function pump \
+              shape; 10 args accepted over struct decomposition for clarity"
 )]
 fn pump_loop(
     mft: IMFTransform,
@@ -1720,7 +1768,15 @@ fn pump_loop(
     // GPU-resident pipeline, `Some` only when the GPU path was negotiated (PR-4
     // runtime). In PR-3 this is always `None`, so the FramePayload::GpuShared arm
     // is structurally present but unreachable (no producer constructs GpuShared).
-    gpu_pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    // Mutable so an unrecoverable GPU-arm error can tear the pipeline down to `None`
+    // for the rest of the session (device-lost degradation, REQ-05).
+    mut gpu_pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    // GPU hand-off latch (PR-4 / TASK-08, Fix 1). `Some` only when the GPU path is
+    // wired. On a GPU-arm device-removed/unrecoverable error the pump calls
+    // `degrade_to_cpu()` here so the capture thread STOPS emitting `GpuShared` and the
+    // session continues on the byte-identical CPU-staged path (no per-frame retry,
+    // no encoder-thread death). `None` runs the CPU path exactly as before.
+    gpu_handoff: Option<&Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 ) -> IMFTransform {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
     use std::sync::mpsc::RecvTimeoutError;
@@ -1979,7 +2035,18 @@ fn pump_loop(
                         );
                         ho_count -= 1;
                     } else {
-                        tracing::error!("pump_loop: collect_output failed: {e}");
+                        // Fix 1: a fatal ProcessOutput error (incl. device-removed/reset on the
+                        // GPU path) terminates this encoder thread — it can no longer pull output.
+                        // Before returning, degrade the GPU hand-off to CPU so the capture thread
+                        // STOPS emitting GpuShared and a subsequent session rebuild comes up on the
+                        // byte-identical CPU-staged path instead of re-arming a dead GPU device.
+                        match device_lost_label(&reason) {
+                            Some(label) => tracing::error!(
+                                "pump_loop: ProcessOutput device lost ({label}): {e}; degrading GPU hand-off and exiting"
+                            ),
+                            None => tracing::error!("pump_loop: collect_output failed: {e}"),
+                        }
+                        degrade_gpu_to_cpu(&mut gpu_pipeline, gpu_handoff, "ProcessOutput error");
                         return mft;
                     }
                 }
@@ -2088,9 +2155,27 @@ fn pump_loop(
                                             restore_pending_codec(state, &swap);
                                             return mft;
                                         }
-                                        tracing::warn!(
-                                            target: "sm_infra::encode::windows_mft",
-                                            "pump_loop: GPU ProcessInput failed (skipping frame): {e}"
+                                        // Fix 1: any other GPU-arm error is unrecoverable for the
+                                        // session — DO NOT retry the GPU arm per frame (REQ-05). A
+                                        // device-removed/reset (or any blt/open/ProcessInput hard
+                                        // failure) means the GPU pipeline is unusable; degrade to
+                                        // the byte-identical CPU-staged path for the rest of the
+                                        // session and keep the encoder thread alive. The capture
+                                        // side stops emitting GpuShared once the hand-off latches.
+                                        match device_lost_label(&reason) {
+                                            Some(label) => tracing::error!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU device lost ({label}): {e}; degrading to CPU for the session"
+                                            ),
+                                            None => tracing::warn!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU ProcessInput failed ({e}); degrading to CPU for the session"
+                                            ),
+                                        }
+                                        degrade_gpu_to_cpu(
+                                            &mut gpu_pipeline,
+                                            gpu_handoff,
+                                            "GPU submit error",
                                         );
                                         // Carry-forward #3b: ProcessInput did not consume the
                                         // pending bitrate (swap_pending_codec_settings already
@@ -2101,14 +2186,25 @@ fn pump_loop(
                                     }
                                 }
                             } else {
-                                // GpuShared received without a negotiated pipeline — a wiring
-                                // bug (the capture side must only emit GpuShared when the gate
-                                // selected GpuResident). Skip the frame; do not panic.
-                                tracing::error!(
+                                // GpuShared received without a live pipeline. Two cases:
+                                //  (a) brief drain of in-flight GpuShared frames AFTER Fix 1
+                                //      degraded the pipeline to None — expected, transient;
+                                //  (b) a genuine wiring bug (capture emitted GpuShared while
+                                //      the gate never selected GpuResident).
+                                // Either way: skip the frame, do not panic, and re-latch the
+                                // hand-off to CPU so the capture side stops emitting GpuShared
+                                // (idempotent if already degraded). The credit is NOT consumed
+                                // (ProcessInput was not called) — the frame is simply dropped.
+                                tracing::warn!(
                                     target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: GpuShared frame received but no GPU pipeline negotiated — skipping"
+                                    "pump_loop: GpuShared frame with no live GPU pipeline — dropping and latching CPU"
                                 );
                                 state.dropped.fetch_add(1, Ordering::Relaxed);
+                                degrade_gpu_to_cpu(
+                                    &mut gpu_pipeline,
+                                    gpu_handoff,
+                                    "GpuShared without pipeline",
+                                );
                                 restore_pending_codec(state, &swap);
                             }
                             // The GPU arm fully services (or skips) the frame above; continue
@@ -3222,4 +3318,63 @@ mod tests {
     // `nvenc_path_gate_selects_cpu_staged_fallback_task04` above. The remaining
     // `matches!(payload, FramePayload::Cpu(_))` check was tautological (the value
     // had just been constructed as Cpu). Removed rather than left misleading.
+
+    // ─── Fix 1: device-lost degradation helpers (pure logic, no COM) ──────────
+
+    #[test]
+    fn device_lost_label_recognizes_removed_and_reset() {
+        // The error strings are produced as "...: 0x{:08X}" by gpu_path/submit_gpu_frame.
+        let removed = format!("VideoProcessorBlt: 0x{DXGI_ERROR_DEVICE_REMOVED:08X}");
+        assert_eq!(
+            device_lost_label(&removed),
+            Some("DXGI_ERROR_DEVICE_REMOVED")
+        );
+        let reset = format!("OpenSharedResource1(bgra): 0x{DXGI_ERROR_DEVICE_RESET:08X}");
+        assert_eq!(device_lost_label(&reset), Some("DXGI_ERROR_DEVICE_RESET"));
+        // A non-device-lost error returns None (still degrades, but logged as a plain warn).
+        assert_eq!(device_lost_label("ProcessInput(dxgi): 0x80004005"), None);
+    }
+
+    #[test]
+    fn degrade_gpu_to_cpu_drops_pipeline_and_latches_handoff() {
+        // The local pipeline must drop to None (consumer stops attempting the GPU arm)
+        // AND the shared hand-off must latch CPU (producer stops emitting GpuShared).
+        // We use None for the pipeline (no real GPU needed) — the latch + None-set is
+        // the behavior under test; a real GpuEncodePipeline requires COM/hardware.
+        use crate::encode::gpu_handoff::GpuHandoff;
+        use crate::encode::path_select::EncodePath;
+
+        let handoff = GpuHandoff::new();
+        // Pretend the gate had resolved GPU.
+        handoff.resolve_path(EncodePath::GpuResident);
+        assert_eq!(handoff.resolved_path(), Some(EncodePath::GpuResident));
+
+        let mut pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline> = None;
+        degrade_gpu_to_cpu(&mut pipeline, Some(&handoff), "unit test");
+
+        assert!(pipeline.is_none(), "pipeline must be torn down to None");
+        assert_eq!(
+            handoff.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "degrade must latch the shared hand-off to CPU for the session"
+        );
+
+        // Idempotent + a later GpuResident resolve cannot un-degrade (Fix 4 stickiness).
+        degrade_gpu_to_cpu(&mut pipeline, Some(&handoff), "unit test repeat");
+        handoff.resolve_path(EncodePath::GpuResident);
+        assert_eq!(
+            handoff.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "CPU degrade is sticky against a later GPU resolve"
+        );
+    }
+
+    #[test]
+    fn degrade_gpu_to_cpu_without_handoff_is_safe() {
+        // No hand-off wired (CPU-only session): degrade must still null the pipeline and
+        // not panic.
+        let mut pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline> = None;
+        degrade_gpu_to_cpu(&mut pipeline, None, "no handoff");
+        assert!(pipeline.is_none());
+    }
 }
