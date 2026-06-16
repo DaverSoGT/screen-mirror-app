@@ -179,6 +179,16 @@ enum HeartbeatFrame {
 impl HeartbeatFrame {
     /// Advance the timestamp by `delta` (heartbeat cadence) and return a `FramePayload`
     /// to inject.
+    ///
+    /// In GPU-resident mode the heartbeat still injects a system-memory `FramePayload::Cpu`
+    /// (Fix 3), which the encoder feeds to the MFT via `submit_frame` (a memory-backed
+    /// `IMFSample`) even though the MFT was negotiated with a D3D device manager. This
+    /// relies on the standard MF contract that hardware encoders (QSV/NVENC) in D3D mode
+    /// still accept system-memory input samples; the MFT internally stages them. A driver
+    /// that rejects system-memory input surfaces a `ProcessInput` error, which the pump
+    /// already handles by degrading the whole session to the CPU-staged path — so the
+    /// worst case is a graceful CPU degrade, never undefined behavior. Heartbeats fire
+    /// only on a static screen (rare), so this path is cold.
     fn into_payload_advanced(self, delta: std::time::Duration) -> FramePayload {
         match self {
             HeartbeatFrame::Cpu(mut f) => {
@@ -551,16 +561,26 @@ impl WgcHandler {
             timestamp,
         }) {
             Ok(()) => {
+                // Fix 6: the frame is now QUEUED, so this slot is live. Advance the ring
+                // cursor ONLY here — the next frame writes the next slot, so the producer
+                // cannot overwrite this slot's pixels while its handle is still in the
+                // channel (no residual aliasing under backpressure).
+                if let Some(producer) = self.gpu_producer.as_mut() {
+                    producer.advance_after_send();
+                }
                 self.fps_frame_count += 1;
                 GpuFrameOutcome::Handled
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // Fix 6: the frame was DROPPED and never queued, so we DO NOT advance the
+                // cursor. The next frame reuses this same slot — safe, because this handle
+                // never entered the channel and nothing references this slot's pixels.
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 GpuFrameOutcome::Handled
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 // Consumer dropped the receiver — request session teardown (the caller
-                // owns `capture_control` and stops it).
+                // owns `capture_control` and stops it). No advance: the frame was not queued.
                 GpuFrameOutcome::HandledStop
             }
         };

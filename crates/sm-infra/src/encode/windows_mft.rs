@@ -2150,6 +2150,15 @@ fn pump_loop(
                                                 target: "sm_infra::encode::windows_mft",
                                                 "pump_loop: GPU MF_E_NOTACCEPTING — counter desync (should be unreachable): {e}"
                                             );
+                                            // Degrade-before-return for consistency with the
+                                            // ProcessOutput-error arm: stop the capture side
+                                            // emitting GpuShared even though this path is
+                                            // documented-unreachable.
+                                            degrade_gpu_to_cpu(
+                                                &mut gpu_pipeline,
+                                                gpu_handoff,
+                                                "GPU MF_E_NOTACCEPTING",
+                                            );
                                             // Re-arm codec atomics before the fatal return so
                                             // a pending bitrate/IDR is not silently lost.
                                             restore_pending_codec(state, &swap);
@@ -2162,6 +2171,14 @@ fn pump_loop(
                                         // the byte-identical CPU-staged path for the rest of the
                                         // session and keep the encoder thread alive. The capture
                                         // side stops emitting GpuShared once the hand-off latches.
+                                        //
+                                        // Asymmetry: a ProcessINPUT error (here) CONTINUES the
+                                        // thread on the CPU-staged path — input failure does not
+                                        // imply the MFT can no longer produce output. A
+                                        // ProcessOUTPUT error (collect_output arm above) instead
+                                        // RETURNS/tears down the thread — once the MFT cannot pull
+                                        // output the encode session is dead, so we degrade the
+                                        // hand-off and exit for a clean session rebuild.
                                         match device_lost_label(&reason) {
                                             Some(label) => tracing::error!(
                                                 target: "sm_infra::encode::windows_mft",
@@ -2361,6 +2378,12 @@ fn pump_loop(
 ///
 /// The `MFSampleExtension_CleanPoint` attribute is READ (not written) in `collect_output`
 /// for IDR detection — the output-side read path is unchanged (DD7).
+///
+/// This is also the path GPU-mode heartbeats use (Fix 3 re-injects a system-memory
+/// `FramePayload::Cpu`). Hardware encoders (QSV/NVENC) negotiated with a D3D device
+/// manager still accept system-memory input samples and stage them internally; a driver
+/// that rejects them returns a `ProcessInput` error here, which the pump turns into a
+/// graceful session-wide CPU degrade — never undefined behavior.
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,

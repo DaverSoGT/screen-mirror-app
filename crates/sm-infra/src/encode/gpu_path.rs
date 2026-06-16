@@ -450,11 +450,46 @@ impl GpuEncodePipeline {
         let keyed: IDXGIKeyedMutex = bgra_tex.cast().map_err(|e| {
             EncoderError::EncodeFailed(format!("cast IDXGIKeyedMutex: 0x{:08X}", e.code().0))
         })?;
-        // SAFETY: AcquireSync blocks until the producer's ReleaseSync; INFINITE wait
-        // is acceptable because the producer releases immediately after CopyResource.
-        unsafe { keyed.AcquireSync(KEYED_MUTEX_KEY, u32::MAX) }.map_err(|e| {
-            EncoderError::EncodeFailed(format!("KeyedMutex AcquireSync: 0x{:08X}", e.code().0))
-        })?;
+        // Read the RAW HRESULT from AcquireSync rather than the safe `-> Result<()>`
+        // wrapper. The INFINITE wait cannot return WAIT_TIMEOUT, but it CAN return
+        // WAIT_ABANDONED_0 (0x80) if the producer thread dies while holding the mutex —
+        // and 0x80 is a NON-NEGATIVE HRESULT, so windows-rs `.ok()` would wrongly report
+        // it as success and we would blt an undefined-state texture under the prior
+        // timestamp. Reading the numeric code lets us reject abandoned explicitly.
+        // SAFETY: `keyed` is a live IDXGIKeyedMutex; the AcquireSync vtable slot takes
+        // (this, key, milliseconds) and returns the raw HRESULT.
+        let hr = unsafe {
+            (Interface::vtable(&keyed).AcquireSync)(
+                Interface::as_raw(&keyed),
+                KEYED_MUTEX_KEY,
+                u32::MAX,
+            )
+        };
+        match hr.0 as u32 {
+            0x0000_0000 => {} // S_OK — mutex held, proceed to blt + release.
+            0x0000_0080 => {
+                // WAIT_ABANDONED_0: per Win32 we DID acquire the mutex (the prior owner
+                // died), so we MUST release it to not leave it held forever, but the
+                // texture contents are undefined — do NOT blt; surface the error so the
+                // encoder degrades.
+                // SAFETY: WAIT_ABANDONED_0 grants ownership, so this ReleaseSync is the
+                // balanced counterpart of the acquire above.
+                let _ = unsafe { keyed.ReleaseSync(KEYED_MUTEX_KEY) };
+                return Err(EncoderError::EncodeFailed(
+                    "KeyedMutex AcquireSync: WAIT_ABANDONED_0 (producer died holding the mutex)"
+                        .into(),
+                ));
+            }
+            // Any negative HRESULT is a genuine acquire failure; we do NOT hold the mutex,
+            // so we must NOT ReleaseSync.
+            other if other & 0x8000_0000 != 0 => {
+                return Err(EncoderError::EncodeFailed(format!(
+                    "KeyedMutex AcquireSync: 0x{other:08X}"
+                )));
+            }
+            // Other non-negative codes (e.g. S_FALSE) still mean we hold the mutex.
+            _ => {}
+        }
         let blt = self.gpu_bgra_to_nv12(bgra_tex);
         // SAFETY: ReleaseSync is paired with the AcquireSync above; it MUST run on
         // both the Ok and Err blt paths so the producer's next AcquireSync does not
