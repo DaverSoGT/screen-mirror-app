@@ -257,20 +257,24 @@ impl GpuProducer {
         (self.width, self.height)
     }
 
-    /// Copy the live WGC BGRA texture into the CURRENT ring slot with a BOUNDED keyed-mutex
-    /// acquire, returning that slot's share handle for `FramePayload::GpuShared`
-    /// (Fix 2 + Fix 5 + Fix 6).
+    /// Copy the live WGC BGRA texture into the CURRENT ring slot with a NON-BLOCKING
+    /// keyed-mutex acquire, returning that slot's share handle for `FramePayload::GpuShared`
+    /// (Fix 1 + Fix 2 + Fix 5 + Fix 6).
     ///
-    /// Acquires the current slot's keyed mutex with `timeout_ms` (NOT `INFINITE`),
-    /// `CopyResource`s, releases, and returns the per-frame handle WITHOUT advancing the
-    /// ring cursor. The caller advances the cursor via [`Self::advance_after_send`] ONLY
-    /// after a confirmed `try_send` success (Fix 6); a dropped frame reuses this same slot
-    /// next time, which is safe because its handle was never queued. Returning a distinct
-    /// handle per QUEUED frame (the ring) is what removes frame aliasing (Fix 2). The
-    /// bounded wait keeps the WGC `on_frame_arrived` callback thread from hanging forever
-    /// if a stalled or dead consumer holds the slot's mutex (Fix 5). The acquire/release
-    /// pair is balanced on BOTH the success and error paths so a failed copy cannot leave
-    /// the mutex held (which would deadlock the consumer).
+    /// Acquires the current slot's keyed mutex with `timeout_ms` (the caller passes `0` —
+    /// try-acquire — to kill judder; see `GPU_ACQUIRE_TIMEOUT_MS`), `CopyResource`s,
+    /// releases, and returns the per-frame handle WITHOUT advancing the ring cursor. The
+    /// caller advances the cursor via [`Self::advance_after_send`] ONLY after a confirmed
+    /// `try_send` success (Fix 6); a dropped frame reuses this same slot next time, which is
+    /// safe because its handle was never queued. Returning a distinct handle per QUEUED
+    /// frame (the ring) is what removes frame aliasing (Fix 2). The non-blocking wait keeps
+    /// the WGC `on_frame_arrived` callback thread from ever PARKING on the consumer's blt
+    /// (Fix 1: a 0–50ms stall on the callback thread was the judder source). The
+    /// acquire/release pair is balanced on BOTH the success and error paths so a failed copy
+    /// cannot leave the mutex held (which would deadlock the consumer).
+    ///
+    /// `acquire_wait` is an out-param: the elapsed time of the `AcquireSync` call, written
+    /// on every path (GATE B acquire-wait metric). With `timeout_ms == 0` it should be ~0.
     ///
     /// `IDXGIKeyedMutex::AcquireSync` does NOT return an `Err` for `WAIT_TIMEOUT` or
     /// `WAIT_ABANDONED_0`: both are NON-NEGATIVE `HRESULT`s, and windows-rs maps the call
@@ -280,9 +284,11 @@ impl GpuProducer {
     ///
     /// Failure classification (by raw numeric `HRESULT`):
     /// * `S_OK` (`0`) → mutex acquired; `CopyResource` + `ReleaseSync`, return the handle.
-    /// * `WAIT_TIMEOUT` (`0x102`) → [`CopyError::Timeout`] — consumer stalled holding the
-    ///   slot. We did NOT acquire it: do NOT copy, do NOT `ReleaseSync`. The caller degrades
-    ///   to CPU for the session instead of blocking.
+    /// * `WAIT_TIMEOUT` (`0x102`) → [`CopyError::Timeout`] — the consumer is mid-blt holding
+    ///   the slot. We did NOT acquire it: do NOT copy, do NOT `ReleaseSync`. With the
+    ///   non-blocking acquire this is transient contention, so the caller SKIPS this frame
+    ///   (drops it, counts it) WITHOUT degrading the session (Fix 1) — only genuine
+    ///   device-lost / non-timeout errors degrade to CPU.
     /// * `WAIT_ABANDONED_0` (`0x80`) → [`CopyError::Abandoned`] — the consumer thread died
     ///   while holding the mutex. Per Win32 keyed-mutex semantics an ABANDONED wait DOES
     ///   grant ownership to the caller (the mutex is now held by us), so we MUST `ReleaseSync`
@@ -297,6 +303,7 @@ impl GpuProducer {
         &mut self,
         wgc_tex: &ID3D11Texture2D,
         timeout_ms: u32,
+        acquire_wait: &mut std::time::Duration,
     ) -> Result<isize, CopyError> {
         let slot_idx = self.next;
 
@@ -306,6 +313,11 @@ impl GpuProducer {
         // which are exactly the codes we need to detect. Calling the vtable directly gives
         // us the numeric code so we can classify timeout / abandoned / success precisely.
         let keyed = &self.ring[slot_idx].keyed;
+        // GATE B metric #2: time the AcquireSync call. With a non-blocking acquire
+        // (timeout_ms == 0) this is ~0; under the old bounded wait it could be up to
+        // `timeout_ms`. Written to the out-param on EVERY path (success, timeout, abandoned,
+        // failed) so the caller can always record the wait into its per-second histogram.
+        let acquire_started = std::time::Instant::now();
         // SAFETY: `keyed` is a live IDXGIKeyedMutex for this slot; the AcquireSync vtable
         // slot takes (this, key, milliseconds) and returns the raw HRESULT. This is the
         // same call the windows-rs wrapper makes, minus the `.ok()` lossy mapping.
@@ -316,6 +328,7 @@ impl GpuProducer {
                 timeout_ms,
             )
         };
+        *acquire_wait = acquire_started.elapsed();
         // Classify the RAW numeric HRESULT through the shared decision function so the
         // exact branch logic this path depends on is unit-testable (the test feeds the
         // same codes and asserts the same outcomes). This is the real detection path.
@@ -454,7 +467,9 @@ fn classify_acquire_error(hr: u32) -> CopyError {
 /// Outcome of a bounded [`GpuProducer::copy_frame_bounded`] (Fix 5).
 #[derive(Debug)]
 pub(crate) enum CopyError {
-    /// The keyed-mutex acquire timed out (consumer stalled holding the slot). Degrade.
+    /// The keyed-mutex acquire timed out (consumer is mid-blt holding the slot). With the
+    /// non-blocking acquire (Fix 1) this is transient contention: the caller SKIPS the
+    /// frame WITHOUT degrading the session (only `Abandoned` / `Encoder` degrade).
     Timeout,
     /// The keyed mutex was abandoned (consumer died holding it). Degrade; the texture
     /// state is undefined so it must not be treated as a successful copy.

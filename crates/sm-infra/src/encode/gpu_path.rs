@@ -440,12 +440,19 @@ impl GpuEncodePipeline {
     /// The `AcquireSync`/`ReleaseSync` pair is balanced on BOTH the success and the
     /// error path (no leaked lock that would deadlock the producer's next acquire).
     ///
+    /// `blt_hold` (GATE B metric #3) is an out-param: the wall-clock span the consumer
+    /// HELD the keyed mutex (AcquireSync → ReleaseSync, the whole blt). The producer's
+    /// non-blocking acquire (Fix 1) skips a frame whenever this hold overlaps a capture
+    /// callback, so a long hold here directly maps to producer skips. Written on every
+    /// path that takes the lock.
+    ///
     /// # Safety
     /// `bgra_tex` MUST be a texture opened via [`Self::open_shared_bgra`] that
     /// exposes an `IDXGIKeyedMutex` (created with `SHARED_KEYEDMUTEX`).
     unsafe fn convert_shared_bgra_to_nv12(
         &self,
         bgra_tex: &ID3D11Texture2D,
+        blt_hold: &mut Duration,
     ) -> Result<(), EncoderError> {
         let keyed: IDXGIKeyedMutex = bgra_tex.cast().map_err(|e| {
             EncoderError::EncodeFailed(format!("cast IDXGIKeyedMutex: 0x{:08X}", e.code().0))
@@ -471,6 +478,9 @@ impl GpuEncodePipeline {
         const S_OK_HR: u32 = 0x0000_0000;
         const WAIT_ABANDONED_HR: u32 = 0x0000_0080;
         const HRESULT_FAILURE_BIT: u32 = 0x8000_0000;
+        // Default the out-param to zero so the abandoned / failed early-returns below report
+        // "no hold" (we did not blt). It is overwritten with the real span on the held path.
+        *blt_hold = Duration::ZERO;
         match hr.0 as u32 {
             S_OK_HR => {} // mutex held, proceed to blt + release.
             WAIT_ABANDONED_HR => {
@@ -496,11 +506,15 @@ impl GpuEncodePipeline {
             // Other non-negative codes (e.g. S_FALSE) still mean we hold the mutex.
             _ => {}
         }
+        // GATE B metric #3: time the span the mutex is HELD (here through ReleaseSync).
+        // This is exactly the window during which a producer try-acquire would skip.
+        let hold_started = std::time::Instant::now();
         let blt = self.gpu_bgra_to_nv12(bgra_tex);
         // SAFETY: ReleaseSync is paired with the AcquireSync above; it MUST run on
         // both the Ok and Err blt paths so the producer's next AcquireSync does not
         // deadlock. We use the same key so the texture returns to the unlocked state.
         let release = unsafe { keyed.ReleaseSync(KEYED_MUTEX_KEY) };
+        *blt_hold = hold_started.elapsed();
         blt?;
         release.map_err(|e| {
             EncoderError::EncodeFailed(format!("KeyedMutex ReleaseSync: 0x{:08X}", e.code().0))
@@ -517,15 +531,21 @@ impl GpuEncodePipeline {
     /// PR-3 `ManuallyDrop` input-view leak is NOT reintroduced because
     /// `gpu_bgra_to_nv12` drops its input view internally).
     ///
+    /// `blt_hold` (GATE B metric #3) reports the keyed-mutex hold span for this frame.
+    ///
     /// # Safety
     /// `handle` MUST be a live keyed-mutex NT share handle for a BGRA texture on a
     /// device sharing this pipeline's adapter LUID (gate-guaranteed same-adapter).
-    pub(crate) unsafe fn consume_shared_bgra(&self, handle: isize) -> Result<(), EncoderError> {
+    pub(crate) unsafe fn consume_shared_bgra(
+        &self,
+        handle: isize,
+        blt_hold: &mut Duration,
+    ) -> Result<(), EncoderError> {
         // SAFETY: handle contract forwarded from the caller (FramePayload::GpuShared).
         let bgra_tex = unsafe { self.open_shared_bgra(handle) }?;
         // SAFETY: bgra_tex was opened above with SHARED_KEYEDMUTEX, so it exposes an
         // IDXGIKeyedMutex. AcquireSync/ReleaseSync are balanced inside.
-        unsafe { self.convert_shared_bgra_to_nv12(&bgra_tex) }
+        unsafe { self.convert_shared_bgra_to_nv12(&bgra_tex, blt_hold) }
         // bgra_tex (and its keyed mutex cast) drop here → COM Release, no leak.
     }
 

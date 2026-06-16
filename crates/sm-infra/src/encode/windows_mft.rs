@@ -1836,6 +1836,10 @@ fn pump_loop(
     // I2 (D-PPT-2): per-second convert timing accumulator. Shares the encode_fps window
     // so all encoder-thread metrics reset at the same tick (one timestamp, one reset).
     let mut convert_stats = ConvertStats::default();
+    // GATE B metric #3: per-second consumer keyed-mutex blt-hold accumulator. Shares the
+    // encode_fps window so it resets at the same tick. Only the GPU arm records into it; on
+    // the CPU-staged path it stays empty and logs zero.
+    let mut blt_hold_stats = BltHoldStats::default();
     // I3 (D-PPT-3): snapshot of state.dropped at the last encode window boundary, used
     // to compute per-interval drop delta for the enc_to_sender channel.
     let mut last_dropped_enc_snapshot: u64 = 0;
@@ -1992,6 +1996,17 @@ fn pump_loop(
                             "convert throughput"
                         );
 
+                        // GATE B metric #3: consumer keyed-mutex blt-hold time. The producer's
+                        // non-blocking acquire skips a frame whenever a capture callback overlaps
+                        // this hold, so a high max here predicts producer skips on the capture side.
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            blt_hold_mean_ms = %format!("{:.2}", blt_hold_stats.mean_us() as f64 / 1000.0),
+                            blt_hold_max_ms = %format!("{:.2}", blt_hold_stats.max_us() as f64 / 1000.0),
+                            frames = blt_hold_stats.frames,
+                            "consumer blt-hold"
+                        );
+
                         // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
                         // state.dropped accumulates both drops from the TrySendError::Full arm
                         // above and dimension-mismatch drops from the drop site in the NeedInput
@@ -2012,6 +2027,7 @@ fn pump_loop(
 
                         // Reset all window-shared accumulators at the same boundary.
                         convert_stats.reset();
+                        blt_hold_stats.reset();
                         fps_frame_count = 0;
                         fps_window_start = std::time::Instant::now();
                     }
@@ -2123,14 +2139,19 @@ fn pump_loop(
                                 // submit, matching the CPU arm ordering — a forced IDR must
                                 // not be dropped on the GPU path.
                                 consume_force_keyframe(state, &codec_api);
+                                let mut blt_hold = std::time::Duration::ZERO;
                                 match submit_gpu_frame(
                                     &mft,
                                     pipe,
                                     handle,
                                     timestamp,
                                     frame_dur_100ns,
+                                    &mut blt_hold,
                                 ) {
                                     Ok(()) => {
+                                        // GATE B metric #3: accumulate the consumer keyed-mutex
+                                        // hold span (the window producer try-acquires skip on).
+                                        blt_hold_stats.record(blt_hold);
                                         current_ts = timestamp;
                                         ni_count -= 1;
                                         fire_pending_codec_settings(&codec_api, &swap);
@@ -2414,13 +2435,15 @@ fn submit_gpu_frame(
     shared_handle: isize,
     timestamp: std::time::Duration,
     duration_100ns: i64,
+    blt_hold: &mut std::time::Duration,
 ) -> Result<(), EncoderError> {
     // SAFETY: shared_handle is a live, same-adapter keyed-mutex NT share handle per
     // the FramePayload::GpuShared contract (the capture thread produced it on a device
     // that shares this pipeline's adapter LUID — enforced by the path-selection gate).
     // consume_shared_bgra opens it, AcquireSync → blt → ReleaseSync (balanced on all
     // paths), and releases the opened texture before returning (no per-frame leak).
-    unsafe { pipe.consume_shared_bgra(shared_handle) }?;
+    // `blt_hold` (GATE B metric #3) reports the keyed-mutex hold span for this frame.
+    unsafe { pipe.consume_shared_bgra(shared_handle, blt_hold) }?;
     let sample = pipe.build_dxgi_imfsample(timestamp, duration_100ns)?;
     unsafe {
         mft.ProcessInput(0, &sample, 0).map_err(|e| {
@@ -2719,6 +2742,59 @@ impl ConvertStats {
     fn reset(&mut self) {
         self.frames = 0;
         self.total_us = 0;
+    }
+}
+
+/// GATE B metric #3: per-second consumer keyed-mutex blt-hold accumulator.
+///
+/// Tracks frame count, cumulative hold microseconds (for the mean), and the exact max hold
+/// this window. Mirrors `ConvertStats` plus a `max_us` — the max is the diagnostic field
+/// (one long blt is what makes a producer try-acquire skip), kept exact while the mean gives
+/// the typical hold. Reset at the same window boundary as the other encoder-thread metrics.
+#[derive(Default)]
+struct BltHoldStats {
+    /// Number of GPU frames whose blt-hold was recorded this window.
+    frames: u32,
+    /// Cumulative hold duration of all recorded frames this window, in microseconds.
+    total_us: u64,
+    /// Exact maximum single-frame hold this window, in microseconds.
+    max_us: u64,
+}
+
+impl BltHoldStats {
+    /// Record one keyed-mutex hold span into the current window.
+    #[inline]
+    fn record(&mut self, dur: std::time::Duration) {
+        let us = dur.as_micros() as u64;
+        self.frames += 1;
+        self.total_us += us;
+        if us > self.max_us {
+            self.max_us = us;
+        }
+    }
+
+    /// Mean per-frame hold in microseconds over the current window (0 when empty).
+    #[inline]
+    fn mean_us(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_us / self.frames as u64
+        }
+    }
+
+    /// Exact max single-frame hold in microseconds over the current window.
+    #[inline]
+    fn max_us(&self) -> u64 {
+        self.max_us
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_us = 0;
+        self.max_us = 0;
     }
 }
 
