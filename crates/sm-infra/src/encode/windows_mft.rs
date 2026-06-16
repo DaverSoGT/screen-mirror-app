@@ -2150,14 +2150,19 @@ fn submit_frame(
 /// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07 GPU path).
 ///
 /// Opens the cross-thread shared BGRA texture by its handle on the encoder-thread
-/// device, runs `VideoProcessorBlt` BGRA→NV12 on the GPU, wraps the NV12 texture in
-/// an `MFCreateDXGISurfaceBuffer` sample, and feeds it to the MFT — no GPU→CPU
+/// device (PR-3: plain `OpenSharedResource`, no keyed-mutex acquire), runs
+/// `VideoProcessorBlt` BGRA→NV12 on the GPU, wraps the NV12 texture in an
+/// `MFCreateDXGISurfaceBuffer` sample, and feeds it to the MFT — no GPU→CPU
 /// readback, no rayon convert, no `MFCreateMemoryBuffer`. The CPU `submit_frame`
 /// path above is untouched and remains the byte-identical fallback (REQ-08).
 ///
 /// Reachable only when a `GpuEncodePipeline` was negotiated and a producer emitted
 /// `FramePayload::GpuShared`; in PR-3 there is no producer, so this is compiled and
 /// linked but not exercised at runtime (the keyed-mutex producer lands in PR-4).
+///
+/// TODO(PR-4): switch to `OpenSharedResource1` + `IDXGIKeyedMutex::AcquireSync`/
+/// `ReleaseSync` around the blt, per design D1 (PR-3 opens a plain shared texture
+/// without any keyed-mutex synchronization).
 fn submit_gpu_frame(
     mft: &IMFTransform,
     pipe: &crate::encode::gpu_path::GpuEncodePipeline,
@@ -2168,6 +2173,7 @@ fn submit_gpu_frame(
     // SAFETY: shared_handle is a live, same-adapter D3D11 share handle per the
     // FramePayload::GpuShared contract (the capture thread produced it on a device
     // that shares this pipeline's adapter LUID — enforced by the path-selection gate).
+    // PR-3 opens it via plain OpenSharedResource (no IDXGIKeyedMutex::AcquireSync).
     let bgra_tex = unsafe { pipe.open_shared_bgra(shared_handle) }?;
     pipe.gpu_bgra_to_nv12(&bgra_tex)?;
     let sample = pipe.build_dxgi_imfsample(timestamp, duration_100ns)?;

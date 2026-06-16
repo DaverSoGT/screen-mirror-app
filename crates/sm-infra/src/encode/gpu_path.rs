@@ -321,13 +321,18 @@ impl GpuEncodePipeline {
     }
 
     /// Open a cross-thread shared BGRA texture by its share handle on this
-    /// pipeline's device (TASK-08/PR-4 keyed-mutex hand-off consumer).
+    /// pipeline's device (PR-3 shared-texture hand-off consumer).
     ///
-    /// The handle comes from `FramePayload::GpuShared`: the capture thread does a
-    /// GPU `CopyResource` into a `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` texture
-    /// and sends the share handle. This opens it as an `ID3D11Texture2D` on the
-    /// encoder-thread device so [`Self::gpu_bgra_to_nv12`] can blt it. Returns an
+    /// The handle comes from `FramePayload::GpuShared`. In PR-3 this opens the
+    /// shared texture as an `ID3D11Texture2D` on the encoder-thread device via the
+    /// plain legacy `OpenSharedResource` API — there is NO keyed-mutex acquire here;
+    /// the texture is opened so [`Self::gpu_bgra_to_nv12`] can blt it. Returns an
     /// `EncodeFailed` error on an invalid handle rather than panicking.
+    ///
+    /// TODO(PR-4): switch to `OpenSharedResource1` + `IDXGIKeyedMutex::AcquireSync`/
+    /// `ReleaseSync` around the blt, per design D1. PR-4 produces the texture with
+    /// `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` and synchronizes the cross-thread
+    /// hand-off; PR-3 only opens a plain shared resource.
     ///
     /// # Safety
     /// `handle` MUST be a live D3D11 shared-resource handle produced on a device
@@ -337,9 +342,11 @@ impl GpuEncodePipeline {
         &self,
         handle: isize,
     ) -> Result<ID3D11Texture2D, EncoderError> {
-        // SAFETY: OpenSharedResource<T> takes a raw HANDLE and writes an owned T
-        // (here ID3D11Texture2D, the IID inferred from the type) on Ok. The caller's
-        // safety contract guarantees a live, same-adapter share handle.
+        // SAFETY: OpenSharedResource<T> (the legacy, non-keyed-mutex open API) takes
+        // a raw HANDLE and writes an owned T (here ID3D11Texture2D, the IID inferred
+        // from the type) on Ok. The caller's safety contract guarantees a live,
+        // same-adapter share handle. No IDXGIKeyedMutex::AcquireSync is performed in
+        // PR-3 (see the TODO(PR-4) above).
         let mut tex: Option<ID3D11Texture2D> = None;
         unsafe {
             self.device.OpenSharedResource(
@@ -397,7 +404,7 @@ impl GpuEncodePipeline {
         })?;
 
         // VideoProcessorBlt: BGRA → NV12 on the GPU.
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+        let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
             InputFrameOrField: 0,
@@ -409,19 +416,32 @@ impl GpuEncodePipeline {
             ppPastSurfacesRight: std::ptr::null_mut(),
             pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
             ppFutureSurfacesRight: std::ptr::null_mut(),
-        };
-        // SAFETY: video_processor + nv12_out_view are valid; `stream` borrows the
-        // input view for the duration of the call. ManuallyDrop releases the view
-        // when `stream` drops at end of scope (the COM ref is owned by the struct).
-        unsafe {
+        }];
+        // SAFETY: video_processor + nv12_out_view are valid; `streams` borrows the
+        // input view for the duration of the call.
+        let result = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.video_processor,
                 &self.nv12_out_view,
                 0,
-                &[stream],
+                &streams,
             )
         }
-        .map_err(|e| EncoderError::EncodeFailed(format!("VideoProcessorBlt: 0x{:08X}", e.code().0)))
+        .map_err(|e| {
+            EncoderError::EncodeFailed(format!("VideoProcessorBlt: 0x{:08X}", e.code().0))
+        });
+        // SAFETY: `D3D11_VIDEO_PROCESSOR_STREAM` is a windows-rs FFI struct with no
+        // `Drop`, and `ManuallyDrop` inhibits the inner `Option<...InputView>`'s
+        // destructor — so windows-rs requires the caller to release COM-interface
+        // fields manually. We drop `pInputSurface` here (releasing the one COM ref
+        // created above) on BOTH the success and error paths, before returning, to
+        // avoid leaking one `ID3D11VideoProcessorInputView` per converted frame.
+        // `pInputSurfaceRight` holds `None` (no COM ref) but is dropped for symmetry.
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface);
+            std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurfaceRight);
+        }
+        result
     }
 
     /// Wrap this pipeline's NV12 texture in a DXGI-surface-backed `IMFSample`
