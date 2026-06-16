@@ -16,14 +16,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-test = "0.2"
 sm-domain = { path = "crates/sm-domain" }
 sm-infra = { path = "crates/sm-infra" }
-
-# Vendored + patched windows-capture (judder fix — engram bugfix #1232).
-# The crates.io 2.0.0 release creates the WGC Direct3D11CaptureFramePool with a
-# single buffer (graphics_capture_api.rs Create/Recreate), which serializes the
-# synchronous FrameArrived callback latency into the inter-frame interval and locks
-# the QSV GpuResident path at ~30fps. The vendored copy under third_party/ bumps the
-# pool to NUMBER_OF_BUFFERS = 2 and is otherwise byte-identical to the published crate
-# (Cargo.toml preserved verbatim so transitive resolution does not drift — see
-# crates/sm-infra/Cargo.toml:45-46).
-[patch.crates-io]
-windows-capture = { path = "third_party/windows-capture" }
