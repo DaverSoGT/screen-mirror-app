@@ -465,9 +465,15 @@ impl GpuEncodePipeline {
                 u32::MAX,
             )
         };
+        // Named HRESULT codes for the raw AcquireSync classification. These mirror the
+        // producer side in `capture::gpu_producer`; they are Win32 ABI-fixed values, kept
+        // local to each side to avoid a capture<->encode coupling for three constants.
+        const S_OK_HR: u32 = 0x0000_0000;
+        const WAIT_ABANDONED_HR: u32 = 0x0000_0080;
+        const HRESULT_FAILURE_BIT: u32 = 0x8000_0000;
         match hr.0 as u32 {
-            0x0000_0000 => {} // S_OK — mutex held, proceed to blt + release.
-            0x0000_0080 => {
+            S_OK_HR => {} // mutex held, proceed to blt + release.
+            WAIT_ABANDONED_HR => {
                 // WAIT_ABANDONED_0: per Win32 we DID acquire the mutex (the prior owner
                 // died), so we MUST release it to not leave it held forever, but the
                 // texture contents are undefined — do NOT blt; surface the error so the
@@ -482,7 +488,7 @@ impl GpuEncodePipeline {
             }
             // Any negative HRESULT is a genuine acquire failure; we do NOT hold the mutex,
             // so we must NOT ReleaseSync.
-            other if other & 0x8000_0000 != 0 => {
+            other if other & HRESULT_FAILURE_BIT != 0 => {
                 return Err(EncoderError::EncodeFailed(format!(
                     "KeyedMutex AcquireSync: 0x{other:08X}"
                 )));

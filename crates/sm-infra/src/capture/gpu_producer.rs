@@ -362,7 +362,7 @@ impl GpuProducer {
     /// same slot is overwritten next frame — safe, because the dropped handle was never
     /// queued (Fix 6).
     pub(crate) fn advance_after_send(&mut self) {
-        self.next = (self.next + 1) % RING_LEN;
+        self.next = next_slot(self.next);
     }
 
     /// `CopyResource` the WGC texture into ring slot `slot_idx`. Caller holds the slot's
@@ -380,6 +380,13 @@ impl GpuProducer {
         unsafe { self.context.CopyResource(&dst, &src) };
         Ok(())
     }
+}
+
+/// Advance a ring cursor by one slot, modulo [`RING_LEN`]. A pure free function so that
+/// `advance_after_send` and its unit test exercise the SAME arithmetic — a regression in
+/// the step (wrong increment or a missing modulo) is then caught by the test.
+fn next_slot(cur: usize) -> usize {
+    (cur + 1) % RING_LEN
 }
 
 /// `S_OK` — the keyed mutex was acquired.
@@ -494,9 +501,10 @@ mod tests {
     fn advance_after_send_is_modular_and_dropped_send_reuses_slot() {
         // Fix 6: copy_frame_bounded does NOT advance; advance_after_send does, modulo
         // RING_LEN. A dropped send (no advance call) must leave the cursor put so the
-        // SAME slot is reused next frame. We exercise the cursor arithmetic directly.
+        // SAME slot is reused next frame. We drive the REAL `next_slot` helper that
+        // `advance_after_send` uses, so a regression in the step is caught here.
         let mut next = 0usize;
-        let advance = |n: &mut usize| *n = (*n + 1) % RING_LEN;
+        let advance = |n: &mut usize| *n = next_slot(*n);
 
         // Queue RING_LEN frames: cursor walks every slot and wraps to 0.
         for expected in 0..RING_LEN {
