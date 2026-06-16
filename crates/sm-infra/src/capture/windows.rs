@@ -277,6 +277,23 @@ fn hash_sample_due(counter: u32, every_n: u32) -> bool {
     every_n <= 1 || counter % every_n == 0
 }
 
+/// Decide whether the CPU-arm strided duplicate-pixel hash may sample THIS session
+/// (C: keep the only new per-frame CPU work off the NVENC callback).
+///
+/// `strided_pixel_hash` is a GATE B (metric #4) QSV diagnostic. The CPU-staged arm of
+/// `on_frame_arrived` runs on EVERY session that is not GPU-resident — including NVENC,
+/// which is the `CpuStagedFallback` path and MUST do zero new per-frame work versus master.
+/// We therefore sample the hash only when the session resolved to `GpuResident`; on NVENC
+/// (`CpuStagedFallback`) or before path resolution (`None`) the CPU callback skips it
+/// entirely. Pure decision so the gate is unit-testable without a live hand-off.
+#[cfg(feature = "hw-encoder")]
+fn cpu_hash_should_sample(resolved_path: Option<crate::encode::path_select::EncodePath>) -> bool {
+    matches!(
+        resolved_path,
+        Some(crate::encode::path_select::EncodePath::GpuResident)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Helper: map Monitor errors to CaptureError
 // ---------------------------------------------------------------------------
@@ -577,7 +594,20 @@ impl GraphicsCaptureApiHandler for WgcHandler {
         // the strided read of a write-combined buffer must NOT run on every CPU/NVENC frame —
         // that perturbed the smooth baseline GATE B compares against. The duplicate detector
         // stays a coarse secondary signal; the primary repeticiones signal is metric #5.
-        if self.hash_sample_due_now() {
+        //
+        // C: this is the ONLY new per-frame CPU work on the NVENC callback, so under
+        // `hw-encoder` we gate it to the QSV `GpuResident` session only — NVENC runs the
+        // CpuStagedFallback path and must stay byte-for-byte equal to master (zero new work).
+        // Without `hw-encoder` there is no NVENC and no path concept; the hash runs as before.
+        #[cfg(feature = "hw-encoder")]
+        let cpu_hash_enabled = cpu_hash_should_sample(
+            self.gpu_handoff
+                .as_ref()
+                .and_then(|h| h.resolved_path()),
+        );
+        #[cfg(not(feature = "hw-encoder"))]
+        let cpu_hash_enabled = true;
+        if cpu_hash_enabled && self.hash_sample_due_now() {
             self.record_emitted_hash(strided_pixel_hash(bytes));
         }
 
@@ -1705,6 +1735,27 @@ mod tests {
         assert!(
             gpu_readback_due(Some(base), well_past, HEARTBEAT_INTERVAL),
             "long after the last readback must be due"
+        );
+    }
+
+    /// C: the CPU-arm strided hash samples ONLY on the GpuResident session. NVENC runs the
+    /// CpuStagedFallback path and must do zero new per-frame work, so its hash gate is false;
+    /// the pre-resolution `None` state is also false (no work before the path is known).
+    #[cfg(feature = "hw-encoder")]
+    #[test]
+    fn cpu_hash_samples_only_on_gpu_resident_path() {
+        use crate::encode::path_select::EncodePath;
+        assert!(
+            cpu_hash_should_sample(Some(EncodePath::GpuResident)),
+            "the QSV GpuResident session is the only path that samples the CPU-arm hash"
+        );
+        assert!(
+            !cpu_hash_should_sample(Some(EncodePath::CpuStagedFallback)),
+            "NVENC (CpuStagedFallback) must do ZERO new per-frame work — no hash"
+        );
+        assert!(
+            !cpu_hash_should_sample(None),
+            "before the path resolves, the CPU callback must not sample the hash"
         );
     }
 
