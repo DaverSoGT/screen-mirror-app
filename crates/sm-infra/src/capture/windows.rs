@@ -439,6 +439,25 @@ struct WgcHandler {
     /// fix in `try_gpu_frame`), so a real frame never looks stale to `heartbeat_loop`.
     #[cfg(feature = "hw-encoder")]
     last_gpu_readback: Option<std::time::Instant>,
+    /// Fix 7: asynchronous GPU→CPU readback engine for the heartbeat snapshot. Owns a
+    /// ping-pong pool of `D3D11_USAGE_STAGING` textures + WGC's immediate context and does
+    /// a NON-BLOCKING `Map` (`D3D11_MAP_FLAG_DO_NOT_WAIT`), so the WGC callback thread never
+    /// stalls on a GPU→CPU pipeline flush (the judder source). Built lazily on the first GPU
+    /// frame from `frame.device()` / `frame.device_context()`. `None` until then.
+    #[cfg(feature = "hw-encoder")]
+    async_readback: Option<crate::capture::gpu_readback::AsyncReadback>,
+    /// Fix 7: reusable destination buffer for the async readback's tight-BGRA copy. Held on
+    /// the handler so the readback does NOT reallocate its staging-copy buffer per frame;
+    /// cleared and refilled in place each successful readback. (The owned `Arc<[u8]>` snapshot
+    /// handed to the heartbeat IS allocated per successful readback, but only at the ~10Hz
+    /// throttled rate on the cold heartbeat path — not on the per-frame hot path.)
+    #[cfg(feature = "hw-encoder")]
+    readback_buf: Vec<u8>,
+    /// GATE B confirmation metric (Fix 7): per-second histogram of the async readback step's
+    /// wall-clock (CopyResource issue + try-map + tight copy). After the blocking Map is gone
+    /// this max should be sub-millisecond. Logged as `readback_dur_max_ms`.
+    #[cfg(feature = "hw-encoder")]
+    readback_dur_stats: LatencyHistogram,
 }
 
 impl GraphicsCaptureApiHandler for WgcHandler {
@@ -480,6 +499,12 @@ impl GraphicsCaptureApiHandler for WgcHandler {
             gpu_degraded: false,
             #[cfg(feature = "hw-encoder")]
             last_gpu_readback: None,
+            #[cfg(feature = "hw-encoder")]
+            async_readback: None,
+            #[cfg(feature = "hw-encoder")]
+            readback_buf: Vec::new(),
+            #[cfg(feature = "hw-encoder")]
+            readback_dur_stats: LatencyHistogram::default(),
         })
     }
 
@@ -787,24 +812,64 @@ impl WgcHandler {
             }
         }
 
-        // Fix 3 + Fix 2: build the heartbeat snapshot as a CPU readback BEFORE the GPU copy,
-        // while the WGC frame's CPU buffer is still borrowable. GPU-mode heartbeats must
-        // NEVER re-emit a live shared-texture handle (another thread may overwrite it);
-        // instead, the static-content heartbeat re-injects this CPU copy of the last frame.
+        // Fix 7 + Fix 3 + Fix 2: refresh the heartbeat snapshot via an ASYNCHRONOUS GPU→CPU
+        // readback. GPU-mode heartbeats must NEVER re-emit a live shared-texture handle
+        // (another thread may overwrite it); instead, the static-content heartbeat re-injects
+        // this CPU copy of the last frame.
         //
-        // Fix 2 (throttle): we no longer run the full-frame readback on EVERY frame — that
-        // was a per-frame memcpy on a busy screen for a snapshot only the rare static-screen
-        // heartbeat reads. We refresh the snapshot PIXELS at most once per HEARTBEAT_INTERVAL
-        // (`gpu_readback_due`). The heartbeat FRESHNESS instant is refreshed separately on
-        // every real queued frame below, so a throttled readback NEVER makes a real frame
-        // look stale (that hole was the repeticiones source).
+        // Fix 7 (async): the snapshot readback used to call `windows-capture`'s `frame.buffer()`,
+        // which does a SYNCHRONOUS, BLOCKING GPU→CPU Map (full pipeline flush + CPU stall) ON
+        // this WGC callback thread. With the size-1 WGC frame pool that stall delayed the NEXT
+        // frame's delivery → non-uniform cadence → judder. We now issue a non-blocking
+        // `CopyResource` into our own ping-pong staging pool and try-map the OTHER slot with
+        // `D3D11_MAP_FLAG_DO_NOT_WAIT` (returns instead of stalling if the copy is still
+        // drawing). The snapshot is at most ~1 readback-interval (~100ms) stale, which is fine:
+        // the heartbeat consumes it only when the screen is static, where a slightly-stale copy
+        // equals the current frame.
+        //
+        // Fix 2 (throttle): we still gate the readback to at most once per HEARTBEAT_INTERVAL
+        // (`gpu_readback_due`) to limit iGPU copy work on a busy screen. The heartbeat FRESHNESS
+        // instant is refreshed separately on every real queued frame below, so a throttled
+        // readback NEVER makes a real frame look stale (that hole was the repeticiones source).
         let now_for_readback = std::time::Instant::now();
         let heartbeat_snapshot =
             if gpu_readback_due(self.last_gpu_readback, now_for_readback, HEARTBEAT_INTERVAL) {
-                let snap = self.gpu_heartbeat_snapshot(frame, width, height, timestamp);
+                // Lazily build the async readback engine on WGC's device + immediate context
+                // (the SAME device that owns the frame texture — `CopyResource` requires it).
+                if self.async_readback.is_none() {
+                    let device = frame.device();
+                    let context = frame.device_context();
+                    // SAFETY: device/context are WGC's live device + immediate context for this
+                    // capture thread, the same device that owns `frame.as_raw_texture()`.
+                    self.async_readback =
+                        Some(unsafe { crate::capture::gpu_readback::AsyncReadback::new(device, context) });
+                }
+                // SAFETY: as_raw_texture() is WGC's live BGRA texture for this frame, on the
+                // device the readback was built with.
+                let wgc_tex = frame.as_raw_texture();
+                // GATE B confirmation metric (Fix 7): time the whole async step (CopyResource
+                // issue + try-map + copy). Sub-millisecond once the blocking Map is gone.
+                let readback_started = std::time::Instant::now();
+                let snap = if let Some(rb) = self.async_readback.as_mut() {
+                    // SAFETY: wgc_tex lives on the readback's device; width/height are current.
+                    match unsafe { rb.readback(wgc_tex, width, height, &mut self.readback_buf) } {
+                        Some(stride) => Some(HeartbeatFrame::Cpu(CaptureFrame {
+                            data: Arc::from(self.readback_buf.as_slice()),
+                            width,
+                            height,
+                            stride,
+                            format: PixelFormat::Bgra8,
+                            timestamp,
+                        })),
+                        None => None, // still-drawing / first-frame / error — keep prior snapshot
+                    }
+                } else {
+                    None
+                };
+                self.readback_dur_stats.record(readback_started.elapsed());
                 // Mark the readback taken only if it actually produced pixels; a momentary
-                // buffer-unavailable (`None`) leaves `last_gpu_readback` so the next frame
-                // retries instead of waiting a full interval with no snapshot.
+                // still-drawing (`None`) leaves `last_gpu_readback` so the next frame retries
+                // instead of waiting a full interval with no snapshot.
                 if snap.is_some() {
                     self.last_gpu_readback = Some(now_for_readback);
                 }
@@ -992,43 +1057,6 @@ impl WgcHandler {
         self.last_emitted_hash = Some(hash);
     }
 
-    /// Build a CPU-backed heartbeat snapshot for a GPU frame (Fix 3).
-    ///
-    /// Reads the WGC frame's CPU buffer ONCE and wraps it in a `HeartbeatFrame::Cpu`
-    /// so the static-content heartbeat re-injects this stable copy instead of a live
-    /// shared-texture handle (which another thread could overwrite, aliasing pixels and
-    /// timestamps). Returns `None` if the buffer is momentarily unavailable — the caller
-    /// then leaves the previous snapshot in place rather than emitting a GPU handle.
-    ///
-    /// This is the only GPU-path CPU readback; the real-time `GpuShared` send stays
-    /// readback-free.
-    #[cfg(feature = "hw-encoder")]
-    fn gpu_heartbeat_snapshot(
-        &self,
-        frame: &mut Frame,
-        width: u32,
-        height: u32,
-        timestamp: std::time::Duration,
-    ) -> Option<HeartbeatFrame> {
-        let mut buf = match frame.buffer() {
-            Ok(b) => b,
-            Err(_) => return None, // buffer unavailable this frame — keep prior snapshot
-        };
-        let bytes: &[u8] = buf.as_raw_buffer();
-        let stride = (bytes.len() as u32)
-            .checked_div(height)
-            .unwrap_or(width * 4);
-        let data: Arc<[u8]> = Arc::from(bytes);
-        Some(HeartbeatFrame::Cpu(CaptureFrame {
-            data,
-            width,
-            height,
-            stride,
-            format: PixelFormat::Bgra8,
-            timestamp,
-        }))
-    }
-
     /// Per-second observability window: emit capture_fps and capture drop-delta
     /// (I1, D-PPT-1/3). Shared by the CPU and GPU producer paths.
     fn emit_capture_throughput_window(&mut self) {
@@ -1087,12 +1115,17 @@ impl WgcHandler {
             );
 
             // Metric #2 + Fix 1 skip count: GPU producer acquire wait + skipped frames.
+            // Fix 7 confirmation metric: `readback_dur_max_ms` is the max wall-clock of the
+            // async heartbeat readback step this window (CopyResource issue + non-blocking
+            // try-map + tight copy). After the blocking Map is removed this is sub-millisecond,
+            // which is the objective proof the GPU→CPU stall is gone.
             #[cfg(feature = "hw-encoder")]
             tracing::info!(
                 target: "sm_infra::capture::windows",
                 acquire_wait_max_ms = %format!("{:.1}", self.acquire_wait_stats.max_ms()),
                 acquire_wait_p99_ms = self.acquire_wait_stats.p99_ms(),
                 gpu_skips = self.gpu_skip_count,
+                readback_dur_max_ms = %format!("{:.3}", self.readback_dur_stats.max_ms()),
                 "capture gpu-producer contention"
             );
 
@@ -1107,6 +1140,7 @@ impl WgcHandler {
             {
                 self.acquire_wait_stats.reset();
                 self.gpu_skip_count = 0;
+                self.readback_dur_stats.reset();
             }
         }
     }
