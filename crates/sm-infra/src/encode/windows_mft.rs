@@ -1191,22 +1191,28 @@ fn run_encoder_thread(
     }
     tracing::debug!("setup_mft OK; entering pump_loop");
 
-    // PR-2 path-selection gate: evaluate ONCE at init; log the decision.
-    // TASK-08 will supply real capture/encode adapter LUIDs obtained from the
-    // capture device and the MFT adapter.  In PR-2 both LUIDs are 0 (placeholder),
-    // so the LUID-equality check passes (0 == 0) and only the vendor floor decides:
-    // an IntelQsv encoder selects GpuResident (logged), while every other vendor
-    // selects CpuStagedFallback. The GPU execution path is not yet implemented
-    // (PR-3), so the GpuResident arm is routed to the CPU-staged code below as well.
-    // BOTH arms therefore route to the existing CPU-staged code. Production
-    // behaviour is UNCHANGED.
-    {
+    // Path-selection gate + live D3D negotiation: evaluate ONCE at init.
+    //
+    // TASK-08/PR-4 will supply the real capture/encode adapter LUIDs (from the
+    // capture device and the MFT adapter) and the shared keyed-mutex D3D11 device
+    // produced by the capture-thread CopyResource hand-off. In PR-3 there is no
+    // GPU producer yet, so:
+    //   1. The gate still runs and logs the selected path (placeholder LUIDs).
+    //   2. negotiate_gpu_path_runtime receives `None` for the shared device and
+    //      therefore returns CpuStagedFallback + no pipeline — the session runs on
+    //      the CPU-staged path exactly as before. Production behaviour is UNCHANGED.
+    //
+    // The returned `gpu_pipeline: Option<GpuEncodePipeline>` is threaded into
+    // pump_loop. The FramePayload::GpuShared arm routes through it (TASK-06/07
+    // GPU code) instead of `todo!()`; the arm is unreachable at runtime until a
+    // producer exists (PR-4), but it compiles and links the real GPU path.
+    let gpu_pipeline = {
+        use crate::encode::gpu_path::negotiate_gpu_path_runtime;
         use crate::encode::path_select::{EncodePath, select_encode_path};
-        // Placeholder LUIDs until TASK-08 wires real adapter LUID reads.
-        // Using 0 for both so LUIDs differ-by-vendor-logic is the only gate,
-        // but since 0 == 0 the LUID check passes; vendor floor still applies.
-        // Net result in PR-2: IntelQsv → GpuResident logged but routed CPU (stub);
-        // all other vendors → CpuStagedFallback.
+
+        // Placeholder LUIDs until PR-4 wires real adapter LUID reads. With both 0
+        // the LUID-equality check passes (0 == 0); the vendor floor still applies,
+        // so only an IntelQsv encoder selects GpuResident here.
         let placeholder_capture_luid: i64 = 0;
         let placeholder_encode_luid: i64 = 0;
         let selected =
@@ -1215,35 +1221,31 @@ fn run_encoder_thread(
             target: "sm_infra::encode::windows_mft",
             path = ?selected,
             vendor = ?vendor,
-            "encode path selected at init (PR-2: GpuResident routes to CpuStagedFallback until PR-3)"
+            "encode path selected at init"
         );
-        // In PR-2 BOTH arms use the CPU path. PR-3 will branch on GpuResident.
-        // Also run the D3D negotiation seam (negotiate_gpu_path) so it is exercised
-        // at production init and is not dead code. In PR-2 no rejection is injected
-        // (None) — the stub returns GpuResident but we fall through to CPU regardless.
-        let negotiated = {
-            use crate::encode::path_select::negotiate_gpu_path;
-            // PR-2: no injection; PR-3 will pass the real MFT + D3D manager result.
-            negotiate_gpu_path(None)
-        };
+
+        let (w, h) = effective_dimensions(&config);
         match selected {
             EncodePath::GpuResident => {
-                // TODO(PR-3): wire GPU-resident path (VideoProcessorBlt + DXGI surface).
-                // negotiate_gpu_path already ran; if it returned CpuStagedFallback that
-                // would supersede GpuResident (handled in PR-3 wiring). In PR-2 both
-                // selected and negotiated are GpuResident → still route to CPU below.
+                // Run the live encoder-thread D3D negotiation. In PR-3 the shared
+                // device is None (no producer), so this returns CpuStagedFallback
+                // with no pipeline; in PR-4 it builds the real GPU pipeline or
+                // degrades via the TASK-05 fallback branch (WARN + CpuStagedFallback).
+                let (negotiated, pipeline) = negotiate_gpu_path_runtime(None, &mft, w, h, &config);
                 tracing::debug!(
                     target: "sm_infra::encode::windows_mft",
                     negotiated = ?negotiated,
-                    "GpuResident selected; routing to CpuStagedFallback until PR-3 GPU path"
+                    gpu_pipeline_active = pipeline.is_some(),
+                    "GpuResident selected; live negotiation complete"
                 );
+                pipeline
             }
             EncodePath::CpuStagedFallback => {
-                // Existing CPU path — no change required.
-                let _ = negotiated; // suppress unused warning in this arm
+                // Existing CPU path — the GPU pipeline is never built.
+                None
             }
         }
-    }
+    };
 
     // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
     // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
@@ -1285,6 +1287,8 @@ fn run_encoder_thread(
 
     // Step 8: Pump loop. mft is passed by value (owned) so it can be returned after
     // the stream ends. pump_loop takes ownership of mft, codec_api, and event_gen.
+    // gpu_pipeline is `Some` only when the GPU-resident path was negotiated (PR-4
+    // runtime); in PR-3 it is always `None` and the GpuShared arm is unreachable.
     let mft = pump_loop(
         mft,
         codec_api,
@@ -1294,6 +1298,7 @@ fn run_encoder_thread(
         tx,
         &mut output_format_known,
         &config,
+        gpu_pipeline,
     );
 
     // Steps 9a–9e: Notify end of stream and release.
@@ -1581,8 +1586,9 @@ fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx and format state \
-              — design §5a one-function pump shape; 8 args accepted over struct decomposition for clarity"
+    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx, format state \
+              and the optional GPU pipeline — design §5a one-function pump shape; 9 args accepted \
+              over struct decomposition for clarity"
 )]
 fn pump_loop(
     mft: IMFTransform,
@@ -1593,6 +1599,10 @@ fn pump_loop(
     tx: SyncSender<EncodedPacket>,
     output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
+    // GPU-resident pipeline, `Some` only when the GPU path was negotiated (PR-4
+    // runtime). In PR-3 this is always `None`, so the FramePayload::GpuShared arm
+    // is structurally present but unreachable (no producer constructs GpuShared).
+    gpu_pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline>,
 ) -> IMFTransform {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
     use std::sync::mpsc::RecvTimeoutError;
@@ -1884,17 +1894,70 @@ fn pump_loop(
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
                 Ok(raw_frame) => {
-                    // PR-2 FramePayload dispatch seam: wrap the received CaptureFrame
-                    // as FramePayload::Cpu so the routing match below is the single
-                    // authoritative dispatch point.  In PR-3 the capture side will
-                    // produce FramePayload::GpuShared; for now only Cpu is reachable.
+                    // FramePayload dispatch seam: wrap the received CaptureFrame as
+                    // FramePayload::Cpu so the routing match below is the single
+                    // authoritative dispatch point. The channel carries CaptureFrame
+                    // at the frozen VideoEncoder::start() boundary, so only the Cpu
+                    // variant can be produced here today; PR-4 adds a GpuShared producer
+                    // on the capture side via the keyed-mutex texture hand-off.
                     let payload = FramePayload::Cpu(raw_frame);
                     let frame = match payload {
                         FramePayload::Cpu(f) => f,
-                        FramePayload::GpuShared { .. } => {
-                            // PR-3: GPU-resident path (VideoProcessorBlt + DXGI surface
-                            // MFSample).  Not yet reachable — no producer in PR-2.
-                            todo!("PR-3: GPU resident path — GpuShared arm not yet implemented");
+                        FramePayload::GpuShared {
+                            handle,
+                            width,
+                            height,
+                            stride: _,
+                            timestamp,
+                        } => {
+                            // GPU-resident path (TASK-06/07): convert the shared BGRA
+                            // texture to NV12 on the GPU and feed the MFT a DXGI-surface
+                            // sample — no readback, no CPU convert, no MFCreateMemoryBuffer.
+                            //
+                            // Reachable only when a GpuEncodePipeline was negotiated AND a
+                            // producer constructed GpuShared. In PR-3 neither holds, so this
+                            // arm does not run at runtime; it compiles and links the real GPU
+                            // code path (gpu_path::GpuEncodePipeline) instead of `todo!()`.
+                            if let Some(pipe) = gpu_pipeline.as_ref() {
+                                debug_assert_eq!(
+                                    pipe.dimensions(),
+                                    (width, height),
+                                    "GpuShared frame dims must match the negotiated pipeline"
+                                );
+                                match submit_gpu_frame(
+                                    &mft,
+                                    pipe,
+                                    handle,
+                                    timestamp,
+                                    frame_dur_100ns,
+                                ) {
+                                    Ok(()) => {
+                                        current_ts = timestamp;
+                                        ni_count -= 1;
+                                        fire_pending_codec_settings(&codec_api, &swap);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "sm_infra::encode::windows_mft",
+                                            "pump_loop: GPU ProcessInput failed (skipping frame): {e}"
+                                        );
+                                        ni_count -= 1;
+                                    }
+                                }
+                            } else {
+                                // GpuShared received without a negotiated pipeline — a wiring
+                                // bug (the capture side must only emit GpuShared when the gate
+                                // selected GpuResident). Skip the frame; do not panic.
+                                tracing::error!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    "pump_loop: GpuShared frame received but no GPU pipeline negotiated — skipping"
+                                );
+                                state.dropped.fetch_add(1, Ordering::Relaxed);
+                                restore_pending_codec(state, &swap);
+                            }
+                            // The GPU arm fully services (or skips) the frame above; continue
+                            // the credit loop without falling through to the CPU convert path.
+                            continue;
                         }
                     };
                     if frame.width != cfg_w || frame.height != cfg_h {
@@ -2081,6 +2144,37 @@ fn submit_frame(
     unsafe {
         mft.ProcessInput(0, &sample, 0)
             .map_err(|e| EncoderError::EncodeFailed(format!("ProcessInput: 0x{:08X}", e.code().0)))
+    }
+}
+
+/// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07 GPU path).
+///
+/// Opens the cross-thread shared BGRA texture by its handle on the encoder-thread
+/// device, runs `VideoProcessorBlt` BGRA→NV12 on the GPU, wraps the NV12 texture in
+/// an `MFCreateDXGISurfaceBuffer` sample, and feeds it to the MFT — no GPU→CPU
+/// readback, no rayon convert, no `MFCreateMemoryBuffer`. The CPU `submit_frame`
+/// path above is untouched and remains the byte-identical fallback (REQ-08).
+///
+/// Reachable only when a `GpuEncodePipeline` was negotiated and a producer emitted
+/// `FramePayload::GpuShared`; in PR-3 there is no producer, so this is compiled and
+/// linked but not exercised at runtime (the keyed-mutex producer lands in PR-4).
+fn submit_gpu_frame(
+    mft: &IMFTransform,
+    pipe: &crate::encode::gpu_path::GpuEncodePipeline,
+    shared_handle: isize,
+    timestamp: std::time::Duration,
+    duration_100ns: i64,
+) -> Result<(), EncoderError> {
+    // SAFETY: shared_handle is a live, same-adapter D3D11 share handle per the
+    // FramePayload::GpuShared contract (the capture thread produced it on a device
+    // that shares this pipeline's adapter LUID — enforced by the path-selection gate).
+    let bgra_tex = unsafe { pipe.open_shared_bgra(shared_handle) }?;
+    pipe.gpu_bgra_to_nv12(&bgra_tex)?;
+    let sample = pipe.build_dxgi_imfsample(timestamp, duration_100ns)?;
+    unsafe {
+        mft.ProcessInput(0, &sample, 0).map_err(|e| {
+            EncoderError::EncodeFailed(format!("ProcessInput(dxgi): 0x{:08X}", e.code().0))
+        })
     }
 }
 

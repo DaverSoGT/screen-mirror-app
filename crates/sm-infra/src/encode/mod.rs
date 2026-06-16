@@ -5,6 +5,9 @@ pub mod bgra_to_nv12; // always-on; Linux/macOS CI catches stride bugs
 pub mod frame_payload; // always-on: FramePayload carrier (PR-2 seam)
 
 #[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+pub mod gpu_path; // encoder-thread GPU BGRA→NV12 + DXGI-surface MFT input (PR-3)
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
 pub mod path_select; // path-selection gate + EncodePath (PR-2 seam)
 
 #[cfg(target_os = "windows")]
