@@ -32,10 +32,10 @@
 //! before joining drain threads, interrupting any in-flight backoff sleep (AC-13).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sm_domain::session::{DeadReason, ReconnectPolicy, ReconnectTrigger, SessionState};
 use sm_domain::signaling::{IceCandidate, SdpAnswer, SignalingEvent};
@@ -54,6 +54,9 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_sender_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
+const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
+const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
+const QSV_WIFI_INPUT_FPS: u32 = 10;
 
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
@@ -2102,6 +2105,101 @@ fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn qsv_wifi_adaptive_env_enabled() -> bool {
+    std::env::var(QSV_WIFI_ADAPTIVE_ENV).as_deref() == Ok("1")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn qsv_wifi_input_pacing_enabled_for_backend(backend_name: &str, wifi_enabled: bool) -> bool {
+    wifi_enabled && backend_name == QSV_WIFI_BACKEND
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_qsv_wifi_input_pacer(
+    rx: Receiver<sm_domain::FramePayload>,
+    tx: SyncSender<sm_domain::FramePayload>,
+    stop_flag: Arc<AtomicBool>,
+    target_fps: u32,
+) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("sm-qsv-wifi-input-pacer".into())
+        .spawn(move || run_qsv_wifi_input_pacer(rx, tx, stop_flag, target_fps))
+}
+
+#[cfg(target_os = "windows")]
+fn run_qsv_wifi_input_pacer(
+    rx: Receiver<sm_domain::FramePayload>,
+    tx: SyncSender<sm_domain::FramePayload>,
+    stop_flag: Arc<AtomicBool>,
+    target_fps: u32,
+) {
+    const STOP_POLL: Duration = Duration::from_millis(50);
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
+    let mut next_send = Instant::now();
+    let mut window_start = Instant::now();
+    let mut forwarded = 0u64;
+    let mut coalesced_drops = 0u64;
+    let mut output_full_drops = 0u64;
+
+    while !stop_flag.load(Ordering::Acquire) {
+        let mut frame = match rx.recv_timeout(STOP_POLL) {
+            Ok(frame) => frame,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let now = Instant::now();
+        if now < next_send {
+            loop {
+                if stop_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                let wait = next_send.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
+                }
+                let timeout = wait.min(STOP_POLL);
+                match rx.recv_timeout(timeout) {
+                    Ok(newer) => {
+                        frame = newer;
+                        coalesced_drops += 1;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if Instant::now() >= next_send {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        }
+
+        while let Ok(newer) = rx.try_recv() {
+            frame = newer;
+            coalesced_drops += 1;
+        }
+
+        match tx.try_send(frame) {
+            Ok(()) => forwarded += 1,
+            Err(TrySendError::Full(_)) => output_full_drops += 1,
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+        next_send = Instant::now() + frame_interval;
+
+        let elapsed = window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let forwarded_fps = forwarded as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "[sm-qsv-wifi-input] forwarded_fps={forwarded_fps:.1} coalesced_drops={coalesced_drops} output_full_drops={output_full_drops}"
+            );
+            forwarded = 0;
+            coalesced_drops = 0;
+            output_full_drops = 0;
+            window_start = Instant::now();
+        }
+    }
+}
+
 /// Build the production sender bundle.
 ///
 /// Windows-only: `WindowsCaptureSource`, `WindowsOpenH264Encoder`, `Str0mVideoSender`,
@@ -2194,6 +2292,9 @@ fn build_production_sender_bundle(
     let mut encoder =
         build_video_encoder_with_gpu_handoff(encoder_config, std::sync::Arc::clone(&gpu_handoff))
             .map_err(|e| BundleError::Other(e.to_string()))?;
+    let backend_name = encoder.backend_name().to_string();
+    let qsv_wifi_input_pacing =
+        qsv_wifi_input_pacing_enabled_for_backend(&backend_name, qsv_wifi_adaptive_env_enabled());
 
     let transport_config = TransportConfig {
         udp_port,
@@ -2204,7 +2305,24 @@ fn build_production_sender_bundle(
         Str0mVideoSender::new(transport_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     // ── 2. Channels ───────────────────────────────────────────────────────────
-    let (capture_to_enc_tx, capture_to_enc_rx) = sync_channel(CHANNEL_CAP);
+    let capture_stage_cap = if qsv_wifi_input_pacing { 0 } else { CHANNEL_CAP };
+    let (capture_to_stage_tx, capture_to_stage_rx) = sync_channel(capture_stage_cap);
+    let (capture_to_enc_rx, qsv_wifi_pacer_handle) = if qsv_wifi_input_pacing {
+        // Rendezvous output: if the encoder is not waiting, drop this raw frame instead
+        // of buffering stale work ahead of the encoder.
+        let (paced_tx, paced_rx) = sync_channel(0);
+        let handle = spawn_qsv_wifi_input_pacer(
+            capture_to_stage_rx,
+            paced_tx,
+            _stop_flag.clone(),
+            QSV_WIFI_INPUT_FPS,
+        )
+        .map_err(|e| BundleError::Other(format!("qsv wifi input pacer spawn failed: {e}")))?;
+        eprintln!("[sm-qsv-wifi-input] enabled target_fps={QSV_WIFI_INPUT_FPS}");
+        (paced_rx, Some(handle))
+    } else {
+        (capture_to_stage_rx, None)
+    };
     let (enc_to_sender_tx, enc_to_sender_rx) = sync_channel(CHANNEL_CAP);
     let (sig_ev_tx, sig_ev_rx) = sync_channel(CHANNEL_CAP);
     let (tr_ev_tx, tr_ev_rx) = sync_channel(CHANNEL_CAP);
@@ -2216,7 +2334,7 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     capture
-        .start(capture_to_enc_tx)
+        .start(capture_to_stage_tx)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     encoder
@@ -2226,7 +2344,8 @@ fn build_production_sender_bundle(
     // Capture backend_name() BEFORE type erasure (DD2 ordering invariant).
     // `capture_backend_and_erase` is the only production call site for Arc::from(encoder);
     // move semantics prevent any ordering violation.
-    let (encoder_arc, backend_name) = capture_backend_and_erase(encoder);
+    let (encoder_arc, captured_backend_name) = capture_backend_and_erase(encoder);
+    debug_assert_eq!(backend_name, captured_backend_name);
     tracing::info!(target: "sender", backend = %backend_name, "encoder backend selected");
     sender.set_encoder(Arc::clone(&encoder_arc));
 
@@ -2580,6 +2699,7 @@ fn build_production_sender_bundle(
     // C1 fix: move production arcs into the shutdown closure so they outlive the
     // bundle-build call and are dropped in order ONLY when stop_sender_session runs.
     let shutdown: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _ = capture.stop();
         drop(capture);
         drop(sender_arc);
         drop(encoder_arc);
@@ -2616,8 +2736,13 @@ fn build_production_sender_bundle(
             escalation_disarmed_for_hook.store(true, Ordering::Relaxed);
         }));
 
+    let mut drain_handles = vec![sig_drain, tr_drain];
+    if let Some(handle) = qsv_wifi_pacer_handle {
+        drain_handles.push(handle);
+    }
+
     Ok(SenderBundle {
-        drain_handles: vec![sig_drain, tr_drain],
+        drain_handles,
         shutdown: Some(shutdown),
         backend_name,
         suppress_bye_on_rebuild,
@@ -3820,6 +3945,25 @@ mod tests {
             (1920, 1080),
             "helper must propagate the capture dimensions it is given"
         );
+    }
+
+    #[test]
+    fn qsv_wifi_input_pacing_gate_is_qsv_only() {
+        assert!(super::qsv_wifi_input_pacing_enabled_for_backend(
+            "hw_intel_qsv",
+            true
+        ));
+        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
+            "hw_intel_qsv",
+            false
+        ));
+        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
+            "hw_nvenc", true
+        ));
+        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
+            "sw_openh264",
+            true
+        ));
     }
 
     // ─── T4.2: encoder_config_default_framerate_stays_30 ─────────────────────────
