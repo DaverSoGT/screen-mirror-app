@@ -48,11 +48,14 @@ const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.45;
 // Minimum required gap between bufEnd and computed snap target (loop-protection
 // on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
 const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
+// If 'waiting' fires while already this close to the live edge, a backward
+// stall-snap only replays old frames and can present as a visible loop.
+const LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC = 0.2;
 // Stall-snap debounce window: suppress a 'waiting'-triggered snap if one already
 // executed within this many ms (kills the 95% back-to-back self-retrigger storm,
 // GATE-7). FIXED, short on purpose — prioritizes fast genuine-stall recovery; the
 // GATE-6 max feed gap (258 ms) fits just under it. Bypassed only on hard
-// starvation (rs<=1, D-PPT8-4); the effectiveness guard still gates that path.
+// starvation (rs<=2, D-PPT9-C); the effectiveness guard still gates that path.
 const LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS = 300;
 // ── rs<=2 hatch 2-strike threshold (Slice 10, D-PPT10-B) ─────────────────────
 // Consecutive rs<=2 'waiting' invocations (post-N1) required before the N2
@@ -928,8 +931,8 @@ function onVideoWaiting() {
   const rawTarget   = bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC;
   const target      = clampSnapTarget(buf, ct, rawTarget); // no-hole clamp (D-PPT9-B4)
   if (target === null) return; // no substantial range to land in — silent no-op
-  const now         = performance.now();
   const hardStarve  = VIDEO_EL.readyState <= 2; // was <=1; widened to rs<=2 (D-PPT9-C, locked D4)
+  const now         = performance.now();
   // N1 EFFECTIVENESS GUARD (runs first — gates ALL paths including escape hatch).
   // Suppresses futile re-snaps where neither ct nor bufEnd has advanced by > ADV_EPS
   // since the last EXECUTED snap baseline (the 147x dead-position storm, GATE-7).
@@ -949,14 +952,16 @@ function onVideoWaiting() {
     suppressedDebounceCount++;
     return;
   }
-  // N3 NO-OP KILL: eliminates the 438 exact seek-to-self events (target===ct).
-  // Placed after target is computed and before G6 so these events are attributed
-  // to suppressedGuardCount rather than silently disappearing in the S7 cushion path.
+  // N3 NO-OP KILL: eliminates exact seek-to-self events.
   if (target === ct) { suppressedGuardCount++; return; }
+  const drift = bufEnd - ct;
+  if (hardStarve && target < ct && drift >= 0 && drift <= LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC) {
+    suppressedGuardCount++;
+    return;
+  }
   // G6: cushion guard — prevent tight replay loops on sliver ranges.
   if (bufEnd - target < LIVE_EDGE_STALL_MIN_CUSHION_SEC) return;
   // Log BEFORE assignment (seekToLiveEdge precedent, D-PPT7-3).
-  const drift = bufEnd - ct;
   mseLog(
     "event=seek result=stall_snap from=" + ct.toFixed(3) +
     " to=" + target.toFixed(3) +
