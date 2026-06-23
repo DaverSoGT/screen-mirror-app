@@ -34,7 +34,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use str0m::bwe::Bitrate;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::SdpPendingOffer;
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
@@ -106,6 +106,11 @@ impl SenderShared {
 
 /// Latency-first: drain a worst-case IDR within one frame interval. See design D-PPT3-2.
 const PACER_HEADROOM: u64 = 4;
+/// WiFi/QSV safety margin: encode below the transport estimate so RTP/RTCP/RTX have room.
+const ADAPTIVE_ENCODER_BWE_NUM: u64 = 80;
+const ADAPTIVE_ENCODER_BWE_DEN: u64 = 100;
+const ADAPTIVE_QSV_BACKEND: &str = "hw_intel_qsv";
+const ADAPTIVE_QSV_WIFI_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 
 // ─── Str0mVideoSender ────────────────────────────────────────────────────────
 
@@ -277,6 +282,12 @@ impl VideoSender for Str0mVideoSender {
             // We need &mut rtc to add the candidate. Briefly borrow from pre_neg.
             // pre_neg is now owned locally.
             let mut rtc_tmp = pre_neg.rtc;
+            let adaptive_bitrate_enabled = sender_uses_adaptive_bitrate(&self.encoder);
+            if adaptive_bitrate_enabled {
+                rtc_tmp
+                    .bwe()
+                    .set_desired_bitrate(Bitrate::bps(self.config.bitrate_bps as u64));
+            }
             if let Some(cand) = local_candidate_opt {
                 rtc_tmp.add_local_candidate(cand);
             }
@@ -297,6 +308,7 @@ impl VideoSender for Str0mVideoSender {
 
             let state = Arc::clone(&self.state);
             let encoder = self.encoder.clone();
+            let configured_bitrate_bps = self.config.bitrate_bps;
 
             let handle = std::thread::Builder::new()
                 .name("sm-transport-sender".into())
@@ -310,6 +322,8 @@ impl VideoSender for Str0mVideoSender {
                         ctrl_rx,
                         state,
                         encoder,
+                        configured_bitrate_bps,
+                        adaptive_bitrate_enabled,
                     );
                 })
                 .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
@@ -462,9 +476,9 @@ impl Str0mVideoSender {
 /// Runs on the dedicated OS thread spawned by `start()`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "SansIO tick loop owns 8 distinct, non-aggregatable resources \
+    reason = "SansIO tick loop owns 10 distinct, non-aggregatable resources \
               (pre-neg state, UDP socket, local addr, packet receiver, event \
-              sender, control receiver, shared state, optional encoder); \
+              sender, control receiver, shared state, optional encoder, bitrate cap, adaptive flag); \
               bundling them into a struct adds indirection without simplifying \
               the loop's responsibilities"
 )]
@@ -477,6 +491,8 @@ fn run_sender_loop(
     ctrl_rx: std::sync::mpsc::Receiver<SenderControl>,
     state: Arc<SenderShared>,
     encoder: Option<Arc<dyn VideoEncoder + Send + Sync>>,
+    configured_bitrate_bps: u32,
+    adaptive_bitrate_enabled: bool,
 ) {
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
@@ -493,7 +509,6 @@ fn run_sender_loop(
     // Window boundary owned by the loop (design D-PPT3-4).
     let mut pace_stats = PaceStats::new();
     let mut pace_window_start = Instant::now();
-
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
         if state.stop.load(Ordering::Acquire) {
@@ -504,10 +519,12 @@ fn run_sender_loop(
         pace_stats.on_tick();
         let pace_elapsed = pace_window_start.elapsed();
         if pace_elapsed >= Duration::from_secs(1) {
-            let (ticks_s, pkts_s, max_burst) =
+            let (ticks_s, pkts_s, max_burst, frames_s, bytes_s, keyframes_s, write_drops) =
                 pace_stats.snapshot_per_s(pace_elapsed.as_secs_f64());
             eprintln!(
-                "[sm-sender-pace] ticks_per_s={ticks_s:.1} pkts_sent_per_s={pkts_s:.1} max_burst={max_burst}"
+                "[sm-sender-pace] ticks_per_s={ticks_s:.1} pkts_sent_per_s={pkts_s:.1} \
+                 max_burst={max_burst} frames_in_per_s={frames_s:.1} bytes_in_per_s={bytes_s:.0} \
+                 keyframes_in_per_s={keyframes_s:.1} writer_drops={write_drops}"
             );
             pace_stats.reset();
             pace_window_start = Instant::now();
@@ -590,6 +607,7 @@ fn run_sender_loop(
         if let Some(mid) = pre_neg.mid {
             if ice_ready {
                 while let Ok(pkt) = rx.try_recv() {
+                    pace_stats.on_frame_in(pkt.data.len(), pkt.is_keyframe);
                     // Resolve H264 PT lazily if not yet known.
                     if pre_neg.pt.is_none() {
                         if let Some(writer) = rtc.writer(mid) {
@@ -611,11 +629,13 @@ fn run_sender_loop(
                             if let Err(_e) =
                                 writer.write(pt, wallclock, rtp_time, pkt.data.as_ref())
                             {
+                                pace_stats.on_writer_drop();
                                 state.dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     } else {
                         // PT not yet resolved — drop this packet (pre-DTLS).
+                        pace_stats.on_writer_drop();
                         state.dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -652,6 +672,16 @@ fn run_sender_loop(
                     pace_stats.on_transmit();
                 }
                 Ok(Output::Event(ev)) => {
+                    if let Event::EgressBitrateEstimate(ref estimate) = ev {
+                        if adaptive_bitrate_enabled {
+                            eprintln!("[sm-sender-bwe] {}", format_bwe_estimate(estimate));
+                            maybe_apply_adaptive_encoder_bitrate(
+                                estimate,
+                                &encoder,
+                                configured_bitrate_bps,
+                            );
+                        }
+                    }
                     // Capture mid from MediaAdded; resolve PT lazily in the write path.
                     // `MediaAdded` fires once SDP negotiation is complete. We store the
                     // mid here so the packet write path knows when to start trying to
@@ -758,6 +788,80 @@ fn run_sender_loop(
     // Thread exits cleanly — socket dropped here.
 }
 
+fn format_bwe_estimate(estimate: &BweKind) -> String {
+    match estimate {
+        BweKind::Twcc(bitrate) => format!("kind=twcc bps={}", bitrate.as_u64()),
+        BweKind::Remb(mid, bitrate) => format!("kind=remb mid={mid} bps={}", bitrate.as_u64()),
+        _ => "kind=unknown".to_string(),
+    }
+}
+
+fn encoder_backend_uses_adaptive_bitrate(backend_name: &str) -> bool {
+    backend_name == ADAPTIVE_QSV_BACKEND
+}
+
+fn qsv_wifi_adaptive_bitrate_enabled() -> bool {
+    std::env::var(ADAPTIVE_QSV_WIFI_ENV).as_deref() == Ok("1")
+}
+
+fn sender_uses_adaptive_bitrate(encoder: &Option<Arc<dyn VideoEncoder + Send + Sync>>) -> bool {
+    sender_uses_adaptive_bitrate_when_enabled(encoder, qsv_wifi_adaptive_bitrate_enabled())
+}
+
+fn sender_uses_adaptive_bitrate_when_enabled(
+    encoder: &Option<Arc<dyn VideoEncoder + Send + Sync>>,
+    wifi_adaptive_enabled: bool,
+) -> bool {
+    if !wifi_adaptive_enabled {
+        return false;
+    }
+    encoder
+        .as_ref()
+        .is_some_and(|encoder| encoder_backend_uses_adaptive_bitrate(encoder.backend_name()))
+}
+
+fn bwe_estimate_bps(estimate: &BweKind) -> Option<u64> {
+    match estimate {
+        BweKind::Twcc(bitrate) | BweKind::Remb(_, bitrate) => Some(bitrate.as_u64()),
+        _ => None,
+    }
+}
+
+fn adaptive_target_bitrate_bps(estimate: &BweKind, configured_max_bps: u32) -> Option<u32> {
+    if configured_max_bps == 0 {
+        return None;
+    }
+    let safe_bps = bwe_estimate_bps(estimate)?.saturating_mul(ADAPTIVE_ENCODER_BWE_NUM)
+        / ADAPTIVE_ENCODER_BWE_DEN;
+    if safe_bps == 0 {
+        return None;
+    }
+    let target_bps = safe_bps.min(configured_max_bps as u64) as u32;
+    Some(target_bps)
+}
+
+fn maybe_apply_adaptive_encoder_bitrate(
+    estimate: &BweKind,
+    encoder: &Option<Arc<dyn VideoEncoder + Send + Sync>>,
+    configured_max_bps: u32,
+) -> Option<u32> {
+    let encoder = encoder.as_ref()?;
+    if !encoder_backend_uses_adaptive_bitrate(encoder.backend_name()) {
+        return None;
+    }
+    let target_bps = adaptive_target_bitrate_bps(estimate, configured_max_bps)?;
+    match encoder.set_bitrate(target_bps) {
+        Ok(()) => {
+            eprintln!("[sm-sender-bwe] adaptive_bitrate_request_bps={target_bps}");
+            Some(target_bps)
+        }
+        Err(e) => {
+            eprintln!("[sm-sender-bwe] adaptive_bitrate_error target_bps={target_bps} error={e}");
+            None
+        }
+    }
+}
+
 /// Return `true` if `ev` is the str0m event that should latch the ICE-ready gate.
 ///
 /// The latch fires for `Connected` and `Completed` because, with a single working
@@ -841,6 +945,10 @@ struct PaceStats {
     pkts: u64,
     max_burst: u32,
     cur_burst: u32,
+    frames_in: u64,
+    bytes_in: u64,
+    keyframes_in: u64,
+    writer_drops: u64,
 }
 
 impl PaceStats {
@@ -850,6 +958,10 @@ impl PaceStats {
             pkts: 0,
             max_burst: 0,
             cur_burst: 0,
+            frames_in: 0,
+            bytes_in: 0,
+            keyframes_in: 0,
+            writer_drops: 0,
         }
     }
 
@@ -864,6 +976,22 @@ impl PaceStats {
     fn on_transmit(&mut self) {
         self.cur_burst += 1;
         self.pkts += 1;
+    }
+
+    /// Called for every encoded frame accepted from the encoder→sender channel.
+    #[inline]
+    fn on_frame_in(&mut self, bytes: usize, is_keyframe: bool) {
+        self.frames_in += 1;
+        self.bytes_in += bytes as u64;
+        if is_keyframe {
+            self.keyframes_in += 1;
+        }
+    }
+
+    /// Called when `writer.write` cannot enqueue the encoded frame into str0m.
+    #[inline]
+    fn on_writer_drop(&mut self) {
+        self.writer_drops += 1;
     }
 
     /// Called after the `poll_output` drain exits (`Output::Timeout` reached).
@@ -890,13 +1018,24 @@ impl PaceStats {
     ///
     /// Precondition: the production caller only invokes this once `elapsed_secs`
     /// has reached ≥ 1 s, so it never reaches the zero-elapsed branch in practice.
-    fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32) {
+    fn snapshot_per_s(&self, elapsed_secs: f64) -> (f64, f64, u32, f64, f64, f64, u64) {
         if elapsed_secs <= 0.0 {
-            return (0.0, 0.0, self.max_burst);
+            return (0.0, 0.0, self.max_burst, 0.0, 0.0, 0.0, self.writer_drops);
         }
         let ticks_s = self.ticks as f64 / elapsed_secs;
         let pkts_s = self.pkts as f64 / elapsed_secs;
-        (ticks_s, pkts_s, self.max_burst)
+        let frames_s = self.frames_in as f64 / elapsed_secs;
+        let bytes_s = self.bytes_in as f64 / elapsed_secs;
+        let keyframes_s = self.keyframes_in as f64 / elapsed_secs;
+        (
+            ticks_s,
+            pkts_s,
+            self.max_burst,
+            frames_s,
+            bytes_s,
+            keyframes_s,
+            self.writer_drops,
+        )
     }
 
     /// Zeroes all fields.  Called after emitting the per-second log line.
@@ -905,6 +1044,10 @@ impl PaceStats {
         self.pkts = 0;
         self.max_burst = 0;
         self.cur_burst = 0;
+        self.frames_in = 0;
+        self.bytes_in = 0;
+        self.keyframes_in = 0;
+        self.writer_drops = 0;
     }
 }
 
@@ -913,7 +1056,7 @@ impl PaceStats {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc::sync_channel;
 
     use sm_domain::encode::{EncoderConfig, VideoEncoder};
@@ -921,7 +1064,11 @@ mod tests {
     use str0m::{Event, IceConnectionState};
 
     use super::bind_udp_socket_reusable;
-    use crate::transport::str0m_sender::{PaceStats, Str0mVideoSender, is_ice_ready_event};
+    use crate::transport::str0m_sender::{
+        PaceStats, Str0mVideoSender, adaptive_target_bitrate_bps,
+        encoder_backend_uses_adaptive_bitrate, format_bwe_estimate, is_ice_ready_event,
+        maybe_apply_adaptive_encoder_bitrate, sender_uses_adaptive_bitrate_when_enabled,
+    };
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
 
@@ -936,13 +1083,23 @@ mod tests {
     struct FakeEncoder {
         keyframe_called: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
+        bitrate: Arc<AtomicU32>,
+        bitrate_calls: Arc<AtomicU64>,
+        backend: &'static str,
     }
 
     impl FakeEncoder {
         fn new() -> Arc<Self> {
+            Self::new_with_backend("sw_fake")
+        }
+
+        fn new_with_backend(backend: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 keyframe_called: Arc::new(AtomicBool::new(false)),
                 dropped: Arc::new(AtomicU64::new(0)),
+                bitrate: Arc::new(AtomicU32::new(0)),
+                bitrate_calls: Arc::new(AtomicU64::new(0)),
+                backend,
             })
         }
     }
@@ -955,6 +1112,9 @@ mod tests {
             Ok(Self {
                 keyframe_called: Arc::new(AtomicBool::new(false)),
                 dropped: Arc::new(AtomicU64::new(0)),
+                bitrate: Arc::new(AtomicU32::new(0)),
+                bitrate_calls: Arc::new(AtomicU64::new(0)),
+                backend: "sw_fake",
             })
         }
 
@@ -974,7 +1134,9 @@ mod tests {
             self.keyframe_called.store(true, Ordering::Release);
         }
 
-        fn set_bitrate(&self, _bps: u32) -> Result<(), sm_domain::encode::EncoderError> {
+        fn set_bitrate(&self, bps: u32) -> Result<(), sm_domain::encode::EncoderError> {
+            self.bitrate.store(bps, Ordering::Release);
+            self.bitrate_calls.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -983,7 +1145,7 @@ mod tests {
         }
 
         fn backend_name(&self) -> &'static str {
-            "sw_fake"
+            self.backend
         }
     }
 
@@ -1857,7 +2019,7 @@ mod tests {
         assert_eq!(s.pkts, 10, "pkts must equal total on_transmit calls");
     }
 
-    /// Seed ticks=60, pkts=120, max_burst=4 → snapshot_per_s(1.0) returns (60.0, 120.0, 4).
+    /// Seed ticks=60, pkts=120, max_burst=4 → snapshot_per_s(1.0) returns the expected rates.
     ///
     /// Build 30 drains of 4 packets each (30×4 = 120 pkts, max_burst = 4), plus 60 ticks.
     #[test]
@@ -1873,7 +2035,8 @@ mod tests {
             }
             s.on_drain_end();
         }
-        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(1.0);
+        let (ticks_s, pkts_s, max_burst, frames_s, bytes_s, keyframes_s, writer_drops) =
+            s.snapshot_per_s(1.0);
         assert!(
             (ticks_s - 60.0).abs() < f64::EPSILON,
             "ticks_per_s must be 60.0, got {ticks_s}"
@@ -1883,6 +2046,30 @@ mod tests {
             "pkts_per_s must be 120.0, got {pkts_s}"
         );
         assert_eq!(max_burst, 4, "max_burst must be 4");
+        assert_eq!(frames_s, 0.0, "frames_in_per_s must default to 0");
+        assert_eq!(bytes_s, 0.0, "bytes_in_per_s must default to 0");
+        assert_eq!(keyframes_s, 0.0, "keyframes_in_per_s must default to 0");
+        assert_eq!(writer_drops, 0, "writer_drops must default to 0");
+    }
+
+    /// Frame ingress counters expose whether encoder output reaches the sender/pacer seam.
+    #[test]
+    fn pace_stats_frame_ingress_rates() {
+        let mut s = PaceStats::new();
+        s.on_frame_in(100, false);
+        s.on_frame_in(300, true);
+        s.on_writer_drop();
+
+        let (_ticks_s, _pkts_s, _max_burst, frames_s, bytes_s, keyframes_s, writer_drops) =
+            s.snapshot_per_s(2.0);
+
+        assert_eq!(frames_s, 1.0, "two frames over two seconds = 1 fps");
+        assert_eq!(bytes_s, 200.0, "400 bytes over two seconds = 200 B/s");
+        assert_eq!(keyframes_s, 0.5, "one keyframe over two seconds = 0.5 fps");
+        assert_eq!(
+            writer_drops, 1,
+            "writer_drops must be a cumulative window count"
+        );
     }
 
     /// snapshot_per_s(0.0): the non-positive-elapsed early return makes the seam
@@ -1894,7 +2081,8 @@ mod tests {
         s.on_tick();
         s.on_transmit();
         s.on_drain_end();
-        let (ticks_s, pkts_s, max_burst) = s.snapshot_per_s(0.0);
+        let (ticks_s, pkts_s, max_burst, frames_s, bytes_s, keyframes_s, writer_drops) =
+            s.snapshot_per_s(0.0);
         assert!(
             ticks_s.is_finite(),
             "ticks_per_s must be finite for zero elapsed, got {ticks_s}"
@@ -1904,6 +2092,10 @@ mod tests {
             "pkts_per_s must be finite for zero elapsed, got {pkts_s}"
         );
         assert_eq!(max_burst, 1, "max_burst is unaffected by the denominator");
+        assert_eq!(frames_s, 0.0);
+        assert_eq!(bytes_s, 0.0);
+        assert_eq!(keyframes_s, 0.0);
+        assert_eq!(writer_drops, 0);
 
         // Realistic large counters: a floored f64::MIN_POSITIVE denominator
         // would overflow these to +inf. The early return must yield exact 0.0.
@@ -1915,7 +2107,8 @@ mod tests {
             big.on_transmit();
         }
         big.on_drain_end();
-        let (ticks_s, pkts_s, max_burst) = big.snapshot_per_s(0.0);
+        let (ticks_s, pkts_s, max_burst, _frames_s, _bytes_s, _keyframes_s, _writer_drops) =
+            big.snapshot_per_s(0.0);
         assert_eq!(
             ticks_s, 0.0,
             "ticks_per_s must be exactly 0.0 for zero elapsed, got {ticks_s}"
@@ -1940,5 +2133,105 @@ mod tests {
         assert_eq!(s.pkts, 0, "pkts must be 0 after reset");
         assert_eq!(s.max_burst, 0, "max_burst must be 0 after reset");
         assert_eq!(s.cur_burst, 0, "cur_burst must be 0 after reset");
+        assert_eq!(s.frames_in, 0, "frames_in must be 0 after reset");
+        assert_eq!(s.bytes_in, 0, "bytes_in must be 0 after reset");
+        assert_eq!(s.keyframes_in, 0, "keyframes_in must be 0 after reset");
+        assert_eq!(s.writer_drops, 0, "writer_drops must be 0 after reset");
+    }
+
+    #[test]
+    fn format_bwe_estimate_twcc_uses_raw_bps() {
+        let estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(1_234_567));
+
+        let formatted = format_bwe_estimate(&estimate);
+
+        assert_eq!(formatted, "kind=twcc bps=1234567");
+    }
+
+    #[test]
+    fn adaptive_target_bitrate_uses_wifi_headroom_and_clamps() {
+        let estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(1_000_000));
+        let low_estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(100_000));
+        let zero_estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(0));
+        let high_estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(20_000_000));
+
+        assert_eq!(
+            adaptive_target_bitrate_bps(&estimate, 4_000_000),
+            Some(800_000)
+        );
+        assert_eq!(
+            adaptive_target_bitrate_bps(&low_estimate, 4_000_000),
+            Some(80_000)
+        );
+        assert_eq!(adaptive_target_bitrate_bps(&zero_estimate, 4_000_000), None);
+        assert_eq!(
+            adaptive_target_bitrate_bps(&high_estimate, 4_000_000),
+            Some(4_000_000)
+        );
+    }
+
+    #[test]
+    fn adaptive_bitrate_backend_gate_is_qsv_only() {
+        assert!(encoder_backend_uses_adaptive_bitrate("hw_intel_qsv"));
+        assert!(!encoder_backend_uses_adaptive_bitrate("hw_nvenc"));
+        assert!(!encoder_backend_uses_adaptive_bitrate("sw_openh264"));
+    }
+
+    #[test]
+    fn sender_adaptive_gate_excludes_nvenc_encoder() {
+        let qsv = Some(
+            FakeEncoder::new_with_backend("hw_intel_qsv") as Arc<dyn VideoEncoder + Send + Sync>
+        );
+        let nvenc = Some(
+            FakeEncoder::new_with_backend("hw_nvenc") as Arc<dyn VideoEncoder + Send + Sync>
+        );
+
+        assert!(sender_uses_adaptive_bitrate_when_enabled(&qsv, true));
+        assert!(!sender_uses_adaptive_bitrate_when_enabled(&qsv, false));
+        assert!(!sender_uses_adaptive_bitrate_when_enabled(&nvenc, true));
+        assert!(!sender_uses_adaptive_bitrate_when_enabled(&None, true));
+    }
+
+    #[test]
+    fn adaptive_bitrate_applies_to_qsv_encoder() {
+        let enc = FakeEncoder::new_with_backend("hw_intel_qsv");
+        let bitrate = Arc::clone(&enc.bitrate);
+        let bitrate_calls = Arc::clone(&enc.bitrate_calls);
+        let encoder = Some(enc as Arc<dyn VideoEncoder + Send + Sync>);
+        let estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(1_000_000));
+
+        let applied = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
+
+        assert_eq!(applied, Some(800_000));
+        assert_eq!(bitrate.load(Ordering::Acquire), 800_000);
+        assert_eq!(bitrate_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn adaptive_bitrate_retries_until_apply_confirmation_exists() {
+        let enc = FakeEncoder::new_with_backend("hw_intel_qsv");
+        let bitrate_calls = Arc::clone(&enc.bitrate_calls);
+        let encoder = Some(enc as Arc<dyn VideoEncoder + Send + Sync>);
+        let estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(1_000_000));
+
+        let first = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
+        let second = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
+
+        assert_eq!(first, Some(800_000));
+        assert_eq!(second, Some(800_000));
+        assert_eq!(bitrate_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn adaptive_bitrate_does_not_touch_nvenc_encoder() {
+        let enc = FakeEncoder::new_with_backend("hw_nvenc");
+        let bitrate = Arc::clone(&enc.bitrate);
+        let encoder = Some(enc as Arc<dyn VideoEncoder + Send + Sync>);
+        let estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(1_000_000));
+
+        let applied = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
+
+        assert_eq!(applied, None);
+        assert_eq!(bitrate.load(Ordering::Acquire), 0);
     }
 }
