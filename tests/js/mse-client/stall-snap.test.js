@@ -148,7 +148,7 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
   // ── T-S7-1: Registration — dispatchEvent('waiting') triggers snap ─────────
   it('T-S7-1: dispatchEvent(waiting) fires snap + log result=stall_snap', () => {
-    sb.buffered = makeBuffered(0, 10.300);
+    sb.buffered = makeBuffered(0, 10.320);
     videoEl.currentTime = 10.016;
 
     videoEl.dispatchEvent(new Event('waiting'));
@@ -156,17 +156,18 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     const lines = getMseLogLines(tauri);
     // S7-4-SC1: mseLog called exactly once (spec "exactly once")
     expect(lines.length).toBe(1);
-    // S10: bufEnd=10.300, ct=10.016, target=10.300-0.450=9.850, drift=0.284.
+    // Gate B threshold update: drift must stay above 0.300 to allow recovery.
+    // bufEnd=10.320, ct=10.016, target=10.320-0.450=9.870, drift=0.304.
     const snapLine = lines.find((l) => l.includes('result=stall_snap'));
     expect(snapLine).toBeDefined();
     expect(snapLine).toContain('from=10.016');
-    expect(snapLine).toContain('to=9.850');
-    expect(snapLine).toContain('drift=0.284');
+    expect(snapLine).toContain('to=9.870');
+    expect(snapLine).toContain('drift=0.304');
   });
 
   // ── T-S7-2: Backward replay-cushion with real drift (S10: lead 0.45) ───────
   it('T-S7-2: backward case with drift >= replay minimum → target=bufEnd−0.450; exact log', () => {
-    const bufEnd = 10.300;
+    const bufEnd = 10.320;
     const ct = 10.016;
     sb.buffered = makeBuffered(0, bufEnd);
     videoEl.currentTime = ct;
@@ -223,8 +224,8 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(lines.filter((l) => l.includes('result=stall_snap')).length).toBe(0);
   });
 
-  it('T-S7-3b-boundary: drift exactly replay minimum → no stall_snap replay', () => {
-    const bufEnd = 10.200;
+  it('T-S7-3b-boundary: drift exactly 0.300s replay minimum → no stall_snap replay', () => {
+    const bufEnd = 10.300;
     const ct = 10.000;
     sb.buffered = makeBuffered(0, bufEnd);
     videoEl.currentTime = ct;
@@ -258,7 +259,7 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
   });
 
   // ── T-S7-3c: Replay guard must not bypass starvation bookkeeping ───────────
-  it('T-S7-3c: near-edge suppression increments guards/streak, then deeper drift still recovers', () => {
+  it('T-S7-3c: near-edge suppression increments guards/streak, then 0.301s drift still recovers', () => {
     overrideProperty(videoEl, 'readyState', { get: () => 2 });
 
     sb.buffered = makeBuffered(0, 10.030);
@@ -271,11 +272,11 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(getMseLogLines(tauri).filter((l) => l.includes('result=stall_snap')).length).toBe(0);
 
     tauri_clearInvoke(tauri);
-    sb.buffered = makeBuffered(0, 10.300);
-    videoEl.currentTime = 10.018;
+    sb.buffered = makeBuffered(0, 10.301);
+    videoEl.currentTime = 10.000;
     exports.onVideoWaiting();
 
-    expect(videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(videoEl.currentTime).toBeCloseTo(10.301 - 0.450, 5);
     expect(exports.getSuppressedGuardCount()).toBe(1);
     expect(exports.getHardStarveStreak()).toBe(2);
     const lines = getMseLogLines(tauri);
@@ -418,11 +419,11 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
 
   // ── T-S7-13: currentTime setter throws → result=throw line from locals ─────
   it('T-S7-13: currentTime setter throws → result=throw from locals; no re-reads; no uncaught', () => {
-    // Setup: ct=10.016, bufEnd=10.300, target=10.300-0.450=9.850, drift=0.284
-    const bufEnd = 10.300;
+    // Setup: ct=10.016, bufEnd=10.320, target=10.320-0.450=9.870, drift=0.304
+    const bufEnd = 10.320;
     const ct = 10.016;
-    const expectedTarget = (bufEnd - 0.450).toFixed(3); // 9.850
-    const expectedDrift  = (bufEnd - ct).toFixed(3);    // 0.284
+    const expectedTarget = (bufEnd - 0.450).toFixed(3); // 9.870
+    const expectedDrift  = (bufEnd - ct).toFixed(3);    // 0.304
 
     sb.buffered = makeBuffered(0, bufEnd);
 
@@ -813,16 +814,16 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
 
     // perfNow=50: 50ms elapsed < 300ms (inside window); hardStarve=true → bypasses N2
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 1, configurable: true });
     h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed: snap executes, debounce count unchanged at 0 (S10: target=10.300-0.450)
+    // N2 bypassed: snap executes, debounce count unchanged at 0 (drift=0.312 > 0.300)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.450, 5);
   });
 
   // T-S8-7: rs=1 inside window, NO ct/bufEnd progress → N1 fires first (S8-3-SC5)
@@ -855,16 +856,16 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.exports.onVideoWaiting(); // snap#1
 
     h.perfNow(50); // inside 300ms
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.018; // ct advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 IS escape hatch
     h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed: snap executes, debounce count unchanged at 0 (S10: target=10.300-0.450)
+    // N2 bypassed: snap executes, debounce count unchanged at 0 (drift=0.312 > 0.300)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.450, 5);
   });
 
   // T-S8-9: rs=0 inside window, ct/bufEnd advanced → N2 bypassed (rs=0 <= 2 hardStarve) (S8-3-SC7)
@@ -877,7 +878,7 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.exports.onVideoWaiting(); // snap#1
 
     h.perfNow(50); // inside 300ms
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.018;
     Object.defineProperty(h.videoEl, 'readyState', { value: 0, configurable: true }); // rs=0 <= 2 hardStarve
     h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
@@ -885,7 +886,7 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.450, 5);
   });
 
   // T-S8-24: rs=1 inside window, no progress → N1 fires (suppressedGuardCount++), NOT N2 (S8-7-SC3)
@@ -1963,16 +1964,16 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
     h.exports.onVideoWaiting(); // snap#1
 
     h.perfNow(50); // inside 300ms
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.019; // advanced > ADV_EPS → N1 passes
     Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true }); // rs=2 escape hatch
     h.exports.setHardStarveStreak(1); // pre-seed: this call → streak 1→2 → bypass fires
 
     h.exports.onVideoWaiting();
 
-    // N2 bypassed (rs=2 IS escape hatch with streak>=2): snap executes (S10: target=10.300-0.450)
+    // N2 bypassed (rs=2 IS escape hatch with streak>=2): snap executes (drift=0.311 > 0.300)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.450, 5);
   });
 
   // T-S9-R2: rs=2, NO ct/bufEnd progress → N1 fires (re-storm defense intact)
@@ -2293,7 +2294,7 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
 
     // 50ms later: ct/bufEnd advance (N1 passes), rs=2 again → streak 1→2 → bypass fires
     h.perfNow(50);
-    const bufEnd2 = 10.300;
+    const bufEnd2 = 10.330;
     h.sb.buffered = makeBuffered(0, bufEnd2);
     h.videoEl.currentTime = 10.018;
     h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
@@ -2344,7 +2345,7 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
 
     // fire a bypassing rs=2 waiting inside window (N1 passes → bypass fires → snap executes)
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.018;
     h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
 
@@ -2355,7 +2356,7 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
     // one increment" — a deterministic value, not a loose floor.
     expect(h.exports.getHardStarveStreak()).toBe(3);
     // also verify the snap actually executed (currentTime changed to bufEnd-0.45)
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.45, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.45, 5);
   });
 
   // T-S10-STK-after-N1: N1 fires (no progress) → streak NOT incremented
@@ -2407,13 +2408,13 @@ describe('S10 regression guards (T-S10-REG-*)', () => {
 
     // 2nd rs=2 call: ct/bufEnd advance again (N1 passes), streak 1→2 → bypass fires → snap executes
     h.perfNow(100);
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.020;
 
     h.exports.onVideoWaiting(); // streak→2, bypass, snap
 
-    // Recovery within 1 extra tick; snap at bufEnd-0.45=10.300-0.45=9.850
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.45, 5);
+    // Recovery within 1 extra tick; snap at bufEnd-0.45=10.330-0.45=9.880
+    expect(h.videoEl.currentTime).toBeCloseTo(10.330 - 0.45, 5);
     expect(h.exports.getHardStarveStreak()).toBe(2);
   });
 

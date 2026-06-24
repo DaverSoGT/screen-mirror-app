@@ -49,8 +49,11 @@ const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.45;
 // on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
 const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
 // If 'waiting' fires while already this close to the live edge, a backward
-// stall-snap only replays old frames and can present as a visible loop.
-const LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC = 0.2;
+// stall-snap only replays old frames and can present as a visible loop. Raised
+// for Gate B bitrate-floor follow-up so low-drift hard-starve snaps around
+// 0.20–0.27 s are suppressed instead of replaying stale frames.
+const LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC = 0.3;
+const LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC = 1e-9;
 // Stall-snap debounce window: suppress a 'waiting'-triggered snap if one already
 // executed within this many ms (kills the 95% back-to-back self-retrigger storm,
 // GATE-7). FIXED, short on purpose — prioritizes fast genuine-stall recovery; the
@@ -955,7 +958,10 @@ function onVideoWaiting() {
   // N3 NO-OP KILL: eliminates exact seek-to-self events.
   if (target === ct) { suppressedGuardCount++; return; }
   const drift = bufEnd - ct;
-  if (hardStarve && target < ct && drift >= 0 && drift <= LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC) {
+  // Gate B bitrate-floor follow-up: suppress low-drift backward hard-starve
+  // snaps near the live edge. Keep the 0.300 s boundary inclusive, but only
+  // allow a tiny float-noise tolerance at equality so 0.301 s still recovers.
+  if (hardStarve && target < ct && drift >= 0 && drift <= (LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC + LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC)) {
     suppressedGuardCount++;
     return;
   }
