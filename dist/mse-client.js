@@ -942,8 +942,8 @@ function onVideoWaiting() {
   const advanced = (ct > lastSnapCt + ADV_EPS) || (bufEnd > lastSnapBufEnd + ADV_EPS);
   if (!advanced) { suppressedGuardCount++; return; }
   // S10 (D-PPT10-B): increment the 2-strike streak AFTER N1, BEFORE N2.
-  // Only increments — no reset here. onVideoWaiting is 'waiting'-only (rs<=2),
-  // so the rs>2 else-branch is dead. Reset is observed in the heartbeat (REV 2).
+  // Only increments — no reset here. A queued 'waiting' callback can observe
+  // readyState > 2 after recovery, so reset still belongs to the heartbeat path.
   if (hardStarve) { hardStarveStreak++; }
   // N2 DEBOUNCE GUARD (bypass now requires rs<=2 AND streak>=HARDSTARVE_STRIKE_TICKS).
   // Collapses the 95% back-to-back storm by rate-limiting to one snap per 300 ms.
@@ -958,10 +958,11 @@ function onVideoWaiting() {
   // N3 NO-OP KILL: eliminates exact seek-to-self events.
   if (target === ct) { suppressedGuardCount++; return; }
   const drift = bufEnd - ct;
-  // Gate B bitrate-floor follow-up: suppress low-drift backward hard-starve
-  // snaps near the live edge. Keep the 0.300 s boundary inclusive, but only
-  // allow a tiny float-noise tolerance at equality so 0.301 s still recovers.
-  if (hardStarve && target < ct && drift >= 0 && drift <= (LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC + LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC)) {
+  // Gate B bitrate-floor follow-up: suppress low-drift backward stall-snap
+  // replays near the live edge regardless of the current readyState. Keep the
+  // 0.300 s boundary inclusive, but only allow a tiny float-noise tolerance at
+  // equality so 0.301 s still recovers.
+  if (target < ct && drift >= 0 && drift <= (LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC + LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC)) {
     suppressedGuardCount++;
     return;
   }
@@ -1267,7 +1268,7 @@ async function main() {
       " watchdog_rescues=" + watchdogRescues  // D-PPT9-D2: strictly last field
     );
     // REV 2 (D-PPT10-B): reset the 2-strike streak on any tick where rs>2 (player recovered).
-    // onVideoWaiting cannot observe rs>2 ('waiting'-only at L1201 — dead code there).
+    // onVideoWaiting can still run after a 'waiting' event once readyState has already rebounded.
     if (VIDEO_EL.readyState > 2) { hardStarveStreak = 0; }
     // ── Gap-stranding watchdog (Slice 9, D-PPT9-A). Rescues a no-progress,
     // data-ahead stranding that seekToLiveEdge's sb.updating/seeking guards block. ──

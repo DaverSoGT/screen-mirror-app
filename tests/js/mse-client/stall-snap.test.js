@@ -239,6 +239,22 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(lines.filter((l) => l.includes('result=stall_snap')).length).toBe(0);
   });
 
+  it('T-S7-3b-rebound-rs: low-drift backward waiting stays suppressed even if readyState rebounds above 2', () => {
+    const bufEnd = 10.300;
+    const ct = 10.000;
+    sb.buffered = makeBuffered(0, bufEnd);
+    videoEl.currentTime = ct;
+    overrideProperty(videoEl, 'readyState', { get: () => 3 });
+
+    exports.onVideoWaiting();
+
+    expect(videoEl.currentTime).toBeCloseTo(ct, 5);
+    expect(exports.getSuppressedGuardCount()).toBe(1);
+    expect(exports.getHardStarveStreak()).toBe(0);
+    const lines = getMseLogLines(tauri);
+    expect(lines.filter((l) => l.includes('result=stall_snap')).length).toBe(0);
+  });
+
   it('T-S7-3b-past-edge: currentTime past bufEnd → backward stall_snap can recover', () => {
     const bufEnd = 10.030;
     const ct = 10.050;
@@ -636,16 +652,16 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
     // Fresh module: lastSnapCt=-Inf, lastSnapBufEnd=-Inf, lastSnapAtMs=-Inf
     // N1: ct(10.016) > -Inf + 1e-3 = true → passes
     // N2: now(any) - (-Inf) = +Inf >= 300 → not debounced → passes
-    // N3: target=9.580 (10.030-0.450) != ct=10.016 → passes (S10 lead=0.45)
-    // G6: 10.030-9.580=0.450 >= 0.1 → passes → snap executes
+    // N3: target=9.880 (10.330-0.450) != ct=10.016 → passes (S10 lead=0.45)
+    // G6: 10.330-9.880=0.450 >= 0.1 → passes → snap executes
     h.perfNow(100); // arbitrary; any value: Inf elapsed from -Inf baseline
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
 
     h.exports.onVideoWaiting();
 
-    // Snap executed: currentTime set to target (S10: bufEnd-0.450=9.580)
-    expect(h.videoEl.currentTime).toBeCloseTo(9.580, 5);
+    // Snap executed: currentTime set to target (S10: bufEnd-0.450=9.880)
+    expect(h.videoEl.currentTime).toBeCloseTo(9.880, 5);
     // Counters: zero (nothing was suppressed)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
@@ -656,15 +672,15 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
 
   // T-S8-25: State NOT updated on suppressed snap — write rule (S8-2-SC2)
   it('T-S8-25: state NOT updated on N1-suppressed snap; getLastSnapState unchanged from snap#1', () => {
-    // Snap#1: executes at perfNow=100, records lastSnapCt=10.016, lastSnapBufEnd=10.030
+    // Snap#1: executes at perfNow=100, records lastSnapCt=10.016, lastSnapBufEnd=10.330
     h.perfNow(100);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
-    // After snap#1: lastSnapCt=10.016, lastSnapBufEnd=10.030, lastSnapAtMs=100
+    // After snap#1: lastSnapCt=10.016, lastSnapBufEnd=10.330, lastSnapAtMs=100
 
     // Trigger N1 suppression: ct and bufEnd NOT advanced past ADV_EPS
-    // (ct=10.016 unchanged, bufEnd=10.030 unchanged → N1 fires)
+    // (ct=10.016 unchanged, bufEnd=10.330 unchanged → N1 fires)
     h.perfNow(500); // well outside debounce window (N2 would pass if N1 didn't fire first)
     tauri_clearInvoke(h.tauri);
     h.exports.onVideoWaiting();
@@ -674,7 +690,7 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
     // State should be unchanged — use getLastSnapState to verify
     const state = h.exports.getLastSnapState();
     expect(state.lastSnapCt).toBeCloseTo(10.016, 5);
-    expect(state.lastSnapBufEnd).toBeCloseTo(10.030, 5);
+    expect(state.lastSnapBufEnd).toBeCloseTo(10.330, 5);
     expect(state.lastSnapAtMs).toBe(100); // unchanged from snap#1
   });
 
@@ -682,14 +698,14 @@ describe('stall-snap — Slice 8 initial state & first snap (T-S8-2, T-S8-25, T-
   it('T-S8-26: state IS updated after executed snap#2; getLastSnapState reflects snap#2 values', () => {
     // Snap#1: executes at perfNow=100
     h.perfNow(100);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
 
     // Advance perfNow past debounce (400 = 300ms elapsed), advance ct and bufEnd > ADV_EPS
     h.perfNow(500); // 500-100=400 >= 300 → N2 passes
-    const bufEnd2 = 10.030 + 0.500; // 10.530
-    const ct2 = 10.016 + 0.300;    // 10.316
+    const bufEnd2 = 10.330 + 0.500; // 10.830
+    const ct2 = 10.016 + 0.500;     // 10.516
     h.sb.buffered = makeBuffered(0, bufEnd2);
     h.videoEl.currentTime = ct2;
 
@@ -719,13 +735,13 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
   it('T-S8-3: snap#2 at T+50ms (inside 300ms window) → N2 fires; debounce count = 1', () => {
     // Snap#1: executes at perfNow=0 (lastSnapAtMs=0)
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting();
 
     // Snap#2: perfNow=50 (50ms elapsed < 300ms). Advance ct/bufEnd > ADV_EPS so N1 passes.
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.032);  // bufEnd advanced by 2ms > ADV_EPS=1ms
+    h.sb.buffered = makeBuffered(0, 10.332);  // bufEnd advanced by 2ms > ADV_EPS=1ms
     h.videoEl.currentTime = 10.018;            // ct advanced by 2ms > ADV_EPS=1ms
 
     const ctBefore = h.videoEl.currentTime;
@@ -739,47 +755,47 @@ describe('stall-snap — Slice 8 N2 debounce window (T-S8-3..5, T-S8-17)', () =>
   // T-S8-4: snap outside 300ms window → N2 does NOT fire (S8-3-SC2)
   it('T-S8-4: snap#2 at T+350ms (outside window) → N2 does not fire; snap executes', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1: lastSnapAtMs=0
 
     h.perfNow(350); // 350 - 0 = 350 >= 300 → N2 does not fire
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.332);
     h.videoEl.currentTime = 10.018;
 
     h.exports.onVideoWaiting();
 
-    // Snap executes: debounce count unchanged at 0 (S10: target=10.300-0.450)
+    // Snap executes: debounce count unchanged at 0 (S10: target=10.332-0.450)
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.332 - 0.450, 5);
   });
 
   // T-S8-5: snap at exactly 300ms boundary → NOT suppressed (S8-3-SC3)
   it('T-S8-5: snap#2 at T+300ms exactly (boundary) → N2 does not fire; snap executes', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1: lastSnapAtMs=0
 
     h.perfNow(300); // 300 - 0 = 300 >= 300 → NOT suppressed (boundary)
-    h.sb.buffered = makeBuffered(0, 10.300);
+    h.sb.buffered = makeBuffered(0, 10.332);
     h.videoEl.currentTime = 10.018;
 
     h.exports.onVideoWaiting();
 
     expect(h.exports.getSuppressedDebounceCount()).toBe(0);
-    expect(h.videoEl.currentTime).toBeCloseTo(10.300 - 0.450, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(10.332 - 0.450, 5);
   });
 
   // T-S8-17: 3 consecutive N2 suppressions → debounce count = 3 (S8-6-SC1)
   it('T-S8-17: 3 consecutive N2 suppressions in window → getSuppressedDebounceCount() === 3', () => {
     // Snap#1: executes at perfNow=0
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
-    let bufEnd = 10.030;
+    let bufEnd = 10.330;
     let ct = 10.016;
 
     // 3 snaps inside 300ms window (perfNow stays < 300), each with ct/bufEnd > ADV_EPS
@@ -829,13 +845,13 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
   // T-S8-7: rs=1 inside window, NO ct/bufEnd progress → N1 fires first (S8-3-SC5)
   it('T-S8-7: rs=1 inside window, no ct/bufEnd progress → N1 fires; suppressedGuardCount++; N2 NOT reached', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1; records ct=10.016, bufEnd=10.030
 
     h.perfNow(50); // inside 300ms window
     // ct and bufEnd NOT advanced (still at snap#1 baseline)
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     Object.defineProperty(h.videoEl, 'readyState', { value: 1, configurable: true });
 
@@ -892,13 +908,13 @@ describe('stall-snap — Slice 8 N2 escape hatch rs<=1 (T-S8-6..9, T-S8-24)', ()
   // T-S8-24: rs=1 inside window, no progress → N1 fires (suppressedGuardCount++), NOT N2 (S8-7-SC3)
   it('T-S8-24: rs=1 inside window, no ct/bufEnd progress → N1 fires (suppressedGuard++); N2 NOT reached (suppressedDebounce unchanged)', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1 records state
 
     h.perfNow(50); // inside 300ms
     // No progress: ct and bufEnd at same values as snap#1
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     Object.defineProperty(h.videoEl, 'readyState', { value: 1, configurable: true });
 
@@ -928,12 +944,12 @@ describe('stall-snap — Slice 8 N1 effectiveness guard (T-S8-10..14, T-S8-18)',
   afterEach(() => teardownS8Harness(h));
 
   // T-S8-10: only ct advanced > ADV_EPS → N1 passes, snap executes (S8-4-SC1)
-  // S10: target=5.300-0.450=4.850; G6: 5.300-4.850=0.450 >= 0.1 ✓
-  it('T-S8-10: lastSnapCt=5.000, lastSnapBufEnd=5.300; ct=5.002 (advanced), bufEnd=5.300 (unchanged) → N1 passes', () => {
-    h.sb.buffered = makeBuffered(0, 5.300); // bufEnd=5.300, unchanged from baseline
-    h.videoEl.currentTime = 5.002;          // ct=5.002 > 5.000+0.001=5.001 ✓
-    // Geometry: target=Math.max(0, 5.300-0.450)=4.850; ct=5.002 != target → N3 passes
-    // G6: 5.300-4.850=0.450 >= 0.1 → passes
+  // Keep drift above the low-drift replay guard while holding bufEnd fixed.
+  it('T-S8-10: lastSnapCt=4.996, lastSnapBufEnd=5.300; ct=4.998 (advanced), bufEnd=5.300 (unchanged) → N1 passes', () => {
+    h.exports.setLastSnapState({ lastSnapAtMs: 0, lastSnapCt: 4.996, lastSnapBufEnd: 5.300 });
+    h.sb.buffered = makeBuffered(0, 5.300); // bufEnd unchanged from baseline
+    h.videoEl.currentTime = 4.998;          // ct=4.998 > 4.996+0.001=4.997 ✓
+    // Geometry: target=Math.max(0, 5.300-0.450)=4.850; drift=0.302 > 0.300 → replay guard stays open
 
     h.exports.onVideoWaiting();
 
@@ -1089,14 +1105,14 @@ describe('stall-snap — Slice 8 N3 no-op kill (T-S8-15..16)', () => {
   });
 
   // T-S8-16: target !== ct → N3 does not fire, snap executes (S8-5-SC2)
-  // S10: target = 10.030-0.450=9.580, ct=10.016 != 9.580 → N3 does not fire
-  it('T-S8-16: target !== ct (10.016 vs 9.580) → N3 does not fire; snap executes', () => {
-    h.sb.buffered = makeBuffered(0, 10.030); // target = 9.580 (S10: 10.030-0.450)
+  // S10: target = 10.330-0.450=9.880, ct=10.016 != 9.880 → N3 does not fire
+  it('T-S8-16: target !== ct (10.016 vs 9.880) → N3 does not fire; snap executes', () => {
+    h.sb.buffered = makeBuffered(0, 10.330); // target = 9.880 (S10: 10.330-0.450)
     h.videoEl.currentTime = 10.016;          // ct = 10.016 != 9.580
 
     h.exports.onVideoWaiting();
 
-    expect(h.videoEl.currentTime).toBeCloseTo(9.580, 5);
+    expect(h.videoEl.currentTime).toBeCloseTo(9.880, 5);
     expect(h.exports.getSuppressedGuardCount()).toBe(0);
   });
 });
@@ -1110,7 +1126,7 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
 
   // T-S8-19: mixed suppressions — counters monotonic and per-type accurate (S8-6-SC3)
   it('T-S8-19: 3 N2 suppressions then 2 N1 suppressions then 1 N2 → debounce=4, guard=2 (monotonic)', () => {
-    let bufEnd = 10.030;
+    let bufEnd = 10.330;
     let ct = 10.016;
     let perfT = 0;
 
@@ -1173,7 +1189,7 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
   // NOTE (Slice 9): the old $-anchor is relaxed because watchdog_rescues=N is now the trailing field.
   it('T-S8-20: tick line matches /suppressed_debounce=(\\d+) suppressed_guard=(\\d+) watchdog_rescues=(\\d+)$/ with correct values', async () => {
     // Set up known counter values: 2 N2 suppressions (debounce=2) + 1 N1 suppression (guard=1)
-    let bufEnd = 10.030;
+    let bufEnd = 10.330;
     let ct = 10.016;
     let perfT = 0;
 
@@ -1244,7 +1260,7 @@ describe('stall-snap — Slice 8 counter monotonicity & telemetry (T-S8-19..21, 
 
   // T-S8-28: counters persist across tearDownMse (NOT reset to 0) (S8-6-SC6)
   it('T-S8-28: counters persist across tearDownMse — NOT reset to 0', () => {
-    let bufEnd = 10.030;
+    let bufEnd = 10.330;
     let ct = 10.016;
     let perfT = 0;
 
@@ -1383,13 +1399,13 @@ describe('stall-snap — Slice 8 getter export contract (T-S8-27)', () => {
   it('T-S8-27: getSuppressedDebounceCount() reads live state after N2 suppression; getSuppressedGuardCount() independent', () => {
     // Snap#1 at perfNow=0
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // lastSnapAtMs=0
 
     // Trigger one N2 suppression: perfNow=50 (inside 300ms), ct/bufEnd advanced > ADV_EPS
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.032);
+    h.sb.buffered = makeBuffered(0, 10.332);
     h.videoEl.currentTime = 10.018;
     h.exports.onVideoWaiting(); // N2 fires
 
@@ -1979,13 +1995,13 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
   // T-S9-R2: rs=2, NO ct/bufEnd progress → N1 fires (re-storm defense intact)
   it('T-S9-R2: rs=2 inside window, NO ct/bufEnd progress → N1 fires (suppressedGuardCount++), no execute', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1, records ct=10.016, bufEnd=10.030
 
     h.perfNow(50);
     // ct and bufEnd NOT advanced (still at snap#1 baseline) → N1 fires
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     Object.defineProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
 
@@ -1999,12 +2015,12 @@ describe('rs<=2 escape hatch (Mechanism C) + re-storm defense (T-S9-R1..R3)', ()
   // T-S9-R3: rs=3 inside 300ms → still debounced by N2 (N2 bypass only for rs<=2)
   it('T-S9-R3: rs=3 inside 300ms window, ct/bufEnd advanced → N2 applies (rs=3 not escape hatch)', () => {
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1
 
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.032);
+    h.sb.buffered = makeBuffered(0, 10.332);
     h.videoEl.currentTime = 10.018;
     // rs=3 is NOT the escape hatch; readyState default is 4, set to 3 explicitly
     Object.defineProperty(h.videoEl, 'readyState', { value: 3, configurable: true });
@@ -2260,13 +2276,13 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
   it('T-S10-STK-1: single rs=2 dip inside 300ms window (streak 0→1) → N2 fires, snap suppressed; streak=1', () => {
     // snap#1 at perfNow=0 (establishes baseline, streak stays at 0 after snap#1: rs=4 default)
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1; readyState=4 (default) → hardStarve=false, no increment
 
     // 50ms later (inside 300ms debounce window): ct/bufEnd advance (N1 passes), rs=2
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.032);
+    h.sb.buffered = makeBuffered(0, 10.332);
     h.videoEl.currentTime = 10.018; // set ct to 10.018 for N1 to pass
     h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
     // streak is 0 before this call; this is the 1-shot transient dip
@@ -2364,13 +2380,13 @@ describe('S10 2-strike state machine (T-S10-STK-*)', () => {
   it('T-S10-STK-after-N1: rs=2 with no ct/bufEnd progress → N1 fires AND getHardStarveStreak() unchanged at 0', () => {
     // snap#1 to establish baseline
     h.perfNow(0);
-    h.sb.buffered = makeBuffered(0, 10.030);
+    h.sb.buffered = makeBuffered(0, 10.330);
     h.videoEl.currentTime = 10.016;
     h.exports.onVideoWaiting(); // snap#1; streak stays 0 (rs=4 default)
 
     // No progress: same ct and bufEnd as snap#1 baseline
     h.perfNow(50);
-    h.sb.buffered = makeBuffered(0, 10.030); // bufEnd unchanged
+    h.sb.buffered = makeBuffered(0, 10.330); // bufEnd unchanged
     h.videoEl.currentTime = 10.016;          // ct unchanged
     h.overrideProperty(h.videoEl, 'readyState', { value: 2, configurable: true });
 
