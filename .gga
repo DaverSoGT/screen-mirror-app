@@ -1,0 +1,21 @@
+# Gentleman Guardian Angel Configuration — screen-mirror-app
+
+# Use OpenCode by default; GGA currently invokes this provider from the Git hook.
+PROVIDER="opencode"
+
+# This project is a Tauri app with hand-edited production JavaScript in dist/ and
+# Rust backend code. Do not exclude dist/: AGENTS.md explicitly treats dist files
+# as source files in this repository.
+FILE_PATTERNS="*.js,*.jsx,*.ts,*.tsx,*.rs,Cargo.toml,tauri.conf.json,*.json,.gga"
+
+# GGA v2.8.1 uses a simplified suffix matcher for patterns beginning with "*".
+# Use explicit suffixes instead of broad patterns like "*.test.*", which are not
+# interpreted as full globs by that matcher.
+EXCLUDE_PATTERNS="*.test.js,*.spec.js,*.test.jsx,*.spec.jsx,*.test.ts,*.spec.ts,*.test.tsx,*.spec.tsx,*.d.ts,build/*,node_modules/*"
+
+RULES_FILE="AGENTS.md"
+STRICT_MODE="true"
+# Temporary while the project is still in active development: review only staged
+# diff hunks so legacy full-file debt does not block unrelated small commits.
+REVIEW_MODE="diff"
+TIMEOUT="300"
