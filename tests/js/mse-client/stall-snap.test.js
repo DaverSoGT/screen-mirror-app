@@ -274,6 +274,58 @@ describe('stall-snap — handler behavior (T-S7-1..14)', () => {
     expect(snapLine).toContain('drift=-0.020');
   });
 
+  it('T-S7-3b-noop-tolerance: near-no-op delta at 0.010s suppresses stall_snap', () => {
+    const bufEnd = 10.000;
+    const expectedTarget = bufEnd - 0.450;
+    const ct = expectedTarget - 0.010;
+    sb.buffered = makeBuffered(0, bufEnd);
+    videoEl.currentTime = ct;
+
+    exports.onVideoWaiting();
+
+    expect(videoEl.currentTime).toBeCloseTo(ct, 5);
+    expect(exports.getSuppressedGuardCount()).toBe(1);
+    expect(getMseLogLines(tauri).filter((l) => l.includes('result=stall_snap')).length).toBe(0);
+  });
+
+  it('T-S7-3b-noop-tolerance-over: near-no-op delta above 0.010s still executes stall_snap', () => {
+    const bufEnd = 10.000;
+    const expectedTarget = bufEnd - 0.450;
+    const ct = expectedTarget - 0.011;
+    sb.buffered = makeBuffered(0, bufEnd);
+    videoEl.currentTime = ct;
+
+    exports.onVideoWaiting();
+
+    expect(videoEl.currentTime).toBeCloseTo(expectedTarget, 5);
+    expect(exports.getSuppressedGuardCount()).toBe(0);
+    const lines = getMseLogLines(tauri);
+    const snapLine = lines.find((l) => l.includes('result=stall_snap'));
+    expect(snapLine).toBeDefined();
+    expect(snapLine).toContain('from=' + ct.toFixed(3));
+    expect(snapLine).toContain('to=' + expectedTarget.toFixed(3));
+    expect(snapLine).toContain('drift=' + (bufEnd - ct).toFixed(3));
+  });
+
+  it('T-S7-3b-noop-tolerance-over-ahead: currentTime 0.011s above target still executes stall_snap', () => {
+    const bufEnd = 10.000;
+    const expectedTarget = bufEnd - 0.450;
+    const ct = expectedTarget + 0.011;
+    sb.buffered = makeBuffered(0, bufEnd);
+    videoEl.currentTime = ct;
+
+    exports.onVideoWaiting();
+
+    expect(videoEl.currentTime).toBeCloseTo(expectedTarget, 5);
+    expect(exports.getSuppressedGuardCount()).toBe(0);
+    const lines = getMseLogLines(tauri);
+    const snapLine = lines.find((l) => l.includes('result=stall_snap'));
+    expect(snapLine).toBeDefined();
+    expect(snapLine).toContain('from=' + ct.toFixed(3));
+    expect(snapLine).toContain('to=' + expectedTarget.toFixed(3));
+    expect(snapLine).toContain('drift=' + (bufEnd - ct).toFixed(3));
+  });
+
   // ── T-S7-3c: Replay guard must not bypass starvation bookkeeping ───────────
   it('T-S7-3c: near-edge suppression increments guards/streak, then 0.301s drift still recovers', () => {
     overrideProperty(videoEl, 'readyState', { get: () => 2 });

@@ -54,6 +54,9 @@ const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
 // 0.20–0.27 s are suppressed instead of replaying stale frames.
 const LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC = 0.3;
 const LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC = 1e-9;
+// Media timestamps that differ by <=10 ms are treated as equivalent for
+// no-op snap suppression; this absorbs float/timestamp rounding in near-self seeks.
+const MEDIA_TIMESTAMP_TOLERANCE_SEC = 0.01;
 // Stall-snap debounce window: suppress a 'waiting'-triggered snap if one already
 // executed within this many ms (kills the 95% back-to-back self-retrigger storm,
 // GATE-7). FIXED, short on purpose — prioritizes fast genuine-stall recovery; the
@@ -955,8 +958,8 @@ function onVideoWaiting() {
     suppressedDebounceCount++;
     return;
   }
-  // N3 NO-OP KILL: eliminates exact seek-to-self events.
-  if (target === ct) { suppressedGuardCount++; return; }
+  // N3 NO-OP KILL: eliminates seek-to-self and near-self events within timestamp tolerance.
+  if (Math.abs(target - ct) <= MEDIA_TIMESTAMP_TOLERANCE_SEC) { suppressedGuardCount++; return; }
   const drift = bufEnd - ct;
   // Gate B bitrate-floor follow-up: suppress low-drift backward stall-snap
   // replays near the live edge regardless of the current readyState. Keep the
