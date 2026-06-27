@@ -231,10 +231,15 @@ pub trait CaptureSource: Send {
 
     /// Begin delivering frames to `tx`.
     ///
-    /// The adapter pushes frames asynchronously on an internal OS thread.
-    /// Frames are delivered via `tx.try_send`; a full channel causes the frame to be dropped
-    /// (drop-newest backpressure).
-    fn start(&mut self, tx: std::sync::mpsc::SyncSender<CaptureFrame>) -> Result<(), CaptureError>;
+    /// The adapter pushes [`crate::FramePayload`]s asynchronously on an internal OS
+    /// thread. Frames are delivered via `tx.try_send`; a full channel causes the
+    /// frame to be dropped (drop-newest backpressure). The CPU-staged path emits
+    /// [`crate::FramePayload::Cpu`]; the Windows GPU-resident path emits
+    /// [`crate::FramePayload::GpuShared`] once its gate selects the GPU pipeline.
+    fn start(
+        &mut self,
+        tx: std::sync::mpsc::SyncSender<crate::FramePayload>,
+    ) -> Result<(), CaptureError>;
 
     /// Stop the capture session.
     ///
@@ -289,10 +294,10 @@ mod tests {
 
         fn start(
             &mut self,
-            tx: std::sync::mpsc::SyncSender<CaptureFrame>,
+            tx: std::sync::mpsc::SyncSender<crate::FramePayload>,
         ) -> Result<(), CaptureError> {
             for f in self.frames.drain(..) {
-                tx.try_send(f).ok();
+                tx.try_send(crate::FramePayload::Cpu(f)).ok();
             }
             Ok(())
         }

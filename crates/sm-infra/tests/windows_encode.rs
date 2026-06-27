@@ -24,7 +24,7 @@ use sm_infra::encode::WindowsOpenH264Encoder;
 /// The pixel values vary by row to give the codec meaningful content to encode
 /// (all-black frames collapse to trivially small IDR packets with no P-frames
 /// exercising rate control). A gradient by row index provides enough variety.
-fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::CaptureFrame {
+fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::encode::FramePayload {
     let stride = width * 4;
     let total = (stride * height) as usize;
     let mut data = vec![0u8; total];
@@ -41,14 +41,14 @@ fn make_synthetic_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::Captu
         }
     }
 
-    sm_domain::CaptureFrame {
+    sm_domain::encode::FramePayload::Cpu(sm_domain::CaptureFrame {
         data: Arc::from(data.as_slice()),
         width,
         height,
         stride,
         format: PixelFormat::Bgra8,
         timestamp: Duration::from_millis(ts_ms),
-    }
+    })
 }
 
 // ─── I1: synthetic 30-frame smoke — ≥1 IDR + ≥10 P-frames ────────────────────

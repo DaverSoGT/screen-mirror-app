@@ -33,7 +33,7 @@ impl VideoEncoder for FakeEncoder {
 
     fn start(
         &mut self,
-        _rx: std::sync::mpsc::Receiver<sm_domain::CaptureFrame>,
+        _rx: std::sync::mpsc::Receiver<sm_domain::encode::FramePayload>,
         _tx: std::sync::mpsc::SyncSender<EncodedPacket>,
     ) -> Result<(), sm_domain::encode::EncoderError> {
         Ok(())

@@ -37,6 +37,93 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Carrier for one frame flowing through the capture→encoder channel.
+///
+/// The capture→encoder channel transports a `FramePayload` rather than a bare
+/// [`crate::CaptureFrame`] so the GPU-resident path (design D7) can hand a shared
+/// GPU texture across the thread boundary instead of CPU-staged bytes. The variant
+/// is selected once at pipeline init by the path-selection gate; it is NOT a
+/// per-frame decision:
+///
+/// - [`FramePayload::Cpu`] — today's behaviour: BGRA8 pixels already read back to
+///   CPU memory in the [`crate::CaptureFrame`]. The encoder runs the rayon BGRA→NV12
+///   convert and `MFCreateMemoryBuffer` sample path VERBATIM. This is the only
+///   variant any non-Windows or non-GPU path ever produces.
+/// - [`FramePayload::GpuShared`] — GPU-resident path: a cross-thread shared
+///   `ID3D11Texture2D` keyed-mutex handle plus geometry and timestamp. The Windows
+///   MFT encoder acquires the keyed mutex, runs `VideoProcessorBlt` BGRA→NV12 on the
+///   GPU, and feeds `MFCreateDXGISurfaceBuffer` to the hardware MFT — no readback.
+///
+/// `FramePayload` lives in `sm-domain` (despite the GPU variant being a
+/// Windows-only concept at runtime) so the frozen [`CaptureSource::start`] /
+/// [`VideoEncoder::start`] channel signatures can carry it without `sm-domain`
+/// depending on `windows`. The `handle` is a raw `isize` (the underlying
+/// `HANDLE` reinterpreted) so no platform type leaks into the domain crate.
+///
+/// [`CaptureSource::start`]: crate::capture::CaptureSource::start
+#[derive(Debug)]
+pub enum FramePayload {
+    /// CPU-staged path: pixel data already in `Arc<[u8]>` (today's code, zero change).
+    Cpu(crate::CaptureFrame),
+
+    /// GPU-resident path: a cross-thread shared DXGI keyed-mutex texture handle
+    /// plus geometry and timestamp.
+    ///
+    /// Produced ONLY by the Windows capture adapter when the path-selection gate
+    /// selected the GPU-resident path; consumed ONLY by the Windows MFT encoder.
+    /// Every other encoder/capture pair only ever sees [`FramePayload::Cpu`].
+    GpuShared {
+        /// Cross-thread shared handle for the keyed-mutex `ID3D11Texture2D` BGRA
+        /// surface, stored as `isize` (the raw `HANDLE` value) so the domain crate
+        /// names no platform type.
+        ///
+        /// This is a BORROW, not an ownership transfer: the producer retains ownership
+        /// of the underlying NT handle (closed only when the producer is dropped) and
+        /// the consumer opens its OWN reference via `OpenSharedResource1`. To avoid
+        /// pixel/timestamp aliasing, the producer cycles a small RING of distinct shared
+        /// textures (one keyed mutex each) and sends a DIFFERENT slot's handle per frame,
+        /// so the handle in each in-flight payload references that frame's own pixels —
+        /// the producer never overwrites a texture whose handle is still queued. The
+        /// consumer acquires the keyed mutex (`IDXGIKeyedMutex::AcquireSync`) before
+        /// reading and releases it (`ReleaseSync`) afterwards; the producer uses a
+        /// BOUNDED acquire on its side so a stalled consumer cannot hang the capture
+        /// callback.
+        handle: isize,
+        /// Surface width in pixels.
+        width: u32,
+        /// Surface height in pixels.
+        height: u32,
+        /// Row stride in bytes of the source BGRA8 surface.
+        stride: u32,
+        /// Monotonic capture timestamp (same semantics as `CaptureFrame::timestamp`).
+        timestamp: Duration,
+        /// Producer generation stamped at queue time (interim missing-fence confirm).
+        ///
+        /// A strictly-increasing value minted once per QUEUED GPU frame on the capture
+        /// thread. The consumer compares it against the producer's latest queued
+        /// generation to compute its lag — `lag == 0` means it is reading the freshest
+        /// queued generation; `lag >= 1` means it dequeued an OLDER queued generation
+        /// (ring-wrap / backlog staleness). This proves whether the consumer reads a
+        /// stale GENERATION, distinct from the in-flight-copy staleness the producer
+        /// `Flush` targets. `gen` is a reserved keyword in edition 2024, so the field is
+        /// spelled `r#gen` at every use site.
+        r#gen: u64,
+    },
+}
+
+impl FramePayload {
+    /// Capture timestamp of the frame, regardless of variant.
+    ///
+    /// Lets consumers that only care about timing (e.g. test stubs, ordering
+    /// checks) read the timestamp without destructuring the variant.
+    pub fn timestamp(&self) -> Duration {
+        match self {
+            FramePayload::Cpu(f) => f.timestamp,
+            FramePayload::GpuShared { timestamp, .. } => *timestamp,
+        }
+    }
+}
+
 /// Rate control mode. Reserved for future expansion; V1 is `ConstantBitrate` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateControlMode {
@@ -141,7 +228,8 @@ pub enum EncoderError {
 /// # Channel discipline
 ///
 /// `start(rx, tx)` injects both channel ends. The encoder thread owns `rx`
-/// and pulls `CaptureFrame`s, then pushes `EncodedPacket`s via `tx.try_send`.
+/// and pulls [`FramePayload`]s (each wrapping either a CPU `CaptureFrame` or a
+/// GPU-shared texture handle), then pushes `EncodedPacket`s via `tx.try_send`.
 /// When the output channel is full the packet is dropped (drop-newest) and
 /// `dropped_frames()` is incremented. The encoder thread exits when `rx`
 /// closes (`Err(RecvError)`) or when `tx` becomes disconnected
@@ -172,7 +260,7 @@ pub trait VideoEncoder: Send + Sync {
     /// `rx.recv()` to return `Err(RecvError)`.
     fn start(
         &mut self,
-        rx: std::sync::mpsc::Receiver<crate::CaptureFrame>,
+        rx: std::sync::mpsc::Receiver<FramePayload>,
         tx: std::sync::mpsc::SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError>;
 
@@ -264,7 +352,7 @@ mod tests {
 
         fn start(
             &mut self,
-            rx: Receiver<crate::CaptureFrame>,
+            rx: Receiver<FramePayload>,
             tx: SyncSender<EncodedPacket>,
         ) -> Result<(), EncoderError> {
             let keyframe = Arc::clone(&self.keyframe_pending);
@@ -276,7 +364,7 @@ mod tests {
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let frame = match rx.recv() {
+                    let payload = match rx.recv() {
                         Ok(f) => f,
                         Err(_) => break,
                     };
@@ -284,7 +372,7 @@ mod tests {
                     let pkt = EncodedPacket {
                         data: Arc::from(vec![0x00u8, 0x00, 0x00, 0x01, 0x65].as_slice()),
                         is_keyframe,
-                        timestamp: frame.timestamp,
+                        timestamp: payload.timestamp(),
                         sequence: seq,
                     };
                     seq += 1;
@@ -507,15 +595,15 @@ mod tests {
 
     // ─── Helper: build a minimal CaptureFrame ──────────────────────────────────
 
-    fn make_frame(ts_ms: u64) -> crate::CaptureFrame {
-        crate::CaptureFrame {
+    fn make_frame(ts_ms: u64) -> FramePayload {
+        FramePayload::Cpu(crate::CaptureFrame {
             data: Arc::from(vec![0u8; 4].as_slice()),
             width: 1,
             height: 1,
             stride: 4,
             format: crate::capture::PixelFormat::Bgra8,
             timestamp: Duration::from_millis(ts_ms),
-        }
+        })
     }
 
     // ─── D9: start then stop — output channel closes cleanly ───────────────────

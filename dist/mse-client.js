@@ -48,11 +48,20 @@ const LIVE_EDGE_STALL_SNAP_LEAD_SEC = 0.45;
 // Minimum required gap between bufEnd and computed snap target (loop-protection
 // on sliver ranges). bufEnd - target < 0.1 → cushion guard fires → silent no-op.
 const LIVE_EDGE_STALL_MIN_CUSHION_SEC = 0.1;
+// If 'waiting' fires while already this close to the live edge, a backward
+// stall-snap only replays old frames and can present as a visible loop. Raised
+// for Gate B bitrate-floor follow-up so low-drift hard-starve snaps around
+// 0.20–0.27 s are suppressed instead of replaying stale frames.
+const LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC = 0.3;
+const LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC = 1e-9;
+// Media timestamps that differ by <=10 ms are treated as equivalent for
+// no-op snap suppression; this absorbs float/timestamp rounding in near-self seeks.
+const MEDIA_TIMESTAMP_TOLERANCE_SEC = 0.01;
 // Stall-snap debounce window: suppress a 'waiting'-triggered snap if one already
 // executed within this many ms (kills the 95% back-to-back self-retrigger storm,
 // GATE-7). FIXED, short on purpose — prioritizes fast genuine-stall recovery; the
 // GATE-6 max feed gap (258 ms) fits just under it. Bypassed only on hard
-// starvation (rs<=1, D-PPT8-4); the effectiveness guard still gates that path.
+// starvation (rs<=2, D-PPT9-C); the effectiveness guard still gates that path.
 const LIVE_EDGE_STALL_SNAP_DEBOUNCE_MS = 300;
 // ── rs<=2 hatch 2-strike threshold (Slice 10, D-PPT10-B) ─────────────────────
 // Consecutive rs<=2 'waiting' invocations (post-N1) required before the N2
@@ -928,16 +937,16 @@ function onVideoWaiting() {
   const rawTarget   = bufEnd - LIVE_EDGE_STALL_SNAP_LEAD_SEC;
   const target      = clampSnapTarget(buf, ct, rawTarget); // no-hole clamp (D-PPT9-B4)
   if (target === null) return; // no substantial range to land in — silent no-op
-  const now         = performance.now();
   const hardStarve  = VIDEO_EL.readyState <= 2; // was <=1; widened to rs<=2 (D-PPT9-C, locked D4)
+  const now         = performance.now();
   // N1 EFFECTIVENESS GUARD (runs first — gates ALL paths including escape hatch).
   // Suppresses futile re-snaps where neither ct nor bufEnd has advanced by > ADV_EPS
   // since the last EXECUTED snap baseline (the 147x dead-position storm, GATE-7).
   const advanced = (ct > lastSnapCt + ADV_EPS) || (bufEnd > lastSnapBufEnd + ADV_EPS);
   if (!advanced) { suppressedGuardCount++; return; }
   // S10 (D-PPT10-B): increment the 2-strike streak AFTER N1, BEFORE N2.
-  // Only increments — no reset here. onVideoWaiting is 'waiting'-only (rs<=2),
-  // so the rs>2 else-branch is dead. Reset is observed in the heartbeat (REV 2).
+  // Only increments — no reset here. A queued 'waiting' callback can observe
+  // readyState > 2 after recovery, so reset still belongs to the heartbeat path.
   if (hardStarve) { hardStarveStreak++; }
   // N2 DEBOUNCE GUARD (bypass now requires rs<=2 AND streak>=HARDSTARVE_STRIKE_TICKS).
   // Collapses the 95% back-to-back storm by rate-limiting to one snap per 300 ms.
@@ -949,14 +958,20 @@ function onVideoWaiting() {
     suppressedDebounceCount++;
     return;
   }
-  // N3 NO-OP KILL: eliminates the 438 exact seek-to-self events (target===ct).
-  // Placed after target is computed and before G6 so these events are attributed
-  // to suppressedGuardCount rather than silently disappearing in the S7 cushion path.
-  if (target === ct) { suppressedGuardCount++; return; }
+  // N3 NO-OP KILL: eliminates seek-to-self and near-self events within timestamp tolerance.
+  if (Math.abs(target - ct) <= MEDIA_TIMESTAMP_TOLERANCE_SEC) { suppressedGuardCount++; return; }
+  const drift = bufEnd - ct;
+  // Gate B bitrate-floor follow-up: suppress low-drift backward stall-snap
+  // replays near the live edge regardless of the current readyState. Keep the
+  // 0.300 s boundary inclusive, but only allow a tiny float-noise tolerance at
+  // equality so 0.301 s still recovers.
+  if (target < ct && drift >= 0 && drift <= (LIVE_EDGE_STALL_REPLAY_MIN_DRIFT_SEC + LIVE_EDGE_STALL_REPLAY_DRIFT_TOLERANCE_SEC)) {
+    suppressedGuardCount++;
+    return;
+  }
   // G6: cushion guard — prevent tight replay loops on sliver ranges.
   if (bufEnd - target < LIVE_EDGE_STALL_MIN_CUSHION_SEC) return;
   // Log BEFORE assignment (seekToLiveEdge precedent, D-PPT7-3).
-  const drift = bufEnd - ct;
   mseLog(
     "event=seek result=stall_snap from=" + ct.toFixed(3) +
     " to=" + target.toFixed(3) +
@@ -1256,7 +1271,7 @@ async function main() {
       " watchdog_rescues=" + watchdogRescues  // D-PPT9-D2: strictly last field
     );
     // REV 2 (D-PPT10-B): reset the 2-strike streak on any tick where rs>2 (player recovered).
-    // onVideoWaiting cannot observe rs>2 ('waiting'-only at L1201 — dead code there).
+    // onVideoWaiting can still run after a 'waiting' event once readyState has already rebounded.
     if (VIDEO_EL.readyState > 2) { hardStarveStreak = 0; }
     // ── Gap-stranding watchdog (Slice 9, D-PPT9-A). Rescues a no-progress,
     // data-ahead stranding that seekToLiveEdge's sb.updating/seeking guards block. ──

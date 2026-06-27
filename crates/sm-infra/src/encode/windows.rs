@@ -53,8 +53,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
-use sm_domain::CaptureFrame;
-use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder};
+use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, FramePayload, VideoEncoder};
 
 use crate::encode::bgra_to_i420::{I420, convert};
 
@@ -145,7 +144,7 @@ impl VideoEncoder for WindowsOpenH264Encoder {
 
     fn start(
         &mut self,
-        rx: Receiver<CaptureFrame>,
+        rx: Receiver<FramePayload>,
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
         use openh264::encoder::{
@@ -183,6 +182,9 @@ impl VideoEncoder for WindowsOpenH264Encoder {
 
             let mut scratch = I420::new(1, 1); // resized on first frame
             let mut seq: u64 = 0;
+            // One-time observability flag: the SW encoder must never see GpuShared. If it
+            // does (a wiring bug), warn ONCE rather than spamming the log every frame.
+            let mut warned_unexpected_gpu_shared = false;
 
             loop {
                 // ── Stop check ────────────────────────────────────────────────
@@ -192,7 +194,25 @@ impl VideoEncoder for WindowsOpenH264Encoder {
 
                 // ── Receive frame ─────────────────────────────────────────────
                 let frame = match rx.recv() {
-                    Ok(f) => f,
+                    Ok(FramePayload::Cpu(f)) => f,
+                    Ok(FramePayload::GpuShared { .. }) => {
+                        // The software encoder is only ever selected for the
+                        // CPU-staged path; the path-selection gate never routes the
+                        // GPU-resident `GpuShared` variant here. If one arrives it is
+                        // a wiring bug — skip it rather than panic so the session
+                        // keeps running on subsequent CPU frames. Warn once for
+                        // observability (functionally a no-op skip otherwise).
+                        if !warned_unexpected_gpu_shared {
+                            warned_unexpected_gpu_shared = true;
+                            tracing::warn!(
+                                target: "sm_infra::encode::windows",
+                                "software encoder received an unexpected GpuShared frame — \
+                                 skipping (path-selection gate should never route GPU frames \
+                                 to the SW encoder; this indicates a wiring bug)"
+                            );
+                        }
+                        continue;
+                    }
                     Err(_) => break, // upstream sender dropped — normal shutdown
                 };
 
@@ -366,20 +386,21 @@ mod tests {
 
     // ─── Helper: build a minimal CaptureFrame ─────────────────────────────────
 
-    /// Build a synthetic BGRA8 `CaptureFrame` at the given resolution.
+    /// Build a synthetic BGRA8 frame at the given resolution, wrapped in a
+    /// `FramePayload::Cpu` (the only variant the software encoder ever consumes).
     /// All pixels are black (0,0,0,255). Width and height are rounded to even
     /// values so the encoder can produce I420 without dimension issues.
-    fn make_frame(width: u32, height: u32, ts_ms: u64) -> sm_domain::CaptureFrame {
+    fn make_frame(width: u32, height: u32, ts_ms: u64) -> FramePayload {
         let stride = width * 4;
         let data = vec![0u8; (stride * height) as usize];
-        sm_domain::CaptureFrame {
+        FramePayload::Cpu(sm_domain::CaptureFrame {
             data: Arc::from(data.as_slice()),
             width,
             height,
             stride,
             format: PixelFormat::Bgra8,
             timestamp: Duration::from_millis(ts_ms),
-        }
+        })
     }
 
     // ─── A1: new with default config returns Ok ────────────────────────────────

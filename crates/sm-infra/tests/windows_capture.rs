@@ -152,7 +152,13 @@ fn windows_capture_delivers_at_least_3_frames() {
     );
 
     use sm_domain::PixelFormat;
-    for (i, frame) in frames.iter().enumerate() {
+    use sm_domain::encode::FramePayload;
+    for (i, payload) in frames.iter().enumerate() {
+        // No GPU hand-off is wired in this test, so the capture source always emits
+        // the CPU-staged variant.
+        let FramePayload::Cpu(frame) = payload else {
+            panic!("frame {i} must be the Cpu variant (no GPU hand-off wired)");
+        };
         assert!(frame.width > 0, "frame {i} width must be > 0");
         assert!(frame.height > 0, "frame {i} height must be > 0");
         assert_eq!(
@@ -188,7 +194,7 @@ fn windows_capture_drops_frames_when_consumer_slow() {
     }
 
     // Capacity 1 means the second frame will cause a drop.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<sm_domain::CaptureFrame>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<sm_domain::encode::FramePayload>(1);
 
     let mut source = WindowsCaptureSource::new(CaptureConfig::default()).expect("new must succeed");
 
@@ -228,7 +234,7 @@ fn windows_capture_stop_is_idempotent() {
         return;
     }
 
-    let (tx, _rx) = std::sync::mpsc::sync_channel::<sm_domain::CaptureFrame>(4);
+    let (tx, _rx) = std::sync::mpsc::sync_channel::<sm_domain::encode::FramePayload>(4);
 
     let mut source = WindowsCaptureSource::new(CaptureConfig::default()).expect("new must succeed");
 

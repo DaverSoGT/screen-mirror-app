@@ -100,16 +100,13 @@ use sm_domain::encode::{EncodedPacket, EncoderConfig, EncoderError, VideoEncoder
 // gate) so both the encode and capture production gates call the same tested function.
 use crate::capture::interval_elapsed;
 
-// ── FramePayload dispatch seam (PR-2) ─────────────────────────────────────────
+// ── FramePayload dispatch seam (PR-4 / TASK-08) ───────────────────────────────
 //
-// The capture→encoder channel still carries `CaptureFrame` at the public
-// VideoEncoder::start() boundary (sm-domain trait is frozen). Inside pump_loop
-// we convert each received frame to `FramePayload` and match on the variant.
-// This introduces the routing seam without changing the external API.
-//
-// In PR-2 the capture side ONLY produces `Cpu` frames; the `GpuShared` arm
-// is a `todo!()` stub that is safe because no such variant can be constructed
-// from production code in this PR.
+// The capture→encoder channel carries `FramePayload` end-to-end (design D7): the
+// `VideoEncoder::start()` boundary now takes `Receiver<FramePayload>`. The capture
+// thread emits `Cpu` for the CPU-staged path and `GpuShared` when the gate
+// selected the GPU-resident path. pump_loop matches on the received variant — no
+// per-frame wrapping. The `Cpu` arm is byte-identical to the pre-GPU CPU path.
 use crate::encode::frame_payload::FramePayload;
 
 // ── A1: GOP size cap ──────────────────────────────────────────────────────────
@@ -344,6 +341,11 @@ pub struct WindowsMftH264Encoder {
     mft_activate_factory: Option<IMFActivate>,
     /// `Some` while the encoder thread is running; `None` before `start` and after `stop`.
     handle: Option<JoinHandle<()>>,
+    /// Cross-thread GPU-resident path coordination (PR-4 / TASK-08), shared with the
+    /// capture source. `None` when the GPU path is not wired (no `hw-encoder` GPU
+    /// hand-off, or the caller did not call `set_gpu_handoff`) — the encoder then runs
+    /// the CPU-staged path with placeholder gate logging, exactly as PR-3.
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 }
 
 impl std::fmt::Debug for WindowsMftH264Encoder {
@@ -408,12 +410,13 @@ impl VideoEncoder for WindowsMftH264Encoder {
             vendor,
             mft_activate_factory: Some(activate),
             handle: None,
+            gpu_handoff: None,
         })
     }
 
     fn start(
         &mut self,
-        rx: Receiver<sm_domain::CaptureFrame>,
+        rx: Receiver<FramePayload>,
         tx: SyncSender<EncodedPacket>,
     ) -> Result<(), EncoderError> {
         let activate = self.mft_activate_factory.take().ok_or_else(|| {
@@ -423,6 +426,8 @@ impl VideoEncoder for WindowsMftH264Encoder {
         let state = Arc::clone(&self.state);
         // Pass vendor so run_encoder_thread can call select_encode_path at init (PR-2 seam).
         let vendor = self.vendor;
+        // GPU-resident hand-off (PR-4). `None` runs the CPU-staged path unchanged.
+        let gpu_handoff = self.gpu_handoff.clone();
 
         state.stop.store(false, Ordering::Release);
 
@@ -436,7 +441,15 @@ impl VideoEncoder for WindowsMftH264Encoder {
 
         let handle = std::thread::spawn(move || {
             // into_inner() unwraps ComSend<IMFActivate> → IMFActivate inside the thread.
-            run_encoder_thread(activate_send.into_inner(), config, state, vendor, rx, tx);
+            run_encoder_thread(
+                activate_send.into_inner(),
+                config,
+                state,
+                vendor,
+                rx,
+                tx,
+                gpu_handoff,
+            );
         });
 
         self.handle = Some(handle);
@@ -490,6 +503,18 @@ impl VideoEncoder for WindowsMftH264Encoder {
             EncoderVendor::Amd => "hw_amd",
             EncoderVendor::Unknown => "hw_unknown",
         }
+    }
+}
+
+impl WindowsMftH264Encoder {
+    /// Attach the GPU-resident path hand-off shared with the capture source
+    /// (PR-4 / TASK-08). MUST be called BEFORE [`VideoEncoder::start`] so the
+    /// encoder thread can publish its encode-adapter LUID + vendor into the
+    /// hand-off and negotiate the GPU pipeline at init.
+    ///
+    /// When this is never called the encoder runs the CPU-staged path unchanged.
+    pub fn set_gpu_handoff(&mut self, handoff: Arc<crate::encode::gpu_handoff::GpuHandoff>) {
+        self.gpu_handoff = Some(handoff);
     }
 }
 
@@ -1106,8 +1131,9 @@ fn run_encoder_thread(
     config: EncoderConfig,
     state: Arc<MftEncoderShared>,
     vendor: EncoderVendor,
-    rx: Receiver<sm_domain::CaptureFrame>,
+    rx: Receiver<FramePayload>,
     tx: SyncSender<EncodedPacket>,
+    gpu_handoff: Option<Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 ) {
     // Step 1: CoInitializeEx on the encoder thread (MTA).
     // SAFETY: CoInitializeEx returns HRESULT directly (not Result). S_OK (0) and
@@ -1181,71 +1207,114 @@ fn run_encoder_thread(
         return;
     }
 
-    // Steps 4–6 (via setup_mft): output-type negotiation, input type, streaming messages.
-    // setup_mft calls try_setup_output_type at its start (same-thread — no cross-thread AV).
+    // Step 4–5 (via setup_mft): output-type + system-memory NV12 input negotiation.
+    // setup_mft NO LONGER sends the streaming-start messages — those are deferred to
+    // `start_mft_streaming` below, AFTER the GPU path-selection gate runs SET_D3D_MANAGER
+    // + DXGI input negotiation (PR-4 carry-forward #4; matches the validated spike order).
     if let Err(e) = setup_mft(&mft, &config) {
         tracing::error!("MFT setup failed: {e}");
         // MFShutdown is handled by MfShutdownGuard; CoUninitialize by CoUninitGuard.
         // Both guards drop automatically when this function returns.
         return;
     }
-    tracing::debug!("setup_mft OK; entering pump_loop");
+    tracing::debug!("setup_mft OK; running path-selection gate before streaming start");
 
-    // Path-selection gate + live D3D negotiation: evaluate ONCE at init.
+    // Path-selection gate + live D3D negotiation: evaluate ONCE at init, with REAL
+    // adapter LUIDs (PR-4 / TASK-08). The encoder thread creates its own hardware
+    // D3D11 device (the shared device the GPU pipeline + keyed-mutex consumer run on),
+    // reads its encode-adapter LUID, and publishes it + the vendor into the GpuHandoff
+    // so the capture thread can resolve the same gate from its WGC-device LUID.
     //
-    // TASK-08/PR-4 will supply the real capture/encode adapter LUIDs (from the
-    // capture device and the MFT adapter) and the shared keyed-mutex D3D11 device
-    // produced by the capture-thread CopyResource hand-off. In PR-3 there is no
-    // GPU producer yet, so:
-    //   1. The gate still runs and logs the selected path (placeholder LUIDs).
-    //   2. negotiate_gpu_path_runtime receives `None` for the shared device and
-    //      therefore returns CpuStagedFallback + no pipeline — the session runs on
-    //      the CPU-staged path exactly as before. Production behaviour is UNCHANGED.
-    //
-    // The returned `gpu_pipeline: Option<GpuEncodePipeline>` is threaded into
-    // pump_loop. The FramePayload::GpuShared arm routes through it (TASK-06/07
-    // GPU code) instead of `todo!()`; the arm is unreachable at runtime until a
-    // producer exists (PR-4), but it compiles and links the real GPU path.
+    // The gate uses the encode LUID for BOTH the capture and encode operands: on a
+    // single-adapter QSV box the capture and encode adapter are the same physical GPU
+    // (LUID equality trivially holds) and the vendor floor (`vendor == IntelQsv`) is the
+    // operative guard; on the NVENC box the vendor floor rejects regardless. The capture
+    // thread independently cross-checks WGC LUID == encode LUID and downgrades to Cpu if
+    // they differ. When no GpuHandoff is wired the session runs CPU-staged unchanged.
     let gpu_pipeline = {
-        use crate::encode::gpu_path::negotiate_gpu_path_runtime;
+        use crate::encode::gpu_path::{create_shared_d3d_device, negotiate_gpu_path_runtime};
         use crate::encode::path_select::{EncodePath, select_encode_path};
 
-        // Placeholder LUIDs until PR-4 wires real adapter LUID reads. With both 0
-        // the LUID-equality check passes (0 == 0); the vendor floor still applies,
-        // so only an IntelQsv encoder selects GpuResident here.
-        let placeholder_capture_luid: i64 = 0;
-        let placeholder_encode_luid: i64 = 0;
-        let selected =
-            select_encode_path(placeholder_capture_luid, placeholder_encode_luid, vendor);
-        tracing::info!(
-            target: "sm_infra::encode::windows_mft",
-            path = ?selected,
-            vendor = ?vendor,
-            "encode path selected at init"
-        );
-
-        let (w, h) = effective_dimensions(&config);
-        match selected {
-            EncodePath::GpuResident => {
-                // Run the live encoder-thread D3D negotiation. In PR-3 the shared
-                // device is None (no producer), so this returns CpuStagedFallback
-                // with no pipeline; in PR-4 it builds the real GPU pipeline or
-                // degrades via the TASK-05 fallback branch (WARN + CpuStagedFallback).
-                let (negotiated, pipeline) = negotiate_gpu_path_runtime(None, &mft, w, h, &config);
-                tracing::debug!(
+        match gpu_handoff.as_ref() {
+            None => {
+                // No GPU hand-off wired — CPU-staged path. Log a placeholder gate for
+                // observability parity with the GPU path.
+                tracing::info!(
                     target: "sm_infra::encode::windows_mft",
-                    negotiated = ?negotiated,
-                    gpu_pipeline_active = pipeline.is_some(),
-                    "GpuResident selected; live negotiation complete"
+                    vendor = ?vendor,
+                    "no GPU hand-off wired — CPU-staged path"
                 );
-                pipeline
-            }
-            EncodePath::CpuStagedFallback => {
-                // Existing CPU path — the GPU pipeline is never built.
                 None
+            }
+            Some(handoff) => {
+                // Create the encoder's shared D3D11 device + read its encode LUID.
+                match create_shared_d3d_device() {
+                    Ok((shared_device, encode_luid)) => {
+                        handoff.publish_encode_luid(encode_luid, vendor);
+                        let selected = select_encode_path(encode_luid, encode_luid, vendor);
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            path = ?selected,
+                            vendor = ?vendor,
+                            encode_luid,
+                            "encode path selected at init"
+                        );
+                        let (w, h) = effective_dimensions(&config);
+                        match selected {
+                            EncodePath::GpuResident => {
+                                // Live encoder-thread D3D negotiation: SET_D3D_MANAGER +
+                                // DXGI NV12 input. On rejection negotiate_gpu_path_runtime
+                                // emits the TASK-05 WARN, rolls back the MFT to a clean CPU
+                                // state (carry-forward #5), and returns no pipeline.
+                                let (negotiated, pipeline) = negotiate_gpu_path_runtime(
+                                    Some(&shared_device),
+                                    &mft,
+                                    w,
+                                    h,
+                                    &config,
+                                );
+                                tracing::debug!(
+                                    target: "sm_infra::encode::windows_mft",
+                                    negotiated = ?negotiated,
+                                    gpu_pipeline_active = pipeline.is_some(),
+                                    "GpuResident selected; live negotiation complete"
+                                );
+                                if pipeline.is_none() {
+                                    // Negotiation failed → force the producer onto CPU.
+                                    handoff.degrade_to_cpu();
+                                }
+                                pipeline
+                            }
+                            EncodePath::CpuStagedFallback => {
+                                handoff.degrade_to_cpu();
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Could not create the shared device — degrade to CPU (REQ-05).
+                        tracing::warn!(
+                            target: "sm_infra::encode::windows_mft",
+                            "shared D3D11 device creation failed ({e}); using CPU-staged path"
+                        );
+                        handoff.degrade_to_cpu();
+                        None
+                    }
+                }
             }
         }
     };
+
+    // Carry-forward #4: send the streaming-start messages NOW — AFTER the GPU gate
+    // ran SET_D3D_MANAGER + DXGI input negotiation. This matches the validated spike
+    // order (SET_D3D_MANAGER → output → input → BEGIN_STREAMING → START_OF_STREAM) and
+    // avoids re-negotiating an already-streaming async HW MFT (which REQ-05 would
+    // reject). For the CPU path this preserves the pre-change message sequence.
+    if let Err(e) = start_mft_streaming(&mft) {
+        tracing::error!("MFT streaming start failed: {e}");
+        return;
+    }
+    tracing::debug!("streaming started; entering pump_loop");
 
     // Step 5: Cast to ICodecAPI — done here on the encoder thread, after setup_mft.
     // SAFETY: IMFTransform for hardware video encoders implements ICodecAPI per Windows docs.
@@ -1299,6 +1368,7 @@ fn run_encoder_thread(
         &mut output_format_known,
         &config,
         gpu_pipeline,
+        gpu_handoff.as_ref(),
     );
 
     // Steps 9a–9e: Notify end of stream and release.
@@ -1398,8 +1468,23 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
             .map_err(|e| EncoderError::InitFailed(format!("SetInputType: 0x{:08X}", e.code().0)))?;
     }
 
-    // Steps 7f–7h: Send streaming messages.
-    // (Async unlock was set by run_encoder_thread before calling this function — not repeated here.)
+    // NOTE: the streaming-start messages (FLUSH / BEGIN_STREAMING / START_OF_STREAM)
+    // are NOT sent here. They are deferred to `start_mft_streaming`, called by
+    // run_encoder_thread AFTER the GPU path-selection gate runs (PR-4 carry-forward
+    // #4). The validated spike order is SET_D3D_MANAGER → output → input(NV12) →
+    // BEGIN_STREAMING → START_OF_STREAM; sending SET_D3D_MANAGER / re-SetInputType to
+    // an already-streaming async HW MFT is exactly what REQ-05 expects to reject.
+    Ok(())
+}
+
+/// Send the MFT streaming-start messages (FLUSH → BEGIN_STREAMING → START_OF_STREAM).
+///
+/// Split out of `setup_mft` (PR-4 carry-forward #4) so that the GPU path-selection
+/// gate can run `SET_D3D_MANAGER` + DXGI `SetInputType` negotiation BEFORE the MFT
+/// begins streaming — matching the validated spike order. For the CPU path this is
+/// called immediately after `setup_mft`, preserving the pre-change message sequence.
+fn start_mft_streaming(mft: &IMFTransform) -> Result<(), EncoderError> {
+    // (Async unlock was set by run_encoder_thread before setup_mft — not repeated.)
     unsafe {
         mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)
             .map_err(|e| {
@@ -1414,7 +1499,6 @@ fn setup_mft(mft: &IMFTransform, config: &EncoderConfig) -> Result<(), EncoderEr
                 EncoderError::InitFailed(format!("START_OF_STREAM: 0x{:08X}", e.code().0))
             })?;
     }
-
     Ok(())
 }
 
@@ -1565,6 +1649,41 @@ fn fire_pending_codec_settings(codec_api: &ICodecAPI, swap: &CodecApiSwap) {
     );
 }
 
+/// Consume a pending force-keyframe request and issue
+/// `ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, VT_UI4=1)` BEFORE
+/// `ProcessInput` (canonical Chromium/FFmpeg ordering; research #808). Shared by
+/// the CPU and GPU submission arms so a forced IDR (e.g. receiver reconnect) is
+/// honored on BOTH paths — the GPU arm previously dropped it (PR-4 carry-forward
+/// #1). Vendor-uniform (NVENC IDR idx 0, Intel QSV idx 1); the property auto-resets
+/// to 0 after the next `ProcessInput` per MS docs. SetValue rejection is non-fatal
+/// (warn + continue) per DD13.
+fn consume_force_keyframe(state: &MftEncoderShared, codec_api: &ICodecAPI) {
+    if state
+        .force_keyframe_icodecapi_pending
+        .swap(false, Ordering::AcqRel)
+    {
+        let v = make_variant_u32(1);
+        // SAFETY: SetValue on a valid ICodecAPI is always safe; the VARIANT is
+        // stack-allocated and correctly typed VT_UI4.
+        unsafe {
+            if let Err(e) = codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v) {
+                tracing::warn!(
+                    target: "sm_infra::encode::windows_mft",
+                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
+                     rejected: 0x{:08X} (non-fatal, encoding continues)",
+                    e.code().0
+                );
+            } else {
+                tracing::debug!(
+                    target: "sm_infra::encode::windows_mft",
+                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
+                     VT_UI4=1) issued BEFORE ProcessInput"
+                );
+            }
+        }
+    }
+}
+
 /// RESTORE step (DD3): re-arm pending codec atomics on early-return paths where
 /// `ProcessInput` was NOT called (frame dropped, timeout, disconnect-without-drain).
 ///
@@ -1584,25 +1703,80 @@ fn restore_pending_codec(state: &MftEncoderShared, swap: &CodecApiSwap) {
     );
 }
 
+/// `DXGI_ERROR_DEVICE_REMOVED` — the GPU device was lost (driver TDR, GPU reset,
+/// adapter removed). The whole D3D device + every resource derived from it is dead.
+const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+/// `DXGI_ERROR_DEVICE_RESET` — the device was reset (e.g. by a hung app); same
+/// consequence for us: the GPU pipeline must be abandoned for the session.
+const DXGI_ERROR_DEVICE_RESET: u32 = 0x887A_0007;
+
+/// Format the two device-lost HRESULTs for log clarity; returns `Some(name)` when the
+/// reason string contains a recognized device-removed/reset code, else `None`.
+///
+/// Policy note: on the GPU arm we degrade to CPU on ANY hard error (not only these two
+/// codes) to honor REQ-05's "no per-frame retry" — re-arming a possibly-dead GPU
+/// pipeline every frame would spin the device-lost error forever. This label only
+/// enriches the log when the error is a recognized device-lost code.
+fn device_lost_label(reason: &str) -> Option<&'static str> {
+    if reason.contains(&format!("0x{DXGI_ERROR_DEVICE_REMOVED:08X}")) {
+        Some("DXGI_ERROR_DEVICE_REMOVED")
+    } else if reason.contains(&format!("0x{DXGI_ERROR_DEVICE_RESET:08X}")) {
+        Some("DXGI_ERROR_DEVICE_RESET")
+    } else {
+        None
+    }
+}
+
+/// Permanently degrade the GPU path to CPU for the rest of the session (REQ-05, Fix 1).
+///
+/// Drops the local `gpu_pipeline` to `None` (so the consumer stops attempting the GPU
+/// arm and the "GpuShared but no pipeline" skip cannot loop) AND latches the shared
+/// `GpuHandoff` to CPU (so the capture thread stops emitting `GpuShared`; it already
+/// reverts when `resolved_path() != GpuResident`). Idempotent and safe to call once.
+fn degrade_gpu_to_cpu(
+    gpu_pipeline: &mut Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    gpu_handoff: Option<&Arc<crate::encode::gpu_handoff::GpuHandoff>>,
+    context: &str,
+) {
+    if gpu_pipeline.is_some() {
+        tracing::warn!(
+            target: "sm_infra::encode::windows_mft",
+            "pump_loop: degrading GPU path to CPU-staged for the session ({context})"
+        );
+    }
+    *gpu_pipeline = None;
+    if let Some(handoff) = gpu_handoff {
+        handoff.degrade_to_cpu();
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
-    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx, format state \
-              and the optional GPU pipeline — design §5a one-function pump shape; 9 args accepted \
-              over struct decomposition for clarity"
+    reason = "pump_loop owns mft, codec_api, event_gen plus config, state, rx, tx, format state, \
+              the optional GPU pipeline and the GPU hand-off latch — design §5a one-function pump \
+              shape; 10 args accepted over struct decomposition for clarity"
 )]
 fn pump_loop(
     mft: IMFTransform,
     initial_codec_api: ICodecAPI,
     initial_event_gen: IMFMediaEventGenerator,
     state: &MftEncoderShared,
-    rx: Receiver<sm_domain::CaptureFrame>,
+    rx: Receiver<FramePayload>,
     tx: SyncSender<EncodedPacket>,
     output_format_known: &mut Option<bool>, // None until first packet sniffed; Some(true)=AVCC, Some(false)=AnnexB
     config: &EncoderConfig,
     // GPU-resident pipeline, `Some` only when the GPU path was negotiated (PR-4
     // runtime). In PR-3 this is always `None`, so the FramePayload::GpuShared arm
     // is structurally present but unreachable (no producer constructs GpuShared).
-    gpu_pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    // Mutable so an unrecoverable GPU-arm error can tear the pipeline down to `None`
+    // for the rest of the session (device-lost degradation, REQ-05).
+    mut gpu_pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline>,
+    // GPU hand-off latch (PR-4 / TASK-08, Fix 1). `Some` only when the GPU path is
+    // wired. On a GPU-arm device-removed/unrecoverable error the pump calls
+    // `degrade_to_cpu()` here so the capture thread STOPS emitting `GpuShared` and the
+    // session continues on the byte-identical CPU-staged path (no per-frame retry,
+    // no encoder-thread death). `None` runs the CPU path exactly as before.
+    gpu_handoff: Option<&Arc<crate::encode::gpu_handoff::GpuHandoff>>,
 ) -> IMFTransform {
     use crate::encode::bgra_to_nv12::{Nv12, convert as nv12_convert};
     use std::sync::mpsc::RecvTimeoutError;
@@ -1662,6 +1836,14 @@ fn pump_loop(
     // I2 (D-PPT-2): per-second convert timing accumulator. Shares the encode_fps window
     // so all encoder-thread metrics reset at the same tick (one timestamp, one reset).
     let mut convert_stats = ConvertStats::default();
+    // GATE B metric #3: per-second consumer keyed-mutex blt-hold accumulator. Shares the
+    // encode_fps window so it resets at the same tick. Only the GPU arm records into it; on
+    // the CPU-staged path it stays empty and logs zero.
+    let mut blt_hold_stats = BltHoldStats::default();
+    // Interim missing-fence confirm: per-second consumer generation-lag accumulator. Shares
+    // the encode_fps window so it resets at the same tick. Only the GPU arm records into it;
+    // on the CPU-staged path it stays empty and logs zero.
+    let mut gen_lag_stats = GenLagStats::default();
     // I3 (D-PPT-3): snapshot of state.dropped at the last encode window boundary, used
     // to compute per-interval drop delta for the enc_to_sender channel.
     let mut last_dropped_enc_snapshot: u64 = 0;
@@ -1818,6 +2000,30 @@ fn pump_loop(
                             "convert throughput"
                         );
 
+                        // GATE B metric #3: consumer keyed-mutex blt-hold time. The producer's
+                        // non-blocking acquire skips a frame whenever a capture callback overlaps
+                        // this hold, so a high max here predicts producer skips on the capture side.
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            blt_hold_mean_ms = %format!("{:.2}", blt_hold_stats.mean_us() as f64 / 1000.0),
+                            blt_hold_max_ms = %format!("{:.2}", blt_hold_stats.max_us() as f64 / 1000.0),
+                            frames = blt_hold_stats.frames,
+                            "consumer blt-hold"
+                        );
+
+                        // Interim missing-fence confirm: consumer generation lag. `gpu_gen_lag_max
+                        // == 0` every window ⇒ the consumer always dequeues the freshest queued
+                        // generation (the ring is not behind). `>= 1` ⇒ it is reading an OLDER
+                        // queued generation (ring-wrap/backlog staleness, distinct from the
+                        // in-flight-copy staleness the producer Flush targets).
+                        tracing::info!(
+                            target: "sm_infra::encode::windows_mft",
+                            gpu_gen_lag_max = gen_lag_stats.max_lag(),
+                            gpu_gen_lag_mean = gen_lag_stats.mean_lag(),
+                            frames = gen_lag_stats.frames,
+                            "consumer gen-lag"
+                        );
+
                         // I3 (D-PPT-3): emit per-interval encode drop delta (CAPT-OBS-4).
                         // state.dropped accumulates both drops from the TrySendError::Full arm
                         // above and dimension-mismatch drops from the drop site in the NeedInput
@@ -1838,6 +2044,8 @@ fn pump_loop(
 
                         // Reset all window-shared accumulators at the same boundary.
                         convert_stats.reset();
+                        blt_hold_stats.reset();
+                        gen_lag_stats.reset();
                         fps_frame_count = 0;
                         fps_window_start = std::time::Instant::now();
                     }
@@ -1861,7 +2069,18 @@ fn pump_loop(
                         );
                         ho_count -= 1;
                     } else {
-                        tracing::error!("pump_loop: collect_output failed: {e}");
+                        // Fix 1: a fatal ProcessOutput error (incl. device-removed/reset on the
+                        // GPU path) terminates this encoder thread — it can no longer pull output.
+                        // Before returning, degrade the GPU hand-off to CPU so the capture thread
+                        // STOPS emitting GpuShared and a subsequent session rebuild comes up on the
+                        // byte-identical CPU-staged path instead of re-arming a dead GPU device.
+                        match device_lost_label(&reason) {
+                            Some(label) => tracing::error!(
+                                "pump_loop: ProcessOutput device lost ({label}): {e}; degrading GPU hand-off and exiting"
+                            ),
+                            None => tracing::error!("pump_loop: collect_output failed: {e}"),
+                        }
+                        degrade_gpu_to_cpu(&mut gpu_pipeline, gpu_handoff, "ProcessOutput error");
                         return mft;
                     }
                 }
@@ -1893,14 +2112,14 @@ fn pump_loop(
             // and reaches the top-of-loop stop check. Option A (Phase 1 user decision).
             // See spec OQ-5 + design DD7. DO NOT increase beyond 50ms.
             match rx.recv_timeout(FRAME_RECV_TIMEOUT) {
-                Ok(raw_frame) => {
-                    // FramePayload dispatch seam: wrap the received CaptureFrame as
-                    // FramePayload::Cpu so the routing match below is the single
-                    // authoritative dispatch point. The channel carries CaptureFrame
-                    // at the frozen VideoEncoder::start() boundary, so only the Cpu
-                    // variant can be produced here today; PR-4 adds a GpuShared producer
-                    // on the capture side via the keyed-mutex texture hand-off.
-                    let payload = FramePayload::Cpu(raw_frame);
+                Ok(payload) => {
+                    // FramePayload dispatch (design D7): the channel carries the
+                    // variant the capture thread produced. `GpuShared` is the
+                    // GPU-resident path (only emitted when the gate selected it);
+                    // `Cpu` is the byte-identical CPU-staged path. The `Cpu` arm
+                    // falls through below to the existing nv12_convert + submit_frame
+                    // path VERBATIM; the `GpuShared` arm fully services the frame and
+                    // `continue`s the credit loop.
                     let frame = match payload {
                         FramePayload::Cpu(f) => f,
                         FramePayload::GpuShared {
@@ -1909,50 +2128,151 @@ fn pump_loop(
                             height,
                             stride: _,
                             timestamp,
+                            r#gen: frame_gen,
                         } => {
-                            // GPU-resident path (TASK-06/07): convert the shared BGRA
-                            // texture to NV12 on the GPU and feed the MFT a DXGI-surface
-                            // sample — no readback, no CPU convert, no MFCreateMemoryBuffer.
-                            //
-                            // Reachable only when a GpuEncodePipeline was negotiated AND a
-                            // producer constructed GpuShared. In PR-3 neither holds, so this
-                            // arm does not run at runtime; it compiles and links the real GPU
-                            // code path (gpu_path::GpuEncodePipeline) instead of `todo!()`.
+                            // Interim missing-fence confirm: measure how far behind the
+                            // producer's newest QUEUED generation this dequeued frame is. We
+                            // sample it for EVERY dequeued GpuShared frame (before the pipeline
+                            // / dim checks below) so a dropped frame still contributes its lag.
+                            // `lag == 0` ⇒ consumer is current (ring not behind); `lag >= 1` ⇒
+                            // it is reading an older queued generation (ring-wrap/backlog
+                            // staleness — distinct from the in-flight-copy staleness the
+                            // producer Flush targets).
+                            if let Some(handoff) = gpu_handoff.as_ref() {
+                                gen_lag_stats.record(gen_lag(handoff.latest_gen(), frame_gen));
+                            }
+                            // GPU-resident path (TASK-06/07/08): acquire the shared
+                            // keyed-mutex BGRA texture, convert to NV12 on the GPU, and
+                            // feed the MFT a DXGI-surface sample — no readback, no CPU
+                            // convert, no MFCreateMemoryBuffer.
                             if let Some(pipe) = gpu_pipeline.as_ref() {
-                                debug_assert_eq!(
-                                    pipe.dimensions(),
-                                    (width, height),
-                                    "GpuShared frame dims must match the negotiated pipeline"
-                                );
+                                // Carry-forward #2: runtime dim-mismatch guard (NOT a
+                                // release-stripped debug_assert). A smaller-than-expected
+                                // texture causes an out-of-bounds read inside the driver
+                                // → 0xC0000005 AV; DROP the frame and skip, mirroring the
+                                // CPU arm's `state.dropped` + skip below.
+                                if pipe.dimensions() != (width, height) {
+                                    let (pw, ph) = pipe.dimensions();
+                                    tracing::warn!(
+                                        target: "sm_infra::encode::windows_mft",
+                                        "pump_loop: GPU frame dim mismatch — pipeline {}x{}, got {}x{}; dropping frame to avoid driver AV",
+                                        pw, ph, width, height
+                                    );
+                                    state.dropped.fetch_add(1, Ordering::Relaxed);
+                                    // Re-arm pending codec atomics (DD3): ProcessInput was
+                                    // not called, so the IDR hint + bitrate must survive.
+                                    restore_pending_codec(state, &swap);
+                                    continue;
+                                }
+                                // Carry-forward #1: consume the force-keyframe request and
+                                // issue SetValue(CODECAPI_AVEncVideoForceKeyFrame) BEFORE
+                                // submit, matching the CPU arm ordering — a forced IDR must
+                                // not be dropped on the GPU path.
+                                consume_force_keyframe(state, &codec_api);
+                                let mut blt_hold = std::time::Duration::ZERO;
                                 match submit_gpu_frame(
                                     &mft,
                                     pipe,
                                     handle,
                                     timestamp,
                                     frame_dur_100ns,
+                                    &mut blt_hold,
                                 ) {
                                     Ok(()) => {
+                                        // GATE B metric #3: accumulate the consumer keyed-mutex
+                                        // hold span (the window producer try-acquires skip on).
+                                        blt_hold_stats.record(blt_hold);
                                         current_ts = timestamp;
                                         ni_count -= 1;
                                         fire_pending_codec_settings(&codec_api, &swap);
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            target: "sm_infra::encode::windows_mft",
-                                            "pump_loop: GPU ProcessInput failed (skipping frame): {e}"
+                                        // Carry-forward #3a: mirror the CPU arm's
+                                        // MF_E_NOTACCEPTING counter-desync guard. Under
+                                        // DD1+DD14 this must never fire on a serviced
+                                        // NeedInput credit; treat it as a fatal counter bug.
+                                        let reason = e.to_string();
+                                        if reason.contains("0xC00D36B5") {
+                                            debug_assert!(
+                                                false,
+                                                "MF_E_NOTACCEPTING on serviced GPU NeedInput credit — counter logic wrong"
+                                            );
+                                            tracing::error!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU MF_E_NOTACCEPTING — counter desync (should be unreachable): {e}"
+                                            );
+                                            // Degrade-before-return for consistency with the
+                                            // ProcessOutput-error arm: stop the capture side
+                                            // emitting GpuShared even though this path is
+                                            // documented-unreachable.
+                                            degrade_gpu_to_cpu(
+                                                &mut gpu_pipeline,
+                                                gpu_handoff,
+                                                "GPU MF_E_NOTACCEPTING",
+                                            );
+                                            // Re-arm codec atomics before the fatal return so
+                                            // a pending bitrate/IDR is not silently lost.
+                                            restore_pending_codec(state, &swap);
+                                            return mft;
+                                        }
+                                        // Fix 1: any other GPU-arm error is unrecoverable for the
+                                        // session — DO NOT retry the GPU arm per frame (REQ-05). A
+                                        // device-removed/reset (or any blt/open/ProcessInput hard
+                                        // failure) means the GPU pipeline is unusable; degrade to
+                                        // the byte-identical CPU-staged path for the rest of the
+                                        // session and keep the encoder thread alive. The capture
+                                        // side stops emitting GpuShared once the hand-off latches.
+                                        //
+                                        // Asymmetry: a ProcessINPUT error (here) CONTINUES the
+                                        // thread on the CPU-staged path — input failure does not
+                                        // imply the MFT can no longer produce output. A
+                                        // ProcessOUTPUT error (collect_output arm above) instead
+                                        // RETURNS/tears down the thread — once the MFT cannot pull
+                                        // output the encode session is dead, so we degrade the
+                                        // hand-off and exit for a clean session rebuild.
+                                        match device_lost_label(&reason) {
+                                            Some(label) => tracing::error!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU device lost ({label}): {e}; degrading to CPU for the session"
+                                            ),
+                                            None => tracing::warn!(
+                                                target: "sm_infra::encode::windows_mft",
+                                                "pump_loop: GPU ProcessInput failed ({e}); degrading to CPU for the session"
+                                            ),
+                                        }
+                                        degrade_gpu_to_cpu(
+                                            &mut gpu_pipeline,
+                                            gpu_handoff,
+                                            "GPU submit error",
                                         );
+                                        // Carry-forward #3b: ProcessInput did not consume the
+                                        // pending bitrate (swap_pending_codec_settings already
+                                        // cleared it), so restore it — otherwise a set_bitrate()
+                                        // request is lost on the GPU error branch.
+                                        restore_pending_codec(state, &swap);
                                         ni_count -= 1;
                                     }
                                 }
                             } else {
-                                // GpuShared received without a negotiated pipeline — a wiring
-                                // bug (the capture side must only emit GpuShared when the gate
-                                // selected GpuResident). Skip the frame; do not panic.
-                                tracing::error!(
+                                // GpuShared received without a live pipeline. Two cases:
+                                //  (a) brief drain of in-flight GpuShared frames AFTER Fix 1
+                                //      degraded the pipeline to None — expected, transient;
+                                //  (b) a genuine wiring bug (capture emitted GpuShared while
+                                //      the gate never selected GpuResident).
+                                // Either way: skip the frame, do not panic, and re-latch the
+                                // hand-off to CPU so the capture side stops emitting GpuShared
+                                // (idempotent if already degraded). The credit is NOT consumed
+                                // (ProcessInput was not called) — the frame is simply dropped.
+                                tracing::warn!(
                                     target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: GpuShared frame received but no GPU pipeline negotiated — skipping"
+                                    "pump_loop: GpuShared frame with no live GPU pipeline — dropping and latching CPU"
                                 );
                                 state.dropped.fetch_add(1, Ordering::Relaxed);
+                                degrade_gpu_to_cpu(
+                                    &mut gpu_pipeline,
+                                    gpu_handoff,
+                                    "GpuShared without pipeline",
+                                );
                                 restore_pending_codec(state, &swap);
                             }
                             // The GPU arm fully services (or skips) the frame above; continue
@@ -1986,34 +2306,9 @@ fn pump_loop(
                     // ProcessInput — canonical Chromium + FFmpeg ordering (research #808).
                     // Vendor-uniform: both NVENC (IDR idx 0) and Intel QSV (IDR idx 1) honor
                     // this property BEFORE ProcessInput; P2 evidence in engram #809.
-                    // The property auto-resets to 0 after ProcessInput per MS docs.
-                    if state
-                        .force_keyframe_icodecapi_pending
-                        .swap(false, Ordering::AcqRel)
-                    {
-                        let v = make_variant_u32(1);
-                        // SAFETY: SetValue on a valid ICodecAPI is always safe;
-                        // the VARIANT is stack-allocated and correctly typed VT_UI4.
-                        unsafe {
-                            if let Err(e) =
-                                codec_api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &v)
-                            {
-                                // Non-fatal — driver rejection is acceptable (DD13 convention).
-                                tracing::warn!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame) \
-                                     rejected: 0x{:08X} (non-fatal, encoding continues)",
-                                    e.code().0
-                                );
-                            } else {
-                                tracing::debug!(
-                                    target: "sm_infra::encode::windows_mft",
-                                    "pump_loop: ICodecAPI::SetValue(CODECAPI_AVEncVideoForceKeyFrame, \
-                                     VT_UI4=1) issued BEFORE ProcessInput"
-                                );
-                            }
-                        }
-                    }
+                    // The property auto-resets to 0 after ProcessInput per MS docs. Shared
+                    // with the GPU arm via `consume_force_keyframe` (PR-4 carry-forward #1).
+                    consume_force_keyframe(state, &codec_api);
 
                     match submit_frame(&mft, &nv12_scratch, frame.timestamp, frame_dur_100ns) {
                         Ok(()) => {
@@ -2134,6 +2429,12 @@ fn pump_loop(
 ///
 /// The `MFSampleExtension_CleanPoint` attribute is READ (not written) in `collect_output`
 /// for IDR detection — the output-side read path is unchanged (DD7).
+///
+/// This is also the path GPU-mode heartbeats use (Fix 3 re-injects a system-memory
+/// `FramePayload::Cpu`). Hardware encoders (QSV/NVENC) negotiated with a D3D device
+/// manager still accept system-memory input samples and stage them internally; a driver
+/// that rejects them returns a `ProcessInput` error here, which the pump turns into a
+/// graceful session-wide CPU degrade — never undefined behavior.
 fn submit_frame(
     mft: &IMFTransform,
     nv12: &crate::encode::bgra_to_nv12::Nv12,
@@ -2147,35 +2448,32 @@ fn submit_frame(
     }
 }
 
-/// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07 GPU path).
+/// Submit one GPU-resident frame to `ProcessInput` (TASK-06/07/08 GPU path).
 ///
-/// Opens the cross-thread shared BGRA texture by its handle on the encoder-thread
-/// device (PR-3: plain `OpenSharedResource`, no keyed-mutex acquire), runs
-/// `VideoProcessorBlt` BGRA→NV12 on the GPU, wraps the NV12 texture in an
+/// Opens the cross-thread shared keyed-mutex BGRA texture by its NT handle on the
+/// encoder-thread device, acquires the keyed mutex, runs `VideoProcessorBlt`
+/// BGRA→NV12 on the GPU, releases the keyed mutex, wraps the NV12 texture in an
 /// `MFCreateDXGISurfaceBuffer` sample, and feeds it to the MFT — no GPU→CPU
 /// readback, no rayon convert, no `MFCreateMemoryBuffer`. The CPU `submit_frame`
 /// path above is untouched and remains the byte-identical fallback (REQ-08).
 ///
-/// Reachable only when a `GpuEncodePipeline` was negotiated and a producer emitted
-/// `FramePayload::GpuShared`; in PR-3 there is no producer, so this is compiled and
-/// linked but not exercised at runtime (the keyed-mutex producer lands in PR-4).
-///
-/// TODO(PR-4): switch to `OpenSharedResource1` + `IDXGIKeyedMutex::AcquireSync`/
-/// `ReleaseSync` around the blt, per design D1 (PR-3 opens a plain shared texture
-/// without any keyed-mutex synchronization).
+/// Reachable only when a `GpuEncodePipeline` was negotiated and the capture thread
+/// emitted `FramePayload::GpuShared` (gate = GpuResident).
 fn submit_gpu_frame(
     mft: &IMFTransform,
     pipe: &crate::encode::gpu_path::GpuEncodePipeline,
     shared_handle: isize,
     timestamp: std::time::Duration,
     duration_100ns: i64,
+    blt_hold: &mut std::time::Duration,
 ) -> Result<(), EncoderError> {
-    // SAFETY: shared_handle is a live, same-adapter D3D11 share handle per the
-    // FramePayload::GpuShared contract (the capture thread produced it on a device
+    // SAFETY: shared_handle is a live, same-adapter keyed-mutex NT share handle per
+    // the FramePayload::GpuShared contract (the capture thread produced it on a device
     // that shares this pipeline's adapter LUID — enforced by the path-selection gate).
-    // PR-3 opens it via plain OpenSharedResource (no IDXGIKeyedMutex::AcquireSync).
-    let bgra_tex = unsafe { pipe.open_shared_bgra(shared_handle) }?;
-    pipe.gpu_bgra_to_nv12(&bgra_tex)?;
+    // consume_shared_bgra opens it, AcquireSync → blt → ReleaseSync (balanced on all
+    // paths), and releases the opened texture before returning (no per-frame leak).
+    // `blt_hold` (GATE B metric #3) reports the keyed-mutex hold span for this frame.
+    unsafe { pipe.consume_shared_bgra(shared_handle, blt_hold) }?;
     let sample = pipe.build_dxgi_imfsample(timestamp, duration_100ns)?;
     unsafe {
         mft.ProcessInput(0, &sample, 0).map_err(|e| {
@@ -2477,6 +2775,59 @@ impl ConvertStats {
     }
 }
 
+/// GATE B metric #3: per-second consumer keyed-mutex blt-hold accumulator.
+///
+/// Tracks frame count, cumulative hold microseconds (for the mean), and the exact max hold
+/// this window. Mirrors `ConvertStats` plus a `max_us` — the max is the diagnostic field
+/// (one long blt is what makes a producer try-acquire skip), kept exact while the mean gives
+/// the typical hold. Reset at the same window boundary as the other encoder-thread metrics.
+#[derive(Default)]
+struct BltHoldStats {
+    /// Number of GPU frames whose blt-hold was recorded this window.
+    frames: u32,
+    /// Cumulative hold duration of all recorded frames this window, in microseconds.
+    total_us: u64,
+    /// Exact maximum single-frame hold this window, in microseconds.
+    max_us: u64,
+}
+
+impl BltHoldStats {
+    /// Record one keyed-mutex hold span into the current window.
+    #[inline]
+    fn record(&mut self, dur: std::time::Duration) {
+        let us = dur.as_micros() as u64;
+        self.frames += 1;
+        self.total_us += us;
+        if us > self.max_us {
+            self.max_us = us;
+        }
+    }
+
+    /// Mean per-frame hold in microseconds over the current window (0 when empty).
+    #[inline]
+    fn mean_us(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_us / self.frames as u64
+        }
+    }
+
+    /// Exact max single-frame hold in microseconds over the current window.
+    #[inline]
+    fn max_us(&self) -> u64 {
+        self.max_us
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_us = 0;
+        self.max_us = 0;
+    }
+}
+
 /// Compute the per-interval drop delta for a monotonically-increasing drop counter.
 ///
 /// Returns `(delta, new_last)` where `delta = current.saturating_sub(last)` and
@@ -2485,6 +2836,72 @@ impl ConvertStats {
 #[inline]
 fn compute_drop_delta(current: u64, last: u64) -> (u64, u64) {
     (current.saturating_sub(last), current)
+}
+
+/// Consumer generation lag for one dequeued GPU frame (interim missing-fence confirm).
+///
+/// `latest_gen` is the newest generation the producer has QUEUED; `frame_gen` is the
+/// generation stamped into the frame the consumer just dequeued. The lag is
+/// `latest_gen - frame_gen`, saturating at 0 so a benign reordering (or the producer
+/// publishing `latest_gen` a hair after the consumer read it) can never underflow into a
+/// huge value. `lag == 0` ⇒ the consumer is reading the freshest queued generation (ring
+/// not behind); `lag >= 1` ⇒ it is reading an OLDER queued generation (ring-wrap/backlog
+/// staleness — distinct from the in-flight-copy staleness the producer `Flush` targets).
+#[inline]
+fn gen_lag(latest_gen: u64, frame_gen: u64) -> u64 {
+    latest_gen.saturating_sub(frame_gen)
+}
+
+/// Per-second consumer generation-lag accumulator (interim missing-fence confirm metric).
+///
+/// Mirrors [`BltHoldStats`]: tracks frame count, cumulative lag (for the mean), and the
+/// exact max lag this window. Emitted once per second as `gpu_gen_lag_max` /
+/// `gpu_gen_lag_mean` alongside the other GATE B encoder-thread metrics, and reset at the
+/// same window boundary. `max == 0` every window ⇒ the consumer is always current.
+#[derive(Default)]
+struct GenLagStats {
+    /// Number of GPU frames whose lag was recorded this window.
+    frames: u32,
+    /// Cumulative lag (in generations) of all recorded frames this window.
+    total_lag: u64,
+    /// Exact maximum single-frame lag this window (in generations).
+    max_lag: u64,
+}
+
+impl GenLagStats {
+    /// Record one frame's generation lag into the current window.
+    #[inline]
+    fn record(&mut self, lag: u64) {
+        self.frames += 1;
+        self.total_lag += lag;
+        if lag > self.max_lag {
+            self.max_lag = lag;
+        }
+    }
+
+    /// Mean per-frame lag over the current window (0 when empty).
+    #[inline]
+    fn mean_lag(&self) -> u64 {
+        if self.frames == 0 {
+            0
+        } else {
+            self.total_lag / self.frames as u64
+        }
+    }
+
+    /// Exact max single-frame lag over the current window.
+    #[inline]
+    fn max_lag(&self) -> u64 {
+        self.max_lag
+    }
+
+    /// Reset the accumulator to prepare for the next 1-second window.
+    #[inline]
+    fn reset(&mut self) {
+        self.frames = 0;
+        self.total_lag = 0;
+        self.max_lag = 0;
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -2513,6 +2930,7 @@ impl WindowsMftH264Encoder {
             vendor: EncoderVendor::Unknown,
             mft_activate_factory: None,
             handle: None,
+            gpu_handoff: None,
         }
     }
 }
@@ -2997,6 +3415,45 @@ mod tests {
         );
     }
 
+    /// Interim missing-fence confirm: gen_lag is a saturating `latest - frame` difference.
+    #[test]
+    fn gen_lag_is_saturating_difference() {
+        // Consumer current: it dequeued the newest queued generation → lag 0.
+        assert_eq!(gen_lag(10, 10), 0, "reading the freshest queued gen ⇒ lag 0");
+        // Consumer behind by 3 queued generations (backlog/ring-wrap staleness).
+        assert_eq!(gen_lag(10, 7), 3, "lag = latest - frame_gen");
+        // frame_gen ahead of latest (benign reorder / publish race) must saturate, not wrap.
+        assert_eq!(
+            gen_lag(7, 10),
+            0,
+            "frame_gen > latest must saturate to 0, never underflow"
+        );
+    }
+
+    /// Interim missing-fence confirm: GenLagStats accumulates max + mean and resets.
+    #[test]
+    fn gen_lag_stats_record_max_mean_and_reset() {
+        let mut stats = GenLagStats::default();
+        // Empty window: divide-by-zero guard returns 0 for both.
+        assert_eq!(stats.mean_lag(), 0, "empty window mean is 0");
+        assert_eq!(stats.max_lag(), 0, "empty window max is 0");
+
+        // Record lags 0, 2, 4 → total 6, mean 2, max 4.
+        stats.record(0);
+        stats.record(2);
+        stats.record(4);
+        assert_eq!(stats.mean_lag(), 2, "mean_lag = total_lag / frames");
+        assert_eq!(stats.max_lag(), 4, "max_lag is the exact window max");
+        assert_eq!(stats.frames, 3);
+
+        // Reset zeroes every accumulator so the next 1-second window starts clean.
+        stats.reset();
+        assert_eq!(stats.frames, 0, "frames must be 0 after reset");
+        assert_eq!(stats.total_lag, 0, "total_lag must be 0 after reset");
+        assert_eq!(stats.max_lag, 0, "max_lag must be 0 after reset");
+        assert_eq!(stats.mean_lag(), 0, "mean is 0 again after reset");
+    }
+
     /// Task 1.3 [RED]: interval_elapsed returns false below threshold and true at/above threshold.
     #[test]
     fn window_gate_below_threshold_returns_false_and_at_or_above_returns_true() {
@@ -3095,4 +3552,63 @@ mod tests {
     // `nvenc_path_gate_selects_cpu_staged_fallback_task04` above. The remaining
     // `matches!(payload, FramePayload::Cpu(_))` check was tautological (the value
     // had just been constructed as Cpu). Removed rather than left misleading.
+
+    // ─── Fix 1: device-lost degradation helpers (pure logic, no COM) ──────────
+
+    #[test]
+    fn device_lost_label_recognizes_removed_and_reset() {
+        // The error strings are produced as "...: 0x{:08X}" by gpu_path/submit_gpu_frame.
+        let removed = format!("VideoProcessorBlt: 0x{DXGI_ERROR_DEVICE_REMOVED:08X}");
+        assert_eq!(
+            device_lost_label(&removed),
+            Some("DXGI_ERROR_DEVICE_REMOVED")
+        );
+        let reset = format!("OpenSharedResource1(bgra): 0x{DXGI_ERROR_DEVICE_RESET:08X}");
+        assert_eq!(device_lost_label(&reset), Some("DXGI_ERROR_DEVICE_RESET"));
+        // A non-device-lost error returns None (still degrades, but logged as a plain warn).
+        assert_eq!(device_lost_label("ProcessInput(dxgi): 0x80004005"), None);
+    }
+
+    #[test]
+    fn degrade_gpu_to_cpu_drops_pipeline_and_latches_handoff() {
+        // The local pipeline must drop to None (consumer stops attempting the GPU arm)
+        // AND the shared hand-off must latch CPU (producer stops emitting GpuShared).
+        // We use None for the pipeline (no real GPU needed) — the latch + None-set is
+        // the behavior under test; a real GpuEncodePipeline requires COM/hardware.
+        use crate::encode::gpu_handoff::GpuHandoff;
+        use crate::encode::path_select::EncodePath;
+
+        let handoff = GpuHandoff::new();
+        // Pretend the gate had resolved GPU.
+        handoff.resolve_path(EncodePath::GpuResident);
+        assert_eq!(handoff.resolved_path(), Some(EncodePath::GpuResident));
+
+        let mut pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline> = None;
+        degrade_gpu_to_cpu(&mut pipeline, Some(&handoff), "unit test");
+
+        assert!(pipeline.is_none(), "pipeline must be torn down to None");
+        assert_eq!(
+            handoff.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "degrade must latch the shared hand-off to CPU for the session"
+        );
+
+        // Idempotent + a later GpuResident resolve cannot un-degrade (Fix 4 stickiness).
+        degrade_gpu_to_cpu(&mut pipeline, Some(&handoff), "unit test repeat");
+        handoff.resolve_path(EncodePath::GpuResident);
+        assert_eq!(
+            handoff.resolved_path(),
+            Some(EncodePath::CpuStagedFallback),
+            "CPU degrade is sticky against a later GPU resolve"
+        );
+    }
+
+    #[test]
+    fn degrade_gpu_to_cpu_without_handoff_is_safe() {
+        // No hand-off wired (CPU-only session): degrade must still null the pipeline and
+        // not panic.
+        let mut pipeline: Option<crate::encode::gpu_path::GpuEncodePipeline> = None;
+        degrade_gpu_to_cpu(&mut pipeline, None, "no handoff");
+        assert!(pipeline.is_none());
+    }
 }

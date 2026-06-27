@@ -63,6 +63,12 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # PR-4 / TASK-08 keyed-mutex cross-thread hand-off: IDXGIResource1::CreateSharedHandle
+    # (NT share handle for the SHARED_KEYEDMUTEX|SHARED_NTHANDLE texture) needs
+    # Win32_Security (SECURITY_ATTRIBUTES in its signature); CloseHandle + GENERIC_ALL
+    # come from Win32_Foundation/Win32_System_SystemServices.
+    "Win32_Security",
+    "Win32_System_SystemServices",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -766,7 +766,8 @@ mod tests {
 
         // First, encode several frames to get past openh264 warmup and obtain a real IDR.
         let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<CaptureFrame>(8);
+        let (frame_tx, frame_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::FramePayload>(8);
         let (pkt_tx_enc, pkt_rx_enc) = std::sync::mpsc::sync_channel::<EncodedPacket>(8);
         encoder.start(frame_rx, pkt_tx_enc).unwrap();
 
@@ -776,14 +777,14 @@ mod tests {
         let stride = w * 4;
         let frame_data = vec![0u8; (stride * h) as usize];
         for i in 0..5u64 {
-            let _ = frame_tx.try_send(CaptureFrame {
+            let _ = frame_tx.try_send(sm_domain::encode::FramePayload::Cpu(CaptureFrame {
                 data: Arc::from(frame_data.as_slice()),
                 width: w,
                 height: h,
                 stride,
                 format: PixelFormat::Bgra8,
                 timestamp: Duration::from_millis(i * 33),
-            });
+            }));
         }
 
         // Collect the first IDR packet (scan for up to 2 s).
@@ -855,7 +856,8 @@ mod tests {
 
         // ── Encode several frames to get past openh264 warmup ────────────────────
         let mut encoder = WindowsOpenH264Encoder::new(EncoderConfig::default()).unwrap();
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<CaptureFrame>(8);
+        let (frame_tx, frame_rx) =
+            std::sync::mpsc::sync_channel::<sm_domain::encode::FramePayload>(8);
         let (enc_pkt_tx, enc_pkt_rx) = std::sync::mpsc::sync_channel::<EncodedPacket>(8);
         encoder.start(frame_rx, enc_pkt_tx).unwrap();
 
@@ -866,14 +868,14 @@ mod tests {
 
         // Send several frames — openh264 may suppress the first on warmup.
         for i in 0..5u64 {
-            let _ = frame_tx.try_send(CaptureFrame {
+            let _ = frame_tx.try_send(sm_domain::encode::FramePayload::Cpu(CaptureFrame {
                 data: Arc::from(frame_data.as_slice()),
                 width: w,
                 height: h,
                 stride,
                 format: PixelFormat::Bgra8,
                 timestamp: Duration::from_millis(i * 33),
-            });
+            }));
         }
 
         // Collect the first IDR packet (scan up to 2 s).

@@ -16,6 +16,14 @@ serde = { workspace = true }
 serde_json = "1"
 thiserror = { workspace = true }
 sm-domain = { workspace = true }
+# sm-infra's `hw-encoder` feature is ON by default (crates/sm-infra/Cargo.toml:
+# `default = ["hw-encoder"]`) and is LOAD-BEARING for this crate: commands/sender.rs
+# unconditionally wires the GPU-resident hand-off (GpuHandoff,
+# build_video_encoder_with_gpu_handoff, set_gpu_handoff), all of which are gated behind
+# sm-infra's `hw-encoder` feature. We inherit sm-infra with its default features so those
+# symbols are always present. Do NOT disable sm-infra default features for this crate
+# without also feature-forwarding hw-encoder and gating the sender.rs wiring — otherwise
+# the production GPU path silently disappears or the build fails to resolve the symbols.
 sm-infra = { workspace = true }
 rand = "0.8"
 tracing = { workspace = true }

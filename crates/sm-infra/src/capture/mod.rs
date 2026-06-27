@@ -3,6 +3,12 @@
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+mod gpu_producer; // capture-thread keyed-mutex GPU producer (PR-4 / TASK-08)
+
+#[cfg(all(target_os = "windows", feature = "hw-encoder"))]
+mod gpu_readback; // capture-thread async GPU→CPU heartbeat readback (judder Fix 7)
+
 #[cfg(target_os = "windows")]
 pub use windows::{CAPTURE_CHANNEL_CAPACITY, WindowsCaptureSource};
 
