@@ -111,7 +111,7 @@ const ADAPTIVE_ENCODER_BWE_NUM: u64 = 80;
 const ADAPTIVE_ENCODER_BWE_DEN: u64 = 100;
 // Below this, 1080p QSV-over-WiFi becomes visibly blocky while the pacer is already
 // limiting frame rate. Keep this QSV-only and clamp it to the configured max bitrate.
-const ADAPTIVE_ENCODER_MIN_BPS: u64 = 1_200_000;
+const QSV_WIFI_ADAPTIVE_ENCODER_MIN_BPS: u64 = 2_000_000;
 const ADAPTIVE_QSV_BACKEND: &str = "hw_intel_qsv";
 const ADAPTIVE_QSV_WIFI_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 
@@ -840,7 +840,7 @@ fn adaptive_target_bitrate_bps(estimate: &BweKind, configured_max_bps: u32) -> O
         return None;
     }
     let configured_max_bps = configured_max_bps as u64;
-    let floor_bps = ADAPTIVE_ENCODER_MIN_BPS.min(configured_max_bps);
+    let floor_bps = QSV_WIFI_ADAPTIVE_ENCODER_MIN_BPS.min(configured_max_bps);
     let target_bps = safe_bps.max(floor_bps).min(configured_max_bps) as u32;
     Some(target_bps)
 }
@@ -2162,11 +2162,11 @@ mod tests {
 
         assert_eq!(
             adaptive_target_bitrate_bps(&estimate, 4_000_000),
-            Some(1_200_000)
+            Some(2_000_000)
         );
         assert_eq!(
             adaptive_target_bitrate_bps(&low_estimate, 4_000_000),
-            Some(1_200_000)
+            Some(2_000_000)
         );
         assert_eq!(adaptive_target_bitrate_bps(&zero_estimate, 4_000_000), None);
         assert_eq!(
@@ -2187,18 +2187,31 @@ mod tests {
     }
 
     #[test]
-    fn sender_adaptive_gate_excludes_nvenc_encoder() {
-        let qsv = Some(
-            FakeEncoder::new_with_backend("hw_intel_qsv") as Arc<dyn VideoEncoder + Send + Sync>
-        );
-        let nvenc = Some(
-            FakeEncoder::new_with_backend("hw_nvenc") as Arc<dyn VideoEncoder + Send + Sync>
+    fn sender_adaptive_gate_requires_qsv_and_wifi_env() {
+        let qsv =
+            Some(FakeEncoder::new_with_backend("hw_intel_qsv")
+                as Arc<dyn VideoEncoder + Send + Sync>);
+        let nvenc =
+            Some(FakeEncoder::new_with_backend("hw_nvenc") as Arc<dyn VideoEncoder + Send + Sync>);
+        let software = Some(
+            FakeEncoder::new_with_backend("sw_openh264") as Arc<dyn VideoEncoder + Send + Sync>
         );
 
         assert!(sender_uses_adaptive_bitrate_when_enabled(&qsv, true));
         assert!(!sender_uses_adaptive_bitrate_when_enabled(&qsv, false));
         assert!(!sender_uses_adaptive_bitrate_when_enabled(&nvenc, true));
+        assert!(!sender_uses_adaptive_bitrate_when_enabled(&software, true));
         assert!(!sender_uses_adaptive_bitrate_when_enabled(&None, true));
+    }
+
+    #[test]
+    fn adaptive_bitrate_floor_stays_capped_by_configured_max() {
+        let low_estimate = str0m::bwe::BweKind::Twcc(str0m::bwe::Bitrate::bps(100_000));
+
+        assert_eq!(
+            adaptive_target_bitrate_bps(&low_estimate, 1_500_000),
+            Some(1_500_000)
+        );
     }
 
     #[test]
@@ -2211,8 +2224,8 @@ mod tests {
 
         let applied = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
 
-        assert_eq!(applied, Some(1_200_000));
-        assert_eq!(bitrate.load(Ordering::Acquire), 1_200_000);
+        assert_eq!(applied, Some(2_000_000));
+        assert_eq!(bitrate.load(Ordering::Acquire), 2_000_000);
         assert_eq!(bitrate_calls.load(Ordering::Acquire), 1);
     }
 
@@ -2226,8 +2239,8 @@ mod tests {
         let first = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
         let second = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
 
-        assert_eq!(first, Some(1_200_000));
-        assert_eq!(second, Some(1_200_000));
+        assert_eq!(first, Some(2_000_000));
+        assert_eq!(second, Some(2_000_000));
         assert_eq!(bitrate_calls.load(Ordering::Acquire), 2);
     }
 

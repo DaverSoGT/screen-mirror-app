@@ -56,7 +56,10 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
-const QSV_WIFI_INPUT_FPS: u32 = 10;
+// QSV-over-WiFi already coalesces to the latest frame and drops stale work, so a
+// modestly higher pacer target improves motion/latency without reopening the old
+// runaway backlog path.
+const QSV_WIFI_INPUT_TARGET_FPS: u32 = 15;
 
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
@@ -2115,6 +2118,12 @@ fn qsv_wifi_input_pacing_enabled_for_backend(backend_name: &str, wifi_enabled: b
     wifi_enabled && backend_name == QSV_WIFI_BACKEND
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn qsv_wifi_input_target_fps(backend_name: &str, wifi_enabled: bool) -> Option<u32> {
+    qsv_wifi_input_pacing_enabled_for_backend(backend_name, wifi_enabled)
+        .then_some(QSV_WIFI_INPUT_TARGET_FPS)
+}
+
 #[cfg(target_os = "windows")]
 fn spawn_qsv_wifi_input_pacer(
     rx: Receiver<sm_domain::FramePayload>,
@@ -2293,8 +2302,9 @@ fn build_production_sender_bundle(
         build_video_encoder_with_gpu_handoff(encoder_config, std::sync::Arc::clone(&gpu_handoff))
             .map_err(|e| BundleError::Other(e.to_string()))?;
     let backend_name = encoder.backend_name().to_string();
-    let qsv_wifi_input_pacing =
-        qsv_wifi_input_pacing_enabled_for_backend(&backend_name, qsv_wifi_adaptive_env_enabled());
+    let qsv_wifi_input_target_fps =
+        qsv_wifi_input_target_fps(&backend_name, qsv_wifi_adaptive_env_enabled());
+    let qsv_wifi_input_pacing = qsv_wifi_input_target_fps.is_some();
 
     let transport_config = TransportConfig {
         udp_port,
@@ -2305,24 +2315,29 @@ fn build_production_sender_bundle(
         Str0mVideoSender::new(transport_config).map_err(|e| BundleError::Other(e.to_string()))?;
 
     // ── 2. Channels ───────────────────────────────────────────────────────────
-    let capture_stage_cap = if qsv_wifi_input_pacing { 0 } else { CHANNEL_CAP };
-    let (capture_to_stage_tx, capture_to_stage_rx) = sync_channel(capture_stage_cap);
-    let (capture_to_enc_rx, qsv_wifi_pacer_handle) = if qsv_wifi_input_pacing {
-        // Rendezvous output: if the encoder is not waiting, drop this raw frame instead
-        // of buffering stale work ahead of the encoder.
-        let (paced_tx, paced_rx) = sync_channel(0);
-        let handle = spawn_qsv_wifi_input_pacer(
-            capture_to_stage_rx,
-            paced_tx,
-            _stop_flag.clone(),
-            QSV_WIFI_INPUT_FPS,
-        )
-        .map_err(|e| BundleError::Other(format!("qsv wifi input pacer spawn failed: {e}")))?;
-        eprintln!("[sm-qsv-wifi-input] enabled target_fps={QSV_WIFI_INPUT_FPS}");
-        (paced_rx, Some(handle))
+    let capture_stage_cap = if qsv_wifi_input_pacing {
+        0
     } else {
-        (capture_to_stage_rx, None)
+        CHANNEL_CAP
     };
+    let (capture_to_stage_tx, capture_to_stage_rx) = sync_channel(capture_stage_cap);
+    let (capture_to_enc_rx, qsv_wifi_pacer_handle) =
+        if let Some(target_fps) = qsv_wifi_input_target_fps {
+            // Rendezvous output: if the encoder is not waiting, drop this raw frame instead
+            // of buffering stale work ahead of the encoder.
+            let (paced_tx, paced_rx) = sync_channel(0);
+            let handle = spawn_qsv_wifi_input_pacer(
+                capture_to_stage_rx,
+                paced_tx,
+                _stop_flag.clone(),
+                target_fps,
+            )
+            .map_err(|e| BundleError::Other(format!("qsv wifi input pacer spawn failed: {e}")))?;
+            eprintln!("[sm-qsv-wifi-input] enabled target_fps={target_fps}");
+            (paced_rx, Some(handle))
+        } else {
+            (capture_to_stage_rx, None)
+        };
     let (enc_to_sender_tx, enc_to_sender_rx) = sync_channel(CHANNEL_CAP);
     let (sig_ev_tx, sig_ev_rx) = sync_channel(CHANNEL_CAP);
     let (tr_ev_tx, tr_ev_rx) = sync_channel(CHANNEL_CAP);
@@ -3948,22 +3963,17 @@ mod tests {
     }
 
     #[test]
-    fn qsv_wifi_input_pacing_gate_is_qsv_only() {
-        assert!(super::qsv_wifi_input_pacing_enabled_for_backend(
-            "hw_intel_qsv",
-            true
-        ));
-        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
-            "hw_intel_qsv",
-            false
-        ));
-        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
-            "hw_nvenc", true
-        ));
-        assert!(!super::qsv_wifi_input_pacing_enabled_for_backend(
-            "sw_openh264",
-            true
-        ));
+    fn qsv_wifi_input_pacing_target_is_qsv_wifi_only() {
+        assert_eq!(
+            super::qsv_wifi_input_target_fps("hw_intel_qsv", true),
+            Some(15)
+        );
+        assert_eq!(
+            super::qsv_wifi_input_target_fps("hw_intel_qsv", false),
+            None
+        );
+        assert_eq!(super::qsv_wifi_input_target_fps("hw_nvenc", true), None);
+        assert_eq!(super::qsv_wifi_input_target_fps("sw_openh264", true), None);
     }
 
     // ─── T4.2: encoder_config_default_framerate_stays_30 ─────────────────────────
