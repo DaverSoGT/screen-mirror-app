@@ -56,10 +56,10 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
-// QSV-over-WiFi already coalesces to the latest frame and drops stale work, so a
-// modestly higher pacer target improves motion/latency without reopening the old
-// runaway backlog path.
-const QSV_WIFI_INPUT_TARGET_FPS: u32 = 15;
+// QSV-over-WiFi already coalesces to the latest frame and drops stale work, but
+// replay07 showed that 15fps still overdrives the weak WiFi path; keep the
+// conservative 10fps pacer target for this QSV-only adaptive lane.
+const QSV_WIFI_INPUT_TARGET_FPS: u32 = 10;
 
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
@@ -3966,7 +3966,7 @@ mod tests {
     fn qsv_wifi_input_pacing_target_is_qsv_wifi_only() {
         assert_eq!(
             super::qsv_wifi_input_target_fps("hw_intel_qsv", true),
-            Some(15)
+            Some(10)
         );
         assert_eq!(
             super::qsv_wifi_input_target_fps("hw_intel_qsv", false),
