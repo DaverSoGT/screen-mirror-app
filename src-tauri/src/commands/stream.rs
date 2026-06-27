@@ -35,9 +35,10 @@
 //! - Small payloads (< 1024 B, e.g. init segment) take the `webview.eval` fast path.
 //! - Larger payloads (fMP4 segments) use the fetch API path (async, no main-thread block).
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -49,7 +50,9 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, TransportRole,
     VideoReceiver,
 };
-use sm_infra::render::fmp4_muxer::{Mp4Muxer, extract_sps_pps_from_idr};
+use sm_infra::render::fmp4_muxer::{
+    DEFAULT_SUBGOP_FLUSH_FRAMES, Mp4Muxer, extract_sps_pps_from_idr,
+};
 use sm_infra::signaling::mdns::MdnsSignaling;
 use sm_infra::transport::{Str0mVideoReceiver, publish_host_candidate};
 use tauri::ipc::InvokeResponseBody;
@@ -74,6 +77,10 @@ pub const FRAME_STATUS: u8 = 0x02;
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
+const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
+const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
+const QSV_WIFI_LOW_LATENCY_SUBGOP_FLUSH_FRAMES: usize = 2;
+const SDP_BACKEND_ATTR_PREFIX: &str = "a=x-screen-mirror-backend:";
 
 // ─── ChannelLike — abstraction over tauri::ipc::Channel for testability ──────
 
@@ -952,6 +959,81 @@ enum DrainRole {
     ResetSignalingOnly,
 }
 
+fn default_mux_subgop_flush_frames_handle() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(DEFAULT_SUBGOP_FLUSH_FRAMES))
+}
+
+fn mux_subgop_flush_registry() -> &'static Mutex<HashMap<usize, Arc<AtomicUsize>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Arc<AtomicUsize>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mux_subgop_flush_registry_key(stop_flag: &Arc<AtomicBool>) -> usize {
+    Arc::as_ptr(stop_flag) as usize
+}
+
+fn register_mux_subgop_flush_frames(stop_flag: &Arc<AtomicBool>, threshold: Arc<AtomicUsize>) {
+    let mut guard = mux_subgop_flush_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.insert(mux_subgop_flush_registry_key(stop_flag), threshold);
+}
+
+fn take_mux_subgop_flush_frames(stop_flag: &Arc<AtomicBool>) -> Option<Arc<AtomicUsize>> {
+    let mut guard = mux_subgop_flush_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(&mux_subgop_flush_registry_key(stop_flag))
+}
+
+fn qsv_wifi_adaptive_env_enabled() -> bool {
+    std::env::var(QSV_WIFI_ADAPTIVE_ENV).as_deref() == Ok("1")
+}
+
+fn select_mux_subgop_flush_frames(
+    backend_name: Option<&str>,
+    qsv_wifi_env_enabled: bool,
+) -> usize {
+    if qsv_wifi_env_enabled && backend_name == Some(QSV_WIFI_BACKEND) {
+        QSV_WIFI_LOW_LATENCY_SUBGOP_FLUSH_FRAMES
+    } else {
+        DEFAULT_SUBGOP_FLUSH_FRAMES
+    }
+}
+
+fn strip_offer_backend_stamp(
+    offer: sm_domain::signaling::SdpOffer,
+) -> (sm_domain::signaling::SdpOffer, Option<String>) {
+    let mut stripped = String::with_capacity(offer.0.len());
+    let mut backend_name = None;
+
+    for line in offer.0.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = trimmed.strip_prefix(SDP_BACKEND_ATTR_PREFIX) {
+            if backend_name.is_none() && !value.is_empty() {
+                backend_name = Some(value.to_string());
+            }
+            continue;
+        }
+        stripped.push_str(line);
+    }
+
+    (sm_domain::signaling::SdpOffer(stripped), backend_name)
+}
+
+fn apply_offer_backend_mux_config(
+    offer: sm_domain::signaling::SdpOffer,
+    mux_subgop_flush_frames: &AtomicUsize,
+    qsv_wifi_env_enabled: bool,
+) -> sm_domain::signaling::SdpOffer {
+    let (offer, backend_name) = strip_offer_backend_stamp(offer);
+    mux_subgop_flush_frames.store(
+        select_mux_subgop_flush_frames(backend_name.as_deref(), qsv_wifi_env_enabled),
+        Ordering::Release,
+    );
+    offer
+}
+
 /// Signaling-event drain loop.
 ///
 /// Runs on its own OS thread spawned by `build_production_bundle`.
@@ -984,6 +1066,28 @@ fn run_signaling_drain(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>, // D-3 REQ-A
     role: DrainRole,                                                        // D-RDF-1
     expected_attempt: Arc<AtomicU8>, // T1.9: stale-Offer guard (REQ-GE-1, SC-GE-3..6)
+) {
+    run_signaling_drain_with_mux_config(
+        ev_rx,
+        receiver,
+        signaling,
+        stop_flag,
+        supervisor_signal_tx,
+        role,
+        expected_attempt,
+        default_mux_subgop_flush_frames_handle(),
+    );
+}
+
+fn run_signaling_drain_with_mux_config(
+    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    receiver: Arc<dyn SignalingReceiverOps>,
+    signaling: Arc<dyn SignalingPublishOps>,
+    stop_flag: Arc<AtomicBool>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    role: DrainRole,
+    expected_attempt: Arc<AtomicU8>,
+    mux_subgop_flush_frames: Arc<AtomicUsize>,
 ) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -1036,6 +1140,11 @@ fn run_signaling_drain(
                         );
                         continue;
                     }
+                    let offer = apply_offer_backend_mux_config(
+                        offer,
+                        mux_subgop_flush_frames.as_ref(),
+                        qsv_wifi_adaptive_env_enabled(),
+                    );
                     match receiver.apply_remote_offer(offer) {
                         Ok(answer) => {
                             // D-5 (REQ-BYE-5): advance the stale-Bye floor to the live generation
@@ -1682,17 +1791,31 @@ pub fn build_stream_session(
     bundle: ReceiverBundle,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<StreamSession, String> {
+    let ReceiverBundle {
+        receiver,
+        pkt_rx,
+        signaling,
+        drain_handles,
+        _drain_senders,
+    } = bundle;
     let counters = Arc::new(BridgeCounters::default());
 
     let counters_clone = counters.clone();
     let stop_flag_clone = stop_flag.clone();
     let channel_for_thread = channel.clone();
-    let pkt_rx = bundle.pkt_rx;
+    let mux_subgop_flush_frames =
+        take_mux_subgop_flush_frames(&stop_flag).unwrap_or_else(default_mux_subgop_flush_frames_handle);
 
     let handle = thread::Builder::new()
         .name("sm-stream-mux".into())
         .spawn(move || {
-            mux_thread(pkt_rx, stop_flag_clone, counters_clone, channel_for_thread);
+            mux_thread_with_mux_config(
+                pkt_rx,
+                stop_flag_clone,
+                counters_clone,
+                channel_for_thread,
+                mux_subgop_flush_frames,
+            );
         })
         .map_err(|e| format!("failed to spawn mux thread: {e}"))?;
 
@@ -1700,11 +1823,11 @@ pub fn build_stream_session(
         stop_flag,
         mux_handle: Some(handle),
         counters,
-        receiver: Some(bundle.receiver),
+        receiver: Some(receiver),
         last_pli: None,
         channel,
-        signaling: bundle.signaling,
-        drain_handles: bundle.drain_handles,
+        signaling,
+        drain_handles,
     })
 }
 
@@ -2129,10 +2252,12 @@ fn build_production_bundle(
     // is forwarded to the receiver supervisor (enables reconnect on Bye).
     let stop_flag_s = stop_flag.clone();
     let sup_tx_for_drain = sup_tx_for_sig_drain; // pre-cloned above (D-3)
+    let mux_subgop_flush_frames = default_mux_subgop_flush_frames_handle();
+    let mux_subgop_flush_frames_for_sig_drain = mux_subgop_flush_frames.clone();
     let sig_drain = thread::Builder::new()
         .name("sm-signaling-event-drain".into())
         .spawn(move || {
-            run_signaling_drain(
+            run_signaling_drain_with_mux_config(
                 sig_event_rx,
                 recv_ops_for_drain,
                 sig_publish_for_drain,
@@ -2140,8 +2265,11 @@ fn build_production_bundle(
                 sup_tx_for_drain,               // D-3 REQ-A
                 DrainRole::Primary,             // D-RDF-1: primary drain owns offer application
                 expected_attempt_for_sig_drain, // T1.9: reads epoch to reject stale-gen Offers
+                mux_subgop_flush_frames_for_sig_drain,
             );
         })?;
+
+    register_mux_subgop_flush_frames(&stop_flag, mux_subgop_flush_frames.clone());
 
     // ── 6. Build SignalingOps for stop_stream ─────────────────────────────
     struct MdnsStopOps(Arc<Mutex<MdnsSignaling>>);
@@ -2903,11 +3031,28 @@ fn mux_append(
 /// Drains `pkt_rx`, fires PLI on the first packet, buffers non-keyframe
 /// packets until the first IDR, builds the fMP4 init segment from SPS+PPS,
 /// and sends frames through the `ChannelLike` (F-fix-2: replaces app.emit).
+#[cfg_attr(not(test), allow(dead_code))]
 fn mux_thread(
     pkt_rx: Receiver<EncodedPacket>,
     stop_flag: Arc<AtomicBool>,
     counters: Arc<BridgeCounters>,
     channel: Arc<dyn ChannelLike>,
+) {
+    mux_thread_with_mux_config(
+        pkt_rx,
+        stop_flag,
+        counters,
+        channel,
+        default_mux_subgop_flush_frames_handle(),
+    );
+}
+
+fn mux_thread_with_mux_config(
+    pkt_rx: Receiver<EncodedPacket>,
+    stop_flag: Arc<AtomicBool>,
+    counters: Arc<BridgeCounters>,
+    channel: Arc<dyn ChannelLike>,
+    mux_subgop_flush_frames: Arc<AtomicUsize>,
 ) {
     // Muxer is created lazily on the first IDR (SPS+PPS required for init segment).
     let mut muxer: Option<Mp4Muxer> = None;
@@ -3030,7 +3175,13 @@ fn mux_thread(
                         .map(|t| std::time::Instant::now().duration_since(t).as_millis())
                         .unwrap_or(0)
                 );
-                let m = Mp4Muxer::new(w, h, 30, 1);
+                let m = Mp4Muxer::with_subgop_flush_frames(
+                    w,
+                    h,
+                    30,
+                    1,
+                    mux_subgop_flush_frames.load(Ordering::Acquire),
+                );
                 match m.build_init_segment(&sps_info, &sps, &pps) {
                     Ok(init_bytes) => {
                         emit_init(&channel, &counters, init_bytes);
@@ -4180,6 +4331,53 @@ mod tests {
             drain_handles: Vec::new(),
             _drain_senders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn select_mux_subgop_flush_frames_is_qsv_wifi_only() {
+        assert_eq!(
+            super::select_mux_subgop_flush_frames(Some("hw_intel_qsv"), true),
+            2,
+            "QSV + WiFi adaptive must select the low-latency 2-frame threshold"
+        );
+        assert_eq!(
+            super::select_mux_subgop_flush_frames(Some("hw_intel_qsv"), false),
+            super::DEFAULT_SUBGOP_FLUSH_FRAMES,
+            "env-disabled QSV must keep the default threshold"
+        );
+        assert_eq!(
+            super::select_mux_subgop_flush_frames(Some("hw_nvenc"), true),
+            super::DEFAULT_SUBGOP_FLUSH_FRAMES,
+            "NVENC must keep the default threshold"
+        );
+        assert_eq!(
+            super::select_mux_subgop_flush_frames(Some("sw_openh264"), true),
+            super::DEFAULT_SUBGOP_FLUSH_FRAMES,
+            "software encoders must keep the default threshold"
+        );
+    }
+
+    #[test]
+    fn apply_offer_backend_mux_config_updates_shared_threshold_and_strips_stamp() {
+        use sm_domain::signaling::SdpOffer;
+
+        let mux_subgop_flush_frames = AtomicUsize::new(super::DEFAULT_SUBGOP_FLUSH_FRAMES);
+        let offer = SdpOffer(format!(
+            "v=0\r\n{}hw_intel_qsv\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            super::SDP_BACKEND_ATTR_PREFIX
+        ));
+
+        let stripped = super::apply_offer_backend_mux_config(offer, &mux_subgop_flush_frames, true);
+
+        assert_eq!(
+            mux_subgop_flush_frames.load(Ordering::Acquire),
+            2,
+            "QSV + WiFi adaptive offers must store the low-latency 2-frame threshold"
+        );
+        assert!(
+            !stripped.0.contains(super::SDP_BACKEND_ATTR_PREFIX),
+            "backend stamp must be stripped before apply_remote_offer"
+        );
     }
 
     /// W2-A.1 — build_stream_session with a FakeReceiver bundle produces a
@@ -9382,6 +9580,110 @@ mod tests {
             seg_count, EXPECTED_SEGMENTS,
             "exactly {EXPECTED_SEGMENTS} FRAME_SEGMENT must be emitted \
              (8 P-frames / N=4 = 2 count-flushes + 1 IDR-flush for IDR2); got {seg_count}"
+        );
+    }
+
+    #[test]
+    fn build_stream_session_uses_selected_mux_threshold_for_segment_cadence() {
+        const SPS: &[u8] = &[0x67, 0x42, 0xC0, 0x0D, 0xF4, 0x0A, 0x0F, 0xC0];
+        const PPS: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+
+        let make_idr_data = || -> std::sync::Arc<[u8]> {
+            let mut d = Vec::new();
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01]);
+            d.extend_from_slice(SPS);
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01]);
+            d.extend_from_slice(PPS);
+            d.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x01, 0x65]);
+            d.extend(vec![0x88u8; 20]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        };
+
+        let make_p_data = |idx: u8| -> std::sync::Arc<[u8]> {
+            let mut d = vec![0x00u8, 0x00, 0x00, 0x01, 0x41];
+            d.extend(vec![idx; 20]);
+            std::sync::Arc::from(d.into_boxed_slice())
+        };
+
+        let (pkt_tx, pkt_rx) = std::sync::mpsc::sync_channel::<sm_domain::encode::EncodedPacket>(32);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let fake_ch = FakeChannel::new();
+        let channel: Arc<dyn ChannelLike> = fake_ch.clone();
+        register_mux_subgop_flush_frames(&stop_flag, Arc::new(AtomicUsize::new(2)));
+        let mut session = build_stream_session(
+            channel,
+            ReceiverBundle {
+                receiver: Box::new(FakeReceiver::new()),
+                pkt_rx,
+                signaling: None,
+                drain_handles: Vec::new(),
+                _drain_senders: Vec::new(),
+            },
+            stop_flag,
+        )
+        .expect("build_stream_session must succeed with an explicit mux threshold");
+
+        let ms = 17u64;
+        pkt_tx
+            .send(sm_domain::encode::EncodedPacket {
+                data: make_idr_data(),
+                is_keyframe: true,
+                timestamp: std::time::Duration::from_millis(0),
+                sequence: 0,
+            })
+            .expect("send IDR1");
+
+        for i in 1u64..=8 {
+            pkt_tx
+                .send(sm_domain::encode::EncodedPacket {
+                    data: make_p_data(i as u8),
+                    is_keyframe: false,
+                    timestamp: std::time::Duration::from_millis(i * ms),
+                    sequence: i,
+                })
+                .expect("send P-frame");
+        }
+
+        pkt_tx
+            .send(sm_domain::encode::EncodedPacket {
+                data: make_idr_data(),
+                is_keyframe: true,
+                timestamp: std::time::Duration::from_millis(9 * ms),
+                sequence: 9,
+            })
+            .expect("send IDR2");
+
+        const EXPECTED_SEGMENTS: usize = 5;
+        const EXPECTED_INIT: usize = 1;
+        const EXPECTED_TOTAL: usize = EXPECTED_SEGMENTS + EXPECTED_INIT;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake_ch.captured().len() < EXPECTED_TOTAL && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        session.stop_flag.store(true, Ordering::Relaxed);
+        drop(pkt_tx);
+        if let Some(handle) = session.mux_handle.take() {
+            handle
+                .join()
+                .expect("mux thread must stop cleanly after threshold wiring test");
+        }
+
+        let frames = fake_ch.captured();
+        let init_count = frames
+            .iter()
+            .filter(|f| f.first() == Some(&FRAME_INIT))
+            .count();
+        let seg_count = frames
+            .iter()
+            .filter(|f| f.first() == Some(&FRAME_SEGMENT))
+            .count();
+
+        assert_eq!(init_count, EXPECTED_INIT, "exactly 1 FRAME_INIT must be emitted");
+        assert_eq!(
+            seg_count, EXPECTED_SEGMENTS,
+            "selected threshold=2 must reach Mp4Muxer construction and emit 5 segments"
         );
     }
 

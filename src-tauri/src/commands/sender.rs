@@ -56,6 +56,7 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
+const SDP_BACKEND_ATTR_PREFIX: &str = "a=x-screen-mirror-backend:";
 // QSV-over-WiFi already coalesces to the latest frame and drops stale work, but
 // replay07 showed that 15fps still overdrives the weak WiFi path; keep the
 // conservative 10fps pacer target for this QSV-only adaptive lane.
@@ -2060,16 +2061,37 @@ fn decide_candidate_or_nic_error(
 /// `build_production_sender_bundle` (Windows-only) and the test contract both call
 /// this so the production path and the assertion cannot diverge (verify SUGGESTION-1).
 #[cfg(any(target_os = "windows", test))]
+fn stamp_offer_backend(
+    offer: sm_domain::signaling::SdpOffer,
+    backend_name: &str,
+) -> sm_domain::signaling::SdpOffer {
+    if backend_name.is_empty() {
+        return offer;
+    }
+
+    let mut stamped = offer.0;
+    if !stamped.ends_with("\r\n") {
+        stamped.push_str("\r\n");
+    }
+    stamped.push_str(SDP_BACKEND_ATTR_PREFIX);
+    stamped.push_str(backend_name);
+    stamped.push_str("\r\n");
+    sm_domain::signaling::SdpOffer(stamped)
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn stamp_and_publish_offer(
     signaling: &dyn sm_domain::signaling::Signaling,
     offer: sm_domain::signaling::SdpOffer,
     attempt: u8,
+    backend_name: &str,
 ) -> Result<(), sm_domain::signaling::SignalingError> {
     // C1: stamp the LIVE generation `attempt` (cold-start = 1; each rebuild carries
     // the supervisor attempt that fired it) so the receiver's `offer_attempt >=
     // expected_attempt` guard accepts the current generation and only drops strictly
     // older ones (REQ-GE-1, REQ-GE-2).
-    signaling.publish_local_offer(offer, attempt)
+    let stamped_offer = stamp_offer_backend(offer, backend_name);
+    signaling.publish_local_offer(stamped_offer, attempt)
 }
 
 // ─── Production bundle builder (Windows-only skeleton) ────────────────────────
@@ -2378,7 +2400,7 @@ fn build_production_sender_bundle(
     // C1: stamp the LIVE generation `attempt` (cold-start = 1, matches supervisor.rs:268
     // seed and receiver expected_attempt seed; rebuilds carry the supervisor attempt that
     // fired them) via the wire-stamp seam so the receiver accepts the current generation.
-    stamp_and_publish_offer(&signaling, offer, attempt)
+    stamp_and_publish_offer(&signaling, offer, attempt, &backend_name)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
@@ -4623,9 +4645,10 @@ mod tests {
         use std::sync::mpsc::SyncSender;
         use std::sync::{Arc, Mutex};
 
-        // Capture mock: records the `attempt` passed to publish_local_offer.
+        // Capture mock: records the `attempt` and Offer passed to publish_local_offer.
         struct CaptureSignaling {
             captured: Arc<Mutex<Option<u8>>>,
+            offer: Arc<Mutex<Option<SdpOffer>>>,
         }
 
         impl Signaling for CaptureSignaling {
@@ -4635,6 +4658,7 @@ mod tests {
             {
                 Ok(Self {
                     captured: Arc::new(Mutex::new(None)),
+                    offer: Arc::new(Mutex::new(None)),
                 })
             }
 
@@ -4647,9 +4671,10 @@ mod tests {
 
             fn publish_local_offer(
                 &self,
-                _offer: SdpOffer,
+                offer: SdpOffer,
                 attempt: u8,
             ) -> Result<(), SignalingError> {
+                *self.offer.lock().unwrap() = Some(offer);
                 *self.captured.lock().unwrap() = Some(attempt);
                 Ok(())
             }
@@ -4668,8 +4693,10 @@ mod tests {
         }
 
         let captured = Arc::new(Mutex::new(None));
+        let captured_offer = Arc::new(Mutex::new(None));
         let signaling = CaptureSignaling {
             captured: captured.clone(),
+            offer: captured_offer.clone(),
         };
 
         // Generation-2 rebuild: the receiver's expected_attempt has advanced to 2,
@@ -4677,16 +4704,25 @@ mod tests {
         const GEN2_ATTEMPT: u8 = 2;
         let offer = SdpOffer("v=0\r\no=- gen2 test\r\n".to_string());
 
-        super::stamp_and_publish_offer(&signaling, offer, GEN2_ATTEMPT)
+        super::stamp_and_publish_offer(&signaling, offer, GEN2_ATTEMPT, "hw_intel_qsv")
             .expect("stamp_and_publish_offer must succeed with the capture mock");
 
         let got = *captured.lock().unwrap();
+        let offer = captured_offer
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("published Offer must be captured");
         assert_eq!(
             got,
             Some(GEN2_ATTEMPT),
             "C2 FAIL (REQ-GE-2): published Offer carried attempt={got:?}, expected Some(2). \
              A hardcoded 1 here means the receiver drops every legitimate gen-2+ Offer \
              (offer_attempt < expected_attempt) and reconnection breaks."
+        );
+        assert!(
+            offer.0.contains("a=x-screen-mirror-backend:hw_intel_qsv\r\n"),
+            "published Offer must carry the backend stamp so the receiver can keep low-latency muxing QSV-only"
         );
     }
 
