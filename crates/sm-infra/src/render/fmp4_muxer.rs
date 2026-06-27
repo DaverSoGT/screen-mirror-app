@@ -715,9 +715,7 @@ pub fn annex_b_to_avcc(annex_b: &[u8]) -> Result<Vec<u8>, MuxerError> {
 /// Sub-GOP batch size: flush pending non-IDR samples every N frames.
 /// 4 frames ≈ 67ms at 60fps; ~15 moof+IPC sends/s; moof overhead ~120B/fragment.
 /// Increase to 8 if GATE-5 shows WebView2 IPC pressure (133ms, 7.5/s).
-pub const DEFAULT_SUBGOP_FLUSH_FRAMES: usize = 4;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const SUBGOP_FLUSH_FRAMES: usize = DEFAULT_SUBGOP_FLUSH_FRAMES;
+pub(crate) const SUBGOP_FLUSH_FRAMES: usize = 4;
 
 /// Per-sample metadata accumulated during fragment assembly.
 struct PendingSample {
@@ -783,8 +781,6 @@ pub struct Mp4Muxer {
     fragment_seq: u32,
     /// Samples accumulated for the current pending fragment.
     pending: Vec<PendingSample>,
-    /// Per-instance sub-GOP flush threshold.
-    subgop_flush_frames: usize,
     /// DTS of the very first packet ever appended, in TIMESCALE units. Set on
     /// the first `append_packet` call so subsequent samples can be re-based to
     /// start at zero on the MSE timeline regardless of what wall-clock /
@@ -823,34 +819,10 @@ impl Mp4Muxer {
     ///
     /// Panics if `width == 0` or `height == 0`.
     pub fn new(width: u32, height: u32, fps_num: u32, fps_den: u32) -> Self {
-        Self::with_subgop_flush_frames(
-            width,
-            height,
-            fps_num,
-            fps_den,
-            DEFAULT_SUBGOP_FLUSH_FRAMES,
-        )
-    }
-
-    /// Construct a new muxer with an explicit sub-GOP flush threshold.
-    ///
-    /// `subgop_flush_frames` controls how many already-pending samples may accumulate
-    /// before the next packet triggers a count flush.
-    pub fn with_subgop_flush_frames(
-        width: u32,
-        height: u32,
-        fps_num: u32,
-        fps_den: u32,
-        subgop_flush_frames: usize,
-    ) -> Self {
         assert!(width > 0, "Mp4Muxer: width must be > 0");
         assert!(height > 0, "Mp4Muxer: height must be > 0");
         assert!(fps_num > 0, "Mp4Muxer: fps_num must be > 0");
         assert!(fps_den > 0, "Mp4Muxer: fps_den must be > 0");
-        assert!(
-            subgop_flush_frames > 0,
-            "Mp4Muxer: subgop_flush_frames must be > 0"
-        );
         Self {
             width,
             height,
@@ -858,7 +830,6 @@ impl Mp4Muxer {
             fps_den,
             fragment_seq: 0,
             pending: Vec::new(),
-            subgop_flush_frames,
             first_dts_offset: None,
             fps_tracker: crate::render::fps_tracker::FpsTracker::new(),
             prev_flushed_dts: None,
@@ -946,7 +917,7 @@ impl Mp4Muxer {
         // Uniform invariant: Some(segment) ⟹ segment holds everything BEFORE this packet;
         // this packet opens fresh pending (IDR boundary semantics preserved verbatim).
         let should_flush = !self.pending.is_empty()
-            && (packet.is_keyframe || self.pending.len() >= self.subgop_flush_frames);
+            && (packet.is_keyframe || self.pending.len() >= SUBGOP_FLUSH_FRAMES);
 
         if should_flush {
             let segment = self.flush_pending();
@@ -2647,50 +2618,6 @@ mod tests {
     // Test 1 — D-PPT5-6 #1: flush fires after SUBGOP_FLUSH_FRAMES accumulated samples.
     // Two-sided mutation guard: N→3 makes the 4th call return Some; N→5 keeps 5th as None.
     // Spec: SEG-1-SC1. Design: D-PPT5-1, D-PPT5-2.
-    #[test]
-    fn new_uses_default_subgop_flush_frames() {
-        let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
-
-        assert!(
-            muxer.append_packet(&make_packet(true, 0, 100)).is_none(),
-            "first IDR must start accumulation without flushing"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 17, 100)).is_none(),
-            "2nd packet must not flush when default threshold is 4"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 34, 100)).is_none(),
-            "3rd packet must not flush when default threshold is 4"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 51, 100)).is_none(),
-            "4th packet must not flush when default threshold is 4"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 68, 100)).is_some(),
-            "5th packet must trigger the default 4-frame sub-GOP flush"
-        );
-    }
-
-    #[test]
-    fn configurable_threshold_two_flushes_on_third_packet() {
-        let mut muxer = Mp4Muxer::with_subgop_flush_frames(320, 240, 30, 1, 2);
-
-        assert!(
-            muxer.append_packet(&make_packet(true, 0, 100)).is_none(),
-            "first IDR must start accumulation without flushing"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 17, 100)).is_none(),
-            "2nd packet must not flush before the 2-frame threshold is pending"
-        );
-        assert!(
-            muxer.append_packet(&make_packet(false, 34, 100)).is_some(),
-            "3rd packet must flush the 2 pending frames when threshold=2"
-        );
-    }
-
     #[test]
     fn append_packet_flushes_after_subgop_threshold() {
         let mut muxer = Mp4Muxer::new(320, 240, 30, 1);
