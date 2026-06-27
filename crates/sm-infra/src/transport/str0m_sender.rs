@@ -111,7 +111,7 @@ const ADAPTIVE_ENCODER_BWE_NUM: u64 = 80;
 const ADAPTIVE_ENCODER_BWE_DEN: u64 = 100;
 // Below this, 1080p QSV-over-WiFi becomes visibly blocky while the pacer is already
 // limiting frame rate. Keep this QSV-only and clamp it to the configured max bitrate.
-const QSV_WIFI_ADAPTIVE_ENCODER_MIN_BPS: u64 = 2_000_000;
+const QSV_WIFI_ADAPTIVE_ENCODER_MIN_BPS: u64 = 1_200_000;
 const ADAPTIVE_QSV_BACKEND: &str = "hw_intel_qsv";
 const ADAPTIVE_QSV_WIFI_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 
@@ -2162,11 +2162,11 @@ mod tests {
 
         assert_eq!(
             adaptive_target_bitrate_bps(&estimate, 4_000_000),
-            Some(2_000_000)
+            Some(1_200_000)
         );
         assert_eq!(
             adaptive_target_bitrate_bps(&low_estimate, 4_000_000),
-            Some(2_000_000)
+            Some(1_200_000)
         );
         assert_eq!(adaptive_target_bitrate_bps(&zero_estimate, 4_000_000), None);
         assert_eq!(
@@ -2210,7 +2210,12 @@ mod tests {
 
         assert_eq!(
             adaptive_target_bitrate_bps(&low_estimate, 1_500_000),
-            Some(1_500_000)
+            Some(1_200_000)
+        );
+
+        assert_eq!(
+            adaptive_target_bitrate_bps(&low_estimate, 1_100_000),
+            Some(1_100_000)
         );
     }
 
@@ -2224,8 +2229,8 @@ mod tests {
 
         let applied = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
 
-        assert_eq!(applied, Some(2_000_000));
-        assert_eq!(bitrate.load(Ordering::Acquire), 2_000_000);
+        assert_eq!(applied, Some(1_200_000));
+        assert_eq!(bitrate.load(Ordering::Acquire), 1_200_000);
         assert_eq!(bitrate_calls.load(Ordering::Acquire), 1);
     }
 
@@ -2239,8 +2244,8 @@ mod tests {
         let first = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
         let second = maybe_apply_adaptive_encoder_bitrate(&estimate, &encoder, 4_000_000);
 
-        assert_eq!(first, Some(2_000_000));
-        assert_eq!(second, Some(2_000_000));
+        assert_eq!(first, Some(1_200_000));
+        assert_eq!(second, Some(1_200_000));
         assert_eq!(bitrate_calls.load(Ordering::Acquire), 2);
     }
 
