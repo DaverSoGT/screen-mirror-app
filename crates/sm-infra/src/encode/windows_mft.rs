@@ -3419,7 +3419,11 @@ mod tests {
     #[test]
     fn gen_lag_is_saturating_difference() {
         // Consumer current: it dequeued the newest queued generation → lag 0.
-        assert_eq!(gen_lag(10, 10), 0, "reading the freshest queued gen ⇒ lag 0");
+        assert_eq!(
+            gen_lag(10, 10),
+            0,
+            "reading the freshest queued gen ⇒ lag 0"
+        );
         // Consumer behind by 3 queued generations (backlog/ring-wrap staleness).
         assert_eq!(gen_lag(10, 7), 3, "lag = latest - frame_gen");
         // frame_gen ahead of latest (benign reorder / publish race) must saturate, not wrap.

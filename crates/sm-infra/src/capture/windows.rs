@@ -846,8 +846,9 @@ impl WgcHandler {
                     let context = frame.device_context();
                     // SAFETY: device/context are WGC's live device + immediate context for this
                     // capture thread, the same device that owns `frame.as_raw_texture()`.
-                    self.async_readback =
-                        Some(unsafe { crate::capture::gpu_readback::AsyncReadback::new(device, context) });
+                    self.async_readback = Some(unsafe {
+                        crate::capture::gpu_readback::AsyncReadback::new(device, context)
+                    });
                 }
                 // SAFETY: as_raw_texture() is WGC's live BGRA texture for this frame, on the
                 // device the readback was built with.
@@ -1764,7 +1765,10 @@ mod tests {
         );
         // Defensive: a mis-set divisor of 0 or 1 degrades to sampling every frame, never
         // a panic (modulo-by-zero guard).
-        assert!(hash_sample_due(7, 0), "every_n=0 must not panic and samples");
+        assert!(
+            hash_sample_due(7, 0),
+            "every_n=0 must not panic and samples"
+        );
         assert!(hash_sample_due(7, 1), "every_n=1 samples every frame");
     }
 

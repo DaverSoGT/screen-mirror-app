@@ -54,14 +54,19 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_sender_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
+#[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
+#[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
 // QSV-over-WiFi already coalesces to the latest frame and drops stale work, but
 // replay07 showed that 15fps still overdrives the weak WiFi path; keep the
 // conservative 10fps pacer target for this QSV-only adaptive lane.
+#[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_INPUT_TARGET_FPS: u32 = 10;
 
-pub fn is_qsv_backend(backend_name: &str) -> bool { backend_name == "hw_intel_qsv" }
+pub fn is_qsv_backend(backend_name: &str) -> bool {
+    backend_name == "hw_intel_qsv"
+}
 
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
@@ -734,7 +739,9 @@ pub fn run_sender_signaling_drain(
                     }
                 }
                 SignalingEvent::QsvTelemetryRequest | SignalingEvent::QsvTelemetryResponse(_) => {
-                    eprintln!("[sm-sender-signaling-drain] qsv telemetry ignored in PR1 foundation slice");
+                    eprintln!(
+                        "[sm-sender-signaling-drain] qsv telemetry ignored in PR1 foundation slice"
+                    );
                 }
                 SignalingEvent::OfferReceived(_, _) => {
                     // Sender role: ignore incoming offers.
@@ -2106,7 +2113,7 @@ const SENDER_ENCODER_FRAMERATE: u32 = 60;
 /// are testable on all targets without real capture/encoder hardware:
 /// `build_production_sender_bundle` (Windows-only) and the test contract both call this,
 /// so the production path and the assertions cannot diverge.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline; #[cfg(test)] still exercises it on all targets (memory #434)
+#[cfg(any(target_os = "windows", test))]
 fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
     sm_domain::EncoderConfig {
         width,
@@ -2122,10 +2129,21 @@ fn qsv_wifi_adaptive_env_enabled() -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
-#[cfg(any(target_os = "windows", test))]
 fn qsv_wifi_input_target_fps(backend_name: &str, wifi_enabled: bool) -> Option<u32> {
-    (wifi_enabled && backend_name == QSV_WIFI_BACKEND)
-        .then_some(QSV_WIFI_INPUT_TARGET_FPS)
+    (wifi_enabled && backend_name == QSV_WIFI_BACKEND).then_some(QSV_WIFI_INPUT_TARGET_FPS)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn publish_qsv_telemetry_request_if_qsv_backend(
+    signaling: &dyn sm_domain::signaling::Signaling,
+    backend_name: &str,
+) -> Result<bool, sm_domain::signaling::SignalingError> {
+    if is_qsv_backend(backend_name) {
+        signaling.publish_qsv_telemetry_request()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -2387,10 +2405,9 @@ fn build_production_sender_bundle(
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
     // NVENC stays outside the QSV telemetry circuit: only QSV sessions request telemetry.
-    if is_qsv_backend(&backend_name) {
-        signaling
-            .publish_qsv_telemetry_request()
-            .map_err(|e| BundleError::Other(e.to_string()))?;
+    if publish_qsv_telemetry_request_if_qsv_backend(&signaling, &backend_name)
+        .map_err(|e| BundleError::Other(e.to_string()))?
+    {
         eprintln!("[sm-sender-qsv] telemetry request queued backend={backend_name}");
     } else {
         eprintln!("[sm-sender-qsv] telemetry circuit disabled backend={backend_name}");

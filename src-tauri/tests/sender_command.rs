@@ -861,9 +861,15 @@ fn signaling_drain_stop_flag_exits_loop() {
 /// NVENC must stay outside the QSV telemetry request circuit.
 #[test]
 fn nvenc_backend_does_not_request_qsv_telemetry() {
-    assert!(screen_mirror_lib::commands::sender::is_qsv_backend("hw_intel_qsv"));
-    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend("hw_nvenc"));
-    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend("sw_openh264"));
+    assert!(screen_mirror_lib::commands::sender::is_qsv_backend(
+        "hw_intel_qsv"
+    ));
+    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend(
+        "hw_nvenc"
+    ));
+    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend(
+        "sw_openh264"
+    ));
 }
 
 // ─── B8 transport event drain tests ──────────────────────────────────────────

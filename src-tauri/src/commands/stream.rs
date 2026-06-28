@@ -141,8 +141,7 @@ impl Default for BridgeCounters {
     }
 }
 
-impl BridgeCounters {
-}
+impl BridgeCounters {}
 
 // ─── StreamCoordinatorHooks — production wiring seam ─────────────────────────
 
