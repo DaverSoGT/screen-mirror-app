@@ -122,12 +122,26 @@ pub struct StreamStats {
 // ─── Bridge bookkeeping ───────────────────────────────────────────────────────
 
 /// Shared bookkeeping counters for the mux thread + diagnostics command.
-#[derive(Debug, Default)]
-struct BridgeCounters {
+#[derive(Debug)]
+pub struct BridgeCounters {
     fragments_emitted: AtomicU64,
     init_segments_emitted: AtomicU64,
     dropped_segments: AtomicU64,
     keyframe_requests_fired: AtomicU64,
+}
+
+impl Default for BridgeCounters {
+    fn default() -> Self {
+        Self {
+            fragments_emitted: AtomicU64::new(0),
+            init_segments_emitted: AtomicU64::new(0),
+            dropped_segments: AtomicU64::new(0),
+            keyframe_requests_fired: AtomicU64::new(0),
+        }
+    }
+}
+
+impl BridgeCounters {
 }
 
 // ─── StreamCoordinatorHooks — production wiring seam ─────────────────────────
@@ -933,6 +947,8 @@ pub struct ReceiverBundle {
     /// Senders kept alive so their associated drain threads keep running.
     /// These are dropped first in stop_stream to unblock the drain threads.
     pub _drain_senders: Vec<SyncSender<()>>,
+    /// Shared counters for transport diagnostics.
+    pub counters: Arc<BridgeCounters>,
 }
 
 // ─── Drain functions (W2-fix-B, W2-fix-C) ────────────────────────────────────
@@ -1057,6 +1073,20 @@ fn run_signaling_drain(
                     if let Err(e) = receiver.add_remote_candidate(cand) {
                         eprintln!("[sm-signaling-drain] add_remote_candidate failed: {e}");
                     }
+                }
+                SignalingEvent::QsvTelemetryRequest => {
+                    eprintln!(
+                        "[sm-signaling-drain] qsv telemetry request ignored in PR1 foundation slice"
+                    );
+                }
+                SignalingEvent::QsvTelemetryResponse(telemetry) => {
+                    eprintln!(
+                        "[sm-signaling-drain] unexpected qsv telemetry response on receiver drain ignored: gap_ms={} frags_x100={} dropped_segments={} receiver_dropped_frames={}",
+                        telemetry.media_gap_ms,
+                        telemetry.fragments_per_s_x100,
+                        telemetry.dropped_segments,
+                        telemetry.receiver_dropped_frames
+                    );
                 }
                 SignalingEvent::Closed {
                     attempt: bye_attempt,
@@ -1682,8 +1712,7 @@ pub fn build_stream_session(
     bundle: ReceiverBundle,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<StreamSession, String> {
-    let counters = Arc::new(BridgeCounters::default());
-
+    let counters = bundle.counters.clone();
     let counters_clone = counters.clone();
     let stop_flag_clone = stop_flag.clone();
     let channel_for_thread = channel.clone();
@@ -1925,6 +1954,7 @@ fn build_production_bundle(
     // The socket was acquired by `bind_probe` in `start_stream_inner` BEFORE any
     // StreamBridge mutex was held (PQ-D-1). No second `UdpSocket::bind` occurs here.
     let BindCtx { socket } = bind_ctx;
+    let counters = Arc::new(BridgeCounters::default());
 
     // ── 1. Build MdnsSignaling (Receiver role) ─────────────────────────────
     let sig_config = build_signaling_config_for_receiver(udp_port, service_name);
@@ -2157,6 +2187,7 @@ fn build_production_bundle(
         signaling: Some(Box::new(MdnsStopOps(sig_ops_for_stop))),
         drain_handles: vec![transport_drain, sig_drain],
         _drain_senders: vec![],
+        counters,
     })
 }
 
@@ -3238,6 +3269,7 @@ mod tests {
     // window. Poison-safe: a panic in one holder must not cascade.
     static DRAIN_SEAM_GUARD: Mutex<()> = Mutex::new(());
 
+    /// Serialize QSV observation tests.
     /// Acquire the drain-seam guard, recovering from poisoning so a panicking
     /// holder does not cascade into unrelated drain-OfferReceived tests.
     fn lock_drain_seam_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -3426,6 +3458,7 @@ mod tests {
                             signaling: None,
                             drain_handles: Vec::new(),
                             _drain_senders: Vec::new(),
+                            counters: Arc::new(BridgeCounters::default()),
                         })
                     }
                     Err(msg) => Err(BundleError::Other(msg.to_string())),
@@ -3799,6 +3832,7 @@ mod tests {
             signaling: None,
             drain_handles: vec![drain1, drain2],
             _drain_senders: Vec::new(),
+            counters: Arc::new(BridgeCounters::default()),
         };
 
         let session =
@@ -4179,6 +4213,7 @@ mod tests {
             signaling: None,
             drain_handles: Vec::new(),
             _drain_senders: Vec::new(),
+            counters: Arc::new(BridgeCounters::default()),
         }
     }
 
@@ -4744,6 +4779,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -4777,6 +4813,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -4901,6 +4938,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -4947,6 +4985,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5068,6 +5107,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5108,6 +5148,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5149,6 +5190,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5223,6 +5265,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5286,6 +5329,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -5592,6 +5636,7 @@ mod tests {
                     signaling: None,
                     drain_handles: Vec::new(),
                     _drain_senders: Vec::new(),
+                    counters: Arc::new(BridgeCounters::default()),
                 })
             },
         );
@@ -6808,6 +6853,7 @@ mod tests {
                 signaling: None,
                 drain_handles: Vec::new(),
                 _drain_senders: Vec::new(),
+                counters: Arc::new(BridgeCounters::default()),
             })
         })
     }
@@ -7485,6 +7531,7 @@ mod tests {
                 signaling: None,
                 drain_handles: vec![drain],
                 _drain_senders: vec![],
+                counters: Arc::new(super::BridgeCounters::default()),
             })
         });
 

@@ -167,6 +167,7 @@ fn make_supervised_stream_bridge(
                 signaling: None,
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,
@@ -190,6 +191,7 @@ fn t7_1_restart_cache_populated_after_start() {
                 signaling: None,
                 drain_handles: vec![],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,
@@ -225,6 +227,7 @@ fn t7_1_restart_cache_cleared_after_stop() {
                 signaling: None,
                 drain_handles: vec![],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,
@@ -257,6 +260,7 @@ fn t7_1_session_nonce_is_stable_during_session() {
                 signaling: None,
                 drain_handles: vec![],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,
@@ -421,6 +425,7 @@ fn stop_stream_session_internal_leaves_restart_cache_intact() {
                 signaling: None,
                 drain_handles: vec![],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,
@@ -527,6 +532,9 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                         signaling: None,
                         drain_handles: vec![],
                         _drain_senders: vec![],
+                        counters: Arc::new(
+                            screen_mirror_lib::commands::stream::BridgeCounters::default(),
+                        ),
                     })
                 }),
                 cache_for_builder.clone(),
@@ -573,6 +581,7 @@ fn make_supervised_stream_bridge_with_rebuild_hook(
                 signaling: None,
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         session_arc,
@@ -772,6 +781,7 @@ fn rebuild_hook_signals_failed_on_builder_error() {
                 signaling: None,
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         session_arc,
@@ -1093,6 +1103,9 @@ fn stream_rebuild_can_chain_across_generations_swaps_bridge_session_each_time() 
                     signaling: None,
                     drain_handles: vec![h],
                     _drain_senders: vec![],
+                    counters: Arc::new(
+                        screen_mirror_lib::commands::stream::BridgeCounters::default(),
+                    ),
                 })
             });
 
@@ -1374,6 +1387,7 @@ fn rebuild_releases_udp_port_before_rebind() {
                 signaling: None,
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         session_arc,
@@ -1490,6 +1504,7 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                 signaling: None,
                 drain_handles: vec![],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         });
 
@@ -1549,6 +1564,7 @@ fn stream_rebuild_does_not_deadlock_during_concurrent_stop() {
                 signaling: None,
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         session_arc,

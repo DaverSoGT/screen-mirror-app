@@ -42,8 +42,8 @@ use std::time::Duration;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use sm_domain::signaling::{
-    IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError, SignalingEvent,
-    SignalingRole,
+    IceCandidate, QsvReceiverTelemetry, SdpAnswer, SdpOffer, Signaling, SignalingConfig,
+    SignalingError, SignalingEvent, SignalingRole,
 };
 use sm_domain::supervisor::SupervisorSignal;
 
@@ -118,6 +118,10 @@ enum MdnsControl {
     /// Published by the losing side in a simultaneous-detect race, or the
     /// responding side in a one-sided detect.
     ReconnectAck { attempt: u8, session_nonce: u64 },
+    /// QSV telemetry request to be forwarded to the connected peer.
+    QsvTelemetryRequest,
+    /// QSV telemetry response to be forwarded to the connected peer.
+    QsvTelemetryResponse(QsvReceiverTelemetry),
 }
 
 // ─── MdnsSignaling ────────────────────────────────────────────────────────────
@@ -279,6 +283,31 @@ impl Signaling for MdnsSignaling {
             .lock()
             .unwrap()
             .push(MdnsControl::Candidate(cand));
+        Ok(())
+    }
+
+    fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+        if self.handle.is_none() {
+            return Err(SignalingError::NotRunning);
+        }
+        self.inbox
+            .lock()
+            .map_err(|_| SignalingError::Io("mdns control inbox lock poisoned".to_string()))?
+            .push(MdnsControl::QsvTelemetryRequest);
+        Ok(())
+    }
+
+    fn publish_qsv_telemetry_response(
+        &self,
+        telemetry: QsvReceiverTelemetry,
+    ) -> Result<(), SignalingError> {
+        if self.handle.is_none() {
+            return Err(SignalingError::NotRunning);
+        }
+        self.inbox
+            .lock()
+            .map_err(|_| SignalingError::Io("mdns control inbox lock poisoned".to_string()))?
+            .push(MdnsControl::QsvTelemetryResponse(telemetry));
         Ok(())
     }
 
@@ -472,6 +501,7 @@ impl Drop for MdnsSignaling {
 /// to the reconnect supervisor via `supervisor_signal_tx` (if set) instead of producing
 /// a `SignalingEvent`. When `supervisor_signal_tx` is `None`, reconnect frames are
 /// silently consumed (Phase 3 backward-compatible behavior).
+/// Returns telemetry request/response events for the QSV observation path.
 /// All other variants map 1-to-1 to `SignalingEvent`.
 pub(crate) fn frame_to_event(
     frame: SignalingFrame,
@@ -529,6 +559,10 @@ pub(crate) fn frame_to_event(
                 });
             }
             None
+        }
+        SignalingFrame::QsvTelemetryRequest => Some(SignalingEvent::QsvTelemetryRequest),
+        SignalingFrame::QsvTelemetryResponse { telemetry } => {
+            Some(SignalingEvent::QsvTelemetryResponse(telemetry))
         }
     }
 }
@@ -1041,6 +1075,10 @@ fn run_frame_loop(
                     attempt,
                     session_nonce,
                 },
+                MdnsControl::QsvTelemetryRequest => SignalingFrame::QsvTelemetryRequest,
+                MdnsControl::QsvTelemetryResponse(telemetry) => {
+                    SignalingFrame::QsvTelemetryResponse { telemetry }
+                }
             };
             let kind = match &frame {
                 SignalingFrame::Offer { sdp, attempt } => {
@@ -1059,6 +1097,14 @@ fn run_frame_loop(
                     attempt,
                     session_nonce,
                 } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
+                SignalingFrame::QsvTelemetryRequest => "QsvTelemetryRequest".to_string(),
+                SignalingFrame::QsvTelemetryResponse { telemetry } => format!(
+                    "QsvTelemetryResponse (gap_ms={}, frags_x100={}, dropped_segments={}, receiver_dropped_frames={})",
+                    telemetry.media_gap_ms,
+                    telemetry.fragments_per_s_x100,
+                    telemetry.dropped_segments,
+                    telemetry.receiver_dropped_frames
+                ),
             };
             eprintln!("[sm-signaling-frame-loop] OUT → instance={instance_id} {kind}");
             if let Err(e) = write_frame(&mut writer, &frame) {
@@ -1095,6 +1141,14 @@ fn run_frame_loop(
                         attempt,
                         session_nonce,
                     } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
+                    SignalingFrame::QsvTelemetryRequest => "QsvTelemetryRequest".to_string(),
+                    SignalingFrame::QsvTelemetryResponse { telemetry } => format!(
+                        "QsvTelemetryResponse (gap_ms={}, frags_x100={}, dropped_segments={}, receiver_dropped_frames={})",
+                        telemetry.media_gap_ms,
+                        telemetry.fragments_per_s_x100,
+                        telemetry.dropped_segments,
+                        telemetry.receiver_dropped_frames
+                    ),
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← instance={instance_id} {kind}");
                 match frame_to_event(frame, &supervisor_signal_tx) {
@@ -1108,7 +1162,7 @@ fn run_frame_loop(
                     Some(ev) => {
                         let _ = emit(&event_tx, ev);
                     }
-                    None => {} // Hello or reconnect frame — absorbed / routed to supervisor
+                    None => {} // Hello, reconnect or qsv request/response frames — absorbed / routed
                 }
             }
             Ok(None) => {
@@ -2486,6 +2540,8 @@ mod tests {
                 MdnsControl::Candidate(_) => "Candidate",
                 MdnsControl::ReconnectRequest { .. } => "ReconnectRequest",
                 MdnsControl::ReconnectAck { .. } => "ReconnectAck",
+                MdnsControl::QsvTelemetryRequest => "QsvTelemetryRequest",
+                MdnsControl::QsvTelemetryResponse(_) => "QsvTelemetryResponse",
             })
             .collect();
 

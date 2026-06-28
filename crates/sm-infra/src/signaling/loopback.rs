@@ -35,8 +35,8 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use sm_domain::signaling::{
-    IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError, SignalingEvent,
-    SignalingRole,
+    IceCandidate, QsvReceiverTelemetry, SdpAnswer, SdpOffer, Signaling, SignalingConfig,
+    SignalingError, SignalingEvent, SignalingRole,
 };
 
 // ─── Internal wire frame ─────────────────────────────────────────────────────
@@ -52,6 +52,8 @@ enum LoopbackFrame {
     Offer(SdpOffer, u8),
     Answer(SdpAnswer),
     Candidate(IceCandidate),
+    QsvTelemetryRequest,
+    QsvTelemetryResponse(QsvReceiverTelemetry),
 }
 
 // ─── Shared relay state ──────────────────────────────────────────────────────
@@ -111,6 +113,10 @@ fn frame_to_event(frame: LoopbackFrame) -> SignalingEvent {
         LoopbackFrame::Offer(o, attempt) => SignalingEvent::OfferReceived(o, attempt),
         LoopbackFrame::Answer(a) => SignalingEvent::AnswerReceived(a),
         LoopbackFrame::Candidate(c) => SignalingEvent::CandidateReceived(c),
+        LoopbackFrame::QsvTelemetryRequest => SignalingEvent::QsvTelemetryRequest,
+        LoopbackFrame::QsvTelemetryResponse(telemetry) => {
+            SignalingEvent::QsvTelemetryResponse(telemetry)
+        }
     }
 }
 
@@ -242,6 +248,24 @@ impl Signaling for LoopbackSignaling {
         self.peer_relay.relay(LoopbackFrame::Candidate(cand))
     }
 
+    fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+        if !self.running {
+            return Err(SignalingError::NotRunning);
+        }
+        self.peer_relay.relay(LoopbackFrame::QsvTelemetryRequest)
+    }
+
+    fn publish_qsv_telemetry_response(
+        &self,
+        telemetry: QsvReceiverTelemetry,
+    ) -> Result<(), SignalingError> {
+        if !self.running {
+            return Err(SignalingError::NotRunning);
+        }
+        self.peer_relay
+            .relay(LoopbackFrame::QsvTelemetryResponse(telemetry))
+    }
+
     /// Stop signaling.
     ///
     /// Clears `self_relay` so the peer can no longer deliver events to this half.
@@ -263,8 +287,8 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use sm_domain::signaling::{
-        IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError,
-        SignalingEvent, SignalingRole,
+        IceCandidate, QsvReceiverTelemetry, SdpAnswer, SdpOffer, Signaling, SignalingConfig,
+        SignalingError, SignalingEvent, SignalingRole,
     };
 
     use crate::signaling::loopback::LoopbackSignaling;
@@ -373,6 +397,39 @@ mod tests {
             }
             other => panic!("expected CandidateReceived, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn qsv_telemetry_round_trip_between_halves() {
+        let (mut a, mut b) =
+            LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
+
+        let (a_event_tx, a_event_rx) = sync_channel::<SignalingEvent>(8);
+        let (b_event_tx, b_event_rx) = sync_channel::<SignalingEvent>(8);
+        a.start(a_event_tx).unwrap();
+        b.start(b_event_tx).unwrap();
+
+        let telemetry = QsvReceiverTelemetry {
+            media_gap_ms: 120,
+            fragments_per_s_x100: 750,
+            dropped_segments: 3,
+            receiver_dropped_frames: 4,
+        };
+
+        a.publish_qsv_telemetry_request().unwrap();
+        let request_event = b_event_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("expected QsvTelemetryRequest on side B within 1 s");
+        assert_eq!(request_event, SignalingEvent::QsvTelemetryRequest);
+
+        b.publish_qsv_telemetry_response(telemetry.clone()).unwrap();
+        let response_event = a_event_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("expected QsvTelemetryResponse on side A within 1 s");
+        assert_eq!(
+            response_event,
+            SignalingEvent::QsvTelemetryResponse(telemetry)
+        );
     }
 
     // ─── S8.2: stop() is idempotent ──────────────────────────────────────────

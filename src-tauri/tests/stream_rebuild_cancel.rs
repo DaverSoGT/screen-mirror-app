@@ -113,6 +113,7 @@ fn fake_bundle() -> ReceiverBundle {
         signaling: None,
         drain_handles: vec![],
         _drain_senders: vec![],
+        counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
     }
 }
 
@@ -508,6 +509,7 @@ fn sc_rrd_deadlock_teardown_joins_with_live_reset_hook_ref() {
         signaling: None,
         drain_handles: vec![],
         _drain_senders: vec![],
+        counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
     };
     let session = build_stream_session(ch.clone(), bundle, old_stop_flag.clone())
         .expect("build_stream_session must succeed");

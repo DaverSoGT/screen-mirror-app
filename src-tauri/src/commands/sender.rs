@@ -61,6 +61,8 @@ const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
 // conservative 10fps pacer target for this QSV-only adaptive lane.
 const QSV_WIFI_INPUT_TARGET_FPS: u32 = 10;
 
+pub fn is_qsv_backend(backend_name: &str) -> bool { backend_name == "hw_intel_qsv" }
+
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
 /// Seam used by `enter_supervisor_mode` to refresh the signaling layer's stored
@@ -669,6 +671,9 @@ fn dead_reason_to_str(reason: &DeadReason) -> &'static str {
 pub trait SignalingSenderOps: Send + Sync {
     fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError>;
     fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError>;
+    fn backend_name(&self) -> Option<String> {
+        None
+    }
 }
 
 // ─── Drain functions ──────────────────────────────────────────────────────────
@@ -727,6 +732,9 @@ pub fn run_sender_signaling_drain(
                     if let Err(e) = sender.add_remote_candidate(c) {
                         eprintln!("[sm-sender-signaling-drain] add_remote_candidate failed: {e}");
                     }
+                }
+                SignalingEvent::QsvTelemetryRequest | SignalingEvent::QsvTelemetryResponse(_) => {
+                    eprintln!("[sm-sender-signaling-drain] qsv telemetry ignored in PR1 foundation slice");
                 }
                 SignalingEvent::OfferReceived(_, _) => {
                     // Sender role: ignore incoming offers.
@@ -2114,16 +2122,13 @@ fn qsv_wifi_adaptive_env_enabled() -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn qsv_wifi_input_pacing_enabled_for_backend(backend_name: &str, wifi_enabled: bool) -> bool {
-    wifi_enabled && backend_name == QSV_WIFI_BACKEND
-}
-
 #[cfg(any(target_os = "windows", test))]
 fn qsv_wifi_input_target_fps(backend_name: &str, wifi_enabled: bool) -> Option<u32> {
-    qsv_wifi_input_pacing_enabled_for_backend(backend_name, wifi_enabled)
+    (wifi_enabled && backend_name == QSV_WIFI_BACKEND)
         .then_some(QSV_WIFI_INPUT_TARGET_FPS)
 }
 
+#[cfg(any(target_os = "windows", test))]
 #[cfg(target_os = "windows")]
 fn spawn_qsv_wifi_input_pacer(
     rx: Receiver<sm_domain::FramePayload>,
@@ -2381,6 +2386,16 @@ fn build_production_sender_bundle(
     stamp_and_publish_offer(&signaling, offer, attempt)
         .map_err(|e| BundleError::Other(e.to_string()))?;
 
+    // NVENC stays outside the QSV telemetry circuit: only QSV sessions request telemetry.
+    if is_qsv_backend(&backend_name) {
+        signaling
+            .publish_qsv_telemetry_request()
+            .map_err(|e| BundleError::Other(e.to_string()))?;
+        eprintln!("[sm-sender-qsv] telemetry request queued backend={backend_name}");
+    } else {
+        eprintln!("[sm-sender-qsv] telemetry circuit disabled backend={backend_name}");
+    }
+
     // Trickle ICE: publish host candidate AFTER offer so the peer receives
     // Offer → Candidate in FIFO order (design §3.1 revised ordering).
     //
@@ -2462,7 +2477,7 @@ fn build_production_sender_bundle(
     let signaling_refresh: Arc<dyn SignalingSupervisorRefresh> =
         Arc::new(MdnsSupervisorRefresh(signaling_arc.clone()));
 
-    struct Str0mSenderOpsImpl(Arc<Mutex<Str0mVideoSender>>);
+    struct Str0mSenderOpsImpl(Arc<Mutex<Str0mVideoSender>>, String);
     impl SignalingSenderOps for Str0mSenderOpsImpl {
         fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError> {
             self.0.lock().unwrap().apply_remote_answer(ans)
@@ -2470,9 +2485,13 @@ fn build_production_sender_bundle(
         fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError> {
             self.0.lock().unwrap().add_remote_candidate(c)
         }
+        fn backend_name(&self) -> Option<String> {
+            Some(self.1.clone())
+        }
     }
 
-    let sender_ops: Arc<dyn SignalingSenderOps> = Arc::new(Str0mSenderOpsImpl(sender_arc.clone()));
+    let sender_ops: Arc<dyn SignalingSenderOps> =
+        Arc::new(Str0mSenderOpsImpl(sender_arc.clone(), backend_name.clone()));
 
     // `_counters` not forwarded in the production path — production drain uses
     // `coordinator_hooks` instead. Kept to avoid removing the type from scope.
