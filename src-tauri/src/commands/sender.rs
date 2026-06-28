@@ -4709,6 +4709,97 @@ mod tests {
         );
     }
 
+    /// QSV telemetry request is published only for the QSV backend.
+    #[test]
+    fn qsv_backend_only_publishes_qsv_telemetry_request() {
+        use sm_domain::signaling::{
+            IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError,
+            SignalingEvent,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc::SyncSender;
+
+        struct TelemetryRequestSpy {
+            request_count: Arc<AtomicU32>,
+        }
+
+        impl Signaling for TelemetryRequestSpy {
+            fn new(_config: SignalingConfig) -> Result<Self, SignalingError>
+            where
+                Self: Sized,
+            {
+                Ok(Self {
+                    request_count: Arc::new(AtomicU32::new(0)),
+                })
+            }
+
+            fn start(
+                &mut self,
+                _event_tx: SyncSender<SignalingEvent>,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_offer(
+                &self,
+                _offer: SdpOffer,
+                _attempt: u8,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_answer(&self, _answer: SdpAnswer) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_candidate(&self, _cand: IceCandidate) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+                self.request_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn stop(&mut self) -> Result<(), SignalingError> {
+                Ok(())
+            }
+        }
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let signaling = TelemetryRequestSpy {
+            request_count: request_count.clone(),
+        };
+
+        for (backend_name, expected_request) in [
+            ("hw_intel_qsv", true),
+            ("hw_nvenc", false),
+            ("sw_openh264", false),
+        ] {
+            let before = request_count.load(Ordering::SeqCst);
+            let published =
+                super::publish_qsv_telemetry_request_if_qsv_backend(&signaling, backend_name)
+                    .expect("telemetry gate must succeed");
+
+            assert_eq!(
+                published, expected_request,
+                "backend={backend_name} must match the QSV telemetry gate"
+            );
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                before + u32::from(expected_request),
+                "backend={backend_name} must only call publish_qsv_telemetry_request() when it is QSV"
+            );
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "only hw_intel_qsv should publish a QSV telemetry request"
+        );
+    }
+
     // ─── SC-WD-S1..S5: sender media-arrival watchdog (CAP-2-v2, relocated) ────
     //
     // CAP-2-v2 (design #1021, RCA #1020): the watchdog is RELOCATED out of the
