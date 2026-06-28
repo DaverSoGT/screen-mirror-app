@@ -32,10 +32,14 @@
 //! before joining drain threads, interrupting any in-flight backoff sleep (AC-13).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::SyncSender;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 use sm_domain::session::{DeadReason, ReconnectPolicy, ReconnectTrigger, SessionState};
 use sm_domain::signaling::{IceCandidate, SdpAnswer, SignalingEvent};
@@ -54,7 +58,7 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_sender_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
 #[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
@@ -2104,6 +2108,7 @@ fn stamp_and_publish_offer(
 ///
 /// Cycle-5 TODO: replace with `capture.refresh_rate()` dynamic query — only the value
 /// source changes, not the build-site plumbing.
+#[cfg(any(target_os = "windows", test))]
 const SENDER_ENCODER_FRAMERATE: u32 = 60;
 
 /// Build the production sender `EncoderConfig` for the given capture dimensions.
@@ -2123,7 +2128,7 @@ fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn qsv_wifi_adaptive_env_enabled() -> bool {
     std::env::var(QSV_WIFI_ADAPTIVE_ENV).as_deref() == Ok("1")
 }
