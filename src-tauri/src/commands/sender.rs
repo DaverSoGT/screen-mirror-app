@@ -2446,12 +2446,12 @@ fn build_production_sender_bundle(
             });
         }
         Err(e) => {
-            // Budget exhausted: NIC never returned in the retry window.
+            // Budget exhausted: no usable LAN candidate appeared in the retry window.
             // decide_candidate_or_nic_error returned Err(NoLocalNic); the rebuild
             // worker (sender.rs rebuild hook) will forward this as RebuildFailed so
             // the supervisor escalates with backoff. (REQ-HWF-1, GitHub #57 Option 1)
             eprintln!(
-                "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
+                "[sm-sender-bundle] ERROR no usable LAN IPv4 candidate after {CANDIDATE_RETRY_ATTEMPTS} retries; \
                  aborting bundle build — supervisor will escalate with backoff"
             );
             return Err(e);
