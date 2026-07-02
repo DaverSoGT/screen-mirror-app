@@ -1281,6 +1281,181 @@ fn transport_receiver_candidate_addr_is_none_when_only_link_local_exists() {
     receiver.stop().unwrap();
 }
 
+// ─── S-CT-3c: candidate_addr() rejects CGNAT/Tailscale NIC candidates ────────
+
+/// Sender variant — when NIC enumeration only contains CGNAT/Tailscale IPv4
+/// addresses, `candidate_addr()` MUST return `None` rather than publish a VPN
+/// candidate for a LAN hardware-gated session.
+#[test]
+fn transport_sender_candidate_addr_is_none_when_only_cgnat_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let enc = FakeLoopbackEncoder::new();
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(100, 64, 12, 34)]);
+
+    assert!(
+        sender.candidate_addr().is_none(),
+        "candidate_addr must not return a CGNAT/Tailscale-only candidate"
+    );
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// Sender variant — when both CGNAT/Tailscale and RFC1918 LAN addresses exist,
+/// `candidate_addr()` MUST choose the RFC1918 LAN address.
+#[test]
+fn transport_sender_candidate_addr_prefers_lan_over_cgnat() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let valid_lan = std::net::Ipv4Addr::new(192, 168, 1, 44);
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let enc = FakeLoopbackEncoder::new();
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(100, 64, 12, 34), valid_lan]);
+
+    let candidate = sender
+        .candidate_addr()
+        .expect("candidate_addr must select the usable LAN candidate");
+
+    assert_eq!(
+        candidate.ip(),
+        std::net::IpAddr::V4(valid_lan),
+        "candidate_addr must reject CGNAT/Tailscale and prefer the usable LAN address"
+    );
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// Receiver variant — mirrors the sender CGNAT/Tailscale-only rejection rule.
+#[test]
+fn transport_receiver_candidate_addr_is_none_when_only_cgnat_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(100, 64, 12, 34)]);
+
+    assert!(
+        receiver.candidate_addr().is_none(),
+        "candidate_addr must not return a CGNAT/Tailscale-only candidate"
+    );
+
+    receiver.stop().unwrap();
+}
+
+/// Receiver variant — mirrors the sender LAN-over-CGNAT preference rule.
+#[test]
+fn transport_receiver_candidate_addr_prefers_lan_over_cgnat() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let valid_lan = std::net::Ipv4Addr::new(192, 168, 1, 45);
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(100, 64, 12, 34), valid_lan]);
+
+    let candidate = receiver
+        .candidate_addr()
+        .expect("candidate_addr must select the usable LAN candidate");
+
+    assert_eq!(
+        candidate.ip(),
+        std::net::IpAddr::V4(valid_lan),
+        "candidate_addr must reject CGNAT/Tailscale and prefer the usable LAN address"
+    );
+
+    receiver.stop().unwrap();
+}
+
+/// `publish_host_candidate()` MUST refuse CGNAT/Tailscale addresses and must not
+/// publish a candidate event when it refuses the address.
+#[test]
+fn transport_publish_host_candidate_rejects_cgnat_without_publishing_event() {
+    use sm_infra::transport::publish_host_candidate;
+
+    let addr: std::net::SocketAddr = "100.64.12.34:5004".parse().expect("valid addr");
+    let (mut sig_a, mut sig_b) =
+        LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
+    let (sig_a_ev_tx, _sig_a_ev_rx) = sync_channel::<SignalingEvent>(4);
+    let (sig_b_ev_tx, sig_b_ev_rx) = sync_channel::<SignalingEvent>(4);
+    sig_a.start(sig_a_ev_tx).expect("sig_a start");
+    sig_b.start(sig_b_ev_tx).expect("sig_b start");
+
+    let err = publish_host_candidate(&sig_a, addr).expect_err("CGNAT candidate must be refused");
+
+    assert!(
+        matches!(&err, sm_domain::signaling::SignalingError::Protocol(message) if message.contains("Refusing to publish unusable ICE host candidate")),
+        "expected clear protocol refusal, got {err:?}"
+    );
+    assert!(
+        matches!(sig_b_ev_rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout)),
+        "refused CGNAT candidate must not publish a CandidateReceived event"
+    );
+}
+
 // ─── S-CT-4: Candidate JSON round-trip through IceCandidate ──────────────────
 
 /// S-CT-4 — The `publish_host_candidate` helper serialises a `str0m::Candidate`
