@@ -716,6 +716,27 @@ pub fn run_sender_signaling_drain(
     // The NEW generation's flag stays `false`, so its genuine RebuildFailed still escalates.
     escalation_disarmed: Arc<AtomicBool>,
 ) {
+    run_sender_signaling_drain_with_qsv_observation(
+        ev_rx,
+        sender,
+        stop_flag,
+        channel,
+        signal_slot,
+        escalation_disarmed,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sender_signaling_drain_with_qsv_observation(
+    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    sender: Arc<dyn SignalingSenderOps>,
+    stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    signal_slot: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    escalation_disarmed: Arc<AtomicBool>,
+    qsv_backend_name: Option<String>,
+) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -742,10 +763,26 @@ pub fn run_sender_signaling_drain(
                         eprintln!("[sm-sender-signaling-drain] add_remote_candidate failed: {e}");
                     }
                 }
-                SignalingEvent::QsvTelemetryRequest | SignalingEvent::QsvTelemetryResponse(_) => {
+                SignalingEvent::QsvTelemetryRequest => {
                     eprintln!(
-                        "[sm-sender-signaling-drain] qsv telemetry ignored in PR1 foundation slice"
+                        "[sm-sender-signaling-drain] qsv telemetry request ignored on sender"
                     );
+                }
+                SignalingEvent::QsvTelemetryResponse(telemetry) => {
+                    if let Some(backend_name) = qsv_backend_name.as_deref() {
+                        if let Some(observation) =
+                            consume_qsv_receiver_telemetry_for_backend(backend_name, telemetry)
+                        {
+                            eprintln!(
+                                "[sm-sender-qsv] observation backend={} media_gap_ms={} fragments_per_s_x100={} dropped_segments={} receiver_dropped_frames={}",
+                                observation.backend_name,
+                                observation.receiver.media_gap_ms,
+                                observation.receiver.fragments_per_s_x100,
+                                observation.receiver.dropped_segments,
+                                observation.receiver.receiver_dropped_frames,
+                            );
+                        }
+                    }
                 }
                 SignalingEvent::OfferReceived(_, _) => {
                     // Sender role: ignore incoming offers.
@@ -854,6 +891,13 @@ pub fn run_sender_transport_event_drain(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn consume_qsv_receiver_telemetry_for_backend(
+    backend_name: &str,
+    telemetry: sm_domain::signaling::QsvReceiverTelemetry,
+) -> Option<crate::commands::qsv_observation::QsvSenderObservation> {
+    crate::commands::qsv_observation::summarize_sender_observation(backend_name, telemetry)
 }
 
 /// Transport-event drain loop for the sender — WITH reconnect supervisor wiring.
@@ -2540,6 +2584,7 @@ fn build_production_sender_bundle(
     // Seed = 1 matches the supervisor's first attempt (supervisor.rs:268).
     let sender_attempt_arc = Arc::new(AtomicU8::new(1));
 
+    let backend_name_for_reset = backend_name.clone();
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
             let sig = sig_for_req.lock().unwrap();
@@ -2673,16 +2718,18 @@ fn build_production_sender_bundle(
             let sup_clone = sup_tx_for_reset.clone();
             // D-RFG-6: same generation-scoped disarm flag as the primary drain.
             let disarm_clone = escalation_disarmed_for_reset.clone();
+            let qsv_backend_name_for_reset = backend_name_for_reset.clone();
             std::thread::Builder::new()
                 .name("sm-sender-signaling-drain-reset".into())
                 .spawn(move || {
-                    run_sender_signaling_drain(
+                    run_sender_signaling_drain_with_qsv_observation(
                         sig_ev_rx,
                         ops_clone,
                         stop_clone,
                         chan_clone,
                         sup_clone,
                         disarm_clone,
+                        Some(qsv_backend_name_for_reset),
                     );
                 })
                 .map_err(|e| {
@@ -2701,16 +2748,18 @@ fn build_production_sender_bundle(
     let tr_stop = stop_flag.clone();
 
     let sup_tx_for_sig = bridge_supervisor_signal_tx.clone();
+    let qsv_backend_name_for_sig_drain = backend_name.clone();
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(
+            run_sender_signaling_drain_with_qsv_observation(
                 sig_ev_rx,
                 sender_ops,
                 sig_stop,
                 sig_channel,
                 sup_tx_for_sig,
                 escalation_disarmed_for_sig, // D-RFG-6 generation-scoped disarm flag
+                Some(qsv_backend_name_for_sig_drain),
             );
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
