@@ -3802,6 +3802,115 @@ mod tests {
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
     }
 
+    #[test]
+    fn qsv_receiver_snapshot_reports_runtime_counters() {
+        let counters = BridgeCounters::default();
+        counters.fragments_emitted.store(4, Ordering::Relaxed);
+        counters.dropped_segments.store(2, Ordering::Relaxed);
+        counters
+            .first_fragment_at_ms
+            .store(1_000, Ordering::Relaxed);
+        counters.last_fragment_at_ms.store(2_500, Ordering::Relaxed);
+
+        let telemetry = qsv_receiver_telemetry_snapshot(&counters, 7, 3_000);
+
+        assert_eq!(telemetry.media_gap_ms, 500);
+        assert_eq!(telemetry.fragments_per_s_x100, 200);
+        assert_eq!(telemetry.dropped_segments, 2);
+        assert_eq!(telemetry.receiver_dropped_frames, 7);
+    }
+
+    #[test]
+    fn qsv_telemetry_request_publishes_receiver_snapshot() {
+        let _guard = lock_drain_seam_guard();
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(4);
+        struct TestReceiver;
+        impl SignalingReceiverOps for TestReceiver {
+            fn apply_remote_offer(
+                &self,
+                _offer: sm_domain::signaling::SdpOffer,
+            ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+                Ok(sm_domain::signaling::SdpAnswer("answer".into()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn dropped_frames(&self) -> u64 {
+                7
+            }
+        }
+        #[derive(Default)]
+        struct QsvTelemetryPublishSpy {
+            published: Mutex<Vec<QsvReceiverTelemetry>>,
+        }
+        impl SignalingPublishOps for QsvTelemetryPublishSpy {
+            fn publish_local_answer(
+                &self,
+                _answer: sm_domain::signaling::SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_qsv_telemetry_response(
+                &self,
+                telemetry: QsvReceiverTelemetry,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                self.published.lock().unwrap().push(telemetry);
+                Ok(())
+            }
+        }
+
+        let receiver = Arc::new(TestReceiver) as Arc<dyn SignalingReceiverOps>;
+        let signaling = Arc::new(QsvTelemetryPublishSpy::default());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let supervisor_signal_tx = Arc::new(Mutex::new(None));
+        let expected_attempt = Arc::new(AtomicU8::new(1));
+        let counters = Arc::new(BridgeCounters::default());
+        counters.fragments_emitted.store(2, Ordering::Relaxed);
+        counters.dropped_segments.store(1, Ordering::Relaxed);
+        counters
+            .first_fragment_at_ms
+            .store(1_000, Ordering::Relaxed);
+        counters.last_fragment_at_ms.store(1_500, Ordering::Relaxed);
+
+        let signaling_for_assert = signaling.clone();
+        let signaling_for_drain = signaling as Arc<dyn SignalingPublishOps>;
+        let stop_for_thread = stop_flag.clone();
+        let drain = thread::spawn(move || {
+            run_signaling_drain_with_qsv_snapshot(
+                ev_rx,
+                receiver,
+                signaling_for_drain,
+                stop_for_thread,
+                supervisor_signal_tx,
+                DrainRole::Primary,
+                expected_attempt,
+                Some(counters),
+            );
+        });
+
+        ev_tx
+            .send(SignalingEvent::QsvTelemetryRequest)
+            .expect("test drain must accept telemetry request");
+        std::thread::sleep(Duration::from_millis(50));
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        drain.join().expect("drain must exit cleanly");
+
+        let published = signaling_for_assert.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].dropped_segments, 1);
+        assert_eq!(published[0].fragments_per_s_x100, 200);
+    }
+
     // ─── W2-fix-D RED: stop_stream cleans up all threads in correct order ────────
 
     /// D.STOP.1 — `stop_stream_session` (the extractable core of stop_stream) sets
