@@ -1130,6 +1130,157 @@ fn transport_receiver_candidate_addr_is_none_when_no_usable_nic_s_ct_3() {
     receiver.stop().unwrap();
 }
 
+// ─── S-CT-3b: candidate_addr() rejects link-local NIC candidates ─────────────
+
+/// Sender variant — when NIC enumeration contains a link-local IPv4 before a
+/// usable LAN IPv4, `candidate_addr()` MUST skip the link-local address and use
+/// the LAN address. Publishing `169.254.0.0/16` breaks cross-host ICE on LAN.
+#[test]
+fn transport_sender_candidate_addr_skips_link_local_when_lan_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let valid_lan = std::net::Ipv4Addr::new(192, 168, 1, 42);
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let enc = FakeLoopbackEncoder::new();
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(169, 254, 83, 107), valid_lan]);
+
+    let candidate = sender
+        .candidate_addr()
+        .expect("candidate_addr must select the usable LAN candidate");
+
+    assert_eq!(
+        candidate.ip(),
+        std::net::IpAddr::V4(valid_lan),
+        "candidate_addr must skip link-local IPv4 and prefer the usable LAN address"
+    );
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// Sender variant — when NIC enumeration only contains link-local IPv4
+/// addresses, `candidate_addr()` MUST return `None` rather than publish a bad
+/// candidate.
+#[test]
+fn transport_sender_candidate_addr_is_none_when_only_link_local_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let mut sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new");
+
+    let enc = FakeLoopbackEncoder::new();
+    sender.set_encoder(enc as Arc<dyn VideoEncoder + Send + Sync>);
+
+    let (pkt_tx, pkt_rx) = sync_channel(4);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    sender.start(pkt_rx, event_tx).expect("sender start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(169, 254, 83, 107)]);
+
+    assert!(
+        sender.candidate_addr().is_none(),
+        "candidate_addr must not return a link-local-only candidate"
+    );
+
+    drop(pkt_tx);
+    sender.stop().unwrap();
+}
+
+/// Receiver variant — mirrors the sender LAN preference rule so both peers apply
+/// the same host-candidate hygiene.
+#[test]
+fn transport_receiver_candidate_addr_skips_link_local_when_lan_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let valid_lan = std::net::Ipv4Addr::new(192, 168, 1, 43);
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(169, 254, 83, 107), valid_lan]);
+
+    let candidate = receiver
+        .candidate_addr()
+        .expect("candidate_addr must select the usable LAN candidate");
+
+    assert_eq!(
+        candidate.ip(),
+        std::net::IpAddr::V4(valid_lan),
+        "candidate_addr must skip link-local IPv4 and prefer the usable LAN address"
+    );
+
+    receiver.stop().unwrap();
+}
+
+/// Receiver variant — mirrors the sender link-local-only rejection rule.
+#[test]
+fn transport_receiver_candidate_addr_is_none_when_only_link_local_exists() {
+    use sm_infra::transport::NicOverrideGuard;
+
+    let sender = Str0mVideoSender::new(TransportConfig {
+        udp_port: 0,
+        ..TransportConfig::default()
+    })
+    .expect("sender new for offer");
+
+    let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+        udp_port: 0,
+        role: TransportRole::Receiver,
+        ..TransportConfig::default()
+    })
+    .expect("receiver new");
+
+    let offer = sender.create_local_offer().expect("offer");
+    let _answer = receiver.apply_remote_offer(offer).expect("answer");
+
+    let (pkt_out_tx, _pkt_out_rx) = sync_channel::<EncodedPacket>(8);
+    let (event_tx, _event_rx) = sync_channel::<TransportEvent>(8);
+    receiver
+        .start(pkt_out_tx, event_tx)
+        .expect("receiver start");
+
+    let _guard = NicOverrideGuard::new(vec![std::net::Ipv4Addr::new(169, 254, 83, 107)]);
+
+    assert!(
+        receiver.candidate_addr().is_none(),
+        "candidate_addr must not return a link-local-only candidate"
+    );
+
+    receiver.stop().unwrap();
+}
+
 // ─── S-CT-4: Candidate JSON round-trip through IceCandidate ──────────────────
 
 /// S-CT-4 — The `publish_host_candidate` helper serialises a `str0m::Candidate`
