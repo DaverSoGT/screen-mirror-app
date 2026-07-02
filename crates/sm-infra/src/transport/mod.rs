@@ -56,7 +56,8 @@ pub(crate) fn enumerate_local_ipv4() -> Vec<std::net::Ipv4Addr> {
 }
 
 fn is_usable_host_candidate_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    !ip.is_unspecified()
+    ip.is_private()
+        && !ip.is_unspecified()
         && !ip.is_loopback()
         && !ip.is_link_local()
         && !ip.is_multicast()
@@ -67,19 +68,7 @@ fn select_usable_host_candidate_ipv4<I>(ips: I) -> Option<std::net::Ipv4Addr>
 where
     I: IntoIterator<Item = std::net::Ipv4Addr>,
 {
-    let mut first_usable = None;
-
-    for ip in ips {
-        if !is_usable_host_candidate_ipv4(ip) {
-            continue;
-        }
-        if ip.is_private() {
-            return Some(ip);
-        }
-        first_usable.get_or_insert(ip);
-    }
-
-    first_usable
+    ips.into_iter().find(|&ip| is_usable_host_candidate_ipv4(ip))
 }
 
 pub(crate) fn host_candidate_addr_for_local(
@@ -417,8 +406,9 @@ mod resolve_ipv4_with_retry_tests {
 /// `start_with_socket()` calls, AFTER the SDP offer is published (so the peer
 /// processes Offer → Candidate in FIFO order).
 ///
-/// Returns `Err` only if `Candidate::host` construction or JSON serialisation
-/// fails (neither is expected to fail for a valid `SocketAddr`).
+/// Returns `Err` if `addr` is not a conservative RFC1918 LAN IPv4 host candidate,
+/// or if `Candidate::host` construction / JSON serialisation fails (neither is
+/// expected to fail for a valid `SocketAddr`).
 pub fn publish_host_candidate(
     signaling: &dyn sm_domain::signaling::Signaling,
     addr: std::net::SocketAddr,
