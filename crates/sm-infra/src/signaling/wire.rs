@@ -19,6 +19,8 @@
 //! { "type": "Offer",          "sdp": "v=0 ..." }
 //! { "type": "Answer",         "sdp": "v=0 ..." }
 //! { "type": "Candidate",      "sdp": "candidate:..." }
+//! { "type": "QsvTelemetryRequest" }
+//! { "type": "QsvTelemetryResponse", "telemetry": { ... } }
 //! { "type": "Hello",          "proto": "v1" }
 //! { "type": "Bye",            "attempt": 1 }
 //! { "type": "ReconnectRequest", "attempt": 1, "requester_role": "Sender", "session_nonce": 12345678 }
@@ -34,7 +36,7 @@
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
-use sm_domain::signaling::SignalingRole;
+use sm_domain::signaling::{QsvReceiverTelemetry, SignalingRole};
 
 /// Maximum allowed frame body size in bytes (64 KiB).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -69,6 +71,10 @@ pub enum SignalingFrame {
     Answer { sdp: String },
     /// A trickled ICE candidate. `sdp` is the raw candidate attribute line.
     Candidate { sdp: String },
+    /// Request for QSV telemetry.
+    QsvTelemetryRequest,
+    /// QSV telemetry response.
+    QsvTelemetryResponse { telemetry: QsvReceiverTelemetry },
     /// Graceful close. The `attempt` MUST carry the emitter's current generation
     /// (last published Offer attempt, or 0 if no Offer was sent). Receivers use
     /// this to filter stale-generation Byes (REQ-BYE-4).
@@ -237,6 +243,33 @@ mod tests {
         assert_eq!(decoded, frame);
     }
 
+    #[test]
+    fn qsv_telemetry_request_round_trip() {
+        let frame = SignalingFrame::QsvTelemetryRequest;
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        let decoded = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn qsv_telemetry_response_round_trip() {
+        let frame = SignalingFrame::QsvTelemetryResponse {
+            telemetry: QsvReceiverTelemetry {
+                media_gap_ms: 120,
+                fragments_per_s_x100: 750,
+                dropped_segments: 3,
+                receiver_dropped_frames: 4,
+                fragments_emitted: 6,
+                window_ms: 1_500,
+            },
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &frame).unwrap();
+        let decoded = read_frame(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
     // ─── Round-trip: Bye ──────────────────────────────────────────────────────
 
     /// R7.3 — SignalingFrame::Bye survives round-trip (legacy structural check).
@@ -311,6 +344,20 @@ mod tests {
         let json = br#"{"type":"Answer","sdp":"v=0\r\nm=video"}"#;
         let frame: SignalingFrame = serde_json::from_slice(json).expect("known JSON must decode");
         assert!(matches!(frame, SignalingFrame::Answer { .. }));
+    }
+
+    #[test]
+    fn known_json_decodes_to_qsv_telemetry_request() {
+        let json = br#"{"type":"QsvTelemetryRequest"}"#;
+        let frame: SignalingFrame = serde_json::from_slice(json).expect("known JSON must decode");
+        assert!(matches!(frame, SignalingFrame::QsvTelemetryRequest));
+    }
+
+    #[test]
+    fn known_json_decodes_to_qsv_telemetry_response() {
+        let json = br#"{"type":"QsvTelemetryResponse","telemetry":{"media_gap_ms":120,"fragments_per_s_x100":750,"dropped_segments":3,"receiver_dropped_frames":4,"fragments_emitted":6,"window_ms":1500}}"#;
+        let frame: SignalingFrame = serde_json::from_slice(json).expect("known JSON must decode");
+        assert!(matches!(frame, SignalingFrame::QsvTelemetryResponse { .. }));
     }
 
     // ─── Length-prefix structural check ──────────────────────────────────────

@@ -9,6 +9,7 @@ use screen_mirror_lib::commands::sender::{SenderBridge, SenderStats, StartSender
 // B2: Verify the command symbols are importable (compile-level test).
 #[allow(unused_imports)]
 use screen_mirror_lib::commands::sender::{sender_diagnostics, start_sender, stop_sender};
+use sm_domain::signaling::SignalingEvent;
 
 // ─── B1 type assertions ────────────────────────────────────────────────────────
 
@@ -564,7 +565,7 @@ fn start_sender_inner_bring_up_emits_connecting_status() {
 // ─── B7 signaling drain tests ─────────────────────────────────────────────────
 
 use screen_mirror_lib::commands::sender::{SignalingSenderOps, run_sender_signaling_drain};
-use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer, SignalingEvent};
+use sm_domain::signaling::{IceCandidate, SdpAnswer, SdpOffer};
 use sm_domain::transport::TransportError;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -855,6 +856,20 @@ fn signaling_drain_stop_flag_exits_loop() {
         start_time.elapsed() < Duration::from_millis(600),
         "drain must exit within 600ms on stop_flag"
     );
+}
+
+/// NVENC must stay outside the QSV telemetry request circuit.
+#[test]
+fn nvenc_backend_does_not_request_qsv_telemetry() {
+    assert!(screen_mirror_lib::commands::sender::is_qsv_backend(
+        "hw_intel_qsv"
+    ));
+    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend(
+        "hw_nvenc"
+    ));
+    assert!(!screen_mirror_lib::commands::sender::is_qsv_backend(
+        "sw_openh264"
+    ));
 }
 
 // ─── B8 transport event drain tests ──────────────────────────────────────────

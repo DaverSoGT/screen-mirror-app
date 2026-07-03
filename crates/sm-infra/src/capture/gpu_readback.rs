@@ -155,7 +155,11 @@ impl AsyncReadback {
     ///
     /// `D3D11_USAGE_STAGING` + `D3D11_CPU_ACCESS_READ`: the destination of a GPU
     /// `CopyResource` that the CPU later `Map`s for reading.
-    fn build_slots(&self, width: u32, height: u32) -> Result<[StagingSlot; PINGPONG_LEN], EncoderError> {
+    fn build_slots(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<[StagingSlot; PINGPONG_LEN], EncoderError> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -192,12 +196,12 @@ impl AsyncReadback {
         }
         // Exactly PINGPONG_LEN were pushed; convert to a fixed array.
         let mut iter = built.into_iter();
-        let s0 = iter.next().ok_or_else(|| {
-            EncoderError::InitFailed("staging pool under-built (slot 0)".into())
-        })?;
-        let s1 = iter.next().ok_or_else(|| {
-            EncoderError::InitFailed("staging pool under-built (slot 1)".into())
-        })?;
+        let s0 = iter
+            .next()
+            .ok_or_else(|| EncoderError::InitFailed("staging pool under-built (slot 0)".into()))?;
+        let s1 = iter
+            .next()
+            .ok_or_else(|| EncoderError::InitFailed("staging pool under-built (slot 1)".into()))?;
         Ok([s0, s1])
     }
 
@@ -398,10 +402,18 @@ mod tests {
         let mut dst = Vec::new();
         let stride = copy_rows_tight(&src, &mut dst, width, height, row_pitch);
         assert_eq!(stride, 8, "tight stride must be width*4");
-        assert_eq!(dst.len(), 16, "tight buffer must be height*width*4, padding stripped");
+        assert_eq!(
+            dst.len(),
+            16,
+            "tight buffer must be height*width*4, padding stripped"
+        );
         // Row 0 real bytes are src[0..8]; Row 1 real bytes are src[12..20].
         assert_eq!(&dst[0..8], &src[0..8], "row 0 real pixels preserved");
-        assert_eq!(&dst[8..16], &src[12..20], "row 1 real pixels preserved (padding skipped)");
+        assert_eq!(
+            &dst[8..16],
+            &src[12..20],
+            "row 1 real pixels preserved (padding skipped)"
+        );
     }
 
     #[test]
@@ -414,7 +426,11 @@ mod tests {
         let mut dst = Vec::new();
         let stride = copy_rows_tight(&src, &mut dst, width, height, row_pitch);
         assert_eq!(stride, 12);
-        assert_eq!(dst.len(), 24, "no padding → dst length equals source length");
+        assert_eq!(
+            dst.len(),
+            24,
+            "no padding → dst length equals source length"
+        );
         assert_eq!(dst.as_slice(), src.as_slice(), "unpadded copy is identity");
     }
 

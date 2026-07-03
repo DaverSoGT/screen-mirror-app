@@ -41,6 +41,23 @@ pub struct SdpAnswer(pub String);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IceCandidate(pub String);
 
+/// Compact QSV receiver telemetry sampled over the signaling/control channel.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QsvReceiverTelemetry {
+    /// Milliseconds since the last observed media fragment.
+    pub media_gap_ms: u32,
+    /// Fragment rate scaled by 100 to stay integer-only on the wire.
+    pub fragments_per_s_x100: u32,
+    /// Number of dropped media segments observed by the receiver.
+    pub dropped_segments: u64,
+    /// Number of receiver-side dropped frames observed by the transport.
+    pub receiver_dropped_frames: u64,
+    /// Number of emitted media fragments included in this receiver sample.
+    pub fragments_emitted: u64,
+    /// Receiver observation window in milliseconds.
+    pub window_ms: u32,
+}
+
 // ─── SignalingConfig ─────────────────────────────────────────────────────────
 
 /// Role for a signaling instance.
@@ -95,7 +112,7 @@ impl Default for SignalingConfig {
 /// Events emitted by a signaling adapter on the `event_tx` channel.
 ///
 /// All variants are `Send + Sync` — the channel may be polled from any thread.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalingEvent {
     /// A peer was discovered (mDNS) or connected (loopback).
     PeerFound {
@@ -114,6 +131,10 @@ pub enum SignalingEvent {
     AnswerReceived(SdpAnswer),
     /// Remote ICE candidate arrived (either side).
     CandidateReceived(IceCandidate),
+    /// QSV telemetry request arrived on the control channel.
+    QsvTelemetryRequest,
+    /// QSV telemetry response arrived on the control channel.
+    QsvTelemetryResponse(QsvReceiverTelemetry),
     /// Signaling closed.
     ///
     /// - `Some(n)` — a wire `Bye { attempt: n }` arrived from the peer (D-1).
@@ -133,7 +154,7 @@ pub enum SignalingEvent {
 ///
 /// Platform errors are converted to `String` at the adapter boundary so
 /// `sm-domain` never names any platform-specific type.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SignalingError {
     /// `start()` was called on an already-running signaling instance.
     #[error("signaling already running")]
@@ -199,6 +220,20 @@ pub trait Signaling: Send + Sync {
 
     /// Publish a local ICE candidate to the remote peer.
     fn publish_local_candidate(&self, cand: IceCandidate) -> Result<(), SignalingError>;
+
+    /// Publish a QSV telemetry request to the remote peer.
+    fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+        Ok(())
+    }
+
+    /// Publish a QSV telemetry response to the remote peer.
+    fn publish_qsv_telemetry_response(
+        &self,
+        telemetry: QsvReceiverTelemetry,
+    ) -> Result<(), SignalingError> {
+        let _ = telemetry;
+        Ok(())
+    }
 
     /// Stop signaling. Idempotent. Closes the TCP socket and joins the thread.
     fn stop(&mut self) -> Result<(), SignalingError>;
@@ -273,6 +308,25 @@ mod tests {
             Ok(())
         }
 
+        fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+            if let Some(ref tx) = self.event_tx {
+                tx.try_send(SignalingEvent::QsvTelemetryRequest)
+                    .map_err(|_| SignalingError::Io("channel full or closed".to_string()))?;
+            }
+            Ok(())
+        }
+
+        fn publish_qsv_telemetry_response(
+            &self,
+            telemetry: QsvReceiverTelemetry,
+        ) -> Result<(), SignalingError> {
+            if let Some(ref tx) = self.event_tx {
+                tx.try_send(SignalingEvent::QsvTelemetryResponse(telemetry))
+                    .map_err(|_| SignalingError::Io("channel full or closed".to_string()))?;
+            }
+            Ok(())
+        }
+
         fn stop(&mut self) -> Result<(), SignalingError> {
             self.event_tx = None;
             Ok(())
@@ -322,5 +376,37 @@ mod tests {
             }
             other => panic!("expected OfferReceived, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fake_signaling_qsv_telemetry_round_trip() {
+        let mut sig = FakeSignaling::new_fake();
+        let (event_tx, event_rx) = sync_channel::<SignalingEvent>(4);
+        sig.start(event_tx).unwrap();
+        let telemetry = QsvReceiverTelemetry {
+            media_gap_ms: 120,
+            fragments_per_s_x100: 750,
+            dropped_segments: 3,
+            receiver_dropped_frames: 4,
+            fragments_emitted: 6,
+            window_ms: 1_500,
+        };
+
+        sig.publish_qsv_telemetry_request().unwrap();
+        sig.publish_qsv_telemetry_response(telemetry.clone())
+            .unwrap();
+
+        assert!(matches!(
+            event_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            SignalingEvent::QsvTelemetryRequest
+        ));
+        assert_eq!(
+            event_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            SignalingEvent::QsvTelemetryResponse(telemetry)
+        );
     }
 }

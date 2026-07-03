@@ -55,6 +55,39 @@ pub(crate) fn enumerate_local_ipv4() -> Vec<std::net::Ipv4Addr> {
     }
 }
 
+fn is_usable_host_candidate_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private()
+        && !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+}
+
+fn select_usable_host_candidate_ipv4<I>(ips: I) -> Option<std::net::Ipv4Addr>
+where
+    I: IntoIterator<Item = std::net::Ipv4Addr>,
+{
+    ips.into_iter()
+        .find(|&ip| is_usable_host_candidate_ipv4(ip))
+}
+
+pub(crate) fn host_candidate_addr_for_local(
+    local: std::net::SocketAddr,
+) -> Option<std::net::SocketAddr> {
+    if let std::net::IpAddr::V4(ip) = local.ip() {
+        if is_usable_host_candidate_ipv4(ip) {
+            return Some(local);
+        }
+    }
+
+    let ip = select_usable_host_candidate_ipv4(enumerate_local_ipv4())?;
+    Some(std::net::SocketAddr::new(
+        std::net::IpAddr::V4(ip),
+        local.port(),
+    ))
+}
+
 /// RAII guard that overrides NIC enumeration for the current thread during tests.
 ///
 /// Constructing a `NicOverrideGuard` sets the per-thread NIC list to `ips`.
@@ -374,12 +407,19 @@ mod resolve_ipv4_with_retry_tests {
 /// `start_with_socket()` calls, AFTER the SDP offer is published (so the peer
 /// processes Offer → Candidate in FIFO order).
 ///
-/// Returns `Err` only if `Candidate::host` construction or JSON serialisation
-/// fails (neither is expected to fail for a valid `SocketAddr`).
+/// Returns `Err` if `addr` is not a conservative RFC1918 LAN IPv4 host candidate,
+/// or if `Candidate::host` construction / JSON serialisation fails (neither is
+/// expected to fail for a valid `SocketAddr`).
 pub fn publish_host_candidate(
     signaling: &dyn sm_domain::signaling::Signaling,
     addr: std::net::SocketAddr,
 ) -> Result<(), sm_domain::signaling::SignalingError> {
+    if !matches!(addr.ip(), std::net::IpAddr::V4(ip) if is_usable_host_candidate_ipv4(ip)) {
+        return Err(sm_domain::signaling::SignalingError::Protocol(format!(
+            "Refusing to publish unusable ICE host candidate: {addr}"
+        )));
+    }
+
     let cand = str0m::Candidate::host(addr, "udp").map_err(|e| {
         sm_domain::signaling::SignalingError::Protocol(format!("Candidate::host failed: {e}"))
     })?;

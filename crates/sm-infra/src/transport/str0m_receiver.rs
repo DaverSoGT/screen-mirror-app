@@ -339,33 +339,22 @@ impl Str0mVideoReceiver {
     /// Return the ICE host candidate address for this receiver.
     ///
     /// Returns `Some(addr)` after a successful `start()` or `start_with_socket()`, where
-    /// `addr.port()` matches the bound UDP socket port and `addr.ip()` is a non-loopback
-    /// IPv4 address.
+    /// `addr.port()` matches the bound UDP socket port and `addr.ip()` is a usable
+    /// host-candidate IPv4 address.
     ///
     /// When `effective_local_addr` is a loopback address (`127.0.0.1`) — which happens
-    /// when the socket was bound to `0.0.0.0` — this method substitutes the first
-    /// non-loopback IPv4 NIC address from `enumerate_local_ipv4()`, preserving the port.
+    /// when the socket was bound to `0.0.0.0` — this method substitutes a usable
+    /// IPv4 NIC address from `enumerate_local_ipv4()`, preserving the port.
     ///
     /// Returns `None` in these cases:
     /// - `start()` / `start_with_socket()` has not been called yet.
-    /// - No non-loopback IPv4 NIC is available.
+    /// - No usable IPv4 NIC is available.
     ///
     /// MUST NOT mutate `self.local_addr` — that field is used as `Input::Receive {
     /// destination }` inside str0m's tick loop and must remain the bind address.
     pub fn candidate_addr(&self) -> Option<std::net::SocketAddr> {
         let local = self.local_addr?; // None before start()
-        if !local.ip().is_loopback() {
-            return Some(local); // already a routable address — use it directly
-        }
-        // local.ip() is loopback: substitute the first non-loopback IPv4 NIC,
-        // preserving the bound port so STUN reaches the correct UDP socket.
-        let nic = crate::transport::enumerate_local_ipv4()
-            .into_iter()
-            .next()?;
-        Some(std::net::SocketAddr::new(
-            std::net::IpAddr::V4(nic),
-            local.port(),
-        ))
+        crate::transport::host_candidate_addr_for_local(local)
     }
 
     /// Begin receiving with an externally-bound `UdpSocket`. Mirrors `start()` but

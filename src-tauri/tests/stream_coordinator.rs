@@ -246,6 +246,7 @@ fn make_stream_bridge_with_counting_hooks(
                 signaling: Some(Box::new(FakeSignalingOps)),
                 drain_handles: vec![h],
                 _drain_senders: vec![],
+                counters: Arc::new(screen_mirror_lib::commands::stream::BridgeCounters::default()),
             })
         }),
         sup_tx,

@@ -32,10 +32,14 @@
 //! before joining drain threads, interrupting any in-flight backoff sleep (AC-13).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::SyncSender;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 
 use sm_domain::session::{DeadReason, ReconnectPolicy, ReconnectTrigger, SessionState};
 use sm_domain::signaling::{IceCandidate, SdpAnswer, SignalingEvent};
@@ -54,12 +58,77 @@ pub use crate::commands::stream::{BundleError, ChannelLike, PortRejectReason};
 /// `Dead { reason: "peer_unreachable" }` instead of looping at attempt=1 forever.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline (build_production_sender_bundle); dead_code on other targets (memory #434)
 const MEDIA_WATCHDOG_MAX_FIRES_PROD: u8 = 10;
+#[cfg(target_os = "windows")]
 const QSV_WIFI_ADAPTIVE_ENV: &str = "SCREEN_MIRROR_QSV_WIFI_ADAPTIVE";
+#[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
 // QSV-over-WiFi already coalesces to the latest frame and drops stale work, but
 // replay07 showed that 15fps still overdrives the weak WiFi path; keep the
 // conservative 10fps pacer target for this QSV-only adaptive lane.
+#[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_INPUT_TARGET_FPS: u32 = 10;
+#[cfg(target_os = "windows")]
+const QSV_TELEMETRY_FIRST_DELAY: Duration = Duration::from_millis(750);
+#[cfg(target_os = "windows")]
+const QSV_TELEMETRY_PERIOD: Duration = Duration::from_secs(2);
+#[cfg(target_os = "windows")]
+const QSV_TELEMETRY_POLL: Duration = Duration::from_millis(100);
+
+pub fn is_qsv_backend(backend_name: &str) -> bool {
+    backend_name == "hw_intel_qsv"
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug)]
+struct QsvTelemetrySampler {
+    enabled: bool,
+    next_due: Duration,
+    period: Duration,
+    in_flight: bool,
+    in_flight_since: Option<Duration>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl QsvTelemetrySampler {
+    fn new(backend_name: &str, first_delay: Duration, period: Duration) -> Self {
+        Self {
+            enabled: is_qsv_backend(backend_name),
+            next_due: first_delay,
+            period,
+            in_flight: false,
+            in_flight_since: None,
+        }
+    }
+
+    fn should_publish_at(&mut self, elapsed: Duration) -> bool {
+        if !self.enabled || elapsed < self.next_due {
+            return false;
+        }
+        if self.in_flight && !self.in_flight_expired_at(elapsed) {
+            return false;
+        }
+        self.in_flight = true;
+        self.in_flight_since = Some(elapsed);
+        true
+    }
+
+    fn mark_response_received(&mut self, elapsed: Duration) {
+        self.in_flight = false;
+        self.in_flight_since = None;
+        self.next_due = elapsed + self.period;
+    }
+
+    fn mark_publish_failed(&mut self, elapsed: Duration) {
+        self.in_flight = false;
+        self.in_flight_since = None;
+        self.next_due = elapsed + self.period;
+    }
+
+    fn in_flight_expired_at(&self, elapsed: Duration) -> bool {
+        self.in_flight_since
+            .is_some_and(|started_at| elapsed >= started_at + self.period)
+    }
+}
 
 // ─── SignalingSupervisorRefresh — seam for refreshing supervisor tx (D-RBF-1) ──
 
@@ -669,6 +738,9 @@ fn dead_reason_to_str(reason: &DeadReason) -> &'static str {
 pub trait SignalingSenderOps: Send + Sync {
     fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError>;
     fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError>;
+    fn backend_name(&self) -> Option<String> {
+        None
+    }
 }
 
 // ─── Drain functions ──────────────────────────────────────────────────────────
@@ -702,6 +774,29 @@ pub fn run_sender_signaling_drain(
     // The NEW generation's flag stays `false`, so its genuine RebuildFailed still escalates.
     escalation_disarmed: Arc<AtomicBool>,
 ) {
+    run_sender_signaling_drain_with_qsv_observation(
+        ev_rx,
+        sender,
+        stop_flag,
+        channel,
+        signal_slot,
+        escalation_disarmed,
+        None,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sender_signaling_drain_with_qsv_observation(
+    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    sender: Arc<dyn SignalingSenderOps>,
+    stop_flag: Arc<AtomicBool>,
+    channel: Arc<dyn ChannelLike>,
+    signal_slot: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    escalation_disarmed: Arc<AtomicBool>,
+    qsv_backend_name: Option<String>,
+    qsv_response_generation: Option<Arc<AtomicU64>>,
+) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -726,6 +821,38 @@ pub fn run_sender_signaling_drain(
                 SignalingEvent::CandidateReceived(c) => {
                     if let Err(e) = sender.add_remote_candidate(c) {
                         eprintln!("[sm-sender-signaling-drain] add_remote_candidate failed: {e}");
+                    }
+                }
+                SignalingEvent::QsvTelemetryRequest => {
+                    eprintln!(
+                        "[sm-sender-signaling-drain] qsv telemetry request ignored on sender"
+                    );
+                }
+                SignalingEvent::QsvTelemetryResponse(telemetry) => {
+                    let received_at_ms = current_time_ms();
+                    if let Some(backend_name) = qsv_backend_name.as_deref() {
+                        if let Some(observation) = consume_qsv_receiver_telemetry_for_backend(
+                            backend_name,
+                            telemetry,
+                            received_at_ms,
+                        ) {
+                            eprintln!(
+                                "[sm-sender-qsv] observation backend={} maturity={:?} can_actuate={} age_ms={} media_gap_ms={} fragments_per_s_x100={} fragments_emitted={} window_ms={} dropped_segments={} receiver_dropped_frames={}",
+                                observation.backend_name,
+                                observation.maturity,
+                                observation.can_actuate,
+                                observation.age_ms,
+                                observation.receiver.media_gap_ms,
+                                observation.receiver.fragments_per_s_x100,
+                                observation.receiver.fragments_emitted,
+                                observation.receiver.window_ms,
+                                observation.receiver.dropped_segments,
+                                observation.receiver.receiver_dropped_frames,
+                            );
+                            if let Some(generation) = qsv_response_generation.as_ref() {
+                                generation.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
                     }
                 }
                 SignalingEvent::OfferReceived(_, _) => {
@@ -835,6 +962,35 @@ pub fn run_sender_transport_event_drain(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn consume_qsv_receiver_telemetry_for_backend(
+    backend_name: &str,
+    telemetry: sm_domain::signaling::QsvReceiverTelemetry,
+    received_at_ms: u64,
+) -> Option<crate::commands::qsv_observation::QsvSenderObservation> {
+    if !is_qsv_backend(backend_name) {
+        return None;
+    }
+    let sample = crate::commands::qsv_observation::classify_qsv_receiver_sample(
+        telemetry,
+        received_at_ms,
+        current_time_ms(),
+    );
+    Some(crate::commands::qsv_observation::QsvSenderObservation {
+        backend_name: backend_name.to_string(),
+        receiver: sample.telemetry,
+        maturity: sample.maturity,
+        age_ms: sample.age_ms,
+        can_actuate: sample.can_actuate,
+    })
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Transport-event drain loop for the sender — WITH reconnect supervisor wiring.
@@ -2089,6 +2245,7 @@ fn stamp_and_publish_offer(
 ///
 /// Cycle-5 TODO: replace with `capture.refresh_rate()` dynamic query — only the value
 /// source changes, not the build-site plumbing.
+#[cfg(any(target_os = "windows", test))]
 const SENDER_ENCODER_FRAMERATE: u32 = 60;
 
 /// Build the production sender `EncoderConfig` for the given capture dimensions.
@@ -2098,7 +2255,7 @@ const SENDER_ENCODER_FRAMERATE: u32 = 60;
 /// are testable on all targets without real capture/encoder hardware:
 /// `build_production_sender_bundle` (Windows-only) and the test contract both call this,
 /// so the production path and the assertions cannot diverge.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // live only in the Windows production pipeline; #[cfg(test)] still exercises it on all targets (memory #434)
+#[cfg(any(target_os = "windows", test))]
 fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
     sm_domain::EncoderConfig {
         width,
@@ -2108,22 +2265,91 @@ fn sender_encoder_config(width: u32, height: u32) -> sm_domain::EncoderConfig {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn qsv_wifi_adaptive_env_enabled() -> bool {
     std::env::var(QSV_WIFI_ADAPTIVE_ENV).as_deref() == Ok("1")
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn qsv_wifi_input_pacing_enabled_for_backend(backend_name: &str, wifi_enabled: bool) -> bool {
-    wifi_enabled && backend_name == QSV_WIFI_BACKEND
+fn qsv_wifi_input_target_fps(backend_name: &str, wifi_enabled: bool) -> Option<u32> {
+    (wifi_enabled && backend_name == QSV_WIFI_BACKEND).then_some(QSV_WIFI_INPUT_TARGET_FPS)
+}
+
+#[cfg(test)]
+fn publish_qsv_telemetry_request_if_qsv_backend(
+    signaling: &dyn sm_domain::signaling::Signaling,
+    backend_name: &str,
+) -> Result<bool, sm_domain::signaling::SignalingError> {
+    if is_qsv_backend(backend_name) {
+        signaling.publish_qsv_telemetry_request()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_qsv_telemetry_sampler(
+    signaling: Arc<Mutex<sm_infra::signaling::mdns::MdnsSignaling>>,
+    backend_name: String,
+    stop_flag: Arc<AtomicBool>,
+    response_generation: Arc<AtomicU64>,
+) -> Option<JoinHandle<()>> {
+    if !is_qsv_backend(&backend_name) {
+        eprintln!("[sm-sender-qsv] telemetry circuit disabled backend={backend_name}");
+        return None;
+    }
+
+    std::thread::Builder::new()
+        .name("sm-qsv-telemetry-sampler".into())
+        .spawn(move || {
+            let started_at = Instant::now();
+            let mut sampler = QsvTelemetrySampler::new(
+                &backend_name,
+                QSV_TELEMETRY_FIRST_DELAY,
+                QSV_TELEMETRY_PERIOD,
+            );
+            let mut seen_generation = response_generation.load(Ordering::Acquire);
+
+            while !stop_flag.load(Ordering::Acquire) {
+                let elapsed = started_at.elapsed();
+                let current_generation = response_generation.load(Ordering::Acquire);
+                if current_generation != seen_generation {
+                    seen_generation = current_generation;
+                    sampler.mark_response_received(elapsed);
+                }
+
+                if sampler.should_publish_at(elapsed) {
+                    let publish_result = signaling
+                        .lock()
+                        .map_err(|_| sm_domain::signaling::SignalingError::Io(
+                            "qsv telemetry sampler signaling lock poisoned".to_string(),
+                        ))
+                        .and_then(|sig| {
+                            sm_domain::signaling::Signaling::publish_qsv_telemetry_request(&*sig)
+                        });
+                    match publish_result {
+                        Ok(()) => eprintln!(
+                            "[sm-sender-qsv] telemetry request queued backend={backend_name} elapsed_ms={}",
+                            elapsed.as_millis()
+                        ),
+                        Err(e) => {
+                            sampler.mark_publish_failed(elapsed);
+                            eprintln!("[sm-sender-qsv] telemetry request failed: {e}");
+                        }
+                    }
+                }
+
+                std::thread::sleep(QSV_TELEMETRY_POLL);
+            }
+        })
+        .map_err(|e| {
+            eprintln!("[sm-sender-qsv] telemetry sampler spawn failed: {e}");
+        })
+        .ok()
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn qsv_wifi_input_target_fps(backend_name: &str, wifi_enabled: bool) -> Option<u32> {
-    qsv_wifi_input_pacing_enabled_for_backend(backend_name, wifi_enabled)
-        .then_some(QSV_WIFI_INPUT_TARGET_FPS)
-}
-
 #[cfg(target_os = "windows")]
 fn spawn_qsv_wifi_input_pacer(
     rx: Receiver<sm_domain::FramePayload>,
@@ -2409,12 +2635,12 @@ fn build_production_sender_bundle(
             });
         }
         Err(e) => {
-            // Budget exhausted: NIC never returned in the retry window.
+            // Budget exhausted: no usable LAN candidate appeared in the retry window.
             // decide_candidate_or_nic_error returned Err(NoLocalNic); the rebuild
             // worker (sender.rs rebuild hook) will forward this as RebuildFailed so
             // the supervisor escalates with backoff. (REQ-HWF-1, GitHub #57 Option 1)
             eprintln!(
-                "[sm-sender-bundle] ERROR no non-loopback NIC after {CANDIDATE_RETRY_ATTEMPTS} retries; \
+                "[sm-sender-bundle] ERROR no usable LAN IPv4 candidate after {CANDIDATE_RETRY_ATTEMPTS} retries; \
                  aborting bundle build — supervisor will escalate with backoff"
             );
             return Err(e);
@@ -2427,6 +2653,13 @@ fn build_production_sender_bundle(
     // shutdown closure. Both hold an Arc clone so the MdnsSignaling stays alive
     // until shutdown() is called by stop_sender_session.
     let signaling_arc = Arc::new(Mutex::new(signaling));
+    let qsv_response_generation = Arc::new(AtomicU64::new(0));
+    let qsv_sampler_handle = spawn_qsv_telemetry_sampler(
+        signaling_arc.clone(),
+        backend_name.clone(),
+        _stop_flag.clone(),
+        qsv_response_generation.clone(),
+    );
     // Clone for the production coordinator hooks BEFORE moving into shutdown.
     let signaling_for_hooks = signaling_arc.clone();
     // D-6 (REQ-BYE-6): clone for the suppress_bye_on_rebuild hook. Kept separate
@@ -2462,7 +2695,7 @@ fn build_production_sender_bundle(
     let signaling_refresh: Arc<dyn SignalingSupervisorRefresh> =
         Arc::new(MdnsSupervisorRefresh(signaling_arc.clone()));
 
-    struct Str0mSenderOpsImpl(Arc<Mutex<Str0mVideoSender>>);
+    struct Str0mSenderOpsImpl(Arc<Mutex<Str0mVideoSender>>, String);
     impl SignalingSenderOps for Str0mSenderOpsImpl {
         fn apply_remote_answer(&self, ans: SdpAnswer) -> Result<(), TransportError> {
             self.0.lock().unwrap().apply_remote_answer(ans)
@@ -2470,9 +2703,13 @@ fn build_production_sender_bundle(
         fn add_remote_candidate(&self, c: IceCandidate) -> Result<(), TransportError> {
             self.0.lock().unwrap().add_remote_candidate(c)
         }
+        fn backend_name(&self) -> Option<String> {
+            Some(self.1.clone())
+        }
     }
 
-    let sender_ops: Arc<dyn SignalingSenderOps> = Arc::new(Str0mSenderOpsImpl(sender_arc.clone()));
+    let sender_ops: Arc<dyn SignalingSenderOps> =
+        Arc::new(Str0mSenderOpsImpl(sender_arc.clone(), backend_name.clone()));
 
     // `_counters` not forwarded in the production path — production drain uses
     // `coordinator_hooks` instead. Kept to avoid removing the type from scope.
@@ -2499,6 +2736,7 @@ fn build_production_sender_bundle(
     // Seed = 1 matches the supervisor's first attempt (supervisor.rs:268).
     let sender_attempt_arc = Arc::new(AtomicU8::new(1));
 
+    let backend_name_for_reset = backend_name.clone();
     let coordinator_hooks = SenderCoordinatorHooks {
         publish_reconnect_request: Arc::new(move |attempt, session_nonce| {
             let sig = sig_for_req.lock().unwrap();
@@ -2632,16 +2870,19 @@ fn build_production_sender_bundle(
             let sup_clone = sup_tx_for_reset.clone();
             // D-RFG-6: same generation-scoped disarm flag as the primary drain.
             let disarm_clone = escalation_disarmed_for_reset.clone();
+            let qsv_backend_name_for_reset = backend_name_for_reset.clone();
             std::thread::Builder::new()
                 .name("sm-sender-signaling-drain-reset".into())
                 .spawn(move || {
-                    run_sender_signaling_drain(
+                    run_sender_signaling_drain_with_qsv_observation(
                         sig_ev_rx,
                         ops_clone,
                         stop_clone,
                         chan_clone,
                         sup_clone,
                         disarm_clone,
+                        Some(qsv_backend_name_for_reset),
+                        None,
                     );
                 })
                 .map_err(|e| {
@@ -2660,16 +2901,20 @@ fn build_production_sender_bundle(
     let tr_stop = stop_flag.clone();
 
     let sup_tx_for_sig = bridge_supervisor_signal_tx.clone();
+    let qsv_backend_name_for_sig_drain = backend_name.clone();
+    let qsv_response_generation_for_sig = qsv_response_generation.clone();
     let sig_drain = std::thread::Builder::new()
         .name("sm-sender-signaling-drain".into())
         .spawn(move || {
-            run_sender_signaling_drain(
+            run_sender_signaling_drain_with_qsv_observation(
                 sig_ev_rx,
                 sender_ops,
                 sig_stop,
                 sig_channel,
                 sup_tx_for_sig,
                 escalation_disarmed_for_sig, // D-RFG-6 generation-scoped disarm flag
+                Some(qsv_backend_name_for_sig_drain),
+                Some(qsv_response_generation_for_sig),
             );
         })
         .map_err(|e| BundleError::Other(format!("spawn sig drain: {e}")))?;
@@ -2753,6 +2998,9 @@ fn build_production_sender_bundle(
 
     let mut drain_handles = vec![sig_drain, tr_drain];
     if let Some(handle) = qsv_wifi_pacer_handle {
+        drain_handles.push(handle);
+    }
+    if let Some(handle) = qsv_sampler_handle {
         drain_handles.push(handle);
     }
 
@@ -4688,6 +4936,164 @@ mod tests {
              A hardcoded 1 here means the receiver drops every legitimate gen-2+ Offer \
              (offer_attempt < expected_attempt) and reconnection breaks."
         );
+    }
+
+    /// QSV telemetry request is published only for the QSV backend.
+    #[test]
+    fn qsv_backend_only_publishes_qsv_telemetry_request() {
+        use sm_domain::signaling::{
+            IceCandidate, SdpAnswer, SdpOffer, Signaling, SignalingConfig, SignalingError,
+            SignalingEvent,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc::SyncSender;
+
+        struct TelemetryRequestSpy {
+            request_count: Arc<AtomicU32>,
+        }
+
+        impl Signaling for TelemetryRequestSpy {
+            fn new(_config: SignalingConfig) -> Result<Self, SignalingError>
+            where
+                Self: Sized,
+            {
+                Ok(Self {
+                    request_count: Arc::new(AtomicU32::new(0)),
+                })
+            }
+
+            fn start(
+                &mut self,
+                _event_tx: SyncSender<SignalingEvent>,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_offer(
+                &self,
+                _offer: SdpOffer,
+                _attempt: u8,
+            ) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_answer(&self, _answer: SdpAnswer) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_local_candidate(&self, _cand: IceCandidate) -> Result<(), SignalingError> {
+                Ok(())
+            }
+
+            fn publish_qsv_telemetry_request(&self) -> Result<(), SignalingError> {
+                self.request_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn stop(&mut self) -> Result<(), SignalingError> {
+                Ok(())
+            }
+        }
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let signaling = TelemetryRequestSpy {
+            request_count: request_count.clone(),
+        };
+
+        for (backend_name, expected_request) in [
+            ("hw_intel_qsv", true),
+            ("hw_nvenc", false),
+            ("sw_openh264", false),
+        ] {
+            let before = request_count.load(Ordering::SeqCst);
+            let published =
+                super::publish_qsv_telemetry_request_if_qsv_backend(&signaling, backend_name)
+                    .expect("telemetry gate must succeed");
+
+            assert_eq!(
+                published, expected_request,
+                "backend={backend_name} must match the QSV telemetry gate"
+            );
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                before + u32::from(expected_request),
+                "backend={backend_name} must only call publish_qsv_telemetry_request() when it is QSV"
+            );
+        }
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "only hw_intel_qsv should publish a QSV telemetry request"
+        );
+    }
+
+    #[test]
+    fn qsv_sampler_delays_first_request_and_keeps_one_in_flight() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(0)));
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
+
+        sampler.mark_response_received(Duration::from_millis(2_800));
+        assert!(!sampler.should_publish_at(Duration::from_millis(4_799)));
+        assert!(sampler.should_publish_at(Duration::from_millis(4_800)));
+    }
+
+    #[test]
+    fn qsv_sampler_recovers_after_publish_failure() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+        sampler.mark_publish_failed(Duration::from_millis(750));
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
+        assert!(sampler.should_publish_at(Duration::from_millis(2_750)));
+    }
+
+    #[test]
+    fn qsv_sampler_expires_missing_response_and_retries() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
+        assert!(sampler.should_publish_at(Duration::from_millis(2_750)));
+    }
+
+    #[test]
+    fn qsv_sampler_never_requests_for_nvenc() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_nvenc",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(750)));
+        sampler.mark_response_received(Duration::from_millis(1_000));
+        assert!(!sampler.should_publish_at(Duration::from_millis(3_000)));
     }
 
     // ─── SC-WD-S1..S5: sender media-arrival watchdog (CAP-2-v2, relocated) ────
