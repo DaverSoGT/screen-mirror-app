@@ -85,6 +85,7 @@ struct QsvTelemetrySampler {
     next_due: Duration,
     period: Duration,
     in_flight: bool,
+    in_flight_since: Option<Duration>,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -95,20 +96,37 @@ impl QsvTelemetrySampler {
             next_due: first_delay,
             period,
             in_flight: false,
+            in_flight_since: None,
         }
     }
 
     fn should_publish_at(&mut self, elapsed: Duration) -> bool {
-        if !self.enabled || self.in_flight || elapsed < self.next_due {
+        if !self.enabled || elapsed < self.next_due {
+            return false;
+        }
+        if self.in_flight && !self.in_flight_expired_at(elapsed) {
             return false;
         }
         self.in_flight = true;
+        self.in_flight_since = Some(elapsed);
         true
     }
 
     fn mark_response_received(&mut self, elapsed: Duration) {
         self.in_flight = false;
+        self.in_flight_since = None;
         self.next_due = elapsed + self.period;
+    }
+
+    fn mark_publish_failed(&mut self, elapsed: Duration) {
+        self.in_flight = false;
+        self.in_flight_since = None;
+        self.next_due = elapsed + self.period;
+    }
+
+    fn in_flight_expired_at(&self, elapsed: Duration) -> bool {
+        self.in_flight_since
+            .is_some_and(|started_at| elapsed >= started_at + self.period)
     }
 }
 
@@ -2315,7 +2333,10 @@ fn spawn_qsv_telemetry_sampler(
                             "[sm-sender-qsv] telemetry request queued backend={backend_name} elapsed_ms={}",
                             elapsed.as_millis()
                         ),
-                        Err(e) => eprintln!("[sm-sender-qsv] telemetry request failed: {e}"),
+                        Err(e) => {
+                            sampler.mark_publish_failed(elapsed);
+                            eprintln!("[sm-sender-qsv] telemetry request failed: {e}");
+                        }
                     }
                 }
 
@@ -5020,7 +5041,7 @@ mod tests {
 
         assert!(!sampler.should_publish_at(Duration::from_millis(0)));
         assert!(sampler.should_publish_at(Duration::from_millis(750)));
-        assert!(!sampler.should_publish_at(Duration::from_millis(2_750)));
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
 
         sampler.mark_response_received(Duration::from_millis(2_800));
         assert!(!sampler.should_publish_at(Duration::from_millis(4_799)));
