@@ -68,7 +68,8 @@ fn select_usable_host_candidate_ipv4<I>(ips: I) -> Option<std::net::Ipv4Addr>
 where
     I: IntoIterator<Item = std::net::Ipv4Addr>,
 {
-    ips.into_iter().find(|&ip| is_usable_host_candidate_ipv4(ip))
+    ips.into_iter()
+        .find(|&ip| is_usable_host_candidate_ipv4(ip))
 }
 
 pub(crate) fn host_candidate_addr_for_local(

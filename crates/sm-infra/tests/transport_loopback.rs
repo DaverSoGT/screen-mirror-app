@@ -1451,7 +1451,10 @@ fn transport_publish_host_candidate_rejects_cgnat_without_publishing_event() {
         "expected clear protocol refusal, got {err:?}"
     );
     assert!(
-        matches!(sig_b_ev_rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout)),
+        matches!(
+            sig_b_ev_rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ),
         "refused CGNAT candidate must not publish a CandidateReceived event"
     );
 }
