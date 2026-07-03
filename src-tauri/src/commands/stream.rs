@@ -5058,12 +5058,8 @@ mod tests {
         }
     }
 
-    // ─── B5-fix-A RED: service_name threads to SignalingConfig::service_name ────
+    // ─── Receiver candidate guard: missing LAN candidate fails visibly ──────────
 
-    /// B5-fix-A.1 — `build_signaling_config_for_receiver` must set `service_name`
-    /// to the string passed in, NOT leave it at the default.
-    ///
-    /// Spec R2.5: builder receives the resolved `service_name`; explore #284
     /// Receiver candidate guard: no publishable LAN host candidate must be a
     /// terminal bundle-build failure, not a silently-live receiver.
     #[test]
@@ -5129,6 +5125,12 @@ mod tests {
         );
     }
 
+    // ─── B5-fix-A RED: service_name threads to SignalingConfig::service_name ────
+
+    /// B5-fix-A.1 — `build_signaling_config_for_receiver` must set `service_name`
+    /// to the string passed in, NOT leave it at the default.
+    ///
+    /// Spec R2.5: builder receives the resolved `service_name`; explore #284
     /// identified `SignalingConfig::service_name` as the right vehicle.
     ///
     /// RED: `build_signaling_config_for_receiver` does not exist yet → E0425.
