@@ -52,6 +52,10 @@ pub struct QsvReceiverTelemetry {
     pub dropped_segments: u64,
     /// Number of receiver-side dropped frames observed by the transport.
     pub receiver_dropped_frames: u64,
+    /// Number of emitted media fragments included in this receiver sample.
+    pub fragments_emitted: u64,
+    /// Receiver observation window in milliseconds.
+    pub window_ms: u32,
 }
 
 // ─── SignalingConfig ─────────────────────────────────────────────────────────
@@ -384,6 +388,8 @@ mod tests {
             fragments_per_s_x100: 750,
             dropped_segments: 3,
             receiver_dropped_frames: 4,
+            fragments_emitted: 6,
+            window_ms: 1_500,
         };
 
         sig.publish_qsv_telemetry_request().unwrap();
