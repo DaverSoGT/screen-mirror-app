@@ -3947,6 +3947,7 @@ mod tests {
         #[derive(Default)]
         struct QsvTelemetryPublishSpy {
             published: Mutex<Vec<QsvReceiverTelemetry>>,
+            published_ack: Mutex<Option<SyncSender<()>>>,
         }
         impl SignalingPublishOps for QsvTelemetryPublishSpy {
             fn publish_local_answer(
@@ -3966,12 +3967,19 @@ mod tests {
                 telemetry: QsvReceiverTelemetry,
             ) -> Result<(), sm_domain::signaling::SignalingError> {
                 self.published.lock().unwrap().push(telemetry);
+                if let Some(ack) = self.published_ack.lock().unwrap().take() {
+                    ack.send(()).expect("test ack receiver must still exist");
+                }
                 Ok(())
             }
         }
 
         let receiver = Arc::new(TestReceiver) as Arc<dyn SignalingReceiverOps>;
-        let signaling = Arc::new(QsvTelemetryPublishSpy::default());
+        let (published_tx, published_rx) = sync_channel::<()>(1);
+        let signaling = Arc::new(QsvTelemetryPublishSpy {
+            published: Mutex::new(Vec::new()),
+            published_ack: Mutex::new(Some(published_tx)),
+        });
         let stop_flag = Arc::new(AtomicBool::new(false));
         let supervisor_signal_tx = Arc::new(Mutex::new(None));
         let expected_attempt = Arc::new(AtomicU8::new(1));
@@ -4002,7 +4010,9 @@ mod tests {
         ev_tx
             .send(SignalingEvent::QsvTelemetryRequest)
             .expect("test drain must accept telemetry request");
-        std::thread::sleep(Duration::from_millis(50));
+        published_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drain must publish QSV telemetry before the test stops it");
         stop_flag.store(true, Ordering::Relaxed);
         drop(ev_tx);
         drain.join().expect("drain must exit cleanly");
