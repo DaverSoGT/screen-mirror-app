@@ -67,9 +67,9 @@ const QSV_WIFI_BACKEND: &str = "hw_intel_qsv";
 // conservative 10fps pacer target for this QSV-only adaptive lane.
 #[cfg(any(target_os = "windows", test))]
 const QSV_WIFI_INPUT_TARGET_FPS: u32 = 10;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 const QSV_TELEMETRY_FIRST_DELAY: Duration = Duration::from_millis(750);
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 const QSV_TELEMETRY_PERIOD: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const QSV_TELEMETRY_POLL: Duration = Duration::from_millis(100);
