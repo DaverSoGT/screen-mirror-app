@@ -366,6 +366,14 @@ pub(crate) fn bind_probe(port: u16) -> Result<std::net::UdpSocket, BundleError> 
     }
 }
 
+/// Convert receiver host-candidate discovery into the same terminal error used
+/// by the sender path when no usable RFC1918 LAN candidate can be published.
+pub(crate) fn decide_receiver_candidate_or_nic_error(
+    candidate: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, BundleError> {
+    candidate.ok_or(BundleError::NoLocalNic)
+}
+
 impl From<sm_domain::signaling::SignalingError> for BundleError {
     fn from(e: sm_domain::signaling::SignalingError) -> Self {
         // No variant of SignalingError is "port in use" — none touch UDP bind.
@@ -1980,15 +1988,13 @@ fn build_production_bundle(
     // Trickle ICE: publish host candidate AFTER start_with_socket so the candidate
     // is queued in the signaling inbox before the Arc<Mutex<>> wrap occurs.
     // `signaling` is still the un-wrapped local variable here (design §3.2).
-    // If no usable LAN IPv4 candidate is available, log a warning and continue — the bundle
-    // MUST NOT fail solely because no candidate was published (R-CT-5).
-    if let Some(addr) = receiver.candidate_addr() {
-        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
-            eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
-        });
-    } else {
-        eprintln!("[sm-receiver-bundle] no usable LAN IPv4 candidate; skipping candidate publish");
-    }
+    // If no usable LAN IPv4 candidate is available, fail the start visibly.
+    // Host candidates are the only supported path here; continuing would create
+    // a live-but-unconnectable receiver session.
+    let candidate = decide_receiver_candidate_or_nic_error(receiver.candidate_addr())?;
+    publish_host_candidate(&signaling, candidate).unwrap_or_else(|e| {
+        eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
+    });
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
     let receiver_mutex = Arc::new(Mutex::new(receiver));
@@ -5050,6 +5056,73 @@ mod tests {
                 "expected Err(BundleBuildFailed(\"some unrelated build failure\")), got {other:?}"
             ),
         }
+    }
+
+    // ─── Receiver candidate guard: missing LAN candidate fails visibly ──────────
+
+    /// Receiver candidate guard: no publishable LAN host candidate must be a
+    /// terminal bundle-build failure, not a silently-live receiver.
+    #[test]
+    fn receiver_candidate_none_returns_no_local_nic() {
+        let result = decide_receiver_candidate_or_nic_error(None);
+
+        assert!(
+            matches!(result, Err(BundleError::NoLocalNic)),
+            "missing receiver LAN candidate must map to BundleError::NoLocalNic; got {result:?}"
+        );
+    }
+
+    /// Triangulation: a usable receiver candidate must pass through unchanged so
+    /// the guard only fails the no-candidate case.
+    #[test]
+    fn receiver_candidate_some_returns_publishable_addr() {
+        let addr: std::net::SocketAddr = "192.168.1.44:7889"
+            .parse()
+            .expect("test candidate address must parse");
+
+        let result = decide_receiver_candidate_or_nic_error(Some(addr));
+
+        assert_eq!(
+            result.expect("usable receiver candidate must be accepted"),
+            addr,
+            "usable receiver candidate must pass through unchanged"
+        );
+    }
+
+    /// Regression for the user-visible failure path: when the receiver builder
+    /// cannot find a usable LAN candidate, start_stream_inner must return an
+    /// error and must not store a live-but-unconnectable session.
+    #[test]
+    fn start_stream_inner_no_receiver_candidate_fails_without_storing_session() {
+        let builder: BuilderFn = Arc::new(
+            |bind_ctx: BindCtx, _port, _name, _stop_flag, _channel: Arc<dyn ChannelLike>| {
+                let _ = bind_ctx;
+                let _candidate = decide_receiver_candidate_or_nic_error(None)?;
+                panic!(
+                    "builder must stop before constructing a receiver bundle without a candidate"
+                )
+            },
+        );
+        let bridge = StreamBridge::new_with_builder(builder);
+        let channel: Arc<dyn ChannelLike> = FakeChannel::new();
+
+        let result = start_stream_inner(&bridge, channel, Some(pick_free_udp_port()), None);
+
+        match result {
+            Err(StartStreamError::BundleBuildFailed(msg)) => assert!(
+                msg.contains("no local NIC available"),
+                "NoLocalNic must surface through start_stream; got {msg:?}"
+            ),
+            other => panic!("expected visible BundleBuildFailed(NoLocalNic), got {other:?}"),
+        }
+        assert!(
+            !bridge.is_running(),
+            "failed no-candidate receiver start must not store a live session"
+        );
+        assert!(
+            bridge.session.lock().unwrap().is_none(),
+            "failed no-candidate receiver start must leave session empty"
+        );
     }
 
     // ─── B5-fix-A RED: service_name threads to SignalingConfig::service_name ────
