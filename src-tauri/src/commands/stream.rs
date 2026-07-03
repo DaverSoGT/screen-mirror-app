@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 
 use sm_domain::encode::EncodedPacket;
 use sm_domain::session::{DeadReason, ReconnectPolicy, ReconnectTrigger, SessionState};
-use sm_domain::signaling::{Signaling, SignalingConfig, SignalingEvent, SignalingRole};
+use sm_domain::signaling::{
+    QsvReceiverTelemetry, Signaling, SignalingConfig, SignalingEvent, SignalingRole,
+};
 use sm_domain::supervisor::{ReconnectSupervisor, SupervisorOutcome, SupervisorSignal};
 use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, TransportRole,
@@ -128,6 +130,8 @@ pub struct BridgeCounters {
     init_segments_emitted: AtomicU64,
     dropped_segments: AtomicU64,
     keyframe_requests_fired: AtomicU64,
+    first_fragment_at_ms: AtomicU64,
+    last_fragment_at_ms: AtomicU64,
 }
 
 impl Default for BridgeCounters {
@@ -137,6 +141,8 @@ impl Default for BridgeCounters {
             init_segments_emitted: AtomicU64::new(0),
             dropped_segments: AtomicU64::new(0),
             keyframe_requests_fired: AtomicU64::new(0),
+            first_fragment_at_ms: AtomicU64::new(0),
+            last_fragment_at_ms: AtomicU64::new(0),
         }
     }
 }
@@ -910,6 +916,9 @@ trait SignalingReceiverOps: Send + Sync {
         &self,
         cand: sm_domain::signaling::IceCandidate,
     ) -> Result<(), TransportError>;
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 /// Signaling publish operations needed by the signaling drain thread.
@@ -930,6 +939,13 @@ trait SignalingPublishOps: Send + Sync {
         &self,
         cand: sm_domain::signaling::IceCandidate,
     ) -> Result<(), sm_domain::signaling::SignalingError>;
+    fn publish_qsv_telemetry_response(
+        &self,
+        telemetry: QsvReceiverTelemetry,
+    ) -> Result<(), sm_domain::signaling::SignalingError> {
+        let _ = telemetry;
+        Ok(())
+    }
 }
 
 /// Factory closure type: produces a `Box<dyn ReceiverOps>` that has already had
@@ -1008,6 +1024,29 @@ fn run_signaling_drain(
     role: DrainRole,                                                        // D-RDF-1
     expected_attempt: Arc<AtomicU8>, // T1.9: stale-Offer guard (REQ-GE-1, SC-GE-3..6)
 ) {
+    run_signaling_drain_with_qsv_snapshot(
+        ev_rx,
+        receiver,
+        signaling,
+        stop_flag,
+        supervisor_signal_tx,
+        role,
+        expected_attempt,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_signaling_drain_with_qsv_snapshot(
+    ev_rx: std::sync::mpsc::Receiver<SignalingEvent>,
+    receiver: Arc<dyn SignalingReceiverOps>,
+    signaling: Arc<dyn SignalingPublishOps>,
+    stop_flag: Arc<AtomicBool>,
+    supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
+    role: DrainRole,
+    expected_attempt: Arc<AtomicU8>,
+    qsv_counters: Option<Arc<BridgeCounters>>,
+) {
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -1082,9 +1121,20 @@ fn run_signaling_drain(
                     }
                 }
                 SignalingEvent::QsvTelemetryRequest => {
-                    eprintln!(
-                        "[sm-signaling-drain] qsv telemetry request ignored in PR1 foundation slice"
-                    );
+                    if let Some(counters) = qsv_counters.as_ref() {
+                        let telemetry = qsv_receiver_telemetry_snapshot(
+                            counters,
+                            receiver.dropped_frames(),
+                            current_time_ms(),
+                        );
+                        if let Err(e) = signaling.publish_qsv_telemetry_response(telemetry) {
+                            eprintln!("[sm-signaling-drain] publish qsv telemetry failed: {e}");
+                        }
+                    } else {
+                        eprintln!(
+                            "[sm-signaling-drain] qsv telemetry request ignored without receiver counters"
+                        );
+                    }
                 }
                 SignalingEvent::QsvTelemetryResponse(telemetry) => {
                     eprintln!(
@@ -1131,6 +1181,28 @@ fn run_signaling_drain(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn qsv_receiver_telemetry_snapshot(
+    counters: &BridgeCounters,
+    receiver_dropped_frames: u64,
+    now_ms: u64,
+) -> QsvReceiverTelemetry {
+    crate::commands::qsv_observation::receiver_telemetry_from_counters(
+        counters.fragments_emitted.load(Ordering::Relaxed),
+        counters.dropped_segments.load(Ordering::Relaxed),
+        receiver_dropped_frames,
+        counters.first_fragment_at_ms.load(Ordering::Relaxed),
+        counters.last_fragment_at_ms.load(Ordering::Relaxed),
+        now_ms,
+    )
 }
 
 #[cfg(test)]
@@ -1756,7 +1828,10 @@ impl ReceiverOps for Str0mReceiverOps {
         self.0.lock().unwrap().request_keyframe()
     }
     fn dropped_frames(&self) -> u64 {
-        self.0.lock().unwrap().dropped_frames()
+        match self.0.lock() {
+            Ok(receiver) => receiver.dropped_frames(),
+            Err(_) => 0,
+        }
     }
     fn stop(&mut self) -> Result<(), TransportError> {
         self.0.lock().unwrap().stop()
@@ -1775,6 +1850,12 @@ impl SignalingReceiverOps for Str0mReceiverOps {
         cand: sm_domain::signaling::IceCandidate,
     ) -> Result<(), TransportError> {
         self.0.lock().unwrap().add_remote_candidate(cand)
+    }
+    fn dropped_frames(&self) -> u64 {
+        match self.0.lock() {
+            Ok(receiver) => receiver.dropped_frames(),
+            Err(_) => 0,
+        }
     }
 }
 
@@ -1800,6 +1881,15 @@ impl SignalingPublishOps for MdnsSignalingOps {
         cand: sm_domain::signaling::IceCandidate,
     ) -> Result<(), sm_domain::signaling::SignalingError> {
         self.0.lock().unwrap().publish_local_candidate(cand)
+    }
+    fn publish_qsv_telemetry_response(
+        &self,
+        telemetry: QsvReceiverTelemetry,
+    ) -> Result<(), sm_domain::signaling::SignalingError> {
+        let signaling = self.0.lock().map_err(|_| {
+            sm_domain::signaling::SignalingError::Io("mdns signaling lock poisoned".to_string())
+        })?;
+        signaling.publish_qsv_telemetry_response(telemetry)
     }
 }
 
@@ -2164,10 +2254,11 @@ fn build_production_bundle(
     // is forwarded to the receiver supervisor (enables reconnect on Bye).
     let stop_flag_s = stop_flag.clone();
     let sup_tx_for_drain = sup_tx_for_sig_drain; // pre-cloned above (D-3)
+    let qsv_counters_for_sig_drain = counters.clone();
     let sig_drain = thread::Builder::new()
         .name("sm-signaling-event-drain".into())
         .spawn(move || {
-            run_signaling_drain(
+            run_signaling_drain_with_qsv_snapshot(
                 sig_event_rx,
                 recv_ops_for_drain,
                 sig_publish_for_drain,
@@ -2175,6 +2266,7 @@ fn build_production_bundle(
                 sup_tx_for_drain,               // D-3 REQ-A
                 DrainRole::Primary,             // D-RDF-1: primary drain owns offer application
                 expected_attempt_for_sig_drain, // T1.9: reads epoch to reject stale-gen Offers
+                Some(qsv_counters_for_sig_drain),
             );
         })?;
 
@@ -3144,6 +3236,16 @@ fn emit_segment(channel: &Arc<dyn ChannelLike>, counters: &BridgeCounters, bytes
     let len = bytes.len();
     match channel.send_raw(FRAME_SEGMENT, bytes) {
         Ok(_) => {
+            let now_ms = current_time_ms();
+            let _ = counters.first_fragment_at_ms.compare_exchange(
+                0,
+                now_ms,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            counters
+                .last_fragment_at_ms
+                .store(now_ms, Ordering::Relaxed);
             let n = counters.fragments_emitted.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!("[sm-stream-mux] FRAME_SEGMENT #{n} sent to channel ({len} bytes)");
         }
@@ -3800,6 +3902,125 @@ mod tests {
         let counters = Arc::new(BridgeCounters::default());
         counters.fragments_emitted.fetch_add(5, Ordering::Relaxed);
         assert_eq!(counters.fragments_emitted.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn qsv_receiver_snapshot_reports_runtime_counters() {
+        let counters = BridgeCounters::default();
+        counters.fragments_emitted.store(4, Ordering::Relaxed);
+        counters.dropped_segments.store(2, Ordering::Relaxed);
+        counters
+            .first_fragment_at_ms
+            .store(1_000, Ordering::Relaxed);
+        counters.last_fragment_at_ms.store(2_500, Ordering::Relaxed);
+
+        let telemetry = qsv_receiver_telemetry_snapshot(&counters, 7, 3_000);
+
+        assert_eq!(telemetry.media_gap_ms, 500);
+        assert_eq!(telemetry.fragments_per_s_x100, 200);
+        assert_eq!(telemetry.dropped_segments, 2);
+        assert_eq!(telemetry.receiver_dropped_frames, 7);
+    }
+
+    #[test]
+    fn qsv_telemetry_request_publishes_receiver_snapshot() {
+        let _guard = lock_drain_seam_guard();
+        let (ev_tx, ev_rx) = sync_channel::<SignalingEvent>(4);
+        struct TestReceiver;
+        impl SignalingReceiverOps for TestReceiver {
+            fn apply_remote_offer(
+                &self,
+                _offer: sm_domain::signaling::SdpOffer,
+            ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+                Ok(sm_domain::signaling::SdpAnswer("answer".into()))
+            }
+            fn add_remote_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn dropped_frames(&self) -> u64 {
+                7
+            }
+        }
+        #[derive(Default)]
+        struct QsvTelemetryPublishSpy {
+            published: Mutex<Vec<QsvReceiverTelemetry>>,
+            published_ack: Mutex<Option<SyncSender<()>>>,
+        }
+        impl SignalingPublishOps for QsvTelemetryPublishSpy {
+            fn publish_local_answer(
+                &self,
+                _answer: sm_domain::signaling::SdpAnswer,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_local_candidate(
+                &self,
+                _cand: sm_domain::signaling::IceCandidate,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                Ok(())
+            }
+            fn publish_qsv_telemetry_response(
+                &self,
+                telemetry: QsvReceiverTelemetry,
+            ) -> Result<(), sm_domain::signaling::SignalingError> {
+                self.published.lock().unwrap().push(telemetry);
+                if let Some(ack) = self.published_ack.lock().unwrap().take() {
+                    ack.send(()).expect("test ack receiver must still exist");
+                }
+                Ok(())
+            }
+        }
+
+        let receiver = Arc::new(TestReceiver) as Arc<dyn SignalingReceiverOps>;
+        let (published_tx, published_rx) = sync_channel::<()>(1);
+        let signaling = Arc::new(QsvTelemetryPublishSpy {
+            published: Mutex::new(Vec::new()),
+            published_ack: Mutex::new(Some(published_tx)),
+        });
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let supervisor_signal_tx = Arc::new(Mutex::new(None));
+        let expected_attempt = Arc::new(AtomicU8::new(1));
+        let counters = Arc::new(BridgeCounters::default());
+        counters.fragments_emitted.store(2, Ordering::Relaxed);
+        counters.dropped_segments.store(1, Ordering::Relaxed);
+        counters
+            .first_fragment_at_ms
+            .store(1_000, Ordering::Relaxed);
+        counters.last_fragment_at_ms.store(1_500, Ordering::Relaxed);
+
+        let signaling_for_assert = signaling.clone();
+        let signaling_for_drain = signaling as Arc<dyn SignalingPublishOps>;
+        let stop_for_thread = stop_flag.clone();
+        let drain = thread::spawn(move || {
+            run_signaling_drain_with_qsv_snapshot(
+                ev_rx,
+                receiver,
+                signaling_for_drain,
+                stop_for_thread,
+                supervisor_signal_tx,
+                DrainRole::Primary,
+                expected_attempt,
+                Some(counters),
+            );
+        });
+
+        ev_tx
+            .send(SignalingEvent::QsvTelemetryRequest)
+            .expect("test drain must accept telemetry request");
+        published_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drain must publish QSV telemetry before the test stops it");
+        stop_flag.store(true, Ordering::Relaxed);
+        drop(ev_tx);
+        drain.join().expect("drain must exit cleanly");
+
+        let published = signaling_for_assert.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].dropped_segments, 1);
+        assert_eq!(published[0].fragments_per_s_x100, 200);
     }
 
     // ─── W2-fix-D RED: stop_stream cleans up all threads in correct order ────────
