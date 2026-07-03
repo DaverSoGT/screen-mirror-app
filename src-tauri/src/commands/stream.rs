@@ -366,6 +366,14 @@ pub(crate) fn bind_probe(port: u16) -> Result<std::net::UdpSocket, BundleError> 
     }
 }
 
+/// Convert receiver host-candidate discovery into the same terminal error used
+/// by the sender path when no usable RFC1918 LAN candidate can be published.
+pub(crate) fn decide_receiver_candidate_or_nic_error(
+    candidate: Option<std::net::SocketAddr>,
+) -> Result<std::net::SocketAddr, BundleError> {
+    candidate.ok_or(BundleError::NoLocalNic)
+}
+
 impl From<sm_domain::signaling::SignalingError> for BundleError {
     fn from(e: sm_domain::signaling::SignalingError) -> Self {
         // No variant of SignalingError is "port in use" — none touch UDP bind.
@@ -1980,15 +1988,13 @@ fn build_production_bundle(
     // Trickle ICE: publish host candidate AFTER start_with_socket so the candidate
     // is queued in the signaling inbox before the Arc<Mutex<>> wrap occurs.
     // `signaling` is still the un-wrapped local variable here (design §3.2).
-    // If no usable LAN IPv4 candidate is available, log a warning and continue — the bundle
-    // MUST NOT fail solely because no candidate was published (R-CT-5).
-    if let Some(addr) = receiver.candidate_addr() {
-        publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
-            eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
-        });
-    } else {
-        eprintln!("[sm-receiver-bundle] no usable LAN IPv4 candidate; skipping candidate publish");
-    }
+    // If no usable LAN IPv4 candidate is available, fail the start visibly.
+    // Host candidates are the only supported path here; continuing would create
+    // a live-but-unconnectable receiver session.
+    let candidate = decide_receiver_candidate_or_nic_error(receiver.candidate_addr())?;
+    publish_host_candidate(&signaling, candidate).unwrap_or_else(|e| {
+        eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
+    });
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
     let receiver_mutex = Arc::new(Mutex::new(receiver));
