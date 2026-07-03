@@ -414,6 +414,8 @@ mod tests {
             fragments_per_s_x100: 750,
             dropped_segments: 3,
             receiver_dropped_frames: 4,
+            fragments_emitted: 6,
+            window_ms: 1_500,
         };
 
         a.publish_qsv_telemetry_request().unwrap();

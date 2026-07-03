@@ -1138,9 +1138,11 @@ fn run_signaling_drain_with_qsv_snapshot(
                 }
                 SignalingEvent::QsvTelemetryResponse(telemetry) => {
                     eprintln!(
-                        "[sm-signaling-drain] unexpected qsv telemetry response on receiver drain ignored: gap_ms={} frags_x100={} dropped_segments={} receiver_dropped_frames={}",
+                        "[sm-signaling-drain] unexpected qsv telemetry response on receiver drain ignored: gap_ms={} frags_x100={} fragments_emitted={} window_ms={} dropped_segments={} receiver_dropped_frames={}",
                         telemetry.media_gap_ms,
                         telemetry.fragments_per_s_x100,
+                        telemetry.fragments_emitted,
+                        telemetry.window_ms,
                         telemetry.dropped_segments,
                         telemetry.receiver_dropped_frames
                     );
@@ -3920,6 +3922,8 @@ mod tests {
         assert_eq!(telemetry.fragments_per_s_x100, 200);
         assert_eq!(telemetry.dropped_segments, 2);
         assert_eq!(telemetry.receiver_dropped_frames, 7);
+        assert_eq!(telemetry.fragments_emitted, 4);
+        assert_eq!(telemetry.window_ms, 1_500);
     }
 
     #[test]
@@ -4021,6 +4025,8 @@ mod tests {
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].dropped_segments, 1);
         assert_eq!(published[0].fragments_per_s_x100, 200);
+        assert_eq!(published[0].fragments_emitted, 2);
+        assert_eq!(published[0].window_ms, 500);
     }
 
     // ─── W2-fix-D RED: stop_stream cleans up all threads in correct order ────────

@@ -260,6 +260,8 @@ mod tests {
                 fragments_per_s_x100: 750,
                 dropped_segments: 3,
                 receiver_dropped_frames: 4,
+                fragments_emitted: 6,
+                window_ms: 1_500,
             },
         };
         let mut buf = Vec::new();
@@ -353,7 +355,7 @@ mod tests {
 
     #[test]
     fn known_json_decodes_to_qsv_telemetry_response() {
-        let json = br#"{"type":"QsvTelemetryResponse","telemetry":{"media_gap_ms":120,"fragments_per_s_x100":750,"dropped_segments":3,"receiver_dropped_frames":4}}"#;
+        let json = br#"{"type":"QsvTelemetryResponse","telemetry":{"media_gap_ms":120,"fragments_per_s_x100":750,"dropped_segments":3,"receiver_dropped_frames":4,"fragments_emitted":6,"window_ms":1500}}"#;
         let frame: SignalingFrame = serde_json::from_slice(json).expect("known JSON must decode");
         assert!(matches!(frame, SignalingFrame::QsvTelemetryResponse { .. }));
     }
