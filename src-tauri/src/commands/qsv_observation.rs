@@ -83,4 +83,40 @@ mod tests {
 
         assert!(observation.is_none());
     }
+
+    #[test]
+    fn qsv_maturity_rejects_all_zero_pre_fragment_sample() {
+        let telemetry = QsvReceiverTelemetry {
+            media_gap_ms: 0,
+            fragments_per_s_x100: 0,
+            dropped_segments: 0,
+            receiver_dropped_frames: 0,
+        };
+
+        let sample = classify_qsv_receiver_sample(telemetry, 1_000, 1_000);
+
+        assert_eq!(sample.maturity, QsvTelemetryMaturity::ImmatureZero);
+        assert!(!sample.can_actuate);
+    }
+
+    #[test]
+    fn qsv_maturity_accepts_nonzero_sample_with_minimum_window() {
+        let telemetry = receiver_telemetry_from_counters(4, 1, 2, 1_000, 2_500, 3_000);
+
+        let sample = classify_qsv_receiver_sample(telemetry, 3_000, 3_250);
+
+        assert_eq!(sample.maturity, QsvTelemetryMaturity::Mature);
+        assert!(sample.can_actuate);
+        assert_eq!(sample.age_ms, 250);
+    }
+
+    #[test]
+    fn qsv_maturity_marks_old_sample_stale() {
+        let telemetry = receiver_telemetry_from_counters(4, 1, 2, 1_000, 2_500, 3_000);
+
+        let sample = classify_qsv_receiver_sample(telemetry, 3_000, 9_500);
+
+        assert_eq!(sample.maturity, QsvTelemetryMaturity::Stale);
+        assert!(!sample.can_actuate);
+    }
 }

@@ -4871,6 +4871,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qsv_sampler_delays_first_request_and_keeps_one_in_flight() {
+        use std::time::Duration;
+
+        let mut sampler = QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(0)));
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_750)));
+
+        sampler.mark_response_received(Duration::from_millis(2_800));
+        assert!(!sampler.should_publish_at(Duration::from_millis(4_799)));
+        assert!(sampler.should_publish_at(Duration::from_millis(4_800)));
+    }
+
+    #[test]
+    fn qsv_sampler_never_requests_for_nvenc() {
+        use std::time::Duration;
+
+        let mut sampler = QsvTelemetrySampler::new(
+            "hw_nvenc",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(750)));
+        sampler.mark_response_received(Duration::from_millis(1_000));
+        assert!(!sampler.should_publish_at(Duration::from_millis(3_000)));
+    }
+
     // ─── SC-WD-S1..S5: sender media-arrival watchdog (CAP-2-v2, relocated) ────
     //
     // CAP-2-v2 (design #1021, RCA #1020): the watchdog is RELOCATED out of the
