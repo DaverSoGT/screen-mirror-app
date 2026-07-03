@@ -159,6 +159,40 @@ mod tests {
     }
 
     #[test]
+    fn qsv_maturity_rejects_nonzero_sample_with_too_few_fragments() {
+        let telemetry = QsvReceiverTelemetry {
+            media_gap_ms: 40,
+            fragments_per_s_x100: 100,
+            dropped_segments: 0,
+            receiver_dropped_frames: 0,
+            fragments_emitted: 1,
+            window_ms: 1_200,
+        };
+
+        let sample = classify_qsv_receiver_sample(telemetry, 2_000, 2_050);
+
+        assert_eq!(sample.maturity, QsvTelemetryMaturity::ImmatureWindow);
+        assert!(!sample.can_actuate);
+    }
+
+    #[test]
+    fn qsv_maturity_rejects_nonzero_sample_with_short_window() {
+        let telemetry = QsvReceiverTelemetry {
+            media_gap_ms: 40,
+            fragments_per_s_x100: 600,
+            dropped_segments: 0,
+            receiver_dropped_frames: 0,
+            fragments_emitted: 3,
+            window_ms: 999,
+        };
+
+        let sample = classify_qsv_receiver_sample(telemetry, 2_000, 2_050);
+
+        assert_eq!(sample.maturity, QsvTelemetryMaturity::ImmatureWindow);
+        assert!(!sample.can_actuate);
+    }
+
+    #[test]
     fn qsv_maturity_marks_old_sample_stale() {
         let telemetry = receiver_telemetry_from_counters(4, 1, 2, 1_000, 2_500, 3_000);
 

@@ -5028,6 +5028,39 @@ mod tests {
     }
 
     #[test]
+    fn qsv_sampler_recovers_after_publish_failure() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+        sampler.mark_publish_failed(Duration::from_millis(750));
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
+        assert!(sampler.should_publish_at(Duration::from_millis(2_750)));
+    }
+
+    #[test]
+    fn qsv_sampler_expires_missing_response_and_retries() {
+        use std::time::Duration;
+
+        let mut sampler = super::QsvTelemetrySampler::new(
+            "hw_intel_qsv",
+            Duration::from_millis(750),
+            Duration::from_millis(2_000),
+        );
+
+        assert!(sampler.should_publish_at(Duration::from_millis(750)));
+
+        assert!(!sampler.should_publish_at(Duration::from_millis(2_749)));
+        assert!(sampler.should_publish_at(Duration::from_millis(2_750)));
+    }
+
+    #[test]
     fn qsv_sampler_never_requests_for_nvenc() {
         use std::time::Duration;
 
