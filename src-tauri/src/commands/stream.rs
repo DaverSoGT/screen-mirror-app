@@ -1980,14 +1980,14 @@ fn build_production_bundle(
     // Trickle ICE: publish host candidate AFTER start_with_socket so the candidate
     // is queued in the signaling inbox before the Arc<Mutex<>> wrap occurs.
     // `signaling` is still the un-wrapped local variable here (design §3.2).
-    // If no non-loopback NIC is available, log a warning and continue — the bundle
+    // If no usable LAN IPv4 candidate is available, log a warning and continue — the bundle
     // MUST NOT fail solely because no candidate was published (R-CT-5).
     if let Some(addr) = receiver.candidate_addr() {
         publish_host_candidate(&signaling, addr).unwrap_or_else(|e| {
             eprintln!("[sm-receiver-bundle] publish_host_candidate failed: {e}");
         });
     } else {
-        eprintln!("[sm-receiver-bundle] no non-loopback NIC; skipping candidate publish");
+        eprintln!("[sm-receiver-bundle] no usable LAN IPv4 candidate; skipping candidate publish");
     }
 
     // ── 3. Wrap in Arc<Mutex<>> so both trait objects share the same instance ─
