@@ -35,6 +35,8 @@
 //!   the MSE hot path) and `avcc` (SPS parser + avcC box builder). Cross-platform.
 
 pub mod capture;
+#[cfg(test)]
+mod diagnostics;
 pub mod decode;
 pub mod encode;
 pub mod render;
