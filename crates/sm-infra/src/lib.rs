@@ -36,6 +36,7 @@
 
 pub mod capture;
 pub mod decode;
+pub mod diagnostics;
 pub mod encode;
 pub mod render;
 pub mod signaling;
