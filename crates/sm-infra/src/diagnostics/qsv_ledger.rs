@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -9,6 +9,11 @@ pub const RECORD_BYTE_LIMIT: usize = 512;
 pub const RECORD_COUNT_LIMIT: usize = 20_000;
 /// Maximum local monotonic retention window in microseconds.
 pub const RETENTION_WINDOW_US: u64 = 120_000_000;
+
+const REASON_FIELD_JSON_OVERHEAD: usize = 12;
+const MAX_JSON_BYTES_PER_REASON_BYTE: usize = 6;
+const RTP_STREAM_LIMIT: usize = 256;
+const RTP_TIMESTAMP_HISTORY_LIMIT: usize = 1_024;
 
 /// Evidence coverage for one independently observed boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -110,46 +115,45 @@ impl LedgerRecord {
         self.event == "ledger_truncated"
     }
 
-    fn fit_within_limit(&mut self) {
-        while self.serialized_len() > RECORD_BYTE_LIMIT {
-            if !self.trim_longest_text_field() {
-                break;
-            }
-        }
-    }
-
-    fn trim_longest_text_field(&mut self) -> bool {
-        let mut index = 0;
-        let mut length = self.session_id.len();
-        for (candidate_index, candidate_length) in [
-            self.role.len(),
-            self.stage.len(),
-            self.event.len(),
-            self.reason.as_ref().map_or(0, String::len),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if candidate_length > length {
-                index = candidate_index + 1;
-                length = candidate_length;
-            }
-        }
-        if length == 0 {
+    fn prepare_for_storage(&mut self) -> bool {
+        let reason = self.reason.take();
+        let identity_len = self.serialized_len();
+        if identity_len > RECORD_BYTE_LIMIT {
             return false;
         }
-        match index {
-            0 => self.session_id.pop().is_some(),
-            1 => self.role.pop().is_some(),
-            2 => self.stage.pop().is_some(),
-            3 => self.event.pop().is_some(),
-            4 => self
-                .reason
-                .as_mut()
-                .is_some_and(|reason| reason.pop().is_some()),
-            _ => false,
-        }
+
+        self.reason = reason.and_then(|reason| {
+            let available = RECORD_BYTE_LIMIT
+                .saturating_sub(identity_len)
+                .saturating_sub(REASON_FIELD_JSON_OVERHEAD);
+            let max_reason_bytes = available / MAX_JSON_BYTES_PER_REASON_BYTE;
+            (max_reason_bytes > 0).then(|| Self::truncate_reason(&reason, max_reason_bytes))
+        });
+        true
     }
+
+    fn truncate_reason(reason: &str, max_bytes: usize) -> String {
+        if reason.len() <= max_bytes {
+            return reason.to_owned();
+        }
+
+        let mut end = 0;
+        for (offset, character) in reason.char_indices() {
+            let next = offset + character.len_utf8();
+            if next > max_bytes {
+                break;
+            }
+            end = next;
+        }
+        reason[..end].to_owned()
+    }
+}
+
+/// Result of submitting one record to a bounded recorder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordOutcome {
+    Recorded,
+    RejectedOversizedIdentity,
 }
 
 /// In-memory bounded recorder for local diagnostic observations only.
@@ -167,17 +171,20 @@ impl BoundedRecorder {
     }
 
     /// Records one observation, retaining only the configured count and time window.
-    pub fn record(&mut self, mut record: LedgerRecord) {
+    pub fn record(&mut self, mut record: LedgerRecord) -> RecordOutcome {
         self.evict_expired(record.mono_us);
-        record.fit_within_limit();
+        if !record.prepare_for_storage() {
+            return RecordOutcome::RejectedOversizedIdentity;
+        }
 
         if self.records.len() < RECORD_COUNT_LIMIT.saturating_sub(1) {
             self.records.push_back(record);
-            return;
+            return RecordOutcome::Recorded;
         }
 
         self.dropped_records = self.dropped_records.saturating_add(1);
         self.record_truncation(record.mono_us);
+        RecordOutcome::Recorded
     }
 
     /// Returns retained records in their local observation order.
@@ -220,7 +227,7 @@ impl BoundedRecorder {
             },
         );
         truncation.reason = Some(reason);
-        truncation.fit_within_limit();
+        let _ = truncation.prepare_for_storage();
         self.records.push_back(truncation);
     }
 }
@@ -295,16 +302,18 @@ pub struct RtpHeader {
     ssrc: u32,
     timestamp: u32,
     sequence: u16,
+    observed_at_us: u64,
 }
 
 impl RtpHeader {
     /// Creates a header-only observation without retaining RTP payload bytes.
     #[must_use]
-    pub const fn new(ssrc: u32, timestamp: u32, sequence: u16) -> Self {
+    pub const fn new(ssrc: u32, timestamp: u32, sequence: u16, observed_at_us: u64) -> Self {
         Self {
             ssrc,
             timestamp,
             sequence,
+            observed_at_us,
         }
     }
 }
@@ -322,7 +331,36 @@ pub struct RtpObservation {
 struct RtpStreamState {
     last_timestamp: Option<u32>,
     occurrence: u64,
-    seen_timestamps: HashSet<u32>,
+    last_observed_us: u64,
+    seen_timestamps: VecDeque<(u32, u64)>,
+}
+
+impl RtpStreamState {
+    fn expire_timestamp_history(&mut self, now_us: u64) {
+        while self
+            .seen_timestamps
+            .front()
+            .is_some_and(|(_, observed_at_us)| {
+                observed_at_us.saturating_add(RETENTION_WINDOW_US) < now_us
+            })
+        {
+            let _ = self.seen_timestamps.pop_front();
+        }
+    }
+
+    fn remember_timestamp(&mut self, timestamp: u32, observed_at_us: u64) {
+        if let Some(index) = self
+            .seen_timestamps
+            .iter()
+            .position(|(seen_timestamp, _)| *seen_timestamp == timestamp)
+        {
+            let _ = self.seen_timestamps.remove(index);
+        }
+        if self.seen_timestamps.len() == RTP_TIMESTAMP_HISTORY_LIMIT {
+            let _ = self.seen_timestamps.pop_front();
+        }
+        self.seen_timestamps.push_back((timestamp, observed_at_us));
+    }
 }
 
 /// Aggregates RTP headers by SSRC without storing packet payloads.
@@ -340,20 +378,50 @@ impl RtpHeaderAggregator {
 
     /// Observes one RTP header and marks timestamp reuse after a boundary as ambiguous.
     pub fn observe(&mut self, header: RtpHeader) -> RtpObservation {
+        self.evict_expired_streams(header.observed_at_us);
+        if !self.streams.contains_key(&header.ssrc) {
+            self.evict_oldest_stream_to_limit();
+        }
         let state = self.streams.entry(header.ssrc).or_default();
+        state.expire_timestamp_history(header.observed_at_us);
         let timestamp_changed = state
             .last_timestamp
             .is_some_and(|last| last != header.timestamp);
         if timestamp_changed {
             state.occurrence = state.occurrence.saturating_add(1);
         }
-        let ambiguous = timestamp_changed && state.seen_timestamps.contains(&header.timestamp);
+        let ambiguous = timestamp_changed
+            && state
+                .seen_timestamps
+                .iter()
+                .any(|(timestamp, _)| *timestamp == header.timestamp);
         state.last_timestamp = Some(header.timestamp);
-        let _ = state.seen_timestamps.insert(header.timestamp);
+        state.last_observed_us = header.observed_at_us;
+        state.remember_timestamp(header.timestamp, header.observed_at_us);
         let _ = header.sequence;
         RtpObservation {
             occurrence: state.occurrence,
             ambiguous,
+        }
+    }
+
+    fn evict_expired_streams(&mut self, now_us: u64) {
+        self.streams.retain(|_, state| {
+            state.last_observed_us.saturating_add(RETENTION_WINDOW_US) >= now_us
+        });
+    }
+
+    fn evict_oldest_stream_to_limit(&mut self) {
+        if self.streams.len() < RTP_STREAM_LIMIT {
+            return;
+        }
+        let oldest_ssrc = self
+            .streams
+            .iter()
+            .min_by_key(|(ssrc, state)| (state.last_observed_us, **ssrc))
+            .map(|(ssrc, _)| *ssrc);
+        if let Some(ssrc) = oldest_ssrc {
+            let _ = self.streams.remove(&ssrc);
         }
     }
 }
@@ -362,7 +430,8 @@ impl RtpHeaderAggregator {
 mod tests {
     use super::{
         BoundedRecorder, ClockDomain, Evidence, LedgerEvent, LedgerMarker, LedgerRecord,
-        MarkerError, RtpHeader, RtpHeaderAggregator,
+        MarkerError, RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT,
+        RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome, RtpHeader, RtpHeaderAggregator,
     };
 
     const SESSION_ID: &str = "1000 2";
@@ -419,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_bounds_oversized_identity_fields_without_payload_capture() {
+    fn recorder_rejects_oversized_identity_without_truncating_correlation_fields() {
         let mut recorder = BoundedRecorder::new();
         let record = LedgerRecord::new(
             &"session".repeat(1_000),
@@ -434,9 +503,45 @@ mod tests {
             },
         );
 
-        recorder.record(record);
+        let outcome = recorder.record(record);
 
-        assert!(recorder.records()[0].serialized_len() <= 512);
+        assert_eq!(outcome, RecordOutcome::RejectedOversizedIdentity);
+        assert!(recorder.records().is_empty());
+    }
+
+    #[test]
+    fn recorder_bounds_optional_reason_without_changing_identity_fields() {
+        let mut recorder = BoundedRecorder::new();
+        let mut record = observed_record(1);
+        let identity = (
+            record.session_id.clone(),
+            record.epoch,
+            record.role.clone(),
+            record.stage.clone(),
+            record.event.clone(),
+        );
+        record.reason = Some("\u{0000}".repeat(4_000));
+
+        assert_eq!(recorder.record(record), RecordOutcome::Recorded);
+
+        let recorded = &recorder.records()[0];
+        assert_eq!(
+            (
+                recorded.session_id.as_str(),
+                recorded.epoch,
+                recorded.role.as_str(),
+                recorded.stage.as_str(),
+                recorded.event.as_str(),
+            ),
+            (
+                identity.0.as_str(),
+                identity.1,
+                identity.2.as_str(),
+                identity.3.as_str(),
+                identity.4.as_str(),
+            )
+        );
+        assert!(recorded.serialized_len() <= RECORD_BYTE_LIMIT);
     }
 
     #[test]
@@ -509,8 +614,8 @@ mod tests {
     #[test]
     fn rtp_aggregator_keeps_one_occurrence_across_sequence_number_wrap() {
         let mut aggregator = RtpHeaderAggregator::new();
-        aggregator.observe(RtpHeader::new(9, 44, u16::MAX));
-        let observation = aggregator.observe(RtpHeader::new(9, 44, 0));
+        aggregator.observe(RtpHeader::new(9, 44, u16::MAX, 0));
+        let observation = aggregator.observe(RtpHeader::new(9, 44, 0, 1));
 
         assert_eq!(observation.occurrence, 0);
     }
@@ -518,10 +623,41 @@ mod tests {
     #[test]
     fn rtp_aggregator_marks_reused_timestamps_as_ambiguous_new_occurrences() {
         let mut aggregator = RtpHeaderAggregator::new();
-        aggregator.observe(RtpHeader::new(9, 44, 10));
-        aggregator.observe(RtpHeader::new(9, 45, 11));
-        let observation = aggregator.observe(RtpHeader::new(9, 44, 12));
+        aggregator.observe(RtpHeader::new(9, 44, 10, 0));
+        aggregator.observe(RtpHeader::new(9, 45, 11, 1));
+        let observation = aggregator.observe(RtpHeader::new(9, 44, 12, 2));
 
         assert_eq!((observation.occurrence, observation.ambiguous), (2, true));
+    }
+
+    #[test]
+    fn rtp_aggregator_expires_streams_and_timestamp_history_at_retention_boundary() {
+        let mut aggregator = RtpHeaderAggregator::new();
+        aggregator.observe(RtpHeader::new(9, 44, 10, 0));
+        aggregator.observe(RtpHeader::new(9, 45, 11, RETENTION_WINDOW_US + 1));
+        let observation = aggregator.observe(RtpHeader::new(9, 44, 12, RETENTION_WINDOW_US + 2));
+
+        assert_eq!(aggregator.streams.len(), 1);
+        assert!(!observation.ambiguous);
+    }
+
+    #[test]
+    fn rtp_aggregator_evicts_oldest_ssrc_and_bounds_timestamp_history() {
+        let mut aggregator = RtpHeaderAggregator::new();
+        for ssrc in 0..=RTP_STREAM_LIMIT as u32 {
+            aggregator.observe(RtpHeader::new(ssrc, 0, 0, ssrc as u64));
+        }
+        for timestamp in 1..=RTP_TIMESTAMP_HISTORY_LIMIT as u32 {
+            aggregator.observe(RtpHeader::new(
+                99,
+                timestamp,
+                timestamp as u16,
+                timestamp as u64,
+            ));
+        }
+
+        assert_eq!(aggregator.streams.len(), RTP_STREAM_LIMIT);
+        assert!(!aggregator.streams.contains_key(&0));
+        assert!(aggregator.streams[&99].seen_timestamps.len() <= RTP_TIMESTAMP_HISTORY_LIMIT);
     }
 }
