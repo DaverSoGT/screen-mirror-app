@@ -840,6 +840,40 @@ fn classify_bind_error(e: std::io::Error, port: u16) -> TransportError {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod qsv_ledger_slice2_tests {
+    use super::validate_and_strip_qsv_ledger_offer;
+
+    const OFFER: &str = "v=0\r\no=- 42 7 IN IP4 127.0.0.1\r\ns=screen-mirror\r\n";
+
+    #[test]
+    fn validated_marker_is_bound_to_exact_offer_session_and_stripped_before_str0m() {
+        let offer = format!("{OFFER}a=x-sm-qsv-ledger:1:42%207:3\r\n");
+
+        let accepted = validate_and_strip_qsv_ledger_offer(&offer, 3).unwrap();
+
+        assert_eq!(accepted.marker, Some("a=x-sm-qsv-ledger:1:42%207:3".to_string()));
+        assert_eq!(accepted.offer, OFFER);
+    }
+
+    #[test]
+    fn invalid_or_stale_marker_is_rejected_without_changing_media_offer() {
+        let stale = format!("{OFFER}a=x-sm-qsv-ledger:1:42%207:2\r\n");
+        let wrong_session = format!("{OFFER}a=x-sm-qsv-ledger:1:99%207:3\r\n");
+
+        assert!(validate_and_strip_qsv_ledger_offer(&stale, 3).is_err());
+        assert!(validate_and_strip_qsv_ledger_offer(&wrong_session, 3).is_err());
+    }
+
+    #[test]
+    fn missing_marker_fails_open_with_the_original_offer() {
+        let accepted = validate_and_strip_qsv_ledger_offer(OFFER, 3).unwrap();
+
+        assert_eq!(accepted.marker, None);
+        assert_eq!(accepted.offer, OFFER);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
 

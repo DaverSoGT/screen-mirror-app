@@ -601,6 +601,40 @@ enum SenderStatusEvent {
     },
 }
 
+#[cfg(test)]
+mod qsv_ledger_slice2_tests {
+    use super::qsv_ledger_marker_for_confirmed_backend;
+
+    #[test]
+    fn qsv_ledger_marker_requires_explicit_opt_in_and_confirmed_qsv_backend() {
+        assert_eq!(
+            qsv_ledger_marker_for_confirmed_backend(false, "hw_intel_qsv", "42 7", 3),
+            None
+        );
+        assert_eq!(
+            qsv_ledger_marker_for_confirmed_backend(true, "hw_nvidia_nvenc", "42 7", 3),
+            None
+        );
+        assert_eq!(
+            qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 7", 3),
+            Some("a=x-sm-qsv-ledger:1:42%207:3".to_string())
+        );
+    }
+
+    #[test]
+    fn qsv_ledger_marker_rotates_with_the_offer_epoch() {
+        let first = qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 7", 3);
+        let replacement =
+            qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 8", 4);
+
+        assert_eq!(first, Some("a=x-sm-qsv-ledger:1:42%207:3".to_string()));
+        assert_eq!(
+            replacement,
+            Some("a=x-sm-qsv-ledger:1:42%208:4".to_string())
+        );
+    }
+}
+
 // ─── Validation helpers ───────────────────────────────────────────────────────
 
 /// Validate `udp_port` for the sender.
