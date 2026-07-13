@@ -44,6 +44,7 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoReceiver,
 };
 
+use crate::diagnostics::qsv_ledger::{LedgerMarker, MarkerError};
 use crate::transport::annex_b::{contains_idr_nal, reconstruct_annex_b};
 
 // ─── Internal control message ────────────────────────────────────────────────
@@ -78,6 +79,12 @@ struct ReceiverPreNeg {
     rtc: Rtc,
     /// Media identifier captured from `Event::MediaAdded`; needed for PLI.
     mid: Option<Mid>,
+}
+
+// ─── Ledger epoch state ───────────────────────────────────────────────────────
+#[derive(Default)]
+struct ReceiverLedgerState {
+    active_marker: Option<LedgerMarker>,
 }
 
 // ─── Shared state ────────────────────────────────────────────────────────────
@@ -153,6 +160,7 @@ pub struct Str0mVideoReceiver {
     pre_neg: Mutex<Option<ReceiverPreNeg>>,
     /// Shared atomic state between caller and tick thread.
     state: Arc<ReceiverShared>,
+    ledger: Mutex<ReceiverLedgerState>,
     /// Control inbox: caller → tick thread. Created in `start()`.
     control_tx: Option<SyncSender<ReceiverControl>>,
     /// Join handle for the tick thread. `Some` while running.
@@ -201,6 +209,7 @@ impl VideoReceiver for Str0mVideoReceiver {
             config,
             pre_neg: Mutex::new(Some(pre_neg)),
             state: ReceiverShared::new(),
+            ledger: Mutex::new(ReceiverLedgerState::default()),
             control_tx: None,
             handle: None,
             local_addr: None,
@@ -254,40 +263,7 @@ impl VideoReceiver for Str0mVideoReceiver {
     ///   2-second timeout. This is generous for an in-process operation but
     ///   bounded so a dead/wedged tick thread cannot hang the caller forever.
     fn apply_remote_offer(&self, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
-        // Path A: Rtc is still in pre_neg (pre-start). Process synchronously.
-        // The scope `{ ... }` ensures the guard is dropped — and the lock released —
-        // BEFORE any blocking call, preventing future deadlocks if the tick thread
-        // ever needs the pre_neg lock.
-        {
-            let mut guard = self
-                .pre_neg
-                .lock()
-                .map_err(|e| TransportError::Internal(format!("mutex poisoned: {e}")))?;
-            if let Some(pn) = guard.as_mut() {
-                return apply_offer_to_rtc(&mut pn.rtc, offer);
-            }
-        } // lock released here
-
-        // Path B: Rtc moved to tick thread (post-start). Send via control inbox
-        // and block on the reply channel.
-        let tx = self.control_tx.as_ref().ok_or(TransportError::NotRunning)?;
-
-        let (reply_tx, reply_rx) =
-            std::sync::mpsc::sync_channel::<Result<SdpAnswer, TransportError>>(1);
-
-        tx.try_send(ReceiverControl::ApplyOffer {
-            offer,
-            reply: reply_tx,
-        })
-        .map_err(|_| TransportError::Internal("control inbox full or disconnected".into()))?;
-
-        // 2 s is generous for an in-process operation but bounded so a dead/wedged
-        // tick thread cannot hang the caller forever.
-        reply_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| {
-                TransportError::Internal(format!("apply_remote_offer reply timeout: {e}"))
-            })?
+        self.apply_remote_offer_for_epoch(offer, 1)
     }
 
     /// Add a remote ICE candidate. Posts to the tick thread's control inbox.
@@ -328,6 +304,53 @@ impl Drop for Str0mVideoReceiver {
 }
 
 impl Str0mVideoReceiver {
+    pub fn apply_remote_offer_for_epoch(
+        &self,
+        offer: SdpOffer,
+        expected_epoch: u8,
+    ) -> Result<SdpAnswer, TransportError> {
+        let validated = validate_and_strip_qsv_ledger_offer(&offer.0, u64::from(expected_epoch));
+        let (offer, marker) = match validated {
+            Ok(accepted) => (SdpOffer(accepted.offer), accepted.marker),
+            Err(_) => (SdpOffer(strip_qsv_ledger_marker_attributes(&offer.0)), None),
+        };
+        // Epoch rotation clears diagnostic state before a new offer is accepted.
+        if let Ok(mut ledger) = self.ledger.lock() {
+            ledger.active_marker = None;
+        }
+        let pre_start = {
+            let mut guard = self
+                .pre_neg
+                .lock()
+                .map_err(|e| TransportError::Internal(format!("mutex poisoned: {e}")))?;
+            guard
+                .as_mut()
+                .map(|pn| apply_offer_to_rtc(&mut pn.rtc, offer.clone()))
+        };
+        let result = match pre_start {
+            Some(result) => result,
+            None => {
+                let tx = self.control_tx.as_ref().ok_or(TransportError::NotRunning)?;
+                let (reply, rx) = std::sync::mpsc::sync_channel(1);
+                tx.try_send(ReceiverControl::ApplyOffer { offer, reply })
+                    .map_err(|_| {
+                        TransportError::Internal("control inbox full or disconnected".into())
+                    })?;
+                rx.recv_timeout(Duration::from_secs(2)).map_err(|e| {
+                    TransportError::Internal(format!("apply_remote_offer reply timeout: {e}"))
+                })?
+            }
+        };
+        if result.is_ok()
+            && let Some(attribute) = marker
+            && let Ok(marker) = LedgerMarker::parse(&attribute)
+            && let Ok(mut ledger) = self.ledger.lock()
+        {
+            ledger.active_marker = Some(marker);
+        }
+        result
+    }
+
     /// Return the effective local socket address after `start()`.
     ///
     /// Returns `None` before `start()` is called. Used by integration tests and
@@ -475,6 +498,58 @@ impl Str0mVideoReceiver {
 /// - **Path A** (pre-start): called directly on the caller's thread.
 /// - **Path B** (post-start): called on the tick thread after the offer arrives
 ///   via the `ReceiverControl::ApplyOffer` message.
+struct ValidatedLedgerOffer {
+    offer: String,
+    marker: Option<String>,
+}
+
+fn normalized_sdp_origin_identity(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let mut fields = line.strip_prefix("o=")?.split_whitespace();
+        let _username = fields.next()?;
+        Some(format!("{} {}", fields.next()?, fields.next()?))
+    })
+}
+
+fn strip_qsv_ledger_marker_attributes(sdp: &str) -> String {
+    sdp.split_inclusive('\n')
+        .filter(|line| {
+            !line
+                .trim_end_matches(['\r', '\n'])
+                .starts_with("a=x-sm-qsv-ledger:")
+        })
+        .collect()
+}
+fn validate_and_strip_qsv_ledger_offer(
+    sdp: &str,
+    expected_epoch: u64,
+) -> Result<ValidatedLedgerOffer, MarkerError> {
+    let markers: Vec<&str> = sdp
+        .lines()
+        .filter(|line| line.starts_with("a=x-sm-qsv-ledger:"))
+        .collect();
+    if markers.is_empty() {
+        return Ok(ValidatedLedgerOffer {
+            offer: sdp.to_owned(),
+            marker: None,
+        });
+    }
+    if markers.len() != 1 {
+        return Err(MarkerError::Malformed);
+    }
+    let attribute = markers[0];
+    let marker = LedgerMarker::parse(attribute)?;
+    let session_id = normalized_sdp_origin_identity(sdp).ok_or(MarkerError::Malformed)?;
+    marker.validate_for_session(&session_id)?;
+    if marker != LedgerMarker::new(&session_id, expected_epoch) {
+        return Err(MarkerError::Malformed);
+    }
+    Ok(ValidatedLedgerOffer {
+        offer: strip_qsv_ledger_marker_attributes(sdp),
+        marker: Some(attribute.to_owned()),
+    })
+}
+
 fn apply_offer_to_rtc(rtc: &mut Rtc, offer: SdpOffer) -> Result<SdpAnswer, TransportError> {
     let str0m_offer = str0m::change::SdpOffer::from_sdp_string(&offer.0)
         .map_err(|e| TransportError::Internal(format!("SDP offer parse failed: {e}")))?;
@@ -851,7 +926,10 @@ mod qsv_ledger_slice2_tests {
 
         let accepted = validate_and_strip_qsv_ledger_offer(&offer, 3).unwrap();
 
-        assert_eq!(accepted.marker, Some("a=x-sm-qsv-ledger:1:42%207:3".to_string()));
+        assert_eq!(
+            accepted.marker,
+            Some("a=x-sm-qsv-ledger:1:42%207:3".to_string())
+        );
         assert_eq!(accepted.offer, OFFER);
     }
 
@@ -1060,7 +1138,7 @@ mod tests {
 
         // RED: currently returns Err(NotRunning).
         // Task 4.6 must return Ok(SdpAnswer(...)) with non-empty SDP.
-        let result = receiver.apply_remote_offer(domain_offer);
+        let result = receiver.apply_remote_offer_for_epoch(domain_offer, 1);
         assert!(
             result.is_ok(),
             "apply_remote_offer must return Ok(SdpAnswer), got: {result:?}"
@@ -1090,7 +1168,7 @@ mod tests {
 
         let dummy_offer = sm_domain::signaling::SdpOffer("v=0\r\n".into());
         // Must not panic regardless of return value.
-        let _ = receiver.apply_remote_offer(dummy_offer);
+        let _ = receiver.apply_remote_offer_for_epoch(dummy_offer, 1);
     }
 
     /// R6.5, S6.3 — `request_keyframe` before start returns `Err(NotRunning)`.
@@ -1236,7 +1314,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
 
         // Post-start call — MUST succeed via the inbox+reply path (design §3.2).
-        let result = receiver.apply_remote_offer(domain_offer);
+        let result = receiver.apply_remote_offer_for_epoch(domain_offer, 1);
         assert!(
             result.is_ok(),
             "apply_remote_offer AFTER start() must return Ok(SdpAnswer), got: {result:?}"

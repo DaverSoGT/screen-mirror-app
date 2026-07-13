@@ -624,8 +624,7 @@ mod qsv_ledger_slice2_tests {
     #[test]
     fn qsv_ledger_marker_rotates_with_the_offer_epoch() {
         let first = qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 7", 3);
-        let replacement =
-            qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 8", 4);
+        let replacement = qsv_ledger_marker_for_confirmed_backend(true, "hw_intel_qsv", "42 8", 4);
 
         assert_eq!(first, Some("a=x-sm-qsv-ledger:1:42%207:3".to_string()));
         assert_eq!(
@@ -2075,6 +2074,69 @@ fn decide_candidate_or_nic_error(
     candidate.ok_or(BundleError::NoLocalNic)
 }
 
+// ─── QSV ledger activation / offer marker ────────────────────────────────────
+
+/// Returns the normalized SDP origin identity (`<session-id> <session-version>`).
+#[cfg(any(target_os = "windows", test))]
+fn normalized_sdp_origin_identity(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let origin = line.strip_prefix("o=")?;
+        let mut fields = origin.split_whitespace();
+        let _username = fields.next()?;
+        let session_id = fields.next()?;
+        let session_version = fields.next()?;
+        Some(format!("{session_id} {session_version}"))
+    })
+}
+
+/// Emits the exact v1 marker only after a sender-local opt-in and confirmed QSV
+/// backend selection. This helper neither inspects nor changes encoder policy.
+#[cfg(any(target_os = "windows", test))]
+fn qsv_ledger_marker_for_confirmed_backend(
+    explicitly_enabled: bool,
+    backend_name: &str,
+    session_id: &str,
+    epoch: u64,
+) -> Option<String> {
+    (explicitly_enabled && backend_name == "hw_intel_qsv").then(|| {
+        format!(
+            "a=x-sm-qsv-ledger:1:{}:{epoch}",
+            session_id.replace(' ', "%20")
+        )
+    })
+}
+
+/// The ledger remains default-off unless the sender process explicitly enables it.
+#[cfg(target_os = "windows")]
+fn qsv_ledger_opt_in_enabled() -> bool {
+    matches!(std::env::var("SCREEN_MIRROR_QSV_LEDGER"), Ok(value) if value == "1")
+}
+
+/// Adds a private ledger attribute only when the sender's backend confirmation and
+/// explicit opt-in allow diagnostics. All other offers remain byte-for-byte unchanged.
+#[cfg(target_os = "windows")]
+fn add_qsv_ledger_marker_to_offer(
+    mut offer: sm_domain::signaling::SdpOffer,
+    backend_name: &str,
+    attempt: u8,
+) -> sm_domain::signaling::SdpOffer {
+    let marker = normalized_sdp_origin_identity(&offer.0).and_then(|session_id| {
+        qsv_ledger_marker_for_confirmed_backend(
+            qsv_ledger_opt_in_enabled(),
+            backend_name,
+            &session_id,
+            u64::from(attempt),
+        )
+    });
+    if let Some(marker) = marker {
+        if !offer.0.ends_with('\n') {
+            offer.0.push_str("\r\n");
+        }
+        offer.0.push_str(&marker);
+        offer.0.push_str("\r\n");
+    }
+    offer
+}
 // ─── Offer wire-stamp seam (REQ-GE-1 / REQ-GE-2) ──────────────────────────────
 
 /// Stamp the live SDP generation `attempt` onto the published `Offer`.
@@ -2256,6 +2318,7 @@ fn build_production_sender_bundle(
     let offer = sender
         .create_local_offer()
         .map_err(|e| BundleError::Other(e.to_string()))?;
+    let offer = add_qsv_ledger_marker_to_offer(offer, &backend_name, attempt);
 
     sender
         .start(enc_to_sender_rx, tr_ev_tx)
