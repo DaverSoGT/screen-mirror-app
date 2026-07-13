@@ -619,7 +619,26 @@ fn transport_loopback_media_flow_end_to_end() {
         .start(pkt_out_tx, receiver_event_tx)
         .expect("receiver start");
 
+    let sender_addr = sender.local_addr().expect("sender local_addr");
+    let receiver_addr = receiver.local_addr().expect("receiver local_addr");
+
     sender.apply_remote_answer(answer).expect("apply answer");
+
+    let sender_candidate =
+        str0m::Candidate::host(sender_addr, "udp").expect("sender host candidate");
+    let receiver_candidate =
+        str0m::Candidate::host(receiver_addr, "udp").expect("receiver host candidate");
+
+    receiver
+        .add_remote_candidate(IceCandidate(
+            serde_json::to_string(&sender_candidate).expect("serialize sender candidate"),
+        ))
+        .expect("receiver add_remote_candidate");
+    sender
+        .add_remote_candidate(IceCandidate(
+            serde_json::to_string(&receiver_candidate).expect("serialize receiver candidate"),
+        ))
+        .expect("sender add_remote_candidate");
 
     // Wait for ICE to connect (up to 10 s).
     let ice_connected = {
