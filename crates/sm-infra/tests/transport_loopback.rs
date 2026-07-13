@@ -577,7 +577,6 @@ fn transport_loopback_full_wire_up_no_error() {
 /// cargo nextest run -p sm-infra --run-ignored --test transport_loopback
 /// ```
 #[test]
-#[ignore = "Requires DTLS/ICE loopback to complete — not guaranteed in single-process CI"]
 fn transport_loopback_media_flow_end_to_end() {
     let (mut sender_sig, mut receiver_sig) =
         LoopbackSignaling::pair(SignalingRole::Sender, SignalingRole::Receiver);
