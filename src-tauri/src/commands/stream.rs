@@ -884,6 +884,16 @@ trait SignalingReceiverOps: Send + Sync {
         &self,
         offer: sm_domain::signaling::SdpOffer,
     ) -> Result<sm_domain::signaling::SdpAnswer, TransportError>;
+    /// Production receivers receive the real signaling offer epoch. Existing test
+    /// doubles keep the one-argument seam and use this safe default.
+    fn apply_remote_offer_for_epoch(
+        &self,
+        offer: sm_domain::signaling::SdpOffer,
+        offer_epoch: u8,
+    ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+        let _ = offer_epoch;
+        self.apply_remote_offer(offer)
+    }
     /// Forward a remote ICE candidate to the receiver.
     fn add_remote_candidate(
         &self,
@@ -1036,7 +1046,7 @@ fn run_signaling_drain(
                         );
                         continue;
                     }
-                    match receiver.apply_remote_offer(offer) {
+                    match receiver.apply_remote_offer_for_epoch(offer, offer_attempt) {
                         Ok(answer) => {
                             // D-5 (REQ-BYE-5): advance the stale-Bye floor to the live generation
                             // the moment we apply its Offer. MUST be the first statement in this
@@ -1732,7 +1742,20 @@ impl SignalingReceiverOps for Str0mReceiverOps {
         &self,
         offer: sm_domain::signaling::SdpOffer,
     ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
-        self.0.lock().unwrap().apply_remote_offer(offer)
+        self.0
+            .lock()
+            .unwrap()
+            .apply_remote_offer_for_epoch(offer, 1)
+    }
+    fn apply_remote_offer_for_epoch(
+        &self,
+        offer: sm_domain::signaling::SdpOffer,
+        offer_epoch: u8,
+    ) -> Result<sm_domain::signaling::SdpAnswer, TransportError> {
+        self.0
+            .lock()
+            .unwrap()
+            .apply_remote_offer_for_epoch(offer, offer_epoch)
     }
     fn add_remote_candidate(
         &self,
