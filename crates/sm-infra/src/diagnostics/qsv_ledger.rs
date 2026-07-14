@@ -429,9 +429,11 @@ impl RtpHeaderAggregator {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedRecorder, ClockDomain, Evidence, LedgerEvent, LedgerMarker, LedgerRecord,
-        MarkerError, RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT,
-        RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome, RtpHeader, RtpHeaderAggregator,
+        AccessUnitIdentity, BoundedRecorder, ClockDomain, CompletedAuWitness, Evidence,
+        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, MediaTime, OfferEpoch,
+        RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT, RTP_TIMESTAMP_HISTORY_LIMIT,
+        RecordOutcome, RtpHeader, RtpHeaderAggregator, SourceMediaUnit, TransportLedgerProbe,
+        UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
     };
 
     const SESSION_ID: &str = "1000 2";
@@ -659,5 +661,81 @@ mod tests {
         assert_eq!(aggregator.streams.len(), RTP_STREAM_LIMIT);
         assert!(!aggregator.streams.contains_key(&0));
         assert!(aggregator.streams[&99].seen_timestamps.len() <= RTP_TIMESTAMP_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn collecting_probe_keeps_stage_owned_witnesses_and_immutable_exact_deltas() {
+        let probe = TransportLedgerProbe::collecting();
+        let identity = AccessUnitIdentity::new(
+            OfferEpoch::new(7),
+            SourceMediaUnit::new(41),
+            MediaTime::from_90khz(8_100),
+            99,
+            8_100,
+            0,
+        );
+        let second_identity = AccessUnitIdentity::new(
+            OfferEpoch::new(7),
+            SourceMediaUnit::new(42),
+            MediaTime::from_90khz(8_200),
+            99,
+            8_200,
+            1,
+        );
+        let start = probe.positions();
+
+        probe.record_writer(WriterWitness::new(identity));
+        let writer_snapshot = probe.writer_witnesses();
+        let checkpoint = probe.positions();
+        probe.record_writer(WriterWitness::new(second_identity));
+        probe.record_udp_transmit(UdpTransmitWitness::new(identity));
+        probe.record_udp_receive(UdpReceiveWitness::new(identity));
+        probe.record_completed_au(CompletedAuWitness::new(identity));
+
+        assert_eq!(writer_snapshot, vec![WriterWitness::new(identity)]);
+        assert_eq!(probe.exact_delta_since(start), [2, 1, 1, 1]);
+        assert_eq!(probe.exact_delta_since(checkpoint), [1, 1, 1, 1]);
+        assert_eq!(
+            probe.writer_witnesses_since(checkpoint),
+            vec![WriterWitness::new(second_identity)]
+        );
+        assert_eq!(
+            probe.udp_transmit_witnesses_since(start),
+            vec![UdpTransmitWitness::new(identity)]
+        );
+        assert_eq!(
+            probe.udp_receive_witnesses_since(start),
+            vec![UdpReceiveWitness::new(identity)]
+        );
+        assert_eq!(
+            probe.completed_au_witnesses_since(start),
+            vec![CompletedAuWitness::new(identity)]
+        );
+    }
+
+    #[test]
+    fn rejecting_probe_counts_two_attempts_per_stage_without_retaining_witnesses() {
+        let probe = TransportLedgerProbe::rejecting();
+        let identity = AccessUnitIdentity::new(
+            OfferEpoch::new(7),
+            SourceMediaUnit::new(41),
+            MediaTime::from_90khz(8_100),
+            99,
+            8_100,
+            0,
+        );
+
+        for _ in 0..2 {
+            probe.record_writer(WriterWitness::new(identity));
+            probe.record_udp_transmit(UdpTransmitWitness::new(identity));
+            probe.record_udp_receive(UdpReceiveWitness::new(identity));
+            probe.record_completed_au(CompletedAuWitness::new(identity));
+        }
+
+        assert_eq!(probe.attempted_delta(), [2, 2, 2, 2]);
+        assert!(probe.writer_witnesses().is_empty());
+        assert!(probe.udp_transmit_witnesses().is_empty());
+        assert!(probe.udp_receive_witnesses().is_empty());
+        assert!(probe.completed_au_witnesses().is_empty());
     }
 }
