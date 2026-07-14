@@ -341,12 +341,14 @@ impl Str0mVideoReceiver {
                 })?
             }
         };
-        if result.is_ok()
-            && let Some(attribute) = marker
-            && let Ok(marker) = LedgerMarker::parse(&attribute)
-            && let Ok(mut ledger) = self.ledger.lock()
-        {
-            ledger.active_marker = Some(marker);
+        if result.is_ok() {
+            if let Some(attribute) = marker {
+                if let Ok(marker) = LedgerMarker::parse(&attribute) {
+                    if let Ok(mut ledger) = self.ledger.lock() {
+                        ledger.active_marker = Some(marker);
+                    }
+                }
+            }
         }
         result
     }
