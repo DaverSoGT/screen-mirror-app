@@ -986,6 +986,12 @@ mod tests {
             8_100,
             0,
         );
+        assert_eq!(identity.offer_epoch().value(), 7);
+        assert_eq!(identity.source_media_unit().value(), 41);
+        assert_eq!(identity.media_time().as_90khz(), 8_100);
+        assert_eq!(identity.ssrc(), 99);
+        assert_eq!(identity.rtp_timestamp(), 8_100);
+        assert_eq!(identity.occurrence(), 0);
         let second_identity = AccessUnitIdentity::new(
             OfferEpoch::new(7),
             SourceMediaUnit::new(42),
@@ -1004,6 +1010,10 @@ mod tests {
         probe.record_udp_receive(UdpReceiveWitness::new(identity));
         probe.record_completed_au(CompletedAuWitness::new(identity));
 
+        assert_eq!(WriterWitness::new(identity).identity(), identity);
+        assert_eq!(UdpTransmitWitness::new(identity).identity(), identity);
+        assert_eq!(UdpReceiveWitness::new(identity).identity(), identity);
+        assert_eq!(CompletedAuWitness::new(identity).identity(), identity);
         assert_eq!(writer_snapshot, vec![WriterWitness::new(identity)]);
         assert_eq!(probe.exact_delta_since(start), [2, 1, 1, 1]);
         assert_eq!(probe.exact_delta_since(checkpoint), [1, 1, 1, 1]);
