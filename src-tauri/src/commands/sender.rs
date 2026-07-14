@@ -2077,7 +2077,7 @@ fn decide_candidate_or_nic_error(
 // ─── QSV ledger activation / offer marker ────────────────────────────────────
 
 /// Returns the normalized SDP origin identity (`<session-id> <session-version>`).
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn normalized_sdp_origin_identity(sdp: &str) -> Option<String> {
     sdp.lines().find_map(|line| {
         let origin = line.strip_prefix("o=")?;
