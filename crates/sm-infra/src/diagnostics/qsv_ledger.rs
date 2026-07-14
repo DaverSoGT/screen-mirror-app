@@ -1,4 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Mutex, MutexGuard},
+};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -422,6 +425,315 @@ impl RtpHeaderAggregator {
             .map(|(ssrc, _)| *ssrc);
         if let Some(ssrc) = oldest_ssrc {
             let _ = self.streams.remove(&ssrc);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfferEpoch(u64);
+
+impl OfferEpoch {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceMediaUnit(u64);
+
+impl SourceMediaUnit {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaTime(u64);
+
+impl MediaTime {
+    #[must_use]
+    pub const fn from_90khz(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn as_90khz(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccessUnitIdentity {
+    offer_epoch: OfferEpoch,
+    source_media_unit: SourceMediaUnit,
+    media_time: MediaTime,
+    ssrc: u32,
+    rtp_timestamp: u32,
+    occurrence: u64,
+}
+
+impl AccessUnitIdentity {
+    #[must_use]
+    pub const fn new(
+        offer_epoch: OfferEpoch,
+        source_media_unit: SourceMediaUnit,
+        media_time: MediaTime,
+        ssrc: u32,
+        rtp_timestamp: u32,
+        occurrence: u64,
+    ) -> Self {
+        Self {
+            offer_epoch,
+            source_media_unit,
+            media_time,
+            ssrc,
+            rtp_timestamp,
+            occurrence,
+        }
+    }
+
+    #[must_use]
+    pub const fn offer_epoch(self) -> OfferEpoch {
+        self.offer_epoch
+    }
+
+    #[must_use]
+    pub const fn source_media_unit(self) -> SourceMediaUnit {
+        self.source_media_unit
+    }
+
+    #[must_use]
+    pub const fn media_time(self) -> MediaTime {
+        self.media_time
+    }
+
+    #[must_use]
+    pub const fn ssrc(self) -> u32 {
+        self.ssrc
+    }
+
+    #[must_use]
+    pub const fn rtp_timestamp(self) -> u32 {
+        self.rtp_timestamp
+    }
+
+    #[must_use]
+    pub const fn occurrence(self) -> u64 {
+        self.occurrence
+    }
+}
+
+macro_rules! stage_witness {
+    ($name:ident, $description:literal) => {
+        #[doc = $description]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name {
+            identity: AccessUnitIdentity,
+        }
+
+        impl $name {
+            #[must_use]
+            pub const fn new(identity: AccessUnitIdentity) -> Self {
+                Self { identity }
+            }
+
+            #[must_use]
+            pub const fn identity(self) -> AccessUnitIdentity {
+                self.identity
+            }
+        }
+    };
+}
+
+stage_witness!(
+    WriterWitness,
+    "A witness recorded after a source writer accepts an access unit."
+);
+stage_witness!(
+    UdpTransmitWitness,
+    "A witness recorded when UDP transmit owns an access unit."
+);
+stage_witness!(
+    UdpReceiveWitness,
+    "A witness recorded when UDP receive observes an access unit."
+);
+stage_witness!(
+    CompletedAuWitness,
+    "A witness recorded when a completed access unit is delivered."
+);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LedgerPositions {
+    writer: usize,
+    udp_transmit: usize,
+    udp_receive: usize,
+    completed_au: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProbeState {
+    attempts: [u64; 4],
+    writer: Vec<WriterWitness>,
+    udp_transmit: Vec<UdpTransmitWitness>,
+    udp_receive: Vec<UdpReceiveWitness>,
+    completed_au: Vec<CompletedAuWitness>,
+}
+
+#[derive(Debug)]
+pub struct TransportLedgerProbe {
+    collecting: bool,
+    state: Mutex<ProbeState>,
+}
+
+impl TransportLedgerProbe {
+    #[must_use]
+    pub fn collecting() -> Self {
+        Self::new(true)
+    }
+
+    #[must_use]
+    pub fn rejecting() -> Self {
+        Self::new(false)
+    }
+
+    fn new(collecting: bool) -> Self {
+        Self {
+            collecting,
+            state: Mutex::new(ProbeState::default()),
+        }
+    }
+
+    pub fn record_writer(&self, witness: WriterWitness) {
+        let mut state = self.lock_state();
+        state.attempts[0] = state.attempts[0].saturating_add(1);
+        if self.collecting {
+            state.writer.push(witness);
+        }
+    }
+
+    pub fn record_udp_transmit(&self, witness: UdpTransmitWitness) {
+        let mut state = self.lock_state();
+        state.attempts[1] = state.attempts[1].saturating_add(1);
+        if self.collecting {
+            state.udp_transmit.push(witness);
+        }
+    }
+
+    pub fn record_udp_receive(&self, witness: UdpReceiveWitness) {
+        let mut state = self.lock_state();
+        state.attempts[2] = state.attempts[2].saturating_add(1);
+        if self.collecting {
+            state.udp_receive.push(witness);
+        }
+    }
+
+    pub fn record_completed_au(&self, witness: CompletedAuWitness) {
+        let mut state = self.lock_state();
+        state.attempts[3] = state.attempts[3].saturating_add(1);
+        if self.collecting {
+            state.completed_au.push(witness);
+        }
+    }
+
+    #[must_use]
+    pub fn positions(&self) -> LedgerPositions {
+        let state = self.lock_state();
+        LedgerPositions {
+            writer: state.writer.len(),
+            udp_transmit: state.udp_transmit.len(),
+            udp_receive: state.udp_receive.len(),
+            completed_au: state.completed_au.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn exact_delta_since(&self, position: LedgerPositions) -> [usize; 4] {
+        let state = self.lock_state();
+        [
+            state.writer.len().saturating_sub(position.writer),
+            state
+                .udp_transmit
+                .len()
+                .saturating_sub(position.udp_transmit),
+            state.udp_receive.len().saturating_sub(position.udp_receive),
+            state
+                .completed_au
+                .len()
+                .saturating_sub(position.completed_au),
+        ]
+    }
+
+    #[must_use]
+    pub fn attempted_delta(&self) -> [u64; 4] {
+        self.lock_state().attempts
+    }
+
+    #[must_use]
+    pub fn writer_witnesses(&self) -> Vec<WriterWitness> {
+        self.lock_state().writer.clone()
+    }
+
+    #[must_use]
+    pub fn writer_witnesses_since(&self, position: LedgerPositions) -> Vec<WriterWitness> {
+        let state = self.lock_state();
+        state.writer[position.writer.min(state.writer.len())..].to_vec()
+    }
+
+    #[must_use]
+    pub fn udp_transmit_witnesses(&self) -> Vec<UdpTransmitWitness> {
+        self.lock_state().udp_transmit.clone()
+    }
+
+    #[must_use]
+    pub fn udp_transmit_witnesses_since(
+        &self,
+        position: LedgerPositions,
+    ) -> Vec<UdpTransmitWitness> {
+        let state = self.lock_state();
+        state.udp_transmit[position.udp_transmit.min(state.udp_transmit.len())..].to_vec()
+    }
+
+    #[must_use]
+    pub fn udp_receive_witnesses(&self) -> Vec<UdpReceiveWitness> {
+        self.lock_state().udp_receive.clone()
+    }
+
+    #[must_use]
+    pub fn udp_receive_witnesses_since(&self, position: LedgerPositions) -> Vec<UdpReceiveWitness> {
+        let state = self.lock_state();
+        state.udp_receive[position.udp_receive.min(state.udp_receive.len())..].to_vec()
+    }
+
+    #[must_use]
+    pub fn completed_au_witnesses(&self) -> Vec<CompletedAuWitness> {
+        self.lock_state().completed_au.clone()
+    }
+
+    #[must_use]
+    pub fn completed_au_witnesses_since(
+        &self,
+        position: LedgerPositions,
+    ) -> Vec<CompletedAuWitness> {
+        let state = self.lock_state();
+        state.completed_au[position.completed_au.min(state.completed_au.len())..].to_vec()
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ProbeState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 }
