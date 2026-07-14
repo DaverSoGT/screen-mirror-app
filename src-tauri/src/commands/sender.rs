@@ -612,7 +612,7 @@ mod qsv_ledger_slice2_tests {
             None
         );
         assert_eq!(
-            qsv_ledger_marker_for_confirmed_backend(true, "hw_nvidia_nvenc", "42 7", 3),
+            qsv_ledger_marker_for_confirmed_backend(true, "hw_nvenc", "42 7", 3),
             None
         );
         assert_eq!(
