@@ -2178,6 +2178,12 @@ enum RelayError {
     Timeout,
     InvalidEndpoints,
     UnexpectedEvent,
+    AlreadyRunning,
+    CommandBusy,
+    Disconnected,
+    ShutdownTimeout,
+    CompletionDisconnected,
+    WorkerPanicked,
 }
 
 type RelayResult<T> = Result<T, RelayError>;
@@ -2187,10 +2193,21 @@ struct DatagramObservation {
     bytes: Vec<u8>,
 }
 
+enum WorkerCommand {
+    Panic,
+    DisconnectCompletion,
+}
+
+enum WorkerExit {
+    Stopped,
+    Panicked,
+}
+
 struct BidirectionalUdpRelay {
     socket: UdpSocket,
     endpoints: [SocketAddr; 2],
     registered: [bool; 2],
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl BidirectionalUdpRelay {
@@ -2210,6 +2227,7 @@ impl BidirectionalUdpRelay {
             socket,
             endpoints,
             registered: [false; 2],
+            worker: None,
         })
     }
 
@@ -2408,4 +2426,91 @@ fn pr5b_p2a_relay_reports_unexpected_source_for_unregistered_sender() {
                 .expect("unregistered sender address")
         )
     );
+}
+
+// ─── PR5B P2A2 RED: bounded worker lifecycle contracts ──────────────────────
+
+fn bind_started_p2a2_relay() -> (BidirectionalUdpRelay, UdpSocket, UdpSocket) {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let mut relay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A2 relay binds fixed endpoints");
+    assert!(relay.worker.is_none(), "bind must not own a worker");
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A2 relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A2 relay registers endpoint B");
+    relay.start().expect("P2A2 relay starts one worker");
+    assert!(matches!(relay.worker.as_ref(), Some(worker) if !worker.is_finished()));
+    (relay, endpoint_a, endpoint_b)
+}
+
+fn bounded_call(
+    mut relay: BidirectionalUdpRelay,
+    call: impl FnOnce(&mut BidirectionalUdpRelay) -> RelayResult<()> + Send + 'static,
+) -> (RelayResult<()>, BidirectionalUdpRelay) {
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let call_thread = std::thread::spawn(move || completion_tx.send((call(&mut relay), relay)));
+    let completed = completion_rx
+        .recv_timeout(P2A_RELAY_TIMEOUT)
+        .expect("lifecycle call must complete within the test bound");
+    call_thread.join().expect("completed lifecycle call joins");
+    completed
+}
+
+#[test]
+fn pr5b_p2a2_relay_recv_at_is_single_attempt_and_bounded() {
+    let (mut relay, _endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+
+    assert!(matches!(
+        relay.recv_at(&endpoint_b, P2A_RELAY_TIMEOUT),
+        Err(RelayError::Timeout)
+    ));
+}
+
+#[test]
+fn pr5b_p2a2_relay_shutdown_joins_and_prevents_post_shutdown_forwarding() {
+    let (mut relay, endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+    let (shutdown, returned_relay) = bounded_call(relay, |relay| relay.shutdown(P2A_RELAY_TIMEOUT));
+    relay = returned_relay;
+    assert!(shutdown.is_ok() && relay.worker.is_none());
+    endpoint_a
+        .send_to(&[0x81, 0x60, 0x00, 0x01], relay.relay_addr())
+        .expect("endpoint A sends only after shutdown");
+
+    assert!(matches!(
+        relay.recv_at(&endpoint_b, P2A_RELAY_TIMEOUT),
+        Err(RelayError::Timeout)
+    ));
+}
+
+#[test]
+fn pr5b_p2a2_relay_worker_panic_is_reported_and_cleaned_up_boundedly() {
+    let (relay, _endpoint_a, _endpoint_b) = bind_started_p2a2_relay();
+    relay
+        .inject_worker_command(WorkerCommand::Panic)
+        .expect("P2A2 relay accepts the panic command");
+
+    let (shutdown, relay) = bounded_call(relay, |relay| relay.shutdown(P2A_RELAY_TIMEOUT));
+    assert!(shutdown == Err(RelayError::WorkerPanicked) && relay.worker.is_some());
+    let (cleanup, relay) = bounded_call(relay, |relay| relay.cleanup(P2A_RELAY_TIMEOUT));
+    assert!(cleanup.is_ok() && relay.worker.is_none());
+}
+
+#[test]
+fn pr5b_p2a2_relay_completion_disconnect_retains_handle_for_bounded_cleanup() {
+    let (relay, _endpoint_a, _endpoint_b) = bind_started_p2a2_relay();
+    relay
+        .inject_worker_command(WorkerCommand::DisconnectCompletion)
+        .expect("P2A2 relay accepts the completion-disconnect command");
+
+    let (shutdown, relay) = bounded_call(relay, |relay| relay.shutdown(P2A_RELAY_TIMEOUT));
+    assert!(shutdown == Err(RelayError::CompletionDisconnected) && relay.worker.is_some());
+    let (cleanup, relay) = bounded_call(relay, |relay| relay.cleanup(P2A_RELAY_TIMEOUT));
+    assert!(cleanup.is_ok() && relay.worker.is_none());
 }
