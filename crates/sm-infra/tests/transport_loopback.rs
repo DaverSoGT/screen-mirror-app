@@ -2670,3 +2670,110 @@ fn pr5b_p2a2_relay_completion_disconnect_retains_handle_for_bounded_cleanup() {
     let (cleanup, relay) = bounded_call(relay, |relay| relay.cleanup(P2A_RELAY_TIMEOUT));
     assert!(cleanup.is_ok() && relay.worker.is_none());
 }
+
+// ─── PR5B P2B RED: selected RTP hold and generation-token contracts ─────────
+
+fn select_and_hold_rtp(
+    relay: &mut BidirectionalUdpRelay,
+    endpoint: &UdpSocket,
+    selected_rtp: [u8; 12],
+) -> u64 {
+    let token = relay
+        .current_token(endpoint.local_addr().expect("endpoint address"))
+        .expect("P2B relay returns the current endpoint token");
+    relay
+        .hold_selected_rtp(token, selected_rtp)
+        .expect("P2B relay selects one exact RTP header");
+    endpoint
+        .send_to(&selected_rtp, relay.relay_addr())
+        .expect("endpoint sends the selected RTP packet");
+    relay
+        .wait_until_selected_rtp_is_held(P2A_RELAY_TIMEOUT)
+        .expect("P2B relay confirms the selected RTP packet is held");
+    token
+}
+
+#[test]
+fn pr5b_p2b_relay_holds_only_exact_selected_rtp() {
+    let (mut relay, endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+    let selected_rtp = [0x80, 0x60, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 1];
+    let _token = select_and_hold_rtp(&mut relay, &endpoint_a, selected_rtp);
+
+    assert!(matches!(
+        relay.recv_at(&endpoint_b, P2A_RELAY_TIMEOUT),
+        Err(RelayError::Timeout)
+    ));
+}
+
+#[test]
+fn pr5b_p2b_relay_forwards_nonselected_rtp_and_control_while_held() {
+    let (mut relay, endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+    let selected_rtp = [0x80, 0x60, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 1];
+    let nonselected_rtp = [0x80, 0x60, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 1];
+    let control = [0x80, 0xc8, 0x00, 0x06, 0x12, 0x34, 0x56, 0x78];
+    let _token = select_and_hold_rtp(&mut relay, &endpoint_a, selected_rtp);
+
+    endpoint_a
+        .send_to(&nonselected_rtp, relay.relay_addr())
+        .expect("endpoint A sends a non-selected RTP packet");
+    assert_eq!(
+        relay
+            .recv_at(&endpoint_b, P2A_RELAY_TIMEOUT)
+            .expect("non-selected RTP must still be forwarded")
+            .bytes,
+        nonselected_rtp
+    );
+
+    endpoint_a
+        .send_to(&control, relay.relay_addr())
+        .expect("endpoint A sends control bytes while RTP is held");
+    assert_eq!(
+        relay
+            .recv_at(&endpoint_b, P2A_RELAY_TIMEOUT)
+            .expect("control bytes must still be forwarded")
+            .bytes,
+        control
+    );
+}
+
+#[test]
+fn pr5b_p2b_relay_releases_selected_rtp_once_for_current_token() {
+    let (mut relay, endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+    let selected_rtp = [0x80, 0x60, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 1];
+    let token = select_and_hold_rtp(&mut relay, &endpoint_a, selected_rtp);
+
+    relay
+        .release_selected_rtp(token)
+        .expect("current token releases the held RTP packet once");
+    assert_eq!(
+        relay
+            .recv_at(&endpoint_b, P2A_RELAY_TIMEOUT)
+            .expect("released RTP packet is delivered")
+            .bytes,
+        selected_rtp
+    );
+    assert!(matches!(
+        relay.recv_at(&endpoint_b, P2A_RELAY_TIMEOUT),
+        Err(RelayError::Timeout)
+    ));
+}
+
+#[test]
+fn pr5b_p2b_relay_rejects_stale_token_without_delivery() {
+    let (mut relay, endpoint_a, endpoint_b) = bind_started_p2a2_relay();
+    let selected_rtp = [0x80, 0x60, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 1];
+    let endpoint_a_addr = endpoint_a.local_addr().expect("endpoint A address");
+    let stale_token = select_and_hold_rtp(&mut relay, &endpoint_a, selected_rtp);
+    relay
+        .register_endpoint(endpoint_a_addr)
+        .expect("re-registering an endpoint rotates its token");
+
+    assert_eq!(
+        relay.release_selected_rtp(stale_token),
+        Err(RelayError::StaleToken)
+    );
+    assert!(matches!(
+        relay.recv_at(&endpoint_b, P2A_RELAY_TIMEOUT),
+        Err(RelayError::Timeout)
+    ));
+}
