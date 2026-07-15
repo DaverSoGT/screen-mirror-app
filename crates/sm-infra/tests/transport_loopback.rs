@@ -2165,3 +2165,125 @@ fn pr5b_p1_receiver_unattached_lifecycle_stays_operational_and_inert() {
     assert_eq!(unattached_probe.positions(), LedgerPositions::default());
     assert_eq!(unattached_probe.attempted_delta(), [0; 4]);
 }
+
+// ─── PR5B P2A RED: fixed-source opaque relay contracts ──────────────────────
+
+const P2A_RELAY_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Eq, PartialEq)]
+enum RelayError {
+    UnexpectedSource(SocketAddr),
+}
+
+struct BidirectionalUdpRelay;
+
+fn bind_p2a_endpoint() -> UdpSocket {
+    let endpoint = UdpSocket::bind("127.0.0.1:0").expect("P2A endpoint binds");
+    endpoint
+        .set_read_timeout(Some(P2A_RELAY_TIMEOUT))
+        .expect("P2A endpoint uses a bounded receive");
+    endpoint
+}
+
+#[test]
+fn pr5b_p2a_relay_forwards_opaque_datagrams_bidirectionally() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+    let opaque_a_to_b = [0x00, 0xff, 0x10, 0x80, 0x7f];
+    let opaque_b_to_a = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x00];
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+
+    endpoint_a
+        .send_to(&opaque_a_to_b, relay.relay_addr())
+        .expect("endpoint A sends opaque datagram to relay");
+    let mut received_at_b = [0_u8; 64];
+    let (length_at_b, source_at_b) = endpoint_b
+        .recv_from(&mut received_at_b)
+        .expect("endpoint B receives relay delivery within the test bound");
+    assert_eq!(source_at_b, relay.relay_addr());
+    assert_eq!(&received_at_b[..length_at_b], &opaque_a_to_b);
+
+    endpoint_b
+        .send_to(&opaque_b_to_a, relay.relay_addr())
+        .expect("endpoint B sends opaque datagram to relay");
+    let mut received_at_a = [0_u8; 64];
+    let (length_at_a, source_at_a) = endpoint_a
+        .recv_from(&mut received_at_a)
+        .expect("endpoint A receives relay delivery within the test bound");
+    assert_eq!(source_at_a, relay.relay_addr());
+    assert_eq!(&received_at_a[..length_at_a], &opaque_b_to_a);
+}
+
+#[test]
+fn pr5b_p2a_relay_forwards_control_bytes_unchanged() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+    let control = [0x80, 0xc8, 0x00, 0x06, 0x12, 0x34, 0x56, 0x78];
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+
+    endpoint_a
+        .send_to(&control, relay.relay_addr())
+        .expect("endpoint A sends control bytes to relay");
+    let mut delivered = [0_u8; 64];
+    let (length, source) = endpoint_b
+        .recv_from(&mut delivered)
+        .expect("endpoint B receives control bytes within the test bound");
+
+    assert_eq!(source, relay.relay_addr());
+    assert_eq!(&delivered[..length], &control);
+}
+
+#[test]
+fn pr5b_p2a_relay_reports_unexpected_source_for_unregistered_sender() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let unregistered_sender = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+    unregistered_sender
+        .send_to(&[0x00, 0xff, 0x10], relay.relay_addr())
+        .expect("unregistered fixed source sends to relay");
+
+    assert_eq!(
+        relay
+            .recv_error(P2A_RELAY_TIMEOUT)
+            .expect("P2A relay publishes an unexpected-source error"),
+        RelayError::UnexpectedSource(
+            unregistered_sender
+                .local_addr()
+                .expect("unregistered sender address")
+        )
+    );
+}
