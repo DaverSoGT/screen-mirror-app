@@ -48,6 +48,7 @@ use sm_domain::signaling::{IceCandidate, Signaling, SignalingEvent, SignalingRol
 use sm_domain::transport::{
     TransportConfig, TransportEvent, TransportRole, VideoReceiver, VideoSender,
 };
+use sm_infra::diagnostics::qsv_ledger::{LedgerPositions, TransportLedgerProbe};
 use sm_infra::signaling::loopback::LoopbackSignaling;
 use sm_infra::transport::{Str0mVideoReceiver, Str0mVideoSender};
 
@@ -2096,4 +2097,71 @@ fn sc_rrd_c_fresh_offer_lands_on_fresh_rtc_only() {
          Got Ok — which means the Rtc accepted a conflicting offer, indicating str0m \
          m-line state was not established correctly in this test setup."
     );
+}
+
+// ─── P1 receiver probe facade contract ──────────────────────────────────────
+
+fn run_p1_receiver_lifecycle(probe: Option<Arc<TransportLedgerProbe>>) {
+    let (completion_tx, completion_rx) = sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let mut receiver = Str0mVideoReceiver::new(TransportConfig {
+            udp_port: 0,
+            role: TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .expect("P1 receiver construction must succeed");
+
+        if let Some(probe) = probe {
+            receiver.install_transport_ledger_probe_for_test(probe);
+        }
+
+        let (packet_tx, _packet_rx) = sync_channel::<EncodedPacket>(4);
+        let (event_tx, _event_rx) = sync_channel::<TransportEvent>(4);
+        let result = receiver
+            .start(packet_tx, event_tx)
+            .and_then(|()| receiver.stop())
+            .map_err(|error| error.to_string());
+        let _ = completion_tx.send(result);
+    });
+
+    match completion_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(Ok(())) => worker.join().expect("P1 receiver worker must not panic"),
+        Ok(Err(error)) => {
+            worker.join().expect("P1 receiver worker must not panic");
+            panic!("P1 receiver lifecycle must succeed: {error}");
+        }
+        Err(error) => {
+            panic!("P1 receiver lifecycle must complete within the test deadline: {error}")
+        }
+    }
+}
+
+#[test]
+fn pr5b_p1_receiver_collecting_probe_attaches_before_start_and_stays_inert() {
+    let probe = Arc::new(TransportLedgerProbe::collecting());
+
+    run_p1_receiver_lifecycle(Some(Arc::clone(&probe)));
+
+    assert_eq!(probe.positions(), LedgerPositions::default());
+    assert_eq!(probe.attempted_delta(), [0; 4]);
+}
+
+#[test]
+fn pr5b_p1_receiver_rejecting_probe_attaches_before_start_and_stays_inert() {
+    let probe = Arc::new(TransportLedgerProbe::rejecting());
+
+    run_p1_receiver_lifecycle(Some(Arc::clone(&probe)));
+
+    assert_eq!(probe.positions(), LedgerPositions::default());
+    assert_eq!(probe.attempted_delta(), [0; 4]);
+}
+
+#[test]
+fn pr5b_p1_receiver_unattached_lifecycle_stays_operational_and_inert() {
+    let unattached_probe = Arc::new(TransportLedgerProbe::collecting());
+
+    run_p1_receiver_lifecycle(None);
+
+    assert_eq!(unattached_probe.positions(), LedgerPositions::default());
+    assert_eq!(unattached_probe.attempted_delta(), [0; 4]);
 }
