@@ -1452,6 +1452,103 @@ fn transport_receiver_bundle_sequence_publishes_candidate_b6() {
     receiver.stop().unwrap();
 }
 
+// ─── PR4R-harness RED: deterministic relay contracts ─────────────────────────
+
+#[derive(Debug, Eq, PartialEq)]
+struct RtpHeaderFields {
+    payload_type: u8,
+    marker: bool,
+    sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+}
+
+fn parse_rtp_header(_packet: &[u8]) -> Result<RtpHeaderFields, &'static str> {
+    todo!("PR4R GREEN must parse the minimum RTP header fields")
+}
+
+struct DeterministicUdpRelay;
+
+impl DeterministicUdpRelay {
+    fn bind(_destination: std::net::SocketAddr) -> Self {
+        todo!("PR4R GREEN must bind an ephemeral deterministic UDP relay")
+    }
+
+    fn local_addr(&self) -> std::net::SocketAddr {
+        todo!("PR4R GREEN must expose the relay address")
+    }
+
+    fn wait_until_held(&self) {
+        todo!("PR4R GREEN must expose a deterministic hold checkpoint")
+    }
+
+    fn release(&self) {
+        todo!("PR4R GREEN must release the held UDP packet")
+    }
+}
+
+fn rtp_packet(sequence: u16, timestamp: u32, ssrc: u32) -> [u8; 12] {
+    let mut packet = [0_u8; 12];
+    packet[0] = 0x80;
+    packet[1] = 0x80 | 96;
+    packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+    packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+    packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    packet
+}
+
+#[test]
+fn pr4r_harness_parses_minimum_rtp_header_fields() {
+    let packet = rtp_packet(7, 90_000, 0x1020_3040);
+
+    assert_eq!(
+        parse_rtp_header(&packet),
+        Ok(RtpHeaderFields {
+            payload_type: 96,
+            marker: true,
+            sequence: 7,
+            timestamp: 90_000,
+            ssrc: 0x1020_3040,
+        })
+    );
+}
+
+#[test]
+fn pr4r_harness_rejects_short_or_malformed_rtp_packets_deterministically() {
+    let short_packet = [0x80, 96, 0, 7, 0, 1, 95, 144, 16, 32, 48];
+    let malformed_version = [0x40, 96, 0, 7, 0, 1, 95, 144, 16, 32, 48, 64];
+
+    assert!(parse_rtp_header(&short_packet).is_err());
+    assert!(parse_rtp_header(&malformed_version).is_err());
+}
+
+#[test]
+fn pr4r_harness_relay_holds_udp_until_release_then_delivers() {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver binds");
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("receiver timeout configures");
+    let relay = DeterministicUdpRelay::bind(receiver.local_addr().expect("receiver address"));
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let packet = rtp_packet(8, 180_000, 0x1020_3040);
+
+    sender
+        .send_to(&packet, relay.local_addr())
+        .expect("sender writes UDP packet to relay");
+    relay.wait_until_held();
+    assert!(
+        receiver.recv_from(&mut [0_u8; 32]).is_err(),
+        "a held packet must not arrive before release"
+    );
+
+    relay.release();
+    let mut delivered = [0_u8; 32];
+    let (length, _) = receiver
+        .recv_from(&mut delivered)
+        .expect("released packet must arrive");
+    assert_eq!(&delivered[..length], &packet);
+}
+
 // ─── SC-MLO-4: real-str0m m-line conflict reproduction (#[ignore]) ───────────
 //
 // REQ-MLO-2: A real-str0m integration test that documents the m-line order
