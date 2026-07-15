@@ -34,9 +34,13 @@
 //! - `transport_loopback_media_flow_end_to_end` — `#[ignore]`; requires DTLS to complete.
 //! - `transport_loopback_rtcp_pli_reaches_encoder` — `#[ignore]`; requires DTLS + media flow.
 
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, VideoEncoder};
@@ -1463,27 +1467,173 @@ struct RtpHeaderFields {
     ssrc: u32,
 }
 
-fn parse_rtp_header(_packet: &[u8]) -> Result<RtpHeaderFields, &'static str> {
-    todo!("PR4R GREEN must parse the minimum RTP header fields")
+fn parse_rtp_header(packet: &[u8]) -> Result<RtpHeaderFields, &'static str> {
+    const RTP_FIXED_HEADER_LEN: usize = 12;
+    const RTP_VERSION: u8 = 2;
+
+    if packet.len() < RTP_FIXED_HEADER_LEN {
+        return Err("RTP packet is shorter than its fixed header");
+    }
+
+    if packet[0] >> 6 != RTP_VERSION {
+        return Err("RTP packet does not use version 2");
+    }
+
+    Ok(RtpHeaderFields {
+        payload_type: packet[1] & 0x7f,
+        marker: packet[1] & 0x80 != 0,
+        sequence: u16::from_be_bytes([packet[2], packet[3]]),
+        timestamp: u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
+        ssrc: u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
+    })
 }
 
-struct DeterministicUdpRelay;
+struct DeterministicUdpRelay {
+    local_addr: SocketAddr,
+    held_rx: Receiver<Result<(), &'static str>>,
+    release_tx: SyncSender<()>,
+    delivered_rx: Receiver<Result<(), &'static str>>,
+    shutdown_tx: SyncSender<()>,
+    state: Arc<AtomicU8>,
+    worker: Option<JoinHandle<()>>,
+}
+
+const RELAY_CHECKPOINT_TIMEOUT: Duration = Duration::from_millis(250);
+const RELAY_WAITING_FOR_PACKET: u8 = 0;
+const RELAY_HOLDING_PACKET: u8 = 1;
+const RELAY_RELEASED_PACKET: u8 = 2;
 
 impl DeterministicUdpRelay {
-    fn bind(_destination: std::net::SocketAddr) -> Self {
-        todo!("PR4R GREEN must bind an ephemeral deterministic UDP relay")
+    fn bind(destination: SocketAddr) -> Self {
+        let socket =
+            UdpSocket::bind("127.0.0.1:0").expect("relay binds an ephemeral loopback port");
+        let local_addr = socket
+            .local_addr()
+            .expect("relay exposes its local address");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("relay configures a bounded shutdown poll");
+
+        let (held_tx, held_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (delivered_tx, delivered_rx) = sync_channel(1);
+        let (shutdown_tx, shutdown_rx) = sync_channel(1);
+        let state = Arc::new(AtomicU8::new(RELAY_WAITING_FOR_PACKET));
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 65_535];
+            let packet = loop {
+                match socket.recv_from(&mut buffer) {
+                    Ok((length, _)) => break buffer[..length].to_vec(),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        match shutdown_rx.try_recv() {
+                            Ok(()) | Err(TryRecvError::Disconnected) => return,
+                            Err(TryRecvError::Empty) => continue,
+                        }
+                    }
+                    Err(_) => {
+                        let _ = held_tx.send(Err("relay failed before holding a packet"));
+                        return;
+                    }
+                }
+            };
+
+            worker_state.store(RELAY_HOLDING_PACKET, Ordering::Release);
+            if held_tx.send(Ok(())).is_err() || !wait_for_relay_signal(&release_rx, &shutdown_rx) {
+                return;
+            }
+
+            let result = socket
+                .send_to(&packet, destination)
+                .map(|_| ())
+                .map_err(|_| "relay failed to deliver the held packet");
+            let _ = delivered_tx.send(result);
+        });
+
+        Self {
+            local_addr,
+            held_rx,
+            release_tx,
+            delivered_rx,
+            shutdown_tx,
+            state,
+            worker: Some(worker),
+        }
     }
 
-    fn local_addr(&self) -> std::net::SocketAddr {
-        todo!("PR4R GREEN must expose the relay address")
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
-    fn wait_until_held(&self) {
-        todo!("PR4R GREEN must expose a deterministic hold checkpoint")
+    fn wait_until_held(&self) -> Result<(), &'static str> {
+        match self.held_rx.recv_timeout(RELAY_CHECKPOINT_TIMEOUT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err("relay timed out before holding a packet"),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("relay worker exited before holding a packet")
+            }
+        }
     }
 
-    fn release(&self) {
-        todo!("PR4R GREEN must release the held UDP packet")
+    fn release(&self) -> Result<(), &'static str> {
+        match self.state.compare_exchange(
+            RELAY_HOLDING_PACKET,
+            RELAY_RELEASED_PACKET,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(RELAY_WAITING_FOR_PACKET) => return Err("relay has not held a packet"),
+            Err(RELAY_RELEASED_PACKET) => return Err("relay has already released the held packet"),
+            Err(_) => return Err("relay worker exited before accepting the release signal"),
+        }
+
+        match self.release_tx.try_send(()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(())) => {
+                return Err("relay already has a pending release signal");
+            }
+            Err(TrySendError::Disconnected(())) => {
+                return Err("relay worker exited before accepting the release signal");
+            }
+        }
+
+        match self.delivered_rx.recv_timeout(RELAY_CHECKPOINT_TIMEOUT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                Err("relay timed out before delivering the held packet")
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("relay worker exited before delivering the held packet")
+            }
+        }
+    }
+}
+
+impl Drop for DeterministicUdpRelay {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(());
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("relay worker must shut down cleanly");
+        }
+    }
+}
+
+fn wait_for_relay_signal(release_rx: &Receiver<()>, shutdown_rx: &Receiver<()>) -> bool {
+    loop {
+        match release_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(()) => return true,
+            Err(RecvTimeoutError::Disconnected) => return false,
+            Err(RecvTimeoutError::Timeout) => match shutdown_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => return false,
+                Err(TryRecvError::Empty) => {}
+            },
+        }
     }
 }
 
@@ -1535,18 +1685,99 @@ fn pr4r_harness_relay_holds_udp_until_release_then_delivers() {
     sender
         .send_to(&packet, relay.local_addr())
         .expect("sender writes UDP packet to relay");
-    relay.wait_until_held();
+    relay
+        .wait_until_held()
+        .expect("relay worker must hold one packet successfully");
     assert!(
         receiver.recv_from(&mut [0_u8; 32]).is_err(),
         "a held packet must not arrive before release"
     );
 
-    relay.release();
+    relay
+        .release()
+        .expect("relay worker must deliver the held packet");
     let mut delivered = [0_u8; 32];
     let (length, _) = receiver
         .recv_from(&mut delivered)
         .expect("released packet must arrive");
     assert_eq!(&delivered[..length], &packet);
+}
+
+#[test]
+fn pr4r_harness_relay_reports_a_bounded_error_and_joins_when_no_packet_arrives() {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver binds");
+    let relay = DeterministicUdpRelay::bind(receiver.local_addr().expect("receiver address"));
+
+    assert_eq!(
+        relay.wait_until_held(),
+        Err("relay timed out before holding a packet")
+    );
+
+    drop(relay);
+}
+
+#[test]
+fn pr4r_harness_relay_rejects_release_before_holding_without_a_stale_signal() {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver binds");
+    receiver
+        .set_read_timeout(Some(RELAY_CHECKPOINT_TIMEOUT))
+        .expect("receiver configures bounded read");
+    let relay = DeterministicUdpRelay::bind(receiver.local_addr().expect("receiver address"));
+
+    assert_eq!(
+        relay.release(),
+        Err("relay has not held a packet"),
+        "release-before-held must fail without queuing a future release"
+    );
+
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+    let packet = [0x80, 0x60, 0x00, 0x01];
+    sender
+        .send_to(&packet, relay.local_addr())
+        .expect("sender writes UDP packet to relay");
+    relay
+        .wait_until_held()
+        .expect("relay holds the packet after the rejected release");
+
+    assert!(
+        receiver.recv_from(&mut [0_u8; 32]).is_err(),
+        "the rejected release must not auto-deliver a later packet"
+    );
+
+    relay
+        .release()
+        .expect("an explicit release must still deliver the held packet");
+    let mut delivered = [0_u8; 32];
+    let (length, _) = receiver
+        .recv_from(&mut delivered)
+        .expect("receiver reads the explicitly released packet");
+    assert_eq!(&delivered[..length], &packet);
+
+    drop(relay);
+}
+
+#[test]
+fn pr4r_harness_relay_rejects_a_repeated_release_after_delivery() {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver binds");
+    let relay = DeterministicUdpRelay::bind(receiver.local_addr().expect("receiver address"));
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender binds");
+
+    sender
+        .send_to(&[0x80, 0x60, 0x00, 0x01], relay.local_addr())
+        .expect("sender writes UDP packet to relay");
+    relay
+        .wait_until_held()
+        .expect("relay worker must hold one packet successfully");
+    relay
+        .release()
+        .expect("the first explicit release must deliver the held packet");
+
+    assert_eq!(
+        relay.release(),
+        Err("relay has already released the held packet")
+    );
+
+    drop(relay);
 }
 
 // ─── SC-MLO-4: real-str0m m-line conflict reproduction (#[ignore]) ───────────
