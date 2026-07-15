@@ -44,7 +44,7 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoReceiver,
 };
 
-use crate::diagnostics::qsv_ledger::{LedgerMarker, MarkerError};
+use crate::diagnostics::qsv_ledger::{LedgerMarker, MarkerError, TransportLedgerProbe};
 use crate::transport::annex_b::{contains_idr_nal, reconstruct_annex_b};
 
 // ─── Internal control message ────────────────────────────────────────────────
@@ -108,6 +108,12 @@ struct ReceiverShared {
     media_emitted: AtomicBool,
 }
 
+/// Receiver-owned values moved into the dedicated SansIO tick loop.
+struct ReceiverLoopContext {
+    state: Arc<ReceiverShared>,
+    probe: Option<Arc<TransportLedgerProbe>>,
+}
+
 impl ReceiverShared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -161,6 +167,7 @@ pub struct Str0mVideoReceiver {
     /// Shared atomic state between caller and tick thread.
     state: Arc<ReceiverShared>,
     ledger: Mutex<ReceiverLedgerState>,
+    transport_ledger_probe: Mutex<Option<Arc<TransportLedgerProbe>>>,
     /// Control inbox: caller → tick thread. Created in `start()`.
     control_tx: Option<SyncSender<ReceiverControl>>,
     /// Join handle for the tick thread. `Some` while running.
@@ -210,6 +217,7 @@ impl VideoReceiver for Str0mVideoReceiver {
             pre_neg: Mutex::new(Some(pre_neg)),
             state: ReceiverShared::new(),
             ledger: Mutex::new(ReceiverLedgerState::default()),
+            transport_ledger_probe: Mutex::new(None),
             control_tx: None,
             handle: None,
             local_addr: None,
@@ -304,6 +312,27 @@ impl Drop for Str0mVideoReceiver {
 }
 
 impl Str0mVideoReceiver {
+    /// Attaches an inert probe for external test-support contract compilation.
+    #[cfg(feature = "test-support")]
+    pub fn install_transport_ledger_probe_for_test(&self, probe: Arc<TransportLedgerProbe>) {
+        if let Ok(mut attached) = self.transport_ledger_probe.lock() {
+            *attached = Some(probe);
+        }
+    }
+
+    fn receiver_loop_context(&self) -> ReceiverLoopContext {
+        let probe = self
+            .transport_ledger_probe
+            .lock()
+            .ok()
+            .and_then(|attached| attached.clone());
+
+        ReceiverLoopContext {
+            state: Arc::clone(&self.state),
+            probe,
+        }
+    }
+
     pub fn apply_remote_offer_for_epoch(
         &self,
         offer: SdpOffer,
@@ -467,7 +496,7 @@ impl Str0mVideoReceiver {
             std::sync::mpsc::sync_channel::<ReceiverControl>(TRANSPORT_CHANNEL_CAPACITY);
         self.control_tx = Some(ctrl_tx);
 
-        let state = Arc::clone(&self.state);
+        let context = self.receiver_loop_context();
 
         let handle = std::thread::Builder::new()
             .name("sm-transport-receiver".into())
@@ -479,7 +508,7 @@ impl Str0mVideoReceiver {
                     pkt_tx,
                     event_tx,
                     ctrl_rx,
-                    state,
+                    context,
                 );
             })
             .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
@@ -649,8 +678,10 @@ fn run_receiver_loop(
     pkt_tx: SyncSender<EncodedPacket>,
     event_tx: SyncSender<TransportEvent>,
     ctrl_rx: Receiver<ReceiverControl>,
-    state: Arc<ReceiverShared>,
+    context: ReceiverLoopContext,
 ) {
+    let state = context.state;
+    let _probe = context.probe;
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
     // Instrumentation (HW gate): once-per-generation flag + start instant so the
@@ -954,6 +985,7 @@ mod qsv_ledger_slice2_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 mod tests {
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
