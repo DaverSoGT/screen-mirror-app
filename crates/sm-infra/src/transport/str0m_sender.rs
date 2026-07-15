@@ -47,6 +47,10 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoSender,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::diagnostics::qsv_ledger::TransportLedgerProbe;
+#[cfg(test)]
+use crate::diagnostics::qsv_ledger::{LedgerActivation, LedgerMarker};
 use crate::transport::annex_b::duration_to_90khz;
 
 // ─── Internal control message ────────────────────────────────────────────────
@@ -95,6 +99,47 @@ struct SenderShared {
     dropped: AtomicU64,
 }
 
+/// Private proof that this adapter minted a binding for its own canonical offer.
+#[cfg(test)]
+#[derive(Debug)]
+struct OfferEpochBinding {
+    session_id: String,
+    epoch: u64,
+}
+
+/// The negotiated prerequisites needed before a transport observation can exist.
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MediaReadiness {
+    writer_mid: String,
+    negotiated_h264_pt: u8,
+}
+
+#[cfg(test)]
+fn media_readiness_from_state(
+    offer_bound: bool,
+    ice_ready: bool,
+    writer_mid: Option<&str>,
+    negotiated_h264_pt: Option<u8>,
+) -> Option<MediaReadiness> {
+    if !offer_bound || !ice_ready {
+        return None;
+    }
+
+    Some(MediaReadiness {
+        writer_mid: writer_mid?.to_owned(),
+        negotiated_h264_pt: negotiated_h264_pt?,
+    })
+}
+
+#[cfg(test)]
+fn canonical_offer_session_id(offer: &str) -> Option<String> {
+    let origin = offer.lines().find_map(|line| line.strip_prefix("o="))?;
+    let mut fields = origin.split_whitespace();
+    let _username = fields.next()?;
+    Some(format!("{} {}", fields.next()?, fields.next()?))
+}
+
 impl SenderShared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -139,6 +184,9 @@ pub struct Str0mVideoSender {
     /// Effective local socket address after `start()`. `None` before start.
     /// Used by integration tests to discover the bound port for candidate exchange.
     local_addr: Option<std::net::SocketAddr>,
+    /// Inert until a later slice wires stage-owned witness emission.
+    #[cfg(any(test, feature = "test-support"))]
+    transport_ledger_probe: Mutex<Option<Arc<TransportLedgerProbe>>>,
 }
 
 impl std::fmt::Debug for Str0mVideoSender {
@@ -213,6 +261,8 @@ impl VideoSender for Str0mVideoSender {
             control_tx: None,
             handle: None,
             local_addr: None,
+            #[cfg(any(test, feature = "test-support"))]
+            transport_ledger_probe: Mutex::new(None),
         })
     }
 
@@ -387,6 +437,62 @@ impl Drop for Str0mVideoSender {
 }
 
 impl Str0mVideoSender {
+    #[cfg(test)]
+    fn bind_local_offer_epoch(&self, epoch: u64) -> Result<OfferEpochBinding, TransportError> {
+        let guard = self
+            .pre_neg
+            .lock()
+            .map_err(|error| TransportError::Internal(format!("mutex poisoned: {error}")))?;
+        let offer = guard.as_ref().ok_or(TransportError::NotRunning)?;
+        let session_id = canonical_offer_session_id(&offer.offer_str).ok_or_else(|| {
+            TransportError::Internal("canonical local offer has no valid origin identity".into())
+        })?;
+
+        Ok(OfferEpochBinding { session_id, epoch })
+    }
+
+    #[cfg(test)]
+    fn install_transport_ledger_probe_for_offer(
+        &self,
+        offer: &SdpOffer,
+        binding: &OfferEpochBinding,
+        probe: Arc<TransportLedgerProbe>,
+    ) -> LedgerActivation {
+        let mut markers = offer
+            .0
+            .lines()
+            .filter(|line| line.starts_with("a=x-sm-qsv-ledger:"));
+        let Some(marker) = markers.next() else {
+            return LedgerActivation::Disabled;
+        };
+        if markers.next().is_some() {
+            return LedgerActivation::Disabled;
+        }
+
+        let Ok(marker) = LedgerMarker::parse(marker) else {
+            return LedgerActivation::Disabled;
+        };
+        if marker != LedgerMarker::new(&binding.session_id, binding.epoch) {
+            return LedgerActivation::Disabled;
+        }
+
+        match self.transport_ledger_probe.lock() {
+            Ok(mut attached) => {
+                *attached = Some(probe);
+                LedgerActivation::Enabled
+            }
+            Err(_) => LedgerActivation::Disabled,
+        }
+    }
+
+    /// Attaches an inert probe for external test-support contract compilation.
+    #[cfg(feature = "test-support")]
+    pub fn install_transport_ledger_probe_for_test(&self, probe: Arc<TransportLedgerProbe>) {
+        if let Ok(mut attached) = self.transport_ledger_probe.lock() {
+            *attached = Some(probe);
+        }
+    }
+
     /// Return the effective local socket address after `start()`.
     ///
     /// Returns `None` before `start()` is called. Used by integration tests and
@@ -1088,7 +1194,10 @@ mod tests {
             offer.clone(),
             offer_with_ledger_markers(
                 &offer.0,
-                &[(canonical_session.as_str(), 7), (canonical_session.as_str(), 7)],
+                &[
+                    (canonical_session.as_str(), 7),
+                    (canonical_session.as_str(), 7),
+                ],
             ),
             SdpOffer(format!("{}a=x-sm-qsv-ledger:not-a-marker\\r\\n", offer.0)),
             offer_with_ledger_markers(&offer.0, &[("other-session 1", 7)]),
