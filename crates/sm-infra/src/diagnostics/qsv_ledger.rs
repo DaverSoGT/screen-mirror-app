@@ -299,6 +299,15 @@ pub enum MarkerError {
     SessionMismatch,
 }
 
+/// Result of attempting to activate an observation-only transport ledger probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerActivation {
+    /// The probe is attached to a validated canonical offer and epoch binding.
+    Enabled,
+    /// Observation is disabled without affecting media delivery.
+    Disabled,
+}
+
 /// The RTP header fields used for payload-free correlation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtpHeader {
