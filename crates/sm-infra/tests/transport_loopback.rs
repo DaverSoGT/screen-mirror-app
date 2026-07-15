@@ -2203,11 +2203,22 @@ enum WorkerExit {
     Panicked,
 }
 
+enum RelayState {
+    Idle,
+    Running,
+    Stopping,
+    Stopped,
+}
+
 struct BidirectionalUdpRelay {
     socket: UdpSocket,
     endpoints: [SocketAddr; 2],
     registered: [bool; 2],
     worker: Option<std::thread::JoinHandle<()>>,
+    state: RelayState,
+    stop: Arc<AtomicBool>,
+    command_tx: Option<SyncSender<WorkerCommand>>,
+    completion_rx: Option<Receiver<WorkerExit>>,
 }
 
 impl BidirectionalUdpRelay {
@@ -2228,6 +2239,10 @@ impl BidirectionalUdpRelay {
             endpoints,
             registered: [false; 2],
             worker: None,
+            state: RelayState::Idle,
+            stop: Arc::new(AtomicBool::new(false)),
+            command_tx: None,
+            completion_rx: None,
         })
     }
 
@@ -2246,6 +2261,37 @@ impl BidirectionalUdpRelay {
         Ok(())
     }
 
+    fn start(&mut self) -> RelayResult<()> {
+        if self.worker.is_some() {
+            return Err(RelayError::AlreadyRunning);
+        }
+        let (command_tx, command_rx) = sync_channel(1);
+        let (event_tx, _event_rx) = sync_channel(1);
+        let (completion_tx, completion_rx) = sync_channel(1);
+        let socket = self
+            .socket
+            .try_clone()
+            .map_err(|error| RelayError::Io(error.kind()))?;
+        let endpoints = self.endpoints;
+        let registered = self.registered;
+        let stop = Arc::clone(&self.stop);
+        self.stop.store(false, Ordering::Release);
+        self.worker = Some(std::thread::spawn(move || {
+            let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_loop(socket, endpoints, registered, stop, command_rx, event_tx)
+            }));
+            if let Ok(Some(exit)) = exit {
+                let _ = completion_tx.try_send(exit);
+            } else if exit.is_err() {
+                let _ = completion_tx.try_send(WorkerExit::Panicked);
+            }
+        }));
+        self.command_tx = Some(command_tx);
+        self.completion_rx = Some(completion_rx);
+        self.state = RelayState::Running;
+        Ok(())
+    }
+
     fn recv_at(
         &mut self,
         endpoint: &UdpSocket,
@@ -2254,6 +2300,13 @@ impl BidirectionalUdpRelay {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(RelayError::Timeout)?;
+        if matches!(self.state, RelayState::Idle) {
+            self.route_one(deadline)?;
+        }
+        self.observe_at(endpoint, deadline)
+    }
+
+    fn route_one(&self, deadline: Instant) -> RelayResult<()> {
         let mut bytes = [0_u8; 65_535];
         self.socket
             .set_read_timeout(Some(remaining(deadline)?))
@@ -2272,7 +2325,14 @@ impl BidirectionalUdpRelay {
         self.socket
             .send_to(&bytes[..length], destination)
             .map_err(|error| RelayError::Io(error.kind()))?;
+        Ok(())
+    }
 
+    fn observe_at(
+        &self,
+        endpoint: &UdpSocket,
+        deadline: Instant,
+    ) -> RelayResult<DatagramObservation> {
         let mut observed = [0_u8; 65_535];
         endpoint
             .set_read_timeout(Some(remaining(deadline)?))
@@ -2287,6 +2347,59 @@ impl BidirectionalUdpRelay {
             source: observed_source,
             bytes: observed[..observed_length].to_vec(),
         })
+    }
+
+    fn inject_worker_command(&self, command: WorkerCommand) -> RelayResult<()> {
+        let Some(command_tx) = &self.command_tx else {
+            return Err(RelayError::Disconnected);
+        };
+        command_tx.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => RelayError::CommandBusy,
+            TrySendError::Disconnected(_) => RelayError::Disconnected,
+        })
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> RelayResult<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RelayError::ShutdownTimeout)?;
+        self.state = RelayState::Stopping;
+        self.stop.store(true, Ordering::Release);
+        let Some(completion_rx) = &self.completion_rx else {
+            self.state = RelayState::Stopped;
+            return Ok(());
+        };
+        match completion_rx.recv_timeout(remaining(deadline)?) {
+            Ok(WorkerExit::Stopped) => {
+                let result = self.cleanup(remaining(deadline)?);
+                self.state = RelayState::Stopped;
+                result
+            }
+            Ok(WorkerExit::Panicked) => Err(RelayError::WorkerPanicked),
+            Err(RecvTimeoutError::Timeout) => Err(RelayError::ShutdownTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(RelayError::CompletionDisconnected),
+        }
+    }
+
+    fn cleanup(&mut self, timeout: Duration) -> RelayResult<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RelayError::ShutdownTimeout)?;
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            remaining(deadline).map_err(|_| RelayError::ShutdownTimeout)?;
+            std::thread::yield_now();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| RelayError::WorkerPanicked)?;
+        }
+        self.command_tx = None;
+        self.completion_rx = None;
+        self.state = RelayState::Stopped;
+        Ok(())
     }
 
     fn recv_error(&mut self, timeout: Duration) -> RelayResult<RelayError> {
@@ -2304,6 +2417,47 @@ impl BidirectionalUdpRelay {
         } else {
             Ok(RelayError::UnexpectedSource(source))
         }
+    }
+}
+
+impl Drop for BidirectionalUdpRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.cleanup(Duration::from_millis(100));
+    }
+}
+
+fn worker_loop(
+    socket: UdpSocket,
+    endpoints: [SocketAddr; 2],
+    registered: [bool; 2],
+    stop: Arc<AtomicBool>,
+    command_rx: Receiver<WorkerCommand>,
+    event_tx: SyncSender<()>,
+) -> Option<WorkerExit> {
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
+    let mut bytes = [0_u8; 65_535];
+    loop {
+        match command_rx.try_recv() {
+            Ok(WorkerCommand::Panic) => panic!("P2A2 deterministic worker panic"),
+            Ok(WorkerCommand::DisconnectCompletion) => return None,
+            Err(TryRecvError::Disconnected) => return Some(WorkerExit::Stopped),
+            Err(TryRecvError::Empty) => {}
+        }
+        if stop.load(Ordering::Acquire) {
+            return Some(WorkerExit::Stopped);
+        }
+        let Ok((length, source)) = socket.recv_from(&mut bytes) else {
+            continue;
+        };
+        let Some(index) = endpoints.iter().position(|endpoint| *endpoint == source) else {
+            continue;
+        };
+        if !registered[index] || stop.load(Ordering::Acquire) {
+            continue;
+        }
+        let _ = socket.send_to(&bytes[..length], endpoints[1 - index]);
+        let _ = event_tx.try_send(());
     }
 }
 
@@ -2455,7 +2609,9 @@ fn bounded_call(
     call: impl FnOnce(&mut BidirectionalUdpRelay) -> RelayResult<()> + Send + 'static,
 ) -> (RelayResult<()>, BidirectionalUdpRelay) {
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
-    let call_thread = std::thread::spawn(move || completion_tx.send((call(&mut relay), relay)));
+    let call_thread = std::thread::spawn(move || {
+        let _ = completion_tx.send((call(&mut relay), relay));
+    });
     let completed = completion_rx
         .recv_timeout(P2A_RELAY_TIMEOUT)
         .expect("lifecycle call must complete within the test bound");
