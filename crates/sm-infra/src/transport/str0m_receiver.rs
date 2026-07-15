@@ -955,12 +955,16 @@ mod qsv_ledger_slice2_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
 
     use sm_domain::encode::EncodedPacket;
     use sm_domain::transport::{TransportConfig, TransportError, TransportEvent, VideoReceiver};
 
-    use crate::transport::str0m_receiver::Str0mVideoReceiver;
+    use crate::diagnostics::qsv_ledger::TransportLedgerProbe;
+    use crate::transport::str0m_receiver::{
+        ReceiverControl, ReceiverLoopContext, ReceiverPreNeg, Str0mVideoReceiver, run_receiver_loop,
+    };
 
     // ─── Static assertion: Str0mVideoReceiver is Send + Sync (task 3.5) ───────
 
@@ -996,6 +1000,50 @@ mod tests {
         };
         let result = Str0mVideoReceiver::new(cfg);
         assert!(result.is_ok(), "new() must not reject port 0");
+    }
+
+    #[test]
+    fn p1_receiver_loop_context_attached_probe_preserves_pointer_identity() {
+        let receiver = Str0mVideoReceiver::new(TransportConfig {
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .expect("P1 receiver construction must succeed");
+        let probe = Arc::new(TransportLedgerProbe::collecting());
+
+        receiver.install_transport_ledger_probe_for_test(Arc::clone(&probe));
+        let context: ReceiverLoopContext = receiver.receiver_loop_context();
+        let context_probe = context
+            .probe
+            .expect("an attached probe must be propagated into the receiver loop context");
+
+        assert!(Arc::ptr_eq(&probe, &context_probe));
+    }
+
+    #[test]
+    fn p1_receiver_loop_context_unattached_probe_is_none_and_inert() {
+        let receiver = Str0mVideoReceiver::new(TransportConfig {
+            role: sm_domain::transport::TransportRole::Receiver,
+            ..TransportConfig::default()
+        })
+        .expect("P1 receiver construction must succeed");
+
+        let context: ReceiverLoopContext = receiver.receiver_loop_context();
+
+        assert!(context.probe.is_none());
+    }
+
+    #[test]
+    fn p1_receiver_loop_context_is_the_run_receiver_loop_handoff_argument() {
+        let _: fn(
+            ReceiverPreNeg,
+            std::net::UdpSocket,
+            std::net::SocketAddr,
+            std::sync::mpsc::SyncSender<EncodedPacket>,
+            std::sync::mpsc::SyncSender<TransportEvent>,
+            std::sync::mpsc::Receiver<ReceiverControl>,
+            ReceiverLoopContext,
+        ) = run_receiver_loop;
     }
 
     // ─── S6.4 (part 1): start + stop — thread exits cleanly ──────────────────
