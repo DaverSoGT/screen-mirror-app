@@ -41,7 +41,7 @@ use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sm_domain::encode::{EncodedPacket, EncoderConfig, VideoEncoder};
 use sm_domain::signaling::{IceCandidate, Signaling, SignalingEvent, SignalingRole};
@@ -2164,4 +2164,248 @@ fn pr5b_p1_receiver_unattached_lifecycle_stays_operational_and_inert() {
 
     assert_eq!(unattached_probe.positions(), LedgerPositions::default());
     assert_eq!(unattached_probe.attempted_delta(), [0; 4]);
+}
+
+// ─── PR5B P2A RED: fixed-source opaque relay contracts ──────────────────────
+
+const P2A_RELAY_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Eq, PartialEq)]
+enum RelayError {
+    Io(std::io::ErrorKind),
+    UnexpectedSource(SocketAddr),
+    NotRegistered,
+    Timeout,
+    InvalidEndpoints,
+    UnexpectedEvent,
+}
+
+type RelayResult<T> = Result<T, RelayError>;
+
+struct DatagramObservation {
+    source: SocketAddr,
+    bytes: Vec<u8>,
+}
+
+struct BidirectionalUdpRelay {
+    socket: UdpSocket,
+    endpoints: [SocketAddr; 2],
+    registered: [bool; 2],
+}
+
+impl BidirectionalUdpRelay {
+    fn bind(endpoints: [SocketAddr; 2]) -> RelayResult<Self> {
+        if endpoints[0] == endpoints[1] || endpoints[0].is_ipv4() != endpoints[1].is_ipv4() {
+            return Err(RelayError::InvalidEndpoints);
+        }
+
+        let socket = UdpSocket::bind(if endpoints[0].is_ipv4() {
+            "127.0.0.1:0"
+        } else {
+            "[::1]:0"
+        })
+        .map_err(|error| RelayError::Io(error.kind()))?;
+
+        Ok(Self {
+            socket,
+            endpoints,
+            registered: [false; 2],
+        })
+    }
+
+    fn relay_addr(&self) -> SocketAddr {
+        self.socket
+            .local_addr()
+            .expect("P2A relay exposes its bound address")
+    }
+
+    fn register_endpoint(&mut self, addr: SocketAddr) -> RelayResult<()> {
+        let Some(index) = self.endpoints.iter().position(|endpoint| *endpoint == addr) else {
+            return Err(RelayError::UnexpectedSource(addr));
+        };
+
+        self.registered[index] = true;
+        Ok(())
+    }
+
+    fn recv_at(
+        &mut self,
+        endpoint: &UdpSocket,
+        timeout: Duration,
+    ) -> RelayResult<DatagramObservation> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RelayError::Timeout)?;
+        let mut bytes = [0_u8; 65_535];
+        self.socket
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|error| RelayError::Io(error.kind()))?;
+        let (length, source) = self.socket.recv_from(&mut bytes).map_err(receive_error)?;
+        let source_index = self
+            .endpoints
+            .iter()
+            .position(|registered| *registered == source)
+            .ok_or(RelayError::UnexpectedSource(source))?;
+        if !self.registered[source_index] {
+            return Err(RelayError::NotRegistered);
+        }
+
+        let destination = self.endpoints[1 - source_index];
+        self.socket
+            .send_to(&bytes[..length], destination)
+            .map_err(|error| RelayError::Io(error.kind()))?;
+
+        let mut observed = [0_u8; 65_535];
+        endpoint
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|error| RelayError::Io(error.kind()))?;
+        let (observed_length, observed_source) =
+            endpoint.recv_from(&mut observed).map_err(receive_error)?;
+        if observed_source != self.relay_addr() {
+            return Err(RelayError::UnexpectedSource(observed_source));
+        }
+
+        Ok(DatagramObservation {
+            source: observed_source,
+            bytes: observed[..observed_length].to_vec(),
+        })
+    }
+
+    fn recv_error(&mut self, timeout: Duration) -> RelayResult<RelayError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RelayError::Timeout)?;
+        let mut bytes = [0_u8; 65_535];
+        self.socket
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(|error| RelayError::Io(error.kind()))?;
+        let (_, source) = self.socket.recv_from(&mut bytes).map_err(receive_error)?;
+
+        if self.endpoints.contains(&source) {
+            Err(RelayError::UnexpectedEvent)
+        } else {
+            Ok(RelayError::UnexpectedSource(source))
+        }
+    }
+}
+
+fn remaining(deadline: Instant) -> RelayResult<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(RelayError::Timeout)
+}
+
+fn receive_error(error: std::io::Error) -> RelayError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => RelayError::Timeout,
+        kind => RelayError::Io(kind),
+    }
+}
+
+fn bind_p2a_endpoint() -> UdpSocket {
+    let endpoint = UdpSocket::bind("127.0.0.1:0").expect("P2A endpoint binds");
+    endpoint
+        .set_read_timeout(Some(P2A_RELAY_TIMEOUT))
+        .expect("P2A endpoint uses a bounded receive");
+    endpoint
+}
+
+#[test]
+fn pr5b_p2a_relay_forwards_opaque_datagrams_bidirectionally() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+    let opaque_a_to_b = [0x00, 0xff, 0x10, 0x80, 0x7f];
+    let opaque_b_to_a = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x00];
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+
+    endpoint_a
+        .send_to(&opaque_a_to_b, relay.relay_addr())
+        .expect("endpoint A sends opaque datagram to relay");
+    let received_at_b = relay
+        .recv_at(&endpoint_b, P2A_RELAY_TIMEOUT)
+        .expect("endpoint B receives relay delivery within the test bound");
+    assert_eq!(received_at_b.source, relay.relay_addr());
+    assert_eq!(received_at_b.bytes, opaque_a_to_b);
+
+    endpoint_b
+        .send_to(&opaque_b_to_a, relay.relay_addr())
+        .expect("endpoint B sends opaque datagram to relay");
+    let received_at_a = relay
+        .recv_at(&endpoint_a, P2A_RELAY_TIMEOUT)
+        .expect("endpoint A receives relay delivery within the test bound");
+    assert_eq!(received_at_a.source, relay.relay_addr());
+    assert_eq!(received_at_a.bytes, opaque_b_to_a);
+}
+
+#[test]
+fn pr5b_p2a_relay_forwards_control_bytes_unchanged() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+    let control = [0x80, 0xc8, 0x00, 0x06, 0x12, 0x34, 0x56, 0x78];
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+
+    endpoint_a
+        .send_to(&control, relay.relay_addr())
+        .expect("endpoint A sends control bytes to relay");
+    let delivered = relay
+        .recv_at(&endpoint_b, P2A_RELAY_TIMEOUT)
+        .expect("endpoint B receives control bytes within the test bound");
+
+    assert_eq!(delivered.source, relay.relay_addr());
+    assert_eq!(delivered.bytes, control);
+}
+
+#[test]
+fn pr5b_p2a_relay_reports_unexpected_source_for_unregistered_sender() {
+    let endpoint_a = bind_p2a_endpoint();
+    let endpoint_b = bind_p2a_endpoint();
+    let unregistered_sender = bind_p2a_endpoint();
+    let mut relay: BidirectionalUdpRelay = BidirectionalUdpRelay::bind([
+        endpoint_a.local_addr().expect("endpoint A address"),
+        endpoint_b.local_addr().expect("endpoint B address"),
+    ])
+    .expect("P2A relay binds fixed endpoints");
+
+    relay
+        .register_endpoint(endpoint_a.local_addr().expect("endpoint A address"))
+        .expect("P2A relay registers endpoint A");
+    relay
+        .register_endpoint(endpoint_b.local_addr().expect("endpoint B address"))
+        .expect("P2A relay registers endpoint B");
+    unregistered_sender
+        .send_to(&[0x00, 0xff, 0x10], relay.relay_addr())
+        .expect("unregistered fixed source sends to relay");
+
+    assert_eq!(
+        relay
+            .recv_error(P2A_RELAY_TIMEOUT)
+            .expect("P2A relay publishes an unexpected-source error"),
+        RelayError::UnexpectedSource(
+            unregistered_sender
+                .local_addr()
+                .expect("unregistered sender address")
+        )
+    );
 }
