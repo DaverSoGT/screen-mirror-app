@@ -917,10 +917,12 @@ mod tests {
     use std::sync::mpsc::sync_channel;
 
     use sm_domain::encode::{EncoderConfig, VideoEncoder};
+    use sm_domain::signaling::SdpOffer;
     use sm_domain::transport::{TransportConfig, TransportError, TransportEvent, VideoSender};
     use str0m::{Event, IceConnectionState};
 
-    use super::bind_udp_socket_reusable;
+    use super::{MediaReadiness, bind_udp_socket_reusable, media_readiness_from_state};
+    use crate::diagnostics::qsv_ledger::{LedgerActivation, TransportLedgerProbe};
     use crate::transport::str0m_sender::{PaceStats, Str0mVideoSender, is_ice_ready_event};
 
     // ─── Static assertion: Str0mVideoSender is Send + Sync (task 3.5) ─────────
@@ -1026,6 +1028,107 @@ mod tests {
             sdp.0.contains("v=0"),
             "SDP offer must contain 'v=0', got: {}",
             sdp.0
+        );
+    }
+
+    fn offer_origin_identity(offer: &str) -> String {
+        offer
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.strip_prefix("o=")?.split_whitespace();
+                let _username = fields.next()?;
+                Some(format!("{} {}", fields.next()?, fields.next()?))
+            })
+            .expect("local offer has a canonical origin identity")
+    }
+
+    fn offer_with_ledger_markers(offer: &str, markers: &[(&str, u64)]) -> SdpOffer {
+        let marker_lines = markers
+            .iter()
+            .map(|(session_id, epoch)| {
+                format!(
+                    "a=x-sm-qsv-ledger:1:{}:{epoch}\r\n",
+                    session_id.replace(' ', "%20")
+                )
+            })
+            .collect::<String>();
+        SdpOffer(format!("{offer}{marker_lines}"))
+    }
+
+    #[test]
+    fn offer_epoch_binding_is_adapter_minted_from_the_canonical_local_offer() {
+        let sender = Str0mVideoSender::new(TransportConfig::default()).unwrap();
+        let offer = sender.create_local_offer().unwrap();
+        let canonical_session = offer_origin_identity(&offer.0);
+        let binding = sender
+            .bind_local_offer_epoch(7)
+            .expect("the adapter must mint its own canonical binding");
+        let probe = std::sync::Arc::new(TransportLedgerProbe::collecting());
+
+        assert_eq!(
+            sender.install_transport_ledger_probe_for_offer(
+                &offer_with_ledger_markers(&offer.0, &[(canonical_session.as_str(), 7)]),
+                &binding,
+                std::sync::Arc::clone(&probe),
+            ),
+            LedgerActivation::Enabled,
+        );
+    }
+
+    #[test]
+    fn missing_duplicate_malformed_session_mismatch_and_stale_markers_disable_observation() {
+        let sender = Str0mVideoSender::new(TransportConfig::default()).unwrap();
+        let offer = sender.create_local_offer().unwrap();
+        let canonical_session = offer_origin_identity(&offer.0);
+        let binding = sender
+            .bind_local_offer_epoch(7)
+            .expect("the adapter must mint its own canonical binding");
+        let probe = std::sync::Arc::new(TransportLedgerProbe::collecting());
+        let invalid_offers = [
+            offer.clone(),
+            offer_with_ledger_markers(
+                &offer.0,
+                &[(canonical_session.as_str(), 7), (canonical_session.as_str(), 7)],
+            ),
+            SdpOffer(format!("{}a=x-sm-qsv-ledger:not-a-marker\\r\\n", offer.0)),
+            offer_with_ledger_markers(&offer.0, &[("other-session 1", 7)]),
+            offer_with_ledger_markers(&offer.0, &[(canonical_session.as_str(), 6)]),
+        ];
+
+        for invalid_offer in invalid_offers {
+            assert_eq!(
+                sender.install_transport_ledger_probe_for_offer(
+                    &invalid_offer,
+                    &binding,
+                    std::sync::Arc::clone(&probe),
+                ),
+                LedgerActivation::Disabled,
+                "invalid observation markers must fail open without becoming media errors",
+            );
+        }
+    }
+
+    #[test]
+    fn media_readiness_requires_every_observation_transport_prerequisite() {
+        let (mid, h264_payload_type) = ("video", 102);
+        for state in [
+            (false, true, Some(mid), Some(h264_payload_type)),
+            (true, false, Some(mid), Some(h264_payload_type)),
+            (true, true, None, Some(h264_payload_type)),
+            (true, true, Some(mid), None),
+        ] {
+            assert_eq!(
+                media_readiness_from_state(state.0, state.1, state.2, state.3),
+                None,
+            );
+        }
+
+        assert_eq!(
+            media_readiness_from_state(true, true, Some(mid), Some(h264_payload_type)),
+            Some(MediaReadiness {
+                writer_mid: mid.to_owned(),
+                negotiated_h264_pt: h264_payload_type,
+            }),
         );
     }
 
