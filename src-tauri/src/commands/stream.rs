@@ -928,7 +928,7 @@ trait SignalingPublishOps: Send + Sync {
 /// optional `Box<dyn SignalingOps>` plus drain thread handles.
 ///
 /// Signature:
-/// ```
+/// ```text
 /// FnOnce(Arc<AtomicBool>) -> Result<ReceiverBundle, String>
 /// ```
 pub struct ReceiverBundle {
