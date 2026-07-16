@@ -35,11 +35,11 @@
 //! - `transport_loopback_rtcp_pli_reaches_encoder` — `#[ignore]`; requires DTLS + media flow.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -2184,6 +2184,9 @@ enum RelayError {
     ShutdownTimeout,
     CompletionDisconnected,
     WorkerPanicked,
+    StaleToken,
+    SelectionBusy,
+    NotHeld,
 }
 
 type RelayResult<T> = Result<T, RelayError>;
@@ -2203,6 +2206,29 @@ enum WorkerExit {
     Panicked,
 }
 
+enum WorkerEvent {
+    Held { token: u64 },
+}
+
+struct SelectedRtp {
+    token: u64,
+    source_index: usize,
+    bytes: [u8; 12],
+}
+
+struct HeldRtp {
+    token: u64,
+    source_index: usize,
+    bytes: Vec<u8>,
+}
+
+struct HoldState {
+    tokens: [u64; 2],
+    next_token: u64,
+    selected: Option<SelectedRtp>,
+    held: Option<HeldRtp>,
+}
+
 enum RelayState {
     Idle,
     Running,
@@ -2219,6 +2245,8 @@ struct BidirectionalUdpRelay {
     stop: Arc<AtomicBool>,
     command_tx: Option<SyncSender<WorkerCommand>>,
     completion_rx: Option<Receiver<WorkerExit>>,
+    hold_state: Arc<Mutex<HoldState>>,
+    event_rx: Option<Receiver<WorkerEvent>>,
 }
 
 impl BidirectionalUdpRelay {
@@ -2243,6 +2271,13 @@ impl BidirectionalUdpRelay {
             stop: Arc::new(AtomicBool::new(false)),
             command_tx: None,
             completion_rx: None,
+            hold_state: Arc::new(Mutex::new(HoldState {
+                tokens: [1, 2],
+                next_token: 3,
+                selected: None,
+                held: None,
+            })),
+            event_rx: None,
         })
     }
 
@@ -2257,7 +2292,21 @@ impl BidirectionalUdpRelay {
             return Err(RelayError::UnexpectedSource(addr));
         };
 
+        let mut hold_state = self
+            .hold_state
+            .lock()
+            .map_err(|_| RelayError::Disconnected)?;
         self.registered[index] = true;
+        hold_state.tokens[index] = hold_state.next_token;
+        hold_state.next_token = hold_state.next_token.saturating_add(1);
+        hold_state.selected = hold_state
+            .selected
+            .take()
+            .filter(|selected| selected.source_index != index);
+        hold_state.held = hold_state
+            .held
+            .take()
+            .filter(|held| held.source_index != index);
         Ok(())
     }
 
@@ -2266,7 +2315,7 @@ impl BidirectionalUdpRelay {
             return Err(RelayError::AlreadyRunning);
         }
         let (command_tx, command_rx) = sync_channel(1);
-        let (event_tx, _event_rx) = sync_channel(1);
+        let (event_tx, event_rx) = sync_channel(1);
         let (completion_tx, completion_rx) = sync_channel(1);
         let socket = self
             .socket
@@ -2275,10 +2324,13 @@ impl BidirectionalUdpRelay {
         let endpoints = self.endpoints;
         let registered = self.registered;
         let stop = Arc::clone(&self.stop);
+        let hold_state = Arc::clone(&self.hold_state);
         self.stop.store(false, Ordering::Release);
         self.worker = Some(std::thread::spawn(move || {
             let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_loop(socket, endpoints, registered, stop, command_rx, event_tx)
+                worker_loop(
+                    socket, endpoints, registered, stop, command_rx, event_tx, hold_state,
+                )
             }));
             if let Ok(Some(exit)) = exit {
                 let _ = completion_tx.try_send(exit);
@@ -2288,6 +2340,7 @@ impl BidirectionalUdpRelay {
         }));
         self.command_tx = Some(command_tx);
         self.completion_rx = Some(completion_rx);
+        self.event_rx = Some(event_rx);
         self.state = RelayState::Running;
         Ok(())
     }
@@ -2359,6 +2412,95 @@ impl BidirectionalUdpRelay {
         })
     }
 
+    fn current_token(&self, endpoint: SocketAddr) -> RelayResult<u64> {
+        let Some(index) = self
+            .endpoints
+            .iter()
+            .position(|candidate| *candidate == endpoint)
+        else {
+            return Err(RelayError::UnexpectedSource(endpoint));
+        };
+        if !self.registered[index] {
+            return Err(RelayError::NotRegistered);
+        }
+        self.hold_state
+            .lock()
+            .map_err(|_| RelayError::Disconnected)
+            .map(|hold_state| hold_state.tokens[index])
+    }
+
+    fn hold_selected_rtp(&self, token: u64, selected_rtp: [u8; 12]) -> RelayResult<()> {
+        let mut hold_state = self
+            .hold_state
+            .lock()
+            .map_err(|_| RelayError::Disconnected)?;
+        let Some(source_index) = hold_state
+            .tokens
+            .iter()
+            .position(|current_token| *current_token == token)
+        else {
+            return Err(RelayError::StaleToken);
+        };
+        if hold_state.selected.is_some() || hold_state.held.is_some() {
+            return Err(RelayError::SelectionBusy);
+        }
+        hold_state.selected = Some(SelectedRtp {
+            token,
+            source_index,
+            bytes: selected_rtp,
+        });
+        Ok(())
+    }
+
+    fn wait_until_selected_rtp_is_held(&mut self, timeout: Duration) -> RelayResult<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RelayError::Timeout)?;
+        let expected_token = self
+            .hold_state
+            .lock()
+            .map_err(|_| RelayError::Disconnected)
+            .and_then(|hold_state| {
+                hold_state
+                    .selected
+                    .as_ref()
+                    .map(|selected| selected.token)
+                    .or_else(|| hold_state.held.as_ref().map(|held| held.token))
+                    .ok_or(RelayError::UnexpectedEvent)
+            })?;
+        let event_rx = self.event_rx.as_ref().ok_or(RelayError::Disconnected)?;
+        match event_rx.recv_timeout(remaining(deadline)?) {
+            Ok(WorkerEvent::Held { token }) if token == expected_token => Ok(()),
+            Ok(WorkerEvent::Held { .. }) => Err(RelayError::UnexpectedEvent),
+            Err(RecvTimeoutError::Timeout) => Err(RelayError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(RelayError::Disconnected),
+        }
+    }
+
+    fn release_selected_rtp(&self, token: u64) -> RelayResult<()> {
+        let (bytes, destination) = {
+            let mut hold_state = self
+                .hold_state
+                .lock()
+                .map_err(|_| RelayError::Disconnected)?;
+            if !hold_state.tokens.contains(&token) {
+                return Err(RelayError::StaleToken);
+            }
+            let Some(held) = hold_state.held.as_ref() else {
+                return Err(RelayError::NotHeld);
+            };
+            if held.token != token {
+                return Err(RelayError::StaleToken);
+            }
+            let held = hold_state.held.take().ok_or(RelayError::NotHeld)?;
+            (held.bytes, self.endpoints[1 - held.source_index])
+        };
+        self.socket
+            .send_to(&bytes, destination)
+            .map_err(|error| RelayError::Io(error.kind()))?;
+        Ok(())
+    }
+
     fn shutdown(&mut self, timeout: Duration) -> RelayResult<()> {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -2398,6 +2540,7 @@ impl BidirectionalUdpRelay {
         }
         self.command_tx = None;
         self.completion_rx = None;
+        self.event_rx = None;
         self.state = RelayState::Stopped;
         Ok(())
     }
@@ -2433,7 +2576,8 @@ fn worker_loop(
     registered: [bool; 2],
     stop: Arc<AtomicBool>,
     command_rx: Receiver<WorkerCommand>,
-    event_tx: SyncSender<()>,
+    event_tx: SyncSender<WorkerEvent>,
+    hold_state: Arc<Mutex<HoldState>>,
 ) -> Option<WorkerExit> {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(10)));
     let mut bytes = [0_u8; 65_535];
@@ -2456,8 +2600,32 @@ fn worker_loop(
         if !registered[index] || stop.load(Ordering::Acquire) {
             continue;
         }
+        let held_token = {
+            let Ok(mut hold_state) = hold_state.lock() else {
+                continue;
+            };
+            let matches_selected = hold_state.selected.as_ref().is_some_and(|selected| {
+                selected.source_index == index && bytes[..length] == selected.bytes
+            });
+            if !matches_selected {
+                None
+            } else if let Some(selected) = hold_state.selected.take() {
+                let token = selected.token;
+                hold_state.held = Some(HeldRtp {
+                    token,
+                    source_index: index,
+                    bytes: bytes[..length].to_vec(),
+                });
+                Some(token)
+            } else {
+                None
+            }
+        };
+        if let Some(token) = held_token {
+            let _ = event_tx.try_send(WorkerEvent::Held { token });
+            continue;
+        }
         let _ = socket.send_to(&bytes[..length], endpoints[1 - index]);
-        let _ = event_tx.try_send(());
     }
 }
 
