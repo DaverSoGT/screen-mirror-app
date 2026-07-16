@@ -1,0 +1,62 @@
+name: Feature request
+description: Suggest an improvement for screen-mirror-app
+title: "[Feature]: "
+labels:
+  - enhancement
+  - status:needs-review
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      description: Confirm both requirements before submitting this request.
+      options:
+        - label: I searched the existing issues and confirmed this is not a duplicate.
+          required: true
+        - label: I understand a maintainer must add `status:approved` before a pull request can be opened.
+          required: true
+
+  - type: textarea
+    id: problem_description
+    attributes:
+      label: Problem description
+      description: Describe the problem, limitation, or user need this request would address.
+      placeholder: What problem are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed solution
+      description: Explain how the feature should work from the user's perspective.
+      placeholder: What outcome or behavior would solve the problem?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: affected_area
+    attributes:
+      label: Affected area
+      description: Select the area most closely related to this request.
+      options:
+        - Scripts
+        - Skills
+        - Examples
+        - Documentation
+        - CI/Workflows
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe other approaches or workarounds you considered.
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add mockups, examples, references, or other useful details.

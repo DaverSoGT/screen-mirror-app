@@ -1,0 +1,112 @@
+name: Bug report
+description: Report a reproducible problem with screen-mirror-app
+title: "[Bug]: "
+labels:
+  - bug
+  - status:needs-review
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checks
+      description: Confirm both requirements before submitting this report.
+      options:
+        - label: I searched the existing issues and confirmed this is not a duplicate.
+          required: true
+        - label: I understand a maintainer must add `status:approved` before a pull request can be opened.
+          required: true
+
+  - type: textarea
+    id: bug_description
+    attributes:
+      label: Bug description
+      description: Clearly describe the problem and when it occurs.
+      placeholder: What went wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide a numbered sequence that reliably reproduces the problem.
+      placeholder: |
+        1. Start with...
+        2. Configure...
+        3. Observe...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: Describe what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_behavior
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead, including any visible errors.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating_system
+    attributes:
+      label: Operating system
+      description: Select the environment where the problem occurs.
+      options:
+        - macOS
+        - Ubuntu or Debian
+        - Fedora or RHEL
+        - Arch Linux
+        - Other Linux
+        - Windows
+        - WSL
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent_client
+    attributes:
+      label: Agent / Client
+      description: Select the agent or client involved.
+      options:
+        - Codex
+        - OpenCode
+        - Gemini CLI
+        - Cursor
+        - Windsurf
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shell
+    attributes:
+      label: Shell
+      description: Select the shell used when the problem occurs.
+      options:
+        - bash
+        - zsh
+        - fish
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste relevant logs after removing secrets and sensitive data.
+      render: shell
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add screenshots, workarounds, or other useful details.
