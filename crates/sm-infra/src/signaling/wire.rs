@@ -52,7 +52,11 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 #[serde(tag = "type")]
 pub enum SignalingFrame {
     /// Initial handshake. `proto` MUST be `"v1"`.
-    Hello { proto: String },
+    Hello {
+        proto: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     /// SDP offer from the sender peer. `sdp` is plain SDP text.
     ///
     /// `attempt` is the supervisor reconnect-attempt number at the time this Offer was
