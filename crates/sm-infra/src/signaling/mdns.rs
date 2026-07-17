@@ -2714,7 +2714,7 @@ mod tests {
 
         for role in [SignalingRole::Sender, SignalingRole::Receiver] {
             assert_eq!(
-                super::hello_capabilities(role, &negotiated),
+                super::hello_capabilities(&role, &negotiated),
                 vec!["qsv-ledger-v1".to_string()],
                 "{role:?} must advertise the QSV ledger capability"
             );
