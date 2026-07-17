@@ -146,6 +146,91 @@ enum MdnsControl {
     ReconnectAck { attempt: u8, session_nonce: u64 },
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum A1Pr2bReceipt {
+    Entered {
+        invocation: u64,
+        negotiated: Arc<AtomicBool>,
+    },
+    StopObserved,
+    Exited,
+}
+
+#[cfg(test)]
+impl A1Pr2bReceipt {
+    fn same_negotiated_arc(&self, expected: &Arc<AtomicBool>) -> bool {
+        matches!(self, Self::Entered { negotiated, .. } if Arc::ptr_eq(negotiated, expected))
+    }
+
+    fn negotiated(&self) -> bool {
+        matches!(self, Self::Entered { negotiated, .. } if negotiated.load(Ordering::Acquire))
+    }
+
+    fn invocation(&self) -> u64 {
+        match self {
+            Self::Entered { invocation, .. } => *invocation,
+            Self::StopObserved | Self::Exited => panic!("invocation is only available for Entered"),
+        }
+    }
+}
+
+#[cfg(test)]
+struct A1Pr2bReceiptChannel {
+    receiver: std::sync::mpsc::Receiver<A1Pr2bReceipt>,
+}
+
+#[cfg(test)]
+impl A1Pr2bReceiptChannel {
+    fn recv(&self) -> Result<A1Pr2bReceipt, std::sync::mpsc::RecvError> {
+        self.receiver.recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(
+            self.receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        )
+    }
+
+    fn drain(&self) -> Vec<&'static str> {
+        std::iter::from_fn(|| self.receiver.try_recv().ok())
+            .map(|receipt| match receipt {
+                A1Pr2bReceipt::Entered { .. } => "Entered",
+                A1Pr2bReceipt::StopObserved => "StopObserved",
+                A1Pr2bReceipt::Exited => "Exited",
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+struct A1Pr2bHarness {
+    receipts: std::collections::VecDeque<SyncSender<A1Pr2bReceipt>>,
+    next_invocation: u64,
+    fail_next_spawn: bool,
+    stop_notifier: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+impl Default for A1Pr2bHarness {
+    fn default() -> Self {
+        Self {
+            receipts: std::collections::VecDeque::new(),
+            next_invocation: 0,
+            fail_next_spawn: false,
+            stop_notifier: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+struct A1Pr2bAttempt {
+    harness: Arc<Mutex<A1Pr2bHarness>>,
+    receipt_sender: SyncSender<A1Pr2bReceipt>,
+    invocation: u64,
+}
+
 // ─── MdnsSignaling ────────────────────────────────────────────────────────────
 
 /// mDNS auto-discovery + TCP control channel signaling adapter.
@@ -215,6 +300,8 @@ pub struct MdnsSignaling {
     last_offer_attempt: Arc<AtomicU8>,
     /// Shared peer capability state for the active signaling session.
     qsv_ledger_negotiated: Arc<AtomicBool>,
+    #[cfg(test)]
+    a1_pr2b_harness: Option<Arc<Mutex<A1Pr2bHarness>>>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -231,6 +318,8 @@ impl Signaling for MdnsSignaling {
             // D-8 (REQ-BYE-2): seeded 0; set to last drained Offer attempt in run_frame_loop.
             last_offer_attempt: Arc::new(AtomicU8::new(0)),
             qsv_ledger_negotiated: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            a1_pr2b_harness: None,
         })
     }
 
@@ -241,9 +330,6 @@ impl Signaling for MdnsSignaling {
         if self.handle.is_some() {
             return Err(SignalingError::AlreadyRunning);
         }
-        self.stop.store(false, Ordering::Release);
-        self.clear_qsv_ledger_on_peer_disconnect();
-
         let config = self.config.clone();
         let stop = Arc::clone(&self.stop);
         let inbox = Arc::clone(&self.inbox);
@@ -253,7 +339,34 @@ impl Signaling for MdnsSignaling {
         let last_offer_attempt = Arc::clone(&self.last_offer_attempt);
         let qsv_ledger_negotiated = Arc::clone(&self.qsv_ledger_negotiated);
 
-        let handle = thread::Builder::new()
+        #[cfg(test)]
+        let a1_pr2b_attempt = self.a1_pr2b_preflight()?;
+
+        self.stop.store(false, Ordering::Release);
+        self.clear_qsv_ledger_on_peer_disconnect();
+
+        #[cfg(test)]
+        let spawn_result = match a1_pr2b_attempt {
+            Some(attempt) => a1_pr2b_spawn(attempt, stop, qsv_ledger_negotiated),
+            None => thread::Builder::new()
+                .name("sm-signaling-mdns".to_string())
+                .spawn(move || {
+                    run_signaling_thread(
+                        config,
+                        stop,
+                        inbox,
+                        event_tx,
+                        supervisor_signal_tx,
+                        suppress_bye,
+                        superseded,
+                        last_offer_attempt,
+                        qsv_ledger_negotiated,
+                    );
+                }),
+        };
+
+        #[cfg(not(test))]
+        let spawn_result = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
             .spawn(move || {
                 run_signaling_thread(
@@ -267,8 +380,21 @@ impl Signaling for MdnsSignaling {
                     last_offer_attempt,
                     qsv_ledger_negotiated,
                 );
-            })
-            .map_err(|e| SignalingError::Io(e.to_string()))?;
+            });
+
+        let handle = match spawn_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.stop.store(true, Ordering::Release);
+                self.clear_qsv_ledger_on_peer_disconnect();
+                return Err(SignalingError::Io(error.to_string()));
+            }
+        };
+
+        #[cfg(test)]
+        if let Some(harness) = self.a1_pr2b_harness.as_ref() {
+            a1_pr2b_commit(harness);
+        }
 
         self.handle = Some(handle);
         Ok(())
@@ -318,6 +444,10 @@ impl Signaling for MdnsSignaling {
     fn stop(&mut self) -> Result<(), SignalingError> {
         self.stop.store(true, Ordering::Release);
         self.clear_qsv_ledger_on_peer_disconnect();
+        #[cfg(test)]
+        if let Some(harness) = self.a1_pr2b_harness.as_ref() {
+            a1_pr2b_notify_stop(harness);
+        }
         if let Some(handle) = self.handle.take() {
             handle.join().ok();
         }
@@ -502,6 +632,121 @@ impl MdnsSignaling {
     fn qsv_ledger_negotiated_state_for_test(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.qsv_ledger_negotiated)
     }
+
+    #[cfg(test)]
+    fn a1_pr2b_queue_receipts(&mut self) -> A1Pr2bReceiptChannel {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        let harness = self
+            .a1_pr2b_harness
+            .get_or_insert_with(|| Arc::new(Mutex::new(A1Pr2bHarness::default())));
+        harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .receipts
+            .push_back(sender);
+        A1Pr2bReceiptChannel { receiver }
+    }
+
+    #[cfg(test)]
+    fn a1_pr2b_install_runner(&mut self) {
+        self.a1_pr2b_harness
+            .get_or_insert_with(|| Arc::new(Mutex::new(A1Pr2bHarness::default())));
+    }
+
+    #[cfg(test)]
+    fn a1_pr2b_fail_next_spawn(&mut self) {
+        let harness = self
+            .a1_pr2b_harness
+            .get_or_insert_with(|| Arc::new(Mutex::new(A1Pr2bHarness::default())));
+        harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .fail_next_spawn = true;
+    }
+
+    #[cfg(test)]
+    fn a1_pr2b_preflight(&self) -> Result<Option<A1Pr2bAttempt>, SignalingError> {
+        let Some(harness) = self.a1_pr2b_harness.as_ref() else {
+            return Ok(None);
+        };
+        let guard = harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(receipt_sender) = guard.receipts.front().cloned() else {
+            return Err(SignalingError::Io(
+                "A1 PR2b receipt FIFO is empty".to_string(),
+            ));
+        };
+        Ok(Some(A1Pr2bAttempt {
+            harness: Arc::clone(harness),
+            receipt_sender,
+            invocation: guard.next_invocation,
+        }))
+    }
+}
+
+#[cfg(test)]
+fn a1_pr2b_spawn(
+    attempt: A1Pr2bAttempt,
+    stop: Arc<AtomicBool>,
+    negotiated: Arc<AtomicBool>,
+) -> io::Result<JoinHandle<()>> {
+    let stop_notifier = {
+        let mut harness = attempt
+            .harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if harness.fail_next_spawn {
+            harness.fail_next_spawn = false;
+            return Err(io::Error::other("A1 PR2b forced spawn failure"));
+        }
+        let (stopped, _) = &*harness.stop_notifier;
+        *stopped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        Arc::clone(&harness.stop_notifier)
+    };
+    thread::Builder::new()
+        .name("sm-signaling-mdns-test".to_string())
+        .spawn(move || {
+            let _ = attempt.receipt_sender.send(A1Pr2bReceipt::Entered {
+                invocation: attempt.invocation,
+                negotiated,
+            });
+            let (stopped, notifier) = &*stop_notifier;
+            let guard = stopped
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = notifier
+                .wait_while(guard, |_| !stop.load(Ordering::Acquire))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = attempt.receipt_sender.send(A1Pr2bReceipt::StopObserved);
+            let _ = attempt.receipt_sender.send(A1Pr2bReceipt::Exited);
+        })
+}
+
+#[cfg(test)]
+fn a1_pr2b_commit(harness: &Arc<Mutex<A1Pr2bHarness>>) {
+    let mut harness = harness
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = harness.receipts.pop_front();
+    harness.next_invocation += 1;
+}
+
+#[cfg(test)]
+fn a1_pr2b_notify_stop(harness: &Arc<Mutex<A1Pr2bHarness>>) {
+    let stop_notifier = {
+        let harness = harness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&harness.stop_notifier)
+    };
+    let (stopped, notifier) = &*stop_notifier;
+    *stopped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    notifier.notify_all();
 }
 
 impl Drop for MdnsSignaling {
@@ -2953,25 +3198,41 @@ mod tests {
         .expect("new signaling");
         let negotiated = signaling.qsv_ledger_negotiated_state_for_test();
         let (event_tx, _event_rx) = sync_channel(1);
+        signaling.a1_pr2b_install_runner();
 
-        assert!(matches!(signaling.start(event_tx.clone()), Err(SignalingError::Io(_))));
+        assert!(matches!(
+            signaling.start(event_tx.clone()),
+            Err(SignalingError::Io(_))
+        ));
         assert!(!signaling.stop.load(Ordering::Acquire));
         assert!(!negotiated.load(Ordering::Acquire));
         assert!(signaling.handle.is_none());
 
         let receipts = signaling.a1_pr2b_queue_receipts();
-        signaling.a1_pr2b_install_runner();
         signaling.a1_pr2b_fail_next_spawn();
-        assert!(matches!(signaling.start(event_tx.clone()), Err(SignalingError::Io(_))));
+        assert!(matches!(
+            signaling.start(event_tx.clone()),
+            Err(SignalingError::Io(_))
+        ));
         assert!(signaling.stop.load(Ordering::Acquire));
         assert!(!negotiated.load(Ordering::Acquire));
         assert!(signaling.handle.is_none());
-        assert!(receipts.is_empty(), "failed spawn must not send or consume receipts");
+        assert!(
+            receipts.is_empty(),
+            "failed spawn must not send or consume receipts"
+        );
 
         signaling.start(event_tx.clone()).expect("retry start");
         let entered = receipts.recv().expect("retried invocation receipt");
-        assert_eq!(entered.invocation(), 0, "failed spawn must not advance invocation");
-        assert!(matches!(signaling.start(event_tx), Err(SignalingError::AlreadyRunning)));
+        assert_eq!(
+            entered.invocation(),
+            0,
+            "failed spawn must not advance invocation"
+        );
+        assert!(matches!(
+            signaling.start(event_tx),
+            Err(SignalingError::AlreadyRunning)
+        ));
         signaling.stop().expect("retry stop");
         assert_eq!(receipts.drain(), vec!["StopObserved", "Exited"]);
     }
