@@ -2206,7 +2206,7 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let (client, stop, handle, _last_offer_attempt) =
+        let (client, stop, handle, _last_offer_attempt, _negotiated, _event_rx) =
             spawn_frame_loop_over_loopback_with_attempt(suppress_bye, Arc::new(AtomicU8::new(0)));
         (client, stop, handle)
     }
@@ -2223,6 +2223,8 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
         Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        std::sync::mpsc::Receiver<SignalingEvent>,
     ) {
         use std::net::{TcpListener, TcpStream};
 
@@ -2235,7 +2237,9 @@ mod tests {
         let stop_loop = Arc::clone(&stop);
         let suppress_loop = Arc::clone(&suppress_bye);
         let last_offer_loop = Arc::clone(&last_offer_attempt);
-        let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
+        let negotiated = Arc::new(AtomicBool::new(false));
+        let negotiated_loop = Arc::clone(&negotiated);
+        let (event_tx, event_rx) = sync_channel::<SignalingEvent>(16);
         let inbox: Arc<Mutex<Vec<super::MdnsControl>>> = Arc::new(Mutex::new(Vec::new()));
         let supervisor: Arc<
             Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
@@ -2250,10 +2254,19 @@ mod tests {
                 supervisor,
                 suppress_loop,
                 last_offer_loop,
+                SignalingRole::Sender,
+                negotiated_loop,
             );
         });
 
-        (client, stop, handle, last_offer_attempt)
+        (
+            client,
+            stop,
+            handle,
+            last_offer_attempt,
+            negotiated,
+            event_rx,
+        )
     }
 
     // ─── T-06 / D-8: last_offer_attempt stored on Offer drain; teardown Bye carries it ──
@@ -2305,6 +2318,8 @@ mod tests {
                 supervisor,
                 suppress_loop,
                 last_offer_loop,
+                SignalingRole::Sender,
+                Arc::new(AtomicBool::new(false)),
             );
         });
 
@@ -2334,7 +2349,7 @@ mod tests {
 
         let last_offer_attempt = Arc::new(AtomicU8::new(2));
         let suppress_bye = Arc::new(AtomicBool::new(false));
-        let (mut client, stop, handle, _) =
+        let (mut client, stop, handle, _, _, _event_rx) =
             spawn_frame_loop_over_loopback_with_attempt(suppress_bye, last_offer_attempt);
 
         // Read Hello (sent on connection).
@@ -2661,6 +2676,51 @@ mod tests {
         );
 
         handle.join().expect("frame loop thread must join");
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_frame_loop_replaces_and_clears_shared_capability_state() {
+        use crate::signaling::wire::{SignalingFrame, write_frame};
+
+        let (mut peer, stop, handle, _, negotiated, event_rx) =
+            spawn_frame_loop_over_loopback_with_attempt(
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU8::new(0)),
+            );
+        let hello = read_next_frame_or_eof(&mut peer).expect("read outbound Hello");
+        assert!(
+            matches!(hello, Some(SignalingFrame::Hello { capabilities, .. }) if capabilities == vec!["qsv-ledger-v1"])
+        );
+        for (capabilities, expected) in [
+            (vec!["qsv-ledger-v1".to_string()], true),
+            (Vec::new(), false),
+            (vec!["qsv-ledger-v1".to_string()], true),
+        ] {
+            write_frame(
+                &mut peer,
+                &SignalingFrame::Hello {
+                    proto: "v1".to_string(),
+                    capabilities,
+                },
+            )
+            .expect("send peer Hello");
+            write_frame(
+                &mut peer,
+                &SignalingFrame::Offer {
+                    sdp: "v=0".to_string(),
+                    attempt: 1,
+                },
+            )
+            .expect("send barrier Offer");
+            assert!(matches!(
+                event_rx.recv().expect("receive barrier Offer"),
+                SignalingEvent::OfferReceived(_, 1)
+            ));
+            assert_eq!(negotiated.load(Ordering::Acquire), expected);
+        }
+        stop.store(true, Ordering::Release);
+        handle.join().expect("frame loop joins");
+        assert!(!negotiated.load(Ordering::Acquire));
     }
 
     #[test]
