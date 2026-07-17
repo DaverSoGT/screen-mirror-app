@@ -1111,7 +1111,7 @@ mod tests {
 
         pending.push(WriterWitness::new(fresh_front.clone()), 10);
         pending.push(WriterWitness::new(stale_middle), 0);
-        pending.push(WriterWitness::new(fresh_tail.clone()), 11);
+        pending.push(WriterWitness::new(fresh_tail.clone()), 5);
         let outcome = pending.push(WriterWitness::new(new_tail.clone()), 15);
 
         assert_eq!(outcome.stale_evicted, 1);
