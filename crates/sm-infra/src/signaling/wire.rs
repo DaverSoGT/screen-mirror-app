@@ -52,7 +52,11 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 #[serde(tag = "type")]
 pub enum SignalingFrame {
     /// Initial handshake. `proto` MUST be `"v1"`.
-    Hello { proto: String },
+    Hello {
+        proto: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
+    },
     /// SDP offer from the sender peer. `sdp` is plain SDP text.
     ///
     /// `attempt` is the supervisor reconnect-attempt number at the time this Offer was
@@ -176,6 +180,7 @@ mod tests {
     fn hello_frame_round_trip() {
         let frame = SignalingFrame::Hello {
             proto: "v1".to_string(),
+            capabilities: Vec::new(),
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).expect("write_frame must not fail for Hello");
@@ -546,5 +551,34 @@ mod tests {
         let err = read_frame(&mut Cursor::new(bytes))
             .expect_err("must still reject unknown frame types after adding reconnect variants");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+    #[test]
+    fn pr5b_a1_old_json_defaults_capabilities_empty() {
+        let decoded: SignalingFrame = serde_json::from_slice(br#"{"type":"Hello","proto":"v1"}"#)
+            .expect("legacy Hello JSON must remain decodable");
+        assert!(
+            matches!(decoded, SignalingFrame::Hello { capabilities, .. } if capabilities.is_empty())
+        );
+    }
+    #[test]
+    fn pr5b_a1_empty_hello_omits_field_byte_compatibly() {
+        let hello = SignalingFrame::Hello {
+            proto: "v1".to_string(),
+            capabilities: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&hello).expect("empty Hello must serialize"),
+            br#"{"type":"Hello","proto":"v1"}"#,
+        );
+    }
+    #[test]
+    fn pr5b_a1_capability_hello_decodes_with_legacy_shape() {
+        let decoded: SignalingFrame = serde_json::from_slice(
+            br#"{"type":"Hello","proto":"v1","capabilities":["qsv-ledger-v1"],"future":true}"#,
+        )
+        .expect("Hello must tolerate extra known-variant fields");
+        assert!(
+            matches!(decoded, SignalingFrame::Hello { capabilities, .. } if capabilities == ["qsv-ledger-v1"])
+        );
     }
 }
