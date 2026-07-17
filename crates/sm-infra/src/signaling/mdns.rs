@@ -2253,9 +2253,11 @@ mod tests {
                 event_tx,
                 supervisor,
                 suppress_loop,
-                last_offer_loop,
-                SignalingRole::Sender,
-                negotiated_loop,
+                super::FrameLoopContext {
+                    last_offer_attempt: last_offer_loop,
+                    role: SignalingRole::Sender,
+                    qsv_ledger_negotiated: negotiated_loop,
+                },
             );
         });
 
@@ -2317,9 +2319,11 @@ mod tests {
                 event_tx,
                 supervisor,
                 suppress_loop,
-                last_offer_loop,
-                SignalingRole::Sender,
-                Arc::new(AtomicBool::new(false)),
+                super::FrameLoopContext {
+                    last_offer_attempt: last_offer_loop,
+                    role: SignalingRole::Sender,
+                    qsv_ledger_negotiated: Arc::new(AtomicBool::new(false)),
+                },
             );
         });
 
