@@ -478,7 +478,7 @@ pub(crate) fn frame_to_event(
     supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) -> Option<SignalingEvent> {
     match frame {
-        SignalingFrame::Hello { proto: _ } => None,
+        SignalingFrame::Hello { .. } => None,
         SignalingFrame::Offer { sdp, attempt } => {
             Some(SignalingEvent::OfferReceived(SdpOffer(sdp), attempt))
         }
@@ -969,6 +969,7 @@ fn run_frame_loop(
         &mut writer,
         &SignalingFrame::Hello {
             proto: "v1".to_string(),
+            capabilities: Vec::new(),
         },
     ) {
         eprintln!("[sm-signaling-frame-loop] EXIT: hello write failed: {e}");
@@ -1048,7 +1049,7 @@ fn run_frame_loop(
                 }
                 SignalingFrame::Answer { sdp } => format!("Answer (sdp={} bytes)", sdp.len()),
                 SignalingFrame::Candidate { sdp } => format!("Candidate (sdp={} bytes)", sdp.len()),
-                SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
+                SignalingFrame::Hello { proto, .. } => format!("Hello (proto={proto})"),
                 SignalingFrame::Bye { attempt } => format!("Bye(attempt={attempt})"),
                 SignalingFrame::ReconnectRequest {
                     attempt,
@@ -1077,7 +1078,7 @@ fn run_frame_loop(
         match read_frame_or_pending(&mut reader, &stop) {
             Ok(Some(frame)) => {
                 let kind = match &frame {
-                    SignalingFrame::Hello { proto } => format!("Hello (proto={proto})"),
+                    SignalingFrame::Hello { proto, .. } => format!("Hello (proto={proto})"),
                     SignalingFrame::Offer { sdp, attempt } => {
                         format!("Offer (sdp={} bytes, attempt={attempt})", sdp.len())
                     }
@@ -1464,6 +1465,7 @@ mod tests {
         let event = frame_to_event(
             SignalingFrame::Hello {
                 proto: "v1".to_string(),
+                capabilities: Vec::new(),
             },
             &no_supervisor(),
         );
@@ -1872,6 +1874,7 @@ mod tests {
     fn read_frame_or_pending_mid_frame_eof_returns_unexpected_eof() {
         let frame = SignalingFrame::Hello {
             proto: "v1".to_string(),
+            capabilities: Vec::new(),
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &frame).unwrap();
