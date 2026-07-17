@@ -2662,4 +2662,89 @@ mod tests {
 
         handle.join().expect("frame loop thread must join");
     }
+
+    #[test]
+    fn pr5b_a1_pr2a_qsv_ledger_token_is_exact_and_case_sensitive() {
+        assert!(super::is_qsv_ledger_capability("qsv-ledger-v1"));
+        assert!(!super::is_qsv_ledger_capability("QSV-ledger-v1"));
+        assert!(!super::is_qsv_ledger_capability("qsv-ledger-v01"));
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_peer_capabilities_are_bounded_replaced_and_deduplicated() {
+        let negotiated = Arc::new(AtomicBool::new(false));
+
+        super::replace_peer_qsv_ledger_capability(
+            &negotiated,
+            &[
+                "unknown-v1".to_string(),
+                "qsv--ledger-v1".to_string(),
+                "QSV-ledger-v1".to_string(),
+                "qsv-ledger-v1".to_string(),
+                "qsv-ledger-v1".to_string(),
+            ],
+        );
+        assert!(
+            super::qsv_ledger_negotiated(&negotiated),
+            "the first valid exact token must negotiate the capability"
+        );
+
+        let mut later_token = (0..16)
+            .map(|index| format!("unknown-{index}"))
+            .collect::<Vec<_>>();
+        later_token.push("qsv-ledger-v1".to_string());
+        super::replace_peer_qsv_ledger_capability(&negotiated, &later_token);
+        assert!(
+            !super::qsv_ledger_negotiated(&negotiated),
+            "each Hello must replace, not accumulate, and tokens after the first 16 are ignored"
+        );
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_hello_advertises_the_capability_for_sender_and_receiver() {
+        let negotiated = Arc::new(AtomicBool::new(false));
+
+        for role in [SignalingRole::Sender, SignalingRole::Receiver] {
+            assert_eq!(
+                super::hello_capabilities(role, &negotiated),
+                vec!["qsv-ledger-v1".to_string()],
+                "{role:?} must advertise the QSV ledger capability"
+            );
+        }
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_negotiated_state_clears_for_peer_disconnect_reset_and_local_stop() {
+        let mut signaling = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Sender,
+            ..Default::default()
+        })
+        .expect("new signaling");
+        let negotiated = signaling.qsv_ledger_negotiated_state_for_test();
+
+        signaling.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        assert!(super::qsv_ledger_negotiated(&negotiated));
+        signaling.clear_qsv_ledger_on_peer_disconnect();
+        assert!(!super::qsv_ledger_negotiated(&negotiated));
+
+        signaling.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        let reset = signaling.reset().expect("reset signaling");
+        assert!(
+            !super::qsv_ledger_negotiated(&negotiated),
+            "reset must Release-clear the shared state before dropping the old instance"
+        );
+        assert!(
+            !super::qsv_ledger_negotiated(&reset.qsv_ledger_negotiated_state_for_test()),
+            "a reset instance must begin with no negotiated peer capability"
+        );
+
+        let mut stopped = reset;
+        stopped.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        let stopped_state = stopped.qsv_ledger_negotiated_state_for_test();
+        stopped.stop().expect("stop signaling");
+        assert!(
+            !super::qsv_ledger_negotiated(&stopped_state),
+            "local stop must Release-clear the negotiated state"
+        );
+    }
 }
