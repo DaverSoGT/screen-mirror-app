@@ -781,10 +781,10 @@ impl TransportLedgerProbe {
 mod tests {
     use super::{
         AccessUnitIdentity, BoundedRecorder, ClockDomain, CompletedAuWitness, Evidence,
-        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, RECORD_BYTE_LIMIT,
-        RETENTION_WINDOW_US, RTP_STREAM_LIMIT, RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome,
-        RtpBinding, RtpHeader, RtpHeaderAggregator, SourceAuKey, TransportLedgerProbe,
-        UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
+        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, PendingPushOutcome,
+        PendingWriterFifo, RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT,
+        RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome, RtpBinding, RtpHeader, RtpHeaderAggregator,
+        SourceAuKey, TransportLedgerProbe, UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
     };
 
     const SESSION_ID: &str = "1000 2";
@@ -1022,6 +1022,150 @@ mod tests {
         assert_eq!(source.epoch(), 7);
         assert_eq!(source.source_sequence(), 41);
         assert_eq!(source.media_time_90khz(), 8_100);
+    }
+
+    fn writer(session: &str, epoch: u64, sequence: u64, media_time_90khz: u64) -> WriterWitness {
+        WriterWitness::new(SourceAuKey::new(session, epoch, sequence, media_time_90khz))
+    }
+
+    #[test]
+    fn pending_writer_fifo_returns_the_oldest_low_32_bit_timestamp_collision_without_consuming_it()
+    {
+        let first = SourceAuKey::new("session-a", 7, 41, 1);
+        let second = SourceAuKey::new("session-a", 7, 42, (u32::MAX as u64) + 2);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(first.clone()), 10);
+        pending.push(WriterWitness::new(second.clone()), 11);
+
+        assert_eq!(
+            pending.oldest_matching_source("session-a", 7, 1, 12),
+            Some(first.clone())
+        );
+        assert_eq!(
+            pending.oldest_matching_source("session-a", 7, 1, 12),
+            Some(first)
+        );
+        assert_eq!(
+            pending.pending_sources(),
+            vec![SourceAuKey::new("session-a", 7, 41, 1), second]
+        );
+    }
+
+    #[test]
+    fn pending_writer_fifo_isolates_exact_session_and_epoch_while_matching_each_inserted_session() {
+        let session_a = SourceAuKey::new("session-a", 7, 41, 9);
+        let session_b = SourceAuKey::new("session-b", 7, 42, 9);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(session_a.clone()), 10);
+        pending.push(WriterWitness::new(session_b.clone()), 11);
+
+        assert_eq!(pending.oldest_matching_source("session-a", 8, 9, 12), None);
+        assert_eq!(
+            pending.oldest_matching_source("session-missing", 7, 9, 12),
+            None
+        );
+        assert_eq!(
+            pending.oldest_matching_source("session-b", 7, 9, 12),
+            Some(session_b)
+        );
+        assert_eq!(
+            pending.oldest_matching_source("session-a", 7, 9, 12),
+            Some(session_a)
+        );
+    }
+
+    #[test]
+    fn pending_writer_fifo_preserves_equal_acceptance_time_insertion_order() {
+        let first = SourceAuKey::new("session-a", 7, 41, 9);
+        let second = SourceAuKey::new("session-a", 7, 42, 9);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(first.clone()), 10);
+        pending.push(WriterWitness::new(second.clone()), 10);
+
+        assert_eq!(pending.pending_sources(), vec![first, second]);
+    }
+
+    #[test]
+    fn pending_writer_fifo_retains_the_stale_boundary() {
+        let boundary = SourceAuKey::new("session-a", 7, 41, 1);
+        let mut pending = PendingWriterFifo::with_limits(2, 10);
+
+        pending.push(WriterWitness::new(boundary.clone()), 1);
+
+        assert_eq!(
+            pending.oldest_matching_source("session-a", 7, 1, 11),
+            Some(boundary)
+        );
+    }
+
+    #[test]
+    fn pending_writer_fifo_stably_sweeps_a_stale_interior_entry() {
+        let fresh_front = SourceAuKey::new("session-a", 7, 41, 1);
+        let stale_middle = SourceAuKey::new("session-a", 7, 42, 2);
+        let fresh_tail = SourceAuKey::new("session-a", 7, 43, 3);
+        let new_tail = SourceAuKey::new("session-a", 7, 44, 4);
+        let mut pending = PendingWriterFifo::with_limits(4, 10);
+
+        pending.push(WriterWitness::new(fresh_front.clone()), 10);
+        pending.push(WriterWitness::new(stale_middle), 0);
+        pending.push(WriterWitness::new(fresh_tail.clone()), 11);
+        let outcome = pending.push(WriterWitness::new(new_tail.clone()), 15);
+
+        assert_eq!(outcome.stale_evicted, 1);
+        assert_eq!(
+            pending.pending_sources(),
+            vec![fresh_front, fresh_tail, new_tail]
+        );
+    }
+
+    #[test]
+    fn pending_writer_fifo_evicts_the_global_oldest_entry_when_capacity_is_reached() {
+        let first = SourceAuKey::new("session-a", 7, 41, 1);
+        let second = SourceAuKey::new("session-a", 7, 42, 2);
+        let mut pending = PendingWriterFifo::with_limits(2, u64::MAX);
+
+        pending.push(WriterWitness::new(first), 10);
+        pending.push(WriterWitness::new(second.clone()), 11);
+        let outcome = pending.push(writer("session-a", 7, 43, 3), 12);
+
+        assert_eq!(
+            outcome,
+            PendingPushOutcome {
+                retained: true,
+                stale_evicted: 0,
+                cap_evicted: 1
+            }
+        );
+        assert_eq!(
+            pending.pending_sources(),
+            vec![second, SourceAuKey::new("session-a", 7, 43, 3)]
+        );
+    }
+
+    #[test]
+    fn pending_writer_fifo_fails_open_for_zero_capacity_missing_and_stale_matches_without_payloads()
+    {
+        let mut disabled = PendingWriterFifo::new(0);
+
+        assert_eq!(
+            disabled.push(writer("session-a", 7, 41, 9), 10),
+            PendingPushOutcome {
+                retained: false,
+                stale_evicted: 0,
+                cap_evicted: 0
+            }
+        );
+        assert!(disabled.is_empty());
+        assert_eq!(disabled.oldest_matching_source("session-a", 7, 9, 10), None);
+
+        let mut pending = PendingWriterFifo::with_limits(1, 10);
+        pending.push(writer("session-a", 7, 41, 9), 0);
+
+        assert_eq!(pending.oldest_matching_source("session-a", 7, 9, 11), None);
+        assert_eq!(pending.len(), 0);
     }
 
     #[test]
