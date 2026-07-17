@@ -2902,4 +2902,77 @@ mod tests {
             "local stop must Release-clear the negotiated state"
         );
     }
+
+    #[test]
+    fn a1_pr2b_same_object_restart_keeps_the_shared_arc_and_resets_it_before_each_worker() {
+        let mut signaling = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Sender,
+            ..Default::default()
+        })
+        .expect("new signaling");
+        let negotiated = signaling.qsv_ledger_negotiated_state_for_test();
+        let first_receipts = signaling.a1_pr2b_queue_receipts();
+        let second_receipts = signaling.a1_pr2b_queue_receipts();
+        signaling.a1_pr2b_install_runner();
+        let (event_tx, _event_rx) = sync_channel(1);
+
+        signaling.start(event_tx.clone()).expect("first start");
+        let first_entered = first_receipts.recv().expect("first entered receipt");
+        assert!(first_entered.same_negotiated_arc(&negotiated));
+        assert!(!first_entered.negotiated());
+
+        negotiated.store(true, Ordering::Release);
+        signaling.stop().expect("first stop");
+        assert_eq!(
+            first_receipts.drain(),
+            vec!["StopObserved", "Exited"],
+            "receipts must preserve the deterministic first-worker stop order"
+        );
+
+        signaling.start(event_tx).expect("second start");
+        let second_entered = second_receipts.recv().expect("second entered receipt");
+        assert!(second_entered.same_negotiated_arc(&negotiated));
+        assert!(
+            !second_entered.negotiated(),
+            "the restarted worker must enter with peer negotiation reset"
+        );
+        signaling.stop().expect("second stop");
+        assert_eq!(
+            second_receipts.drain(),
+            vec!["StopObserved", "Exited"],
+            "the second worker must retain FIFO receipt ordering"
+        );
+    }
+
+    #[test]
+    fn a1_pr2b_preflight_and_failed_spawn_do_not_consume_receipts_or_invocations() {
+        let mut signaling = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Sender,
+            ..Default::default()
+        })
+        .expect("new signaling");
+        let negotiated = signaling.qsv_ledger_negotiated_state_for_test();
+        let (event_tx, _event_rx) = sync_channel(1);
+
+        assert!(matches!(signaling.start(event_tx.clone()), Err(SignalingError::Io(_))));
+        assert!(!signaling.stop.load(Ordering::Acquire));
+        assert!(!negotiated.load(Ordering::Acquire));
+        assert!(signaling.handle.is_none());
+
+        let receipts = signaling.a1_pr2b_queue_receipts();
+        signaling.a1_pr2b_install_runner();
+        signaling.a1_pr2b_fail_next_spawn();
+        assert!(matches!(signaling.start(event_tx.clone()), Err(SignalingError::Io(_))));
+        assert!(signaling.stop.load(Ordering::Acquire));
+        assert!(!negotiated.load(Ordering::Acquire));
+        assert!(signaling.handle.is_none());
+        assert!(receipts.is_empty(), "failed spawn must not send or consume receipts");
+
+        signaling.start(event_tx.clone()).expect("retry start");
+        let entered = receipts.recv().expect("retried invocation receipt");
+        assert_eq!(entered.invocation(), 0, "failed spawn must not advance invocation");
+        assert!(matches!(signaling.start(event_tx), Err(SignalingError::AlreadyRunning)));
+        signaling.stop().expect("retry stop");
+        assert_eq!(receipts.drain(), vec!["StopObserved", "Exited"]);
+    }
 }
