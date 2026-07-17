@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::Serialize;
@@ -438,94 +438,69 @@ impl RtpHeaderAggregator {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OfferEpoch(u64);
+/// Source-owned identity for one encoded access unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceAuKey {
+    session: Arc<str>,
+    epoch: u64,
+    source_sequence: u64,
+    media_time_90khz: u64,
+}
 
-impl OfferEpoch {
+impl SourceAuKey {
+    /// Creates a source identity with its mandatory session and media fields.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub fn new(
+        session: impl Into<Arc<str>>,
+        epoch: u64,
+        source_sequence: u64,
+        media_time_90khz: u64,
+    ) -> Self {
+        Self {
+            session: session.into(),
+            epoch,
+            source_sequence,
+            media_time_90khz,
+        }
     }
 
     #[must_use]
-    pub const fn value(self) -> u64 {
-        self.0
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+
+    #[must_use]
+    pub const fn media_time_90khz(&self) -> u64 {
+        self.media_time_90khz
     }
 }
 
+/// RTP fields bound to a source access unit at a transport stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceMediaUnit(u64);
-
-impl SourceMediaUnit {
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MediaTime(u64);
-
-impl MediaTime {
-    #[must_use]
-    pub const fn from_90khz(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn as_90khz(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccessUnitIdentity {
-    offer_epoch: OfferEpoch,
-    source_media_unit: SourceMediaUnit,
-    media_time: MediaTime,
+pub struct RtpBinding {
     ssrc: u32,
     rtp_timestamp: u32,
     occurrence: u64,
 }
 
-impl AccessUnitIdentity {
+impl RtpBinding {
     #[must_use]
-    pub const fn new(
-        offer_epoch: OfferEpoch,
-        source_media_unit: SourceMediaUnit,
-        media_time: MediaTime,
-        ssrc: u32,
-        rtp_timestamp: u32,
-        occurrence: u64,
-    ) -> Self {
+    pub const fn new(ssrc: u32, rtp_timestamp: u32, occurrence: u64) -> Self {
         Self {
-            offer_epoch,
-            source_media_unit,
-            media_time,
             ssrc,
             rtp_timestamp,
             occurrence,
         }
-    }
-
-    #[must_use]
-    pub const fn offer_epoch(self) -> OfferEpoch {
-        self.offer_epoch
-    }
-
-    #[must_use]
-    pub const fn source_media_unit(self) -> SourceMediaUnit {
-        self.source_media_unit
-    }
-
-    #[must_use]
-    pub const fn media_time(self) -> MediaTime {
-        self.media_time
     }
 
     #[must_use]
@@ -544,32 +519,87 @@ impl AccessUnitIdentity {
     }
 }
 
+/// Source and RTP bindings composed for a transport-owned access unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccessUnitIdentity {
+    source: SourceAuKey,
+    rtp: RtpBinding,
+}
+
+impl AccessUnitIdentity {
+    #[must_use]
+    pub fn new(source: SourceAuKey, rtp: RtpBinding) -> Self {
+        Self { source, rtp }
+    }
+
+    #[must_use]
+    pub fn source(&self) -> SourceAuKey {
+        self.source.clone()
+    }
+
+    #[must_use]
+    pub const fn rtp(&self) -> RtpBinding {
+        self.rtp
+    }
+
+    /// Returns the bound RTP SSRC for compatibility with existing callers.
+    #[must_use]
+    pub const fn ssrc(&self) -> u32 {
+        self.rtp.ssrc()
+    }
+
+    /// Returns the bound RTP timestamp for compatibility with existing callers.
+    #[must_use]
+    pub const fn rtp_timestamp(&self) -> u32 {
+        self.rtp.rtp_timestamp()
+    }
+
+    /// Returns the bound RTP occurrence for compatibility with existing callers.
+    #[must_use]
+    pub const fn occurrence(&self) -> u64 {
+        self.rtp.occurrence()
+    }
+}
+
 macro_rules! stage_witness {
     ($name:ident, $description:literal) => {
         #[doc = $description]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $name {
             identity: AccessUnitIdentity,
         }
 
         impl $name {
             #[must_use]
-            pub const fn new(identity: AccessUnitIdentity) -> Self {
+            pub fn new(identity: AccessUnitIdentity) -> Self {
                 Self { identity }
             }
 
             #[must_use]
-            pub const fn identity(self) -> AccessUnitIdentity {
-                self.identity
+            pub fn identity(&self) -> AccessUnitIdentity {
+                self.identity.clone()
             }
         }
     };
 }
 
-stage_witness!(
-    WriterWitness,
-    "A witness recorded after a source writer accepts an access unit."
-);
+/// A witness recorded after a source writer accepts an access unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriterWitness {
+    source: SourceAuKey,
+}
+
+impl WriterWitness {
+    #[must_use]
+    pub fn new(source: SourceAuKey) -> Self {
+        Self { source }
+    }
+
+    #[must_use]
+    pub fn source(&self) -> SourceAuKey {
+        self.source.clone()
+    }
+}
 stage_witness!(
     UdpTransmitWitness,
     "A witness recorded when UDP transmit owns an access unit."
@@ -751,9 +781,9 @@ impl TransportLedgerProbe {
 mod tests {
     use super::{
         AccessUnitIdentity, BoundedRecorder, ClockDomain, CompletedAuWitness, Evidence,
-        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, MediaTime, OfferEpoch,
-        RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT, RTP_TIMESTAMP_HISTORY_LIMIT,
-        RecordOutcome, RtpHeader, RtpHeaderAggregator, SourceMediaUnit, TransportLedgerProbe,
+        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, RECORD_BYTE_LIMIT,
+        RETENTION_WINDOW_US, RTP_STREAM_LIMIT, RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome,
+        RtpBinding, RtpHeader, RtpHeaderAggregator, SourceAuKey, TransportLedgerProbe,
         UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
     };
 
@@ -985,58 +1015,76 @@ mod tests {
     }
 
     #[test]
-    fn collecting_probe_keeps_stage_owned_witnesses_and_immutable_exact_deltas() {
-        let probe = TransportLedgerProbe::collecting();
-        let identity = AccessUnitIdentity::new(
-            OfferEpoch::new(7),
-            SourceMediaUnit::new(41),
-            MediaTime::from_90khz(8_100),
-            99,
-            8_100,
-            0,
-        );
-        assert_eq!(identity.offer_epoch().value(), 7);
-        assert_eq!(identity.source_media_unit().value(), 41);
-        assert_eq!(identity.media_time().as_90khz(), 8_100);
+    fn source_key_requires_session_epoch_sequence_and_media_time() {
+        let source = SourceAuKey::new("session-a", 7, 41, 8_100);
+
+        assert_eq!(source.session(), "session-a");
+        assert_eq!(source.epoch(), 7);
+        assert_eq!(source.source_sequence(), 41);
+        assert_eq!(source.media_time_90khz(), 8_100);
+    }
+
+    #[test]
+    fn access_unit_identity_composes_source_and_rtp_bindings() {
+        let source = SourceAuKey::new("session-a", 7, 41, 8_100);
+        let rtp = RtpBinding::new(99, 8_100, 0);
+        let identity = AccessUnitIdentity::new(source.clone(), rtp);
+
+        assert_eq!(identity.source(), source);
+        assert_eq!(identity.rtp(), rtp);
         assert_eq!(identity.ssrc(), 99);
         assert_eq!(identity.rtp_timestamp(), 8_100);
         assert_eq!(identity.occurrence(), 0);
-        let second_identity = AccessUnitIdentity::new(
-            OfferEpoch::new(7),
-            SourceMediaUnit::new(42),
-            MediaTime::from_90khz(8_200),
-            99,
-            8_200,
-            1,
-        );
+    }
+
+    #[test]
+    fn collecting_probe_keeps_stage_owned_witnesses_and_immutable_exact_deltas() {
+        let probe = TransportLedgerProbe::collecting();
+        let source = SourceAuKey::new("session-a", 7, 41, 8_100);
+        let identity = AccessUnitIdentity::new(source.clone(), RtpBinding::new(99, 8_100, 0));
+        let second_source = SourceAuKey::new("session-a", 7, 42, 8_200);
+        let second_identity =
+            AccessUnitIdentity::new(second_source.clone(), RtpBinding::new(99, 8_200, 1));
         let start = probe.positions();
 
-        probe.record_writer(WriterWitness::new(identity));
+        probe.record_writer(WriterWitness::new(source));
         let writer_snapshot = probe.writer_witnesses();
         let checkpoint = probe.positions();
-        probe.record_writer(WriterWitness::new(second_identity));
-        probe.record_udp_transmit(UdpTransmitWitness::new(identity));
-        probe.record_udp_receive(UdpReceiveWitness::new(identity));
-        probe.record_completed_au(CompletedAuWitness::new(identity));
+        probe.record_writer(WriterWitness::new(second_source));
+        probe.record_udp_transmit(UdpTransmitWitness::new(identity.clone()));
+        probe.record_udp_receive(UdpReceiveWitness::new(identity.clone()));
+        probe.record_completed_au(CompletedAuWitness::new(identity.clone()));
 
-        assert_eq!(WriterWitness::new(identity).identity(), identity);
-        assert_eq!(UdpTransmitWitness::new(identity).identity(), identity);
-        assert_eq!(UdpReceiveWitness::new(identity).identity(), identity);
-        assert_eq!(CompletedAuWitness::new(identity).identity(), identity);
-        assert_eq!(writer_snapshot, vec![WriterWitness::new(identity)]);
+        assert_eq!(
+            WriterWitness::new(identity.source()).source(),
+            identity.source()
+        );
+        assert_eq!(
+            UdpTransmitWitness::new(identity.clone()).identity(),
+            identity
+        );
+        assert_eq!(
+            UdpReceiveWitness::new(identity.clone()).identity(),
+            identity
+        );
+        assert_eq!(
+            CompletedAuWitness::new(identity.clone()).identity(),
+            identity
+        );
+        assert_eq!(writer_snapshot, vec![WriterWitness::new(identity.source())]);
         assert_eq!(probe.exact_delta_since(start), [2, 1, 1, 1]);
         assert_eq!(probe.exact_delta_since(checkpoint), [1, 1, 1, 1]);
         assert_eq!(
             probe.writer_witnesses_since(checkpoint),
-            vec![WriterWitness::new(second_identity)]
+            vec![WriterWitness::new(second_identity.source())]
         );
         assert_eq!(
             probe.udp_transmit_witnesses_since(start),
-            vec![UdpTransmitWitness::new(identity)]
+            vec![UdpTransmitWitness::new(identity.clone())]
         );
         assert_eq!(
             probe.udp_receive_witnesses_since(start),
-            vec![UdpReceiveWitness::new(identity)]
+            vec![UdpReceiveWitness::new(identity.clone())]
         );
         assert_eq!(
             probe.completed_au_witnesses_since(start),
@@ -1047,20 +1095,14 @@ mod tests {
     #[test]
     fn rejecting_probe_counts_two_attempts_per_stage_without_retaining_witnesses() {
         let probe = TransportLedgerProbe::rejecting();
-        let identity = AccessUnitIdentity::new(
-            OfferEpoch::new(7),
-            SourceMediaUnit::new(41),
-            MediaTime::from_90khz(8_100),
-            99,
-            8_100,
-            0,
-        );
+        let source = SourceAuKey::new("session-a", 7, 41, 8_100);
+        let identity = AccessUnitIdentity::new(source.clone(), RtpBinding::new(99, 8_100, 0));
 
         for _ in 0..2 {
-            probe.record_writer(WriterWitness::new(identity));
-            probe.record_udp_transmit(UdpTransmitWitness::new(identity));
-            probe.record_udp_receive(UdpReceiveWitness::new(identity));
-            probe.record_completed_au(CompletedAuWitness::new(identity));
+            probe.record_writer(WriterWitness::new(source.clone()));
+            probe.record_udp_transmit(UdpTransmitWitness::new(identity.clone()));
+            probe.record_udp_receive(UdpReceiveWitness::new(identity.clone()));
+            probe.record_completed_au(CompletedAuWitness::new(identity.clone()));
         }
 
         assert_eq!(probe.attempted_delta(), [2, 2, 2, 2]);
