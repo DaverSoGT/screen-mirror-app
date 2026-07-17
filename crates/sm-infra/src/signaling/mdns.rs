@@ -3167,11 +3167,12 @@ mod tests {
         assert!(!first_entered.negotiated());
 
         negotiated.store(true, Ordering::Release);
+        signaling.a1_pr2b_record_negotiated();
         signaling.stop().expect("first stop");
         assert_eq!(
             first_receipts.drain(),
-            vec!["StopObserved", "Exited"],
-            "receipts must preserve the deterministic first-worker stop order"
+            vec!["Negotiated", "StopObserved", "Exited"],
+            "receipts must preserve the deterministic negotiated-to-stop FIFO order"
         );
 
         signaling.start(event_tx).expect("second start");
