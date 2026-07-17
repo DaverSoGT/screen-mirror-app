@@ -153,6 +153,7 @@ enum A1Pr2bReceipt {
         invocation: u64,
         negotiated: Arc<AtomicBool>,
     },
+    Negotiated,
     StopObserved,
     Exited,
 }
@@ -170,7 +171,9 @@ impl A1Pr2bReceipt {
     fn invocation(&self) -> u64 {
         match self {
             Self::Entered { invocation, .. } => *invocation,
-            Self::StopObserved | Self::Exited => panic!("invocation is only available for Entered"),
+            Self::Negotiated | Self::StopObserved | Self::Exited => {
+                panic!("invocation is only available for Entered")
+            }
         }
     }
 }
@@ -197,6 +200,7 @@ impl A1Pr2bReceiptChannel {
         std::iter::from_fn(|| self.receiver.try_recv().ok())
             .map(|receipt| match receipt {
                 A1Pr2bReceipt::Entered { .. } => "Entered",
+                A1Pr2bReceipt::Negotiated => "Negotiated",
                 A1Pr2bReceipt::StopObserved => "StopObserved",
                 A1Pr2bReceipt::Exited => "Exited",
             })
@@ -207,6 +211,7 @@ impl A1Pr2bReceiptChannel {
 #[cfg(test)]
 struct A1Pr2bHarness {
     receipts: std::collections::VecDeque<SyncSender<A1Pr2bReceipt>>,
+    active_receipt_sender: Option<SyncSender<A1Pr2bReceipt>>,
     next_invocation: u64,
     fail_next_spawn: bool,
     stop_notifier: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -217,6 +222,7 @@ impl Default for A1Pr2bHarness {
     fn default() -> Self {
         Self {
             receipts: std::collections::VecDeque::new(),
+            active_receipt_sender: None,
             next_invocation: 0,
             fail_next_spawn: false,
             stop_notifier: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
@@ -665,6 +671,23 @@ impl MdnsSignaling {
     }
 
     #[cfg(test)]
+    fn a1_pr2b_record_negotiated(&self) {
+        if !self.qsv_ledger_negotiated.load(Ordering::Acquire) {
+            return;
+        }
+        let receipt_sender = self.a1_pr2b_harness.as_ref().and_then(|harness| {
+            harness
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_receipt_sender
+                .clone()
+        });
+        if let Some(receipt_sender) = receipt_sender {
+            let _ = receipt_sender.send(A1Pr2bReceipt::Negotiated);
+        }
+    }
+
+    #[cfg(test)]
     fn a1_pr2b_preflight(&self) -> Result<Option<A1Pr2bAttempt>, SignalingError> {
         let Some(harness) = self.a1_pr2b_harness.as_ref() else {
             return Ok(None);
@@ -730,7 +753,7 @@ fn a1_pr2b_commit(harness: &Arc<Mutex<A1Pr2bHarness>>) {
     let mut harness = harness
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _ = harness.receipts.pop_front();
+    harness.active_receipt_sender = harness.receipts.pop_front();
     harness.next_invocation += 1;
 }
 
