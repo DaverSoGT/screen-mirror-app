@@ -2668,6 +2668,7 @@ mod tests {
         assert!(super::is_qsv_ledger_capability("qsv-ledger-v1"));
         assert!(!super::is_qsv_ledger_capability("QSV-ledger-v1"));
         assert!(!super::is_qsv_ledger_capability("qsv-ledger-v01"));
+        assert!(!super::is_qsv_ledger_capability("qsv-ledger-v1-extra"));
     }
 
     #[test]
@@ -2688,6 +2689,13 @@ mod tests {
             super::qsv_ledger_negotiated(&negotiated),
             "the first valid exact token must negotiate the capability"
         );
+
+        let mut sixteenth_token = (0..15)
+            .map(|index| format!("unknown-{index}"))
+            .collect::<Vec<_>>();
+        sixteenth_token.push("qsv-ledger-v1".to_string());
+        super::replace_peer_qsv_ledger_capability(&negotiated, &sixteenth_token);
+        assert!(super::qsv_ledger_negotiated(&negotiated));
 
         let mut later_token = (0..16)
             .map(|index| format!("unknown-{index}"))
