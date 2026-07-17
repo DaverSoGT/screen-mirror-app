@@ -478,7 +478,7 @@ pub(crate) fn frame_to_event(
     supervisor_signal_tx: &Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
 ) -> Option<SignalingEvent> {
     match frame {
-        SignalingFrame::Hello { proto: _, .. } => None,
+        SignalingFrame::Hello { .. } => None,
         SignalingFrame::Offer { sdp, attempt } => {
             Some(SignalingEvent::OfferReceived(SdpOffer(sdp), attempt))
         }
