@@ -585,6 +585,23 @@ fn run_probe_on_isolated_thread(
     run_probe_on_isolated_thread_with(PROBE_TIMEOUT, move || init_mft_sync(&config))
 }
 
+fn classify_probe_receive<T>(
+    received: Result<Result<T, EncoderError>, std::sync::mpsc::RecvTimeoutError>,
+    timeout: std::time::Duration,
+) -> Result<T, EncoderError> {
+    match received {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(EncoderError::InitFailed(format!(
+            "probe thread timeout after {}s",
+            timeout.as_secs()
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(EncoderError::InitFailed(
+            "probe thread panicked before sending result".into(),
+        )),
+    }
+}
+
 /// Testability seam — same machinery as `run_probe_on_isolated_thread`, but the
 /// probe body and timeout are injected. Tests use this to simulate panic, error,
 /// and timeout without touching real Media Foundation.
@@ -630,17 +647,8 @@ where
         .map_err(|e| EncoderError::InitFailed(format!("probe thread spawn: {e}")))?;
     // detached not joined — see REQ-MFT-15
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok((activate_send, vendor))) => Ok((activate_send.into_inner(), vendor)),
-        Ok(Err(e)) => Err(e),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(EncoderError::InitFailed(format!(
-            "probe thread timeout after {}s",
-            timeout.as_secs()
-        ))),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(EncoderError::InitFailed(
-            "probe thread panicked before sending result".into(),
-        )),
-    }
+    classify_probe_receive(rx.recv_timeout(timeout), timeout)
+        .map(|(activate_send, vendor)| (activate_send.into_inner(), vendor))
 }
 
 /// Enumerate hardware H.264 MFT candidates from MFTEnumEx (steps 3–4).
@@ -2885,11 +2893,35 @@ mod tests {
     fn probe_thread_panic_returns_init_failed() {
         use std::time::Duration;
         let r = run_probe_on_isolated_thread_with(Duration::from_secs(5), || {
-            panic!("simulated probe panic")
+            std::panic::resume_unwind(Box::new("simulated probe unwind"))
         });
         assert!(
             matches!(&r, Err(EncoderError::InitFailed(s)) if s.contains("panicked before sending result")),
             "expected InitFailed containing \"panicked before sending result\", got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_receive_disconnect_maps_to_the_existing_init_failure() {
+        use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+
+        let r = classify_probe_receive::<()>(Err(RecvTimeoutError::Disconnected), Duration::ZERO);
+
+        assert!(
+            matches!(&r, Err(EncoderError::InitFailed(s)) if s == "probe thread panicked before sending result"),
+            "expected the existing disconnected-probe InitFailed, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_receive_success_and_timeout_remain_distinct() {
+        use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+
+        assert!(classify_probe_receive(Ok(Ok(())), Duration::ZERO).is_ok());
+        let timeout = classify_probe_receive::<()>(Err(RecvTimeoutError::Timeout), Duration::ZERO);
+        assert!(
+            matches!(&timeout, Err(EncoderError::InitFailed(s)) if s.contains("probe thread timeout")),
+            "expected timeout to remain distinct from disconnect, got {timeout:?}"
         );
     }
 
