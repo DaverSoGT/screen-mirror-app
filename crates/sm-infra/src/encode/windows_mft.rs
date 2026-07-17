@@ -585,6 +585,23 @@ fn run_probe_on_isolated_thread(
     run_probe_on_isolated_thread_with(PROBE_TIMEOUT, move || init_mft_sync(&config))
 }
 
+fn classify_probe_receive<T>(
+    received: Result<Result<T, EncoderError>, std::sync::mpsc::RecvTimeoutError>,
+    timeout: std::time::Duration,
+) -> Result<T, EncoderError> {
+    match received {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(EncoderError::InitFailed(format!(
+            "probe thread timeout after {}s",
+            timeout.as_secs()
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(EncoderError::InitFailed(
+            "probe thread panicked before sending result".into(),
+        )),
+    }
+}
+
 /// Testability seam — same machinery as `run_probe_on_isolated_thread`, but the
 /// probe body and timeout are injected. Tests use this to simulate panic, error,
 /// and timeout without touching real Media Foundation.
@@ -630,17 +647,8 @@ where
         .map_err(|e| EncoderError::InitFailed(format!("probe thread spawn: {e}")))?;
     // detached not joined — see REQ-MFT-15
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok((activate_send, vendor))) => Ok((activate_send.into_inner(), vendor)),
-        Ok(Err(e)) => Err(e),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(EncoderError::InitFailed(format!(
-            "probe thread timeout after {}s",
-            timeout.as_secs()
-        ))),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(EncoderError::InitFailed(
-            "probe thread panicked before sending result".into(),
-        )),
-    }
+    classify_probe_receive(rx.recv_timeout(timeout), timeout)
+        .map(|(activate_send, vendor)| (activate_send.into_inner(), vendor))
 }
 
 /// Enumerate hardware H.264 MFT candidates from MFTEnumEx (steps 3–4).
@@ -2909,10 +2917,7 @@ mod tests {
     fn probe_receive_success_and_timeout_remain_distinct() {
         use std::{sync::mpsc::RecvTimeoutError, time::Duration};
 
-        assert_eq!(
-            classify_probe_receive(Ok(Ok(())), Duration::ZERO),
-            Ok(())
-        );
+        assert!(classify_probe_receive(Ok(Ok(())), Duration::ZERO).is_ok());
         let timeout = classify_probe_receive::<()>(Err(RecvTimeoutError::Timeout), Duration::ZERO);
         assert!(
             matches!(&timeout, Err(EncoderError::InitFailed(s)) if s.contains("probe thread timeout")),

@@ -2197,7 +2197,7 @@ struct DatagramObservation {
 }
 
 enum WorkerCommand {
-    Panic,
+    ResumeUnwind,
     DisconnectCompletion,
 }
 
@@ -2332,10 +2332,8 @@ impl BidirectionalUdpRelay {
                     socket, endpoints, registered, stop, command_rx, event_tx, hold_state,
                 )
             }));
-            if let Ok(Some(exit)) = exit {
+            if let Some(exit) = worker_exit_after_unwind(exit) {
                 let _ = completion_tx.try_send(exit);
-            } else if exit.is_err() {
-                let _ = completion_tx.try_send(WorkerExit::Panicked);
             }
         }));
         self.command_tx = Some(command_tx);
@@ -2583,7 +2581,9 @@ fn worker_loop(
     let mut bytes = [0_u8; 65_535];
     loop {
         match command_rx.try_recv() {
-            Ok(WorkerCommand::Panic) => panic!("P2A2 deterministic worker panic"),
+            Ok(WorkerCommand::ResumeUnwind) => {
+                std::panic::resume_unwind(Box::new("P2A2 deterministic worker unwind"));
+            }
             Ok(WorkerCommand::DisconnectCompletion) => return None,
             Err(TryRecvError::Disconnected) => return Some(WorkerExit::Stopped),
             Err(TryRecvError::Empty) => {}
@@ -2808,6 +2808,13 @@ fn pr5b_p2a2_relay_worker_panic_is_reported_and_cleaned_up_boundedly() {
     assert!(shutdown == Err(RelayError::WorkerPanicked) && relay.worker.is_some());
     let cleanup = relay.cleanup(P2A_RELAY_TIMEOUT);
     assert!(cleanup.is_ok() && relay.worker.is_none());
+}
+
+fn worker_exit_after_unwind(result: std::thread::Result<Option<WorkerExit>>) -> Option<WorkerExit> {
+    match result {
+        Ok(exit) => exit,
+        Err(_) => Some(WorkerExit::Panicked),
+    }
 }
 
 #[test]
