@@ -600,6 +600,116 @@ impl WriterWitness {
         self.source.clone()
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingWriter {
+    witness: WriterWitness,
+    accepted_at_us: u64,
+}
+
+/// The result of adding a writer witness to pending correlation state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingPushOutcome {
+    pub retained: bool,
+    pub stale_evicted: usize,
+    pub cap_evicted: usize,
+}
+
+/// Bounded, single-owner pending state for source writer witnesses.
+#[derive(Debug)]
+pub struct PendingWriterFifo {
+    entries: VecDeque<PendingWriter>,
+    capacity: usize,
+    stale_after_us: u64,
+}
+
+impl PendingWriterFifo {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, RETENTION_WINDOW_US)
+    }
+
+    #[must_use]
+    pub fn with_limits(capacity: usize, stale_after_us: u64) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity,
+            stale_after_us,
+        }
+    }
+
+    pub fn push(&mut self, witness: WriterWitness, accepted_at_us: u64) -> PendingPushOutcome {
+        let stale_evicted = self.sweep_stale(accepted_at_us);
+        if self.capacity == 0 {
+            return PendingPushOutcome {
+                retained: false,
+                stale_evicted,
+                cap_evicted: 0,
+            };
+        }
+
+        self.entries.push_back(PendingWriter {
+            witness,
+            accepted_at_us,
+        });
+        let mut cap_evicted = 0;
+        while self.entries.len() > self.capacity {
+            let _ = self.entries.pop_front();
+            cap_evicted += 1;
+        }
+
+        PendingPushOutcome {
+            retained: true,
+            stale_evicted,
+            cap_evicted,
+        }
+    }
+
+    #[must_use]
+    pub fn oldest_matching_source(
+        &mut self,
+        session: &str,
+        epoch: u64,
+        rtp_timestamp: u32,
+        now_us: u64,
+    ) -> Option<SourceAuKey> {
+        self.sweep_stale(now_us);
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.witness.source.session() == session
+                    && entry.witness.source.epoch() == epoch
+                    && entry.witness.source.media_time_90khz() as u32 == rtp_timestamp
+            })
+            .map(|entry| entry.witness.source())
+    }
+
+    #[must_use]
+    pub fn pending_sources(&self) -> Vec<SourceAuKey> {
+        self.entries
+            .iter()
+            .map(|entry| entry.witness.source())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn sweep_stale(&mut self, now_us: u64) -> usize {
+        let original_len = self.entries.len();
+        self.entries
+            .retain(|entry| entry.accepted_at_us.saturating_add(self.stale_after_us) >= now_us);
+        original_len - self.entries.len()
+    }
+}
+
 stage_witness!(
     UdpTransmitWitness,
     "A witness recorded when UDP transmit owns an access unit."
