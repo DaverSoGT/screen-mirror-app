@@ -75,6 +75,32 @@ const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Read timeout for the TCP frame loop — allows periodic stop-flag checks.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Capability advertised by peers that support the QSV delivery ledger.
+const QSV_LEDGER_CAPABILITY: &str = "qsv-ledger-v1";
+
+fn is_qsv_ledger_capability(capability: &str) -> bool {
+    capability == QSV_LEDGER_CAPABILITY
+}
+
+fn replace_peer_qsv_ledger_capability(negotiated: &Arc<AtomicBool>, capabilities: &[String]) {
+    let peer_supports_ledger = capabilities
+        .iter()
+        .take(16)
+        .any(|capability| is_qsv_ledger_capability(capability));
+    negotiated.store(peer_supports_ledger, Ordering::Release);
+}
+
+#[cfg(test)]
+fn qsv_ledger_negotiated(negotiated: &Arc<AtomicBool>) -> bool {
+    negotiated.load(Ordering::Acquire)
+}
+
+fn hello_capabilities(role: &SignalingRole, _negotiated: &Arc<AtomicBool>) -> Vec<String> {
+    match role {
+        SignalingRole::Sender | SignalingRole::Receiver => vec![QSV_LEDGER_CAPABILITY.to_string()],
+    }
+}
+
 /// Process-global monotonic counter assigning a unique id to each signaling
 /// connection (one per `run_frame_loop` invocation).
 ///
@@ -187,6 +213,8 @@ pub struct MdnsSignaling {
     /// is read on all targets to stamp the teardown Bye. Clippy cross-target will
     /// confirm no dead_code warning here (if it fires, add cfg_attr as in half-1).
     last_offer_attempt: Arc<AtomicU8>,
+    /// Shared peer capability state for the active signaling session.
+    qsv_ledger_negotiated: Arc<AtomicBool>,
 }
 
 impl Signaling for MdnsSignaling {
@@ -202,6 +230,7 @@ impl Signaling for MdnsSignaling {
             superseded: Arc::new(AtomicBool::new(false)),
             // D-8 (REQ-BYE-2): seeded 0; set to last drained Offer attempt in run_frame_loop.
             last_offer_attempt: Arc::new(AtomicU8::new(0)),
+            qsv_ledger_negotiated: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -213,6 +242,7 @@ impl Signaling for MdnsSignaling {
             return Err(SignalingError::AlreadyRunning);
         }
         self.stop.store(false, Ordering::Release);
+        self.clear_qsv_ledger_on_peer_disconnect();
 
         let config = self.config.clone();
         let stop = Arc::clone(&self.stop);
@@ -221,6 +251,7 @@ impl Signaling for MdnsSignaling {
         let suppress_bye = Arc::clone(&self.suppress_bye);
         let superseded = Arc::clone(&self.superseded);
         let last_offer_attempt = Arc::clone(&self.last_offer_attempt);
+        let qsv_ledger_negotiated = Arc::clone(&self.qsv_ledger_negotiated);
 
         let handle = thread::Builder::new()
             .name("sm-signaling-mdns".to_string())
@@ -234,6 +265,7 @@ impl Signaling for MdnsSignaling {
                     suppress_bye,
                     superseded,
                     last_offer_attempt,
+                    qsv_ledger_negotiated,
                 );
             })
             .map_err(|e| SignalingError::Io(e.to_string()))?;
@@ -285,6 +317,7 @@ impl Signaling for MdnsSignaling {
     /// Stop signaling. Idempotent. Joins the thread.
     fn stop(&mut self) -> Result<(), SignalingError> {
         self.stop.store(true, Ordering::Release);
+        self.clear_qsv_ledger_on_peer_disconnect();
         if let Some(handle) = self.handle.take() {
             handle.join().ok();
         }
@@ -450,9 +483,24 @@ impl MdnsSignaling {
         // `self` is consumed (moved), which calls Drop and stops the thread.
         // Construct a fresh instance with the same config.
         let config = self.config.clone();
+        self.clear_qsv_ledger_on_peer_disconnect();
         // Drop `self` — this calls `Stop::drop` which calls `stop()`.
         drop(self);
         MdnsSignaling::new(config)
+    }
+
+    fn clear_qsv_ledger_on_peer_disconnect(&self) {
+        self.qsv_ledger_negotiated.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn replace_peer_qsv_ledger_capability(&self, capabilities: &[String]) {
+        replace_peer_qsv_ledger_capability(&self.qsv_ledger_negotiated, capabilities);
+    }
+
+    #[cfg(test)]
+    fn qsv_ledger_negotiated_state_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.qsv_ledger_negotiated)
     }
 }
 
@@ -535,6 +583,12 @@ pub(crate) fn frame_to_event(
 
 // ─── Thread entry point ───────────────────────────────────────────────────────
 
+struct FrameLoopContext {
+    last_offer_attempt: Arc<AtomicU8>,
+    role: SignalingRole,
+    qsv_ledger_negotiated: Arc<AtomicBool>,
+}
+
 /// Dispatch to the sender or receiver thread based on role.
 #[allow(clippy::too_many_arguments)]
 fn run_signaling_thread(
@@ -546,6 +600,7 @@ fn run_signaling_thread(
     suppress_bye: Arc<AtomicBool>,
     superseded: Arc<AtomicBool>,
     last_offer_attempt: Arc<AtomicU8>,
+    qsv_ledger_negotiated: Arc<AtomicBool>,
 ) {
     match config.role {
         // `superseded` gates ONLY the sender accept loop (listener handover, B).
@@ -558,7 +613,11 @@ fn run_signaling_thread(
             supervisor_signal_tx,
             suppress_bye,
             superseded,
-            last_offer_attempt,
+            FrameLoopContext {
+                last_offer_attempt,
+                role: SignalingRole::Sender,
+                qsv_ledger_negotiated,
+            },
         ),
         SignalingRole::Receiver => run_receiver_thread(
             config,
@@ -567,7 +626,11 @@ fn run_signaling_thread(
             event_tx,
             supervisor_signal_tx,
             suppress_bye,
-            last_offer_attempt,
+            FrameLoopContext {
+                last_offer_attempt,
+                role: SignalingRole::Receiver,
+                qsv_ledger_negotiated,
+            },
         ),
     }
 }
@@ -665,8 +728,11 @@ fn run_sender_thread(
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
     superseded: Arc<AtomicBool>,
-    last_offer_attempt: Arc<AtomicU8>,
+    context: FrameLoopContext,
 ) {
+    context
+        .qsv_ledger_negotiated
+        .store(false, Ordering::Release);
     let port = config.control_port;
 
     // Bind TCP listener BEFORE mDNS registration so the receiver can connect
@@ -793,7 +859,7 @@ fn run_sender_thread(
         event_tx,
         supervisor_signal_tx,
         suppress_bye,
-        last_offer_attempt,
+        context,
     );
     let _ = mdns.shutdown();
 }
@@ -807,8 +873,11 @@ fn run_receiver_thread(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
-    last_offer_attempt: Arc<AtomicU8>,
+    context: FrameLoopContext,
 ) {
+    context
+        .qsv_ledger_negotiated
+        .store(false, Ordering::Release);
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -895,7 +964,7 @@ fn run_receiver_thread(
         event_tx,
         supervisor_signal_tx,
         suppress_bye,
-        last_offer_attempt,
+        context,
     );
     let _ = mdns.shutdown();
 }
@@ -912,8 +981,14 @@ fn run_frame_loop(
     event_tx: SyncSender<SignalingEvent>,
     supervisor_signal_tx: Arc<Mutex<Option<SyncSender<SupervisorSignal>>>>,
     suppress_bye: Arc<AtomicBool>,
-    last_offer_attempt: Arc<AtomicU8>,
+    context: FrameLoopContext,
 ) {
+    let FrameLoopContext {
+        last_offer_attempt,
+        role,
+        qsv_ledger_negotiated,
+    } = context;
+    qsv_ledger_negotiated.store(false, Ordering::Release);
     // D6 instrumentation: assign a unique signaling-instance id to this connection
     // so the HW operator can correlate which listener/connection served it (and,
     // on teardown, which instance emitted a stale Bye) across overlapping
@@ -940,6 +1015,7 @@ fn run_frame_loop(
     // Set read timeout so the loop can check the stop flag and drain the inbox.
     if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
         emit_error(&event_tx, SignalingError::Io(e.to_string()));
+        qsv_ledger_negotiated.store(false, Ordering::Release);
         return;
     }
 
@@ -947,6 +1023,7 @@ fn run_frame_loop(
         Ok(s) => s,
         Err(e) => {
             emit_error(&event_tx, SignalingError::Io(e.to_string()));
+            qsv_ledger_negotiated.store(false, Ordering::Release);
             return;
         }
     };
@@ -969,11 +1046,12 @@ fn run_frame_loop(
         &mut writer,
         &SignalingFrame::Hello {
             proto: "v1".to_string(),
-            capabilities: Vec::new(),
+            capabilities: hello_capabilities(&role, &qsv_ledger_negotiated),
         },
     ) {
         eprintln!("[sm-signaling-frame-loop] EXIT: hello write failed: {e}");
         emit_error(&event_tx, SignalingError::Io(e.to_string()));
+        qsv_ledger_negotiated.store(false, Ordering::Release);
         return;
     }
 
@@ -1065,6 +1143,7 @@ fn run_frame_loop(
             if let Err(e) = write_frame(&mut writer, &frame) {
                 eprintln!("[sm-signaling-frame-loop] write_frame error: {e}");
                 emit_error(&event_tx, SignalingError::Io(e.to_string()));
+                qsv_ledger_negotiated.store(false, Ordering::Release);
                 return;
             }
         }
@@ -1098,6 +1177,9 @@ fn run_frame_loop(
                     } => format!("ReconnectAck (attempt={attempt}, nonce={session_nonce})"),
                 };
                 eprintln!("[sm-signaling-frame-loop] IN  ← instance={instance_id} {kind}");
+                if let SignalingFrame::Hello { capabilities, .. } = &frame {
+                    replace_peer_qsv_ledger_capability(&qsv_ledger_negotiated, capabilities);
+                }
                 match frame_to_event(frame, &supervisor_signal_tx) {
                     Some(SignalingEvent::Closed { attempt }) => {
                         eprintln!(
@@ -1174,6 +1256,7 @@ fn run_frame_loop(
             }
         }
     }
+    qsv_ledger_negotiated.store(false, Ordering::Release);
 }
 
 // ─── Resilient frame reader ──────────────────────────────────────────────────
@@ -2206,7 +2289,7 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        let (client, stop, handle, _last_offer_attempt) =
+        let (client, stop, handle, _last_offer_attempt, _negotiated, _event_rx) =
             spawn_frame_loop_over_loopback_with_attempt(suppress_bye, Arc::new(AtomicU8::new(0)));
         (client, stop, handle)
     }
@@ -2223,6 +2306,8 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
         Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        std::sync::mpsc::Receiver<SignalingEvent>,
     ) {
         use std::net::{TcpListener, TcpStream};
 
@@ -2235,7 +2320,9 @@ mod tests {
         let stop_loop = Arc::clone(&stop);
         let suppress_loop = Arc::clone(&suppress_bye);
         let last_offer_loop = Arc::clone(&last_offer_attempt);
-        let (event_tx, _event_rx) = sync_channel::<SignalingEvent>(16);
+        let negotiated = Arc::new(AtomicBool::new(false));
+        let negotiated_loop = Arc::clone(&negotiated);
+        let (event_tx, event_rx) = sync_channel::<SignalingEvent>(16);
         let inbox: Arc<Mutex<Vec<super::MdnsControl>>> = Arc::new(Mutex::new(Vec::new()));
         let supervisor: Arc<
             Mutex<Option<std::sync::mpsc::SyncSender<sm_domain::supervisor::SupervisorSignal>>>,
@@ -2249,11 +2336,22 @@ mod tests {
                 event_tx,
                 supervisor,
                 suppress_loop,
-                last_offer_loop,
+                super::FrameLoopContext {
+                    last_offer_attempt: last_offer_loop,
+                    role: SignalingRole::Sender,
+                    qsv_ledger_negotiated: negotiated_loop,
+                },
             );
         });
 
-        (client, stop, handle, last_offer_attempt)
+        (
+            client,
+            stop,
+            handle,
+            last_offer_attempt,
+            negotiated,
+            event_rx,
+        )
     }
 
     // ─── T-06 / D-8: last_offer_attempt stored on Offer drain; teardown Bye carries it ──
@@ -2304,7 +2402,11 @@ mod tests {
                 event_tx,
                 supervisor,
                 suppress_loop,
-                last_offer_loop,
+                super::FrameLoopContext {
+                    last_offer_attempt: last_offer_loop,
+                    role: SignalingRole::Sender,
+                    qsv_ledger_negotiated: Arc::new(AtomicBool::new(false)),
+                },
             );
         });
 
@@ -2334,7 +2436,7 @@ mod tests {
 
         let last_offer_attempt = Arc::new(AtomicU8::new(2));
         let suppress_bye = Arc::new(AtomicBool::new(false));
-        let (mut client, stop, handle, _) =
+        let (mut client, stop, handle, _, _, _event_rx) =
             spawn_frame_loop_over_loopback_with_attempt(suppress_bye, last_offer_attempt);
 
         // Read Hello (sent on connection).
@@ -2661,5 +2763,143 @@ mod tests {
         );
 
         handle.join().expect("frame loop thread must join");
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_frame_loop_replaces_and_clears_shared_capability_state() {
+        use crate::signaling::wire::{SignalingFrame, write_frame};
+
+        let (mut peer, stop, handle, _, negotiated, event_rx) =
+            spawn_frame_loop_over_loopback_with_attempt(
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU8::new(0)),
+            );
+        let hello = read_next_frame_or_eof(&mut peer).expect("read outbound Hello");
+        assert!(
+            matches!(hello, Some(SignalingFrame::Hello { capabilities, .. }) if capabilities == vec!["qsv-ledger-v1"])
+        );
+        for (capabilities, expected) in [
+            (vec!["qsv-ledger-v1".to_string()], true),
+            (Vec::new(), false),
+            (vec!["qsv-ledger-v1".to_string()], true),
+        ] {
+            write_frame(
+                &mut peer,
+                &SignalingFrame::Hello {
+                    proto: "v1".to_string(),
+                    capabilities,
+                },
+            )
+            .expect("send peer Hello");
+            write_frame(
+                &mut peer,
+                &SignalingFrame::Offer {
+                    sdp: "v=0".to_string(),
+                    attempt: 1,
+                },
+            )
+            .expect("send barrier Offer");
+            assert!(matches!(
+                event_rx.recv().expect("receive barrier Offer"),
+                SignalingEvent::OfferReceived(_, 1)
+            ));
+            assert_eq!(negotiated.load(Ordering::Acquire), expected);
+        }
+        stop.store(true, Ordering::Release);
+        handle.join().expect("frame loop joins");
+        assert!(!negotiated.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_qsv_ledger_token_is_exact_and_case_sensitive() {
+        assert!(super::is_qsv_ledger_capability("qsv-ledger-v1"));
+        assert!(!super::is_qsv_ledger_capability("QSV-ledger-v1"));
+        assert!(!super::is_qsv_ledger_capability("qsv-ledger-v01"));
+        assert!(!super::is_qsv_ledger_capability("qsv-ledger-v1-extra"));
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_peer_capabilities_are_bounded_replaced_and_deduplicated() {
+        let negotiated = Arc::new(AtomicBool::new(false));
+
+        super::replace_peer_qsv_ledger_capability(
+            &negotiated,
+            &[
+                "unknown-v1".to_string(),
+                "qsv--ledger-v1".to_string(),
+                "QSV-ledger-v1".to_string(),
+                "qsv-ledger-v1".to_string(),
+                "qsv-ledger-v1".to_string(),
+            ],
+        );
+        assert!(
+            super::qsv_ledger_negotiated(&negotiated),
+            "the first valid exact token must negotiate the capability"
+        );
+
+        let mut sixteenth_token = (0..15)
+            .map(|index| format!("unknown-{index}"))
+            .collect::<Vec<_>>();
+        sixteenth_token.push("qsv-ledger-v1".to_string());
+        super::replace_peer_qsv_ledger_capability(&negotiated, &sixteenth_token);
+        assert!(super::qsv_ledger_negotiated(&negotiated));
+
+        let mut later_token = (0..16)
+            .map(|index| format!("unknown-{index}"))
+            .collect::<Vec<_>>();
+        later_token.push("qsv-ledger-v1".to_string());
+        super::replace_peer_qsv_ledger_capability(&negotiated, &later_token);
+        assert!(
+            !super::qsv_ledger_negotiated(&negotiated),
+            "each Hello must replace, not accumulate, and tokens after the first 16 are ignored"
+        );
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_hello_advertises_the_capability_for_sender_and_receiver() {
+        let negotiated = Arc::new(AtomicBool::new(false));
+
+        for role in [SignalingRole::Sender, SignalingRole::Receiver] {
+            assert_eq!(
+                super::hello_capabilities(&role, &negotiated),
+                vec!["qsv-ledger-v1".to_string()],
+                "{role:?} must advertise the QSV ledger capability"
+            );
+        }
+    }
+
+    #[test]
+    fn pr5b_a1_pr2a_negotiated_state_clears_for_peer_disconnect_reset_and_local_stop() {
+        let signaling = MdnsSignaling::new(SignalingConfig {
+            role: SignalingRole::Sender,
+            ..Default::default()
+        })
+        .expect("new signaling");
+        let negotiated = signaling.qsv_ledger_negotiated_state_for_test();
+
+        signaling.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        assert!(super::qsv_ledger_negotiated(&negotiated));
+        signaling.clear_qsv_ledger_on_peer_disconnect();
+        assert!(!super::qsv_ledger_negotiated(&negotiated));
+
+        signaling.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        let reset = signaling.reset().expect("reset signaling");
+        assert!(
+            !super::qsv_ledger_negotiated(&negotiated),
+            "reset must Release-clear the shared state before dropping the old instance"
+        );
+        assert!(
+            !super::qsv_ledger_negotiated(&reset.qsv_ledger_negotiated_state_for_test()),
+            "a reset instance must begin with no negotiated peer capability"
+        );
+
+        let mut stopped = reset;
+        stopped.replace_peer_qsv_ledger_capability(&["qsv-ledger-v1".to_string()]);
+        let stopped_state = stopped.qsv_ledger_negotiated_state_for_test();
+        stopped.stop().expect("stop signaling");
+        assert!(
+            !super::qsv_ledger_negotiated(&stopped_state),
+            "local stop must Release-clear the negotiated state"
+        );
     }
 }
