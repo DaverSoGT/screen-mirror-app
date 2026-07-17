@@ -2885,11 +2885,38 @@ mod tests {
     fn probe_thread_panic_returns_init_failed() {
         use std::time::Duration;
         let r = run_probe_on_isolated_thread_with(Duration::from_secs(5), || {
-            panic!("simulated probe panic")
+            std::panic::resume_unwind(Box::new("simulated probe unwind"))
         });
         assert!(
             matches!(&r, Err(EncoderError::InitFailed(s)) if s.contains("panicked before sending result")),
             "expected InitFailed containing \"panicked before sending result\", got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_receive_disconnect_maps_to_the_existing_init_failure() {
+        use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+
+        let r = classify_probe_receive::<()>(Err(RecvTimeoutError::Disconnected), Duration::ZERO);
+
+        assert!(
+            matches!(&r, Err(EncoderError::InitFailed(s)) if s == "probe thread panicked before sending result"),
+            "expected the existing disconnected-probe InitFailed, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn probe_receive_success_and_timeout_remain_distinct() {
+        use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+
+        assert_eq!(
+            classify_probe_receive(Ok(Ok(())), Duration::ZERO),
+            Ok(())
+        );
+        let timeout = classify_probe_receive::<()>(Err(RecvTimeoutError::Timeout), Duration::ZERO);
+        assert!(
+            matches!(&timeout, Err(EncoderError::InitFailed(s)) if s.contains("probe thread timeout")),
+            "expected timeout to remain distinct from disconnect, got {timeout:?}"
         );
     }
 
