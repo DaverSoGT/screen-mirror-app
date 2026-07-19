@@ -623,6 +623,13 @@ pub struct PendingWriterFifo {
     stale_after_us: u64,
 }
 
+/// A borrowed reservation for one pending writer identity.
+pub(crate) struct PendingSendTransaction<'a> {
+    fifo: &'a mut PendingWriterFifo,
+    identity: AccessUnitIdentity,
+    index: usize,
+}
+
 impl PendingWriterFifo {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
@@ -684,6 +691,16 @@ impl PendingWriterFifo {
             .map(|entry| entry.witness.source())
     }
 
+    pub(crate) fn reserve_send(
+        &mut self,
+        _session: &str,
+        _epoch: u64,
+        _rtp: RtpBinding,
+        _now_us: u64,
+    ) -> Option<PendingSendTransaction<'_>> {
+        None
+    }
+
     #[must_use]
     pub fn pending_sources(&self) -> Vec<SourceAuKey> {
         self.entries
@@ -707,6 +724,21 @@ impl PendingWriterFifo {
         self.entries
             .retain(|entry| entry.accepted_at_us.saturating_add(self.stale_after_us) >= now_us);
         original_len - self.entries.len()
+    }
+}
+
+impl PendingSendTransaction<'_> {
+    pub(crate) fn identity(&self) -> &AccessUnitIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn commit(self) -> Option<AccessUnitIdentity> {
+        let _ = (self.fifo, self.identity, self.index);
+        None
+    }
+
+    pub(crate) fn cancel(self) {
+        let _ = (self.fifo, self.identity, self.index);
     }
 }
 
@@ -1160,6 +1192,94 @@ mod tests {
             pending.pending_sources(),
             vec![SourceAuKey::new("session-a", 7, 41, 1), second]
         );
+    }
+
+    #[test]
+    fn pending_send_reservation_selects_the_oldest_exact_collision_and_preserves_the_caller_binding()
+    {
+        let first = SourceAuKey::new("session-a", 7, 41, 1);
+        let second = SourceAuKey::new("session-a", 7, 42, (u32::MAX as u64) + 2);
+        let binding = RtpBinding::new(99, 1, 12);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(first.clone()), 10);
+        pending.push(WriterWitness::new(second), 11);
+        let reservation = pending.reserve_send("session-a", 7, binding, 12).unwrap();
+
+        assert_eq!(
+            reservation.identity(),
+            &AccessUnitIdentity::new(first, binding)
+        );
+        assert_eq!(reservation.identity().occurrence(), 12);
+    }
+
+    #[test]
+    fn pending_send_commit_removes_only_the_reserved_occurrence_and_leaves_no_retransmission_match()
+    {
+        let first = SourceAuKey::new("session-a", 7, 41, 9);
+        let second = SourceAuKey::new("session-a", 7, 42, 9);
+        let binding = RtpBinding::new(99, 9, 3);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(first.clone()), 10);
+        pending.push(WriterWitness::new(second.clone()), 11);
+        let committed = pending
+            .reserve_send("session-a", 7, binding, 12)
+            .unwrap()
+            .commit();
+
+        assert_eq!(committed, Some(AccessUnitIdentity::new(first, binding)));
+        assert_eq!(pending.pending_sources(), vec![second]);
+        assert!(pending.reserve_send("session-a", 7, binding, 13).is_none());
+    }
+
+    #[test]
+    fn pending_send_cancel_drop_and_retry_preserve_the_selected_identity_and_fifo_order() {
+        let first = SourceAuKey::new("session-a", 7, 41, 9);
+        let second = SourceAuKey::new("session-a", 7, 42, 10);
+        let binding = RtpBinding::new(99, 9, 3);
+        let mut pending = PendingWriterFifo::new(4);
+
+        pending.push(WriterWitness::new(first.clone()), 10);
+        pending.push(WriterWitness::new(second.clone()), 11);
+        pending
+            .reserve_send("session-a", 7, binding, 12)
+            .unwrap()
+            .cancel();
+        {
+            let reservation = pending.reserve_send("session-a", 7, binding, 13).unwrap();
+            assert_eq!(reservation.identity(), &AccessUnitIdentity::new(first.clone(), binding));
+        }
+
+        assert_eq!(pending.pending_sources(), vec![first.clone(), second]);
+        assert_eq!(
+            pending
+                .reserve_send("session-a", 7, binding, 14)
+                .unwrap()
+                .identity(),
+            &AccessUnitIdentity::new(first, binding)
+        );
+    }
+
+    #[test]
+    fn pending_send_reservation_fails_open_for_stale_missing_session_and_epoch_but_retains_equality()
+    {
+        let boundary = SourceAuKey::new("session-a", 7, 41, 9);
+        let binding = RtpBinding::new(99, 9, 3);
+        let mut pending = PendingWriterFifo::with_limits(2, 10);
+
+        pending.push(WriterWitness::new(boundary.clone()), 1);
+
+        assert_eq!(
+            pending
+                .reserve_send("session-a", 7, binding, 11)
+                .unwrap()
+                .identity(),
+            &AccessUnitIdentity::new(boundary.clone(), binding)
+        );
+        assert!(pending.reserve_send("session-missing", 7, binding, 11).is_none());
+        assert!(pending.reserve_send("session-a", 8, binding, 11).is_none());
+        assert!(pending.reserve_send("session-a", 7, binding, 12).is_none());
     }
 
     #[test]
