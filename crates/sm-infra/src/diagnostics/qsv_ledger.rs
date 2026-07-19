@@ -624,6 +624,10 @@ pub struct PendingWriterFifo {
 }
 
 /// A borrowed reservation for one pending writer identity.
+#[allow(
+    dead_code,
+    reason = "Slice 3 reserves transaction mechanics before runtime wiring."
+)]
 pub(crate) struct PendingSendTransaction<'a> {
     fifo: &'a mut PendingWriterFifo,
     identity: AccessUnitIdentity,
@@ -691,14 +695,34 @@ impl PendingWriterFifo {
             .map(|entry| entry.witness.source())
     }
 
+    #[allow(
+        dead_code,
+        reason = "Slice 3 reserves transaction mechanics before runtime wiring."
+    )]
     pub(crate) fn reserve_send(
         &mut self,
-        _session: &str,
-        _epoch: u64,
-        _rtp: RtpBinding,
-        _now_us: u64,
+        session: &str,
+        epoch: u64,
+        rtp: RtpBinding,
+        now_us: u64,
     ) -> Option<PendingSendTransaction<'_>> {
-        None
+        self.sweep_stale(now_us);
+        let (index, source) = self
+            .entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| {
+                entry.witness.source.session() == session
+                    && entry.witness.source.epoch() == epoch
+                    && entry.witness.source.media_time_90khz() as u32 == rtp.rtp_timestamp()
+            })
+            .map(|(index, entry)| (index, entry.witness.source()))?;
+
+        Some(PendingSendTransaction {
+            fifo: self,
+            identity: AccessUnitIdentity::new(source, rtp),
+            index,
+        })
     }
 
     #[must_use]
@@ -727,19 +751,30 @@ impl PendingWriterFifo {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Slice 3 reserves transaction mechanics before runtime wiring."
+)]
 impl PendingSendTransaction<'_> {
     pub(crate) fn identity(&self) -> &AccessUnitIdentity {
         &self.identity
     }
 
     pub(crate) fn commit(self) -> Option<AccessUnitIdentity> {
-        let _ = (self.fifo, self.identity, self.index);
-        None
+        let source = self.identity.source();
+        if !self
+            .fifo
+            .entries
+            .get(self.index)
+            .is_some_and(|entry| entry.witness.source() == source)
+        {
+            return None;
+        }
+
+        self.fifo.entries.remove(self.index).map(|_| self.identity)
     }
 
-    pub(crate) fn cancel(self) {
-        let _ = (self.fifo, self.identity, self.index);
-    }
+    pub(crate) fn cancel(self) {}
 }
 
 stage_witness!(
@@ -1196,7 +1231,7 @@ mod tests {
 
     #[test]
     fn pending_send_reservation_selects_the_oldest_exact_collision_and_preserves_the_caller_binding()
-    {
+     {
         let first = SourceAuKey::new("session-a", 7, 41, 1);
         let second = SourceAuKey::new("session-a", 7, 42, (u32::MAX as u64) + 2);
         let binding = RtpBinding::new(99, 1, 12);
@@ -1230,6 +1265,16 @@ mod tests {
 
         assert_eq!(committed, Some(AccessUnitIdentity::new(first, binding)));
         assert_eq!(pending.pending_sources(), vec![second]);
+        assert_eq!(
+            pending
+                .reserve_send("session-a", 7, binding, 13)
+                .unwrap()
+                .commit(),
+            Some(AccessUnitIdentity::new(
+                SourceAuKey::new("session-a", 7, 42, 9),
+                binding
+            ))
+        );
         assert!(pending.reserve_send("session-a", 7, binding, 13).is_none());
     }
 
@@ -1248,7 +1293,10 @@ mod tests {
             .cancel();
         {
             let reservation = pending.reserve_send("session-a", 7, binding, 13).unwrap();
-            assert_eq!(reservation.identity(), &AccessUnitIdentity::new(first.clone(), binding));
+            assert_eq!(
+                reservation.identity(),
+                &AccessUnitIdentity::new(first.clone(), binding)
+            );
         }
 
         assert_eq!(pending.pending_sources(), vec![first.clone(), second]);
@@ -1263,7 +1311,7 @@ mod tests {
 
     #[test]
     fn pending_send_reservation_fails_open_for_stale_missing_session_and_epoch_but_retains_equality()
-    {
+     {
         let boundary = SourceAuKey::new("session-a", 7, 41, 9);
         let binding = RtpBinding::new(99, 9, 3);
         let mut pending = PendingWriterFifo::with_limits(2, 10);
@@ -1277,7 +1325,11 @@ mod tests {
                 .identity(),
             &AccessUnitIdentity::new(boundary.clone(), binding)
         );
-        assert!(pending.reserve_send("session-missing", 7, binding, 11).is_none());
+        assert!(
+            pending
+                .reserve_send("session-missing", 7, binding, 11)
+                .is_none()
+        );
         assert!(pending.reserve_send("session-a", 8, binding, 11).is_none());
         assert!(pending.reserve_send("session-a", 7, binding, 12).is_none());
     }
