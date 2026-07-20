@@ -250,7 +250,7 @@ fn run_smoke() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 bytes_received += pkt.data.len() as u64;
                 // Print a dot for each batch of 10 packets so CI can see progress.
-                if total_packets % 10 == 0 {
+                if total_packets.is_multiple_of(10) {
                     print!(".");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }

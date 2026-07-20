@@ -588,10 +588,10 @@ mod tests {
                         break;
                     }
                     // Apply any pending PLI request before blocking on recv.
-                    if keyframe_pending.swap(false, Ordering::AcqRel) {
-                        if let Some(ref recv) = receiver {
-                            let _ = recv.request_keyframe();
-                        }
+                    if keyframe_pending.swap(false, Ordering::AcqRel)
+                        && let Some(ref recv) = receiver
+                    {
+                        let _ = recv.request_keyframe();
                     }
                     let pkt = match rx.recv() {
                         Ok(p) => p,

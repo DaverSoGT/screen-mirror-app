@@ -1089,46 +1089,46 @@ pub fn run_sender_transport_event_drain_with_supervisor_custom_and_hooks(
         //   3. Below the cap: re-inject IceFailed exactly as before (REQ-WD-3).
         // A genuine RebuildFailed-Dead on the below-cap path terminates the supervisor
         // and spawns NO successor drain, so the counter is never read again (R-A §2.1).
-        if let Some(deadline) = watchdog_deadline {
-            if std::time::Instant::now() >= deadline {
-                let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(cap) = media_watchdog_max_fires {
-                    if n >= cap {
-                        eprintln!(
-                            "[sm-sender-media-watchdog n={session_nonce}] fired {n}/{cap} \
-                             (CAP reached) — peer unreachable; emitting terminal Dead and \
-                             stopping (no supervisor re-entry)"
-                        );
-                        emit_event(
-                            &channel,
-                            &SenderStatusEvent::Dead {
-                                reason: "peer_unreachable".to_string(),
-                            },
-                        );
-                        break 'drain;
-                    }
-                }
+        if let Some(deadline) = watchdog_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(cap) = media_watchdog_max_fires
+                && n >= cap
+            {
                 eprintln!(
-                    "[sm-sender-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
-                     IceConnected within deadline; injecting IceFailed to drive a fresh \
-                     supervisor cycle"
+                    "[sm-sender-media-watchdog n={session_nonce}] fired {n}/{cap} \
+                     (CAP reached) — peer unreachable; emitting terminal Dead and \
+                     stopping (no supervisor re-entry)"
                 );
-                enter_supervisor_mode(
-                    ReconnectTrigger::IceFailed,
-                    session_nonce,
-                    &ev_rx,
-                    &stop_flag,
+                emit_event(
                     &channel,
-                    &supervisor_signal_tx,
-                    policy,
-                    ack_timeout,
-                    rebuild_timeout,
-                    hooks,
-                    &signaling_refresh,
-                    ice_connected, // REQ-SRR-1 (WU-3)
+                    &SenderStatusEvent::Dead {
+                        reason: "peer_unreachable".to_string(),
+                    },
                 );
                 break 'drain;
             }
+            eprintln!(
+                "[sm-sender-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
+                 IceConnected within deadline; injecting IceFailed to drive a fresh \
+                 supervisor cycle"
+            );
+            enter_supervisor_mode(
+                ReconnectTrigger::IceFailed,
+                session_nonce,
+                &ev_rx,
+                &stop_flag,
+                &channel,
+                &supervisor_signal_tx,
+                policy,
+                ack_timeout,
+                rebuild_timeout,
+                hooks,
+                &signaling_refresh,
+                ice_connected, // REQ-SRR-1 (WU-3)
+            );
+            break 'drain;
         }
 
         // Cap the recv timeout at the remaining watchdog window (when armed) so the

@@ -38,7 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
   # ---------------------------------------------------------------------------
   # test — run the full test suite via cargo-nextest on all three platforms.
@@ -78,7 +78,7 @@ jobs:
       - name: cargo nextest run
         # --no-tests=warn: treat "no tests found" as a warning rather than an
         # error. The scaffold ships with zero tests; later changes will add them.
-        run: cargo nextest run --workspace --no-tests=warn
+        run: cargo nextest run --workspace --locked --no-tests=warn
 
   # ---------------------------------------------------------------------------
   # clippy — lint the workspace on all three target platforms. Cross-target
@@ -112,7 +112,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   # ---------------------------------------------------------------------------
   # fmt — verify all source files conform to rustfmt.toml.
@@ -131,16 +131,19 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # msrv — verify the workspace compiles with the declared minimum Rust version
-  # (1.85.0). Catches accidental use of features stabilised after the MSRV.
-  # Runs only on ubuntu — the compiler's acceptance of a language feature is
-  # not OS-dependent.
+  # (1.88.0). macOS also validates platform-sensitive plist compilation.
   # ---------------------------------------------------------------------------
   msrv:
-    name: MSRV (1.85.0)
-    runs-on: ubuntu-latest
+    name: MSRV (1.88.0, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - name: Install Tauri v2 Linux deps
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -150,10 +153,10 @@ jobs:
             librsvg2-dev \
             patchelf \
             libxdo-dev
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (MSRV)
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
   # ---------------------------------------------------------------------------
   # js-test — run the JavaScript unit tests (vitest + happy-dom) and collect
