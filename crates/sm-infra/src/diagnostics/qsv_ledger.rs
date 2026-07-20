@@ -783,6 +783,15 @@ trait DatagramSend {
     fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize>;
 }
 
+struct SendFinalizeContext<'a> {
+    pending: &'a mut PendingWriterFifo,
+    session: &'a str,
+    epoch: u64,
+    binding: RtpBinding,
+    now_us: u64,
+    probe: &'a TransportLedgerProbe,
+}
+
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
@@ -806,20 +815,22 @@ fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option
 fn send_and_finalize(
     sender: &mut impl DatagramSend,
     datagram: &[u8],
-    pending: &mut PendingWriterFifo,
-    session: &str,
-    epoch: u64,
-    binding: RtpBinding,
-    now_us: u64,
-    probe: &TransportLedgerProbe,
+    context: SendFinalizeContext<'_>,
 ) -> io::Result<usize> {
-    let transaction = pending.reserve_send(session, epoch, binding, now_us);
+    let transaction = context.pending.reserve_send(
+        context.session,
+        context.epoch,
+        context.binding,
+        context.now_us,
+    );
     match sender.send_datagram(datagram) {
         Ok(sent) if sent == datagram.len() => {
-            if let Some(transaction) = transaction {
-                if let Some(identity) = transaction.commit() {
-                    probe.record_udp_transmit(UdpTransmitWitness::new(identity));
-                }
+            if let Some(transaction) = transaction
+                && let Some(identity) = transaction.commit()
+            {
+                context
+                    .probe
+                    .record_udp_transmit(UdpTransmitWitness::new(identity));
             }
             Ok(sent)
         }
@@ -1046,8 +1057,8 @@ mod tests {
         Evidence, LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, PendingPushOutcome,
         PendingWriterFifo, RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT,
         RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome, RtpBinding, RtpHeader, RtpHeaderAggregator,
-        SourceAuKey, TransportLedgerProbe, UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
-        primary_h264_rtp_binding, send_and_finalize,
+        SendFinalizeContext, SourceAuKey, TransportLedgerProbe, UdpReceiveWitness,
+        UdpTransmitWitness, WriterWitness, primary_h264_rtp_binding, send_and_finalize,
     };
 
     const SESSION_ID: &str = "1000 2";
@@ -1324,12 +1335,14 @@ mod tests {
         let result = send_and_finalize(
             &mut FakeSend::Full,
             &[0; 12],
-            &mut pending,
-            "session-a",
-            7,
-            binding,
-            11,
-            &probe,
+            SendFinalizeContext {
+                pending: &mut pending,
+                session: "session-a",
+                epoch: 7,
+                binding,
+                now_us: 11,
+                probe: &probe,
+            },
         );
         assert_eq!(result.expect("full datagram must be sent"), 12);
         assert!(pending.is_empty());
@@ -1344,12 +1357,14 @@ mod tests {
             let _ = send_and_finalize(
                 &mut sender,
                 &[0; 12],
-                &mut pending,
-                "session-a",
-                7,
-                binding,
-                11,
-                &probe,
+                SendFinalizeContext {
+                    pending: &mut pending,
+                    session: "session-a",
+                    epoch: 7,
+                    binding,
+                    now_us: 11,
+                    probe: &probe,
+                },
             );
             assert_eq!(pending.len(), 1);
             assert!(probe.udp_transmit_witnesses().is_empty());
