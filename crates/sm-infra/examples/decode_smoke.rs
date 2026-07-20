@@ -204,14 +204,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if frame.timestamp > Duration::ZERO {
                     first_nonzero_ts = true;
                 }
-                if first_i420_frame.is_none() {
-                    if let PixelData::I420 { .. } = &frame.data {
-                        first_i420_frame = Some(frame);
-                        print!(".");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                    }
+                if first_i420_frame.is_none()
+                    && let PixelData::I420 { .. } = &frame.data
+                {
+                    first_i420_frame = Some(frame);
+                    print!(".");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
-                if decoded_count % 10 == 0 {
+                if decoded_count.is_multiple_of(10) {
                     print!(".");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }

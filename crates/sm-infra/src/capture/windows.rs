@@ -356,12 +356,11 @@ fn heartbeat_loop(
         frame.timestamp = frame.timestamp.saturating_add(HEARTBEAT_INTERVAL);
 
         // Reset the "last observed" instant so we don't immediately re-fire on the next
-        // tick. Real frames continue to overwrite this when they arrive. Nested `if let`
-        // (not let-chains) to stay compatible with MSRV 1.85.
-        if let Ok(mut guard) = last_frame.lock() {
-            if let Some((_, instant)) = guard.as_mut() {
-                *instant = std::time::Instant::now();
-            }
+        // tick. Real frames continue to overwrite this when they arrive.
+        if let Ok(mut guard) = last_frame.lock()
+            && let Some((_, instant)) = guard.as_mut()
+        {
+            *instant = std::time::Instant::now();
         }
 
         match tx.try_send(frame) {

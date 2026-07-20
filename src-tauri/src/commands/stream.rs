@@ -1318,45 +1318,45 @@ pub fn run_stream_transport_event_drain_with_supervisor_custom_and_hooks(
         // A genuine RebuildFailed-Dead on the below-cap path terminates the supervisor
         // and spawns NO successor drain, so the counter is simply never read again — the
         // cap cannot also fire (R-A §2.1). No explicit reset needed there.
-        if let Some(deadline) = watchdog_deadline {
-            if std::time::Instant::now() >= deadline {
-                let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(cap) = media_watchdog_max_fires {
-                    if n >= cap {
-                        eprintln!(
-                            "[sm-stream-media-watchdog n={session_nonce}] fired {n}/{cap} \
-                             (CAP reached) — peer unreachable; emitting terminal Dead and \
-                             stopping (no supervisor re-entry)"
-                        );
-                        emit_stream_status(
-                            &channel,
-                            &StreamStatusEvent::Dead {
-                                reason: "peer_unreachable".to_string(),
-                            },
-                        );
-                        break 'drain;
-                    }
-                }
+        if let Some(deadline) = watchdog_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            let n = media_watchdog_fires.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(cap) = media_watchdog_max_fires
+                && n >= cap
+            {
                 eprintln!(
-                    "[sm-stream-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
-                     MediaData within deadline; injecting IceFailed to drive a fresh \
-                     supervisor cycle"
+                    "[sm-stream-media-watchdog n={session_nonce}] fired {n}/{cap} \
+                     (CAP reached) — peer unreachable; emitting terminal Dead and \
+                     stopping (no supervisor re-entry)"
                 );
-                enter_stream_supervisor_mode(
-                    ReconnectTrigger::IceFailed,
-                    session_nonce,
-                    &ev_rx,
-                    &stop_flag,
+                emit_stream_status(
                     &channel,
-                    &supervisor_signal_tx,
-                    policy,
-                    ack_timeout,
-                    rebuild_timeout,
-                    hooks,
-                    expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
+                    &StreamStatusEvent::Dead {
+                        reason: "peer_unreachable".to_string(),
+                    },
                 );
                 break 'drain;
             }
+            eprintln!(
+                "[sm-stream-media-watchdog n={session_nonce}] fired {n} (below cap) — NO \
+                 MediaData within deadline; injecting IceFailed to drive a fresh \
+                 supervisor cycle"
+            );
+            enter_stream_supervisor_mode(
+                ReconnectTrigger::IceFailed,
+                session_nonce,
+                &ev_rx,
+                &stop_flag,
+                &channel,
+                &supervisor_signal_tx,
+                policy,
+                ack_timeout,
+                rebuild_timeout,
+                hooks,
+                expected_attempt.clone(), // T1.9: cloned — each arm gets own Arc
+            );
+            break 'drain;
         }
 
         // Cap the recv timeout at the remaining watchdog window (when armed) so the
@@ -2998,21 +2998,20 @@ fn mux_thread(
             // After init is emitted: feed to muxer via mux_append (D-PPT5-5).
             // mux_append fixes the FlushTiming ordering bug (SEG-3): on_append fires
             // AFTER append_packet, so on_flush captures the correct frame count.
-            if let Some(m) = muxer.as_mut() {
-                if let Some((segment, seg_frames, seg_interval_ms)) =
+            if let Some(m) = muxer.as_mut()
+                && let Some((segment, seg_frames, seg_interval_ms)) =
                     mux_append(m, &mut flush_timing, &pkt, Instant::now())
-                {
-                    eprintln!(
-                        "[sm-stream-mux] segment flushed ({} bytes) on sub-GOP count-flush",
-                        segment.len()
-                    );
-                    eprintln!(
-                        "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={} (sub-gop-flush)",
-                        seg_frames,
-                        seg_interval_ms.unwrap_or(0),
-                    );
-                    emit_segment(&channel, &counters, segment);
-                }
+            {
+                eprintln!(
+                    "[sm-stream-mux] segment flushed ({} bytes) on sub-GOP count-flush",
+                    segment.len()
+                );
+                eprintln!(
+                    "[sm-stream-mux] flush-timing segment_frames={} segment_interval_ms={} (sub-gop-flush)",
+                    seg_frames,
+                    seg_interval_ms.unwrap_or(0),
+                );
+                emit_segment(&channel, &counters, segment);
             }
             continue;
         }

@@ -697,13 +697,13 @@ fn run_sender_loop(
             if ice_ready {
                 while let Ok(pkt) = rx.try_recv() {
                     // Resolve H264 PT lazily if not yet known.
-                    if pre_neg.pt.is_none() {
-                        if let Some(writer) = rtc.writer(mid) {
-                            pre_neg.pt = writer
-                                .payload_params()
-                                .find(|p| p.spec().codec == Codec::H264)
-                                .map(|p| p.pt());
-                        }
+                    if pre_neg.pt.is_none()
+                        && let Some(writer) = rtc.writer(mid)
+                    {
+                        pre_neg.pt = writer
+                            .payload_params()
+                            .find(|p| p.spec().codec == Codec::H264)
+                            .map(|p| p.pt());
                     }
 
                     if let Some(pt) = pre_neg.pt {

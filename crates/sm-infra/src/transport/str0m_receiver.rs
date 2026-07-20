@@ -370,14 +370,12 @@ impl Str0mVideoReceiver {
                 })?
             }
         };
-        if result.is_ok() {
-            if let Some(attribute) = marker {
-                if let Ok(marker) = LedgerMarker::parse(&attribute) {
-                    if let Ok(mut ledger) = self.ledger.lock() {
-                        ledger.active_marker = Some(marker);
-                    }
-                }
-            }
+        if result.is_ok()
+            && let Some(attribute) = marker
+            && let Ok(marker) = LedgerMarker::parse(&attribute)
+            && let Ok(mut ledger) = self.ledger.lock()
+        {
+            ledger.active_marker = Some(marker);
         }
         result
     }
@@ -711,10 +709,10 @@ fn run_receiver_loop(
                 }
                 ReceiverControl::RequestKeyframe => {
                     // Send a PLI to the remote sender.
-                    if let Some(mid) = pre_neg.mid {
-                        if let Some(mut writer) = rtc.writer(mid) {
-                            let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
-                        }
+                    if let Some(mid) = pre_neg.mid
+                        && let Some(mut writer) = rtc.writer(mid)
+                    {
+                        let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
                     }
                 }
                 ReceiverControl::ApplyOffer { offer, reply } => {

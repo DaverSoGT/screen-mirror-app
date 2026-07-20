@@ -2126,7 +2126,7 @@ fn pump_loop(
         }
 
         // Periodic debug heartbeat every 1000 iterations.
-        if iter_count % 1000 == 0 {
+        if iter_count.is_multiple_of(1000) {
             tracing::debug!(ni_count, ho_count, iter_count, "pump_loop: heartbeat");
         }
     }
