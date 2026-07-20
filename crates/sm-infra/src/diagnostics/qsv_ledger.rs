@@ -783,8 +783,12 @@ trait DatagramSend {
     fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize>;
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
 fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option<RtpBinding> {
-    if datagram.len() < 12 || datagram[1] & 0x7f != primary_payload_type {
+    if datagram.len() < 12 || datagram[0] >> 6 != 2 || datagram[1] & 0x7f != primary_payload_type {
         return None;
     }
 
@@ -795,6 +799,10 @@ fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option
     ))
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
 fn send_and_finalize(
     sender: &mut impl DatagramSend,
     datagram: &[u8],
@@ -806,13 +814,28 @@ fn send_and_finalize(
     probe: &TransportLedgerProbe,
 ) -> io::Result<usize> {
     let transaction = pending.reserve_send(session, epoch, binding, now_us);
-    let result = sender.send_datagram(datagram);
-    if let Some(transaction) = transaction {
-        if let Some(identity) = transaction.commit() {
-            probe.record_udp_transmit(UdpTransmitWitness::new(identity));
+    match sender.send_datagram(datagram) {
+        Ok(sent) if sent == datagram.len() => {
+            if let Some(transaction) = transaction {
+                if let Some(identity) = transaction.commit() {
+                    probe.record_udp_transmit(UdpTransmitWitness::new(identity));
+                }
+            }
+            Ok(sent)
+        }
+        Ok(sent) => {
+            if let Some(transaction) = transaction {
+                transaction.cancel();
+            }
+            Ok(sent)
+        }
+        Err(error) => {
+            if let Some(transaction) = transaction {
+                transaction.cancel();
+            }
+            Err(error)
         }
     }
-    result
 }
 
 stage_witness!(
@@ -882,7 +905,10 @@ impl TransportLedgerProbe {
     pub fn record_writer(&self, witness: WriterWitness) {
         let mut state = self.lock_state();
         state.attempts[0] = state.attempts[0].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.writer.len() >= self.witness_limit {
+                state.writer.remove(0);
+            }
             state.writer.push(witness);
         }
     }
@@ -890,7 +916,10 @@ impl TransportLedgerProbe {
     pub fn record_udp_transmit(&self, witness: UdpTransmitWitness) {
         let mut state = self.lock_state();
         state.attempts[1] = state.attempts[1].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.udp_transmit.len() >= self.witness_limit {
+                state.udp_transmit.remove(0);
+            }
             state.udp_transmit.push(witness);
         }
     }
@@ -898,7 +927,10 @@ impl TransportLedgerProbe {
     pub fn record_udp_receive(&self, witness: UdpReceiveWitness) {
         let mut state = self.lock_state();
         state.attempts[2] = state.attempts[2].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.udp_receive.len() >= self.witness_limit {
+                state.udp_receive.remove(0);
+            }
             state.udp_receive.push(witness);
         }
     }
@@ -906,7 +938,10 @@ impl TransportLedgerProbe {
     pub fn record_completed_au(&self, witness: CompletedAuWitness) {
         let mut state = self.lock_state();
         state.attempts[3] = state.attempts[3].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.completed_au.len() >= self.witness_limit {
+                state.completed_au.remove(0);
+            }
             state.completed_au.push(witness);
         }
     }

@@ -141,6 +141,10 @@ fn canonical_offer_session_id(offer: &str) -> Option<String> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
 struct SenderLedgerSeed {
     session_id: String,
     epoch: u64,
@@ -194,8 +198,11 @@ pub struct Str0mVideoSender {
     /// Effective local socket address after `start()`. `None` before start.
     /// Used by integration tests to discover the bound port for candidate exchange.
     local_addr: Option<std::net::SocketAddr>,
-    /// Inert until a later slice wires stage-owned witness emission.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+    )]
     transport_ledger_probe: Mutex<Option<Arc<TransportLedgerProbe>>>,
     #[cfg(any(test, feature = "test-support"))]
     sender_ledger_seed: Mutex<Option<SenderLedgerSeed>>,
@@ -514,8 +521,8 @@ impl Str0mVideoSender {
         drop(guard);
         if let Ok(mut seed) = self.sender_ledger_seed.lock() {
             *seed = Some(SenderLedgerSeed {
-                session_id: format!("{session_id}-invalid"),
-                epoch: 0,
+                session_id,
+                epoch: TEST_SUPPORT_LEDGER_EPOCH,
                 probe,
             });
         }
