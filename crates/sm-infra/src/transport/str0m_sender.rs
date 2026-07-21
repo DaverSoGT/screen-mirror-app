@@ -132,13 +132,27 @@ fn media_readiness_from_state(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn canonical_offer_session_id(offer: &str) -> Option<String> {
     let origin = offer.lines().find_map(|line| line.strip_prefix("o="))?;
     let mut fields = origin.split_whitespace();
     let _username = fields.next()?;
     Some(format!("{} {}", fields.next()?, fields.next()?))
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
+struct SenderLedgerSeed {
+    session_id: String,
+    epoch: u64,
+    probe: Arc<TransportLedgerProbe>,
+}
+
+#[cfg(feature = "test-support")]
+const TEST_SUPPORT_LEDGER_EPOCH: u64 = 1;
 
 impl SenderShared {
     fn new() -> Arc<Self> {
@@ -184,9 +198,14 @@ pub struct Str0mVideoSender {
     /// Effective local socket address after `start()`. `None` before start.
     /// Used by integration tests to discover the bound port for candidate exchange.
     local_addr: Option<std::net::SocketAddr>,
-    /// Inert until a later slice wires stage-owned witness emission.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+    )]
     transport_ledger_probe: Mutex<Option<Arc<TransportLedgerProbe>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    sender_ledger_seed: Mutex<Option<SenderLedgerSeed>>,
 }
 
 impl std::fmt::Debug for Str0mVideoSender {
@@ -263,6 +282,8 @@ impl VideoSender for Str0mVideoSender {
             local_addr: None,
             #[cfg(any(test, feature = "test-support"))]
             transport_ledger_probe: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            sender_ledger_seed: Mutex::new(None),
         })
     }
 
@@ -488,9 +509,28 @@ impl Str0mVideoSender {
     /// Attaches an inert probe for external test-support contract compilation.
     #[cfg(feature = "test-support")]
     pub fn install_transport_ledger_probe_for_test(&self, probe: Arc<TransportLedgerProbe>) {
-        if let Ok(mut attached) = self.transport_ledger_probe.lock() {
-            *attached = Some(probe);
+        let Ok(guard) = self.pre_neg.lock() else {
+            return;
+        };
+        let Some(pre_neg) = guard.as_ref() else {
+            return;
+        };
+        let Some(session_id) = canonical_offer_session_id(&pre_neg.offer_str) else {
+            return;
+        };
+        drop(guard);
+        if let Ok(mut seed) = self.sender_ledger_seed.lock() {
+            *seed = Some(SenderLedgerSeed {
+                session_id,
+                epoch: TEST_SUPPORT_LEDGER_EPOCH,
+                probe,
+            });
         }
+    }
+
+    #[cfg(test)]
+    fn take_sender_ledger_seed_for_test(&self) -> Option<SenderLedgerSeed> {
+        self.sender_ledger_seed.lock().ok()?.take()
     }
 
     /// Return the effective local socket address after `start()`.
@@ -1179,6 +1219,24 @@ mod tests {
             ),
             LedgerActivation::Enabled,
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_support_attachment_uses_the_canonical_offer_identity_once() {
+        let sender = Str0mVideoSender::new(TransportConfig::default()).unwrap();
+        let offer = sender.create_local_offer().unwrap();
+        let probe = Arc::new(TransportLedgerProbe::collecting());
+
+        sender.install_transport_ledger_probe_for_test(Arc::clone(&probe));
+        let seed = sender
+            .take_sender_ledger_seed_for_test()
+            .expect("test support must attach a sender seed");
+
+        assert_eq!(seed.session_id, offer_origin_identity(&offer.0));
+        assert_eq!(seed.epoch, 1);
+        assert!(Arc::ptr_eq(&seed.probe, &probe));
+        assert!(sender.take_sender_ledger_seed_for_test().is_none());
     }
 
     #[test]

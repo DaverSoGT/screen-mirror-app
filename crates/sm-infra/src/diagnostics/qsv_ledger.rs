@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    io,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -17,6 +18,7 @@ const REASON_FIELD_JSON_OVERHEAD: usize = 12;
 const MAX_JSON_BYTES_PER_REASON_BYTE: usize = 6;
 const RTP_STREAM_LIMIT: usize = 256;
 const RTP_TIMESTAMP_HISTORY_LIMIT: usize = 1_024;
+const TRANSPORT_PROBE_WITNESS_LIMIT: usize = 128;
 
 /// Evidence coverage for one independently observed boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -777,6 +779,76 @@ impl PendingSendTransaction<'_> {
     pub(crate) fn cancel(self) {}
 }
 
+trait DatagramSend {
+    fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize>;
+}
+
+struct SendFinalizeContext<'a> {
+    pending: &'a mut PendingWriterFifo,
+    session: &'a str,
+    epoch: u64,
+    binding: RtpBinding,
+    now_us: u64,
+    probe: &'a TransportLedgerProbe,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
+fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option<RtpBinding> {
+    if datagram.len() < 12 || datagram[0] >> 6 != 2 || datagram[1] & 0x7f != primary_payload_type {
+        return None;
+    }
+
+    Some(RtpBinding::new(
+        u32::from_be_bytes(datagram[8..12].try_into().ok()?),
+        u32::from_be_bytes(datagram[4..8].try_into().ok()?),
+        0,
+    ))
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
+)]
+fn send_and_finalize(
+    sender: &mut impl DatagramSend,
+    datagram: &[u8],
+    context: SendFinalizeContext<'_>,
+) -> io::Result<usize> {
+    let transaction = context.pending.reserve_send(
+        context.session,
+        context.epoch,
+        context.binding,
+        context.now_us,
+    );
+    match sender.send_datagram(datagram) {
+        Ok(sent) if sent == datagram.len() => {
+            if let Some(transaction) = transaction
+                && let Some(identity) = transaction.commit()
+            {
+                context
+                    .probe
+                    .record_udp_transmit(UdpTransmitWitness::new(identity));
+            }
+            Ok(sent)
+        }
+        Ok(sent) => {
+            if let Some(transaction) = transaction {
+                transaction.cancel();
+            }
+            Ok(sent)
+        }
+        Err(error) => {
+            if let Some(transaction) = transaction {
+                transaction.cancel();
+            }
+            Err(error)
+        }
+    }
+}
+
 stage_witness!(
     UdpTransmitWitness,
     "A witness recorded when UDP transmit owns an access unit."
@@ -810,13 +882,14 @@ struct ProbeState {
 #[derive(Debug)]
 pub struct TransportLedgerProbe {
     collecting: bool,
+    witness_limit: usize,
     state: Mutex<ProbeState>,
 }
 
 impl TransportLedgerProbe {
     #[must_use]
     pub fn collecting() -> Self {
-        Self::new(true)
+        Self::collecting_with_witness_limit(TRANSPORT_PROBE_WITNESS_LIMIT)
     }
 
     #[must_use]
@@ -824,9 +897,18 @@ impl TransportLedgerProbe {
         Self::new(false)
     }
 
+    fn collecting_with_witness_limit(witness_limit: usize) -> Self {
+        Self {
+            collecting: true,
+            witness_limit,
+            state: Mutex::new(ProbeState::default()),
+        }
+    }
+
     fn new(collecting: bool) -> Self {
         Self {
             collecting,
+            witness_limit: TRANSPORT_PROBE_WITNESS_LIMIT,
             state: Mutex::new(ProbeState::default()),
         }
     }
@@ -834,7 +916,10 @@ impl TransportLedgerProbe {
     pub fn record_writer(&self, witness: WriterWitness) {
         let mut state = self.lock_state();
         state.attempts[0] = state.attempts[0].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.writer.len() >= self.witness_limit {
+                state.writer.remove(0);
+            }
             state.writer.push(witness);
         }
     }
@@ -842,7 +927,10 @@ impl TransportLedgerProbe {
     pub fn record_udp_transmit(&self, witness: UdpTransmitWitness) {
         let mut state = self.lock_state();
         state.attempts[1] = state.attempts[1].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.udp_transmit.len() >= self.witness_limit {
+                state.udp_transmit.remove(0);
+            }
             state.udp_transmit.push(witness);
         }
     }
@@ -850,7 +938,10 @@ impl TransportLedgerProbe {
     pub fn record_udp_receive(&self, witness: UdpReceiveWitness) {
         let mut state = self.lock_state();
         state.attempts[2] = state.attempts[2].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.udp_receive.len() >= self.witness_limit {
+                state.udp_receive.remove(0);
+            }
             state.udp_receive.push(witness);
         }
     }
@@ -858,7 +949,10 @@ impl TransportLedgerProbe {
     pub fn record_completed_au(&self, witness: CompletedAuWitness) {
         let mut state = self.lock_state();
         state.attempts[3] = state.attempts[3].saturating_add(1);
-        if self.collecting {
+        if self.collecting && self.witness_limit > 0 {
+            if state.completed_au.len() >= self.witness_limit {
+                state.completed_au.remove(0);
+            }
             state.completed_au.push(witness);
         }
     }
@@ -956,12 +1050,15 @@ impl TransportLedgerProbe {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::{
-        AccessUnitIdentity, BoundedRecorder, ClockDomain, CompletedAuWitness, Evidence,
-        LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, PendingPushOutcome,
+        AccessUnitIdentity, BoundedRecorder, ClockDomain, CompletedAuWitness, DatagramSend,
+        Evidence, LedgerEvent, LedgerMarker, LedgerRecord, MarkerError, PendingPushOutcome,
         PendingWriterFifo, RECORD_BYTE_LIMIT, RETENTION_WINDOW_US, RTP_STREAM_LIMIT,
         RTP_TIMESTAMP_HISTORY_LIMIT, RecordOutcome, RtpBinding, RtpHeader, RtpHeaderAggregator,
-        SourceAuKey, TransportLedgerProbe, UdpReceiveWitness, UdpTransmitWitness, WriterWitness,
+        SendFinalizeContext, SourceAuKey, TransportLedgerProbe, UdpReceiveWitness,
+        UdpTransmitWitness, WriterWitness, primary_h264_rtp_binding, send_and_finalize,
     };
 
     const SESSION_ID: &str = "1000 2";
@@ -1203,6 +1300,104 @@ mod tests {
 
     fn writer(session: &str, epoch: u64, sequence: u64, media_time_90khz: u64) -> WriterWitness {
         WriterWitness::new(SourceAuKey::new(session, epoch, sequence, media_time_90khz))
+    }
+
+    enum FakeSend {
+        Full,
+        Short,
+        Error,
+    }
+
+    impl DatagramSend for FakeSend {
+        fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize> {
+            match self {
+                Self::Full => Ok(datagram.len()),
+                Self::Short => Ok(datagram.len().saturating_sub(1)),
+                Self::Error => Err(io::Error::other("test send error")),
+            }
+        }
+    }
+
+    fn pending_send_fixture() -> (PendingWriterFifo, TransportLedgerProbe, RtpBinding) {
+        let mut pending = PendingWriterFifo::new(2);
+        pending.push(writer("session-a", 7, 41, 9), 10);
+        (
+            pending,
+            TransportLedgerProbe::collecting(),
+            RtpBinding::new(99, 9, 0),
+        )
+    }
+
+    #[test]
+    fn send_and_finalize_commits_full_datagrams_and_records_one_transmit_witness() {
+        let (mut pending, probe, binding) = pending_send_fixture();
+
+        let result = send_and_finalize(
+            &mut FakeSend::Full,
+            &[0; 12],
+            SendFinalizeContext {
+                pending: &mut pending,
+                session: "session-a",
+                epoch: 7,
+                binding,
+                now_us: 11,
+                probe: &probe,
+            },
+        );
+        assert_eq!(result.expect("full datagram must be sent"), 12);
+        assert!(pending.is_empty());
+        assert_eq!(probe.udp_transmit_witnesses().len(), 1);
+    }
+
+    #[test]
+    fn send_and_finalize_cancels_short_or_error_sends_without_witnesses() {
+        for mut sender in [FakeSend::Short, FakeSend::Error] {
+            let (mut pending, probe, binding) = pending_send_fixture();
+
+            let _ = send_and_finalize(
+                &mut sender,
+                &[0; 12],
+                SendFinalizeContext {
+                    pending: &mut pending,
+                    session: "session-a",
+                    epoch: 7,
+                    binding,
+                    now_us: 11,
+                    probe: &probe,
+                },
+            );
+            assert_eq!(pending.len(), 1);
+            assert!(probe.udp_transmit_witnesses().is_empty());
+        }
+    }
+
+    #[test]
+    fn primary_h264_classifier_rejects_non_primary_or_malformed_rtp() {
+        let primary = 96;
+        let valid = [0x80, primary, 0, 1, 0, 0, 0, 9, 0, 0, 0, 99];
+
+        assert_eq!(
+            primary_h264_rtp_binding(&valid, primary),
+            Some(RtpBinding::new(99, 9, 0))
+        );
+        assert_eq!(
+            primary_h264_rtp_binding(&[0x40, primary, 0, 1, 0, 0, 0, 9, 0, 0, 0, 99], primary),
+            None
+        );
+        assert_eq!(
+            primary_h264_rtp_binding(&[0x80, 97, 0, 1, 0, 0, 0, 9, 0, 0, 0, 99], primary),
+            None
+        );
+    }
+
+    #[test]
+    fn collecting_probe_retains_at_most_the_configured_witness_bound() {
+        let probe = TransportLedgerProbe::collecting_with_witness_limit(2);
+        for sequence in 0..3 {
+            probe.record_writer(writer("session-a", 7, sequence, sequence));
+        }
+
+        assert_eq!(probe.writer_witnesses().len(), 2);
     }
 
     #[test]
