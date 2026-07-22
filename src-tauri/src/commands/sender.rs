@@ -2106,6 +2106,34 @@ fn qsv_ledger_marker_for_confirmed_backend(
     })
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct LedgerInstallTrace {
+    installed_marker: Option<String>,
+    installed_epoch: Option<u64>,
+    start_called: bool,
+}
+
+#[cfg(test)]
+fn install_qsv_ledger_before_start_for_test(
+    explicitly_enabled: bool,
+    backend_name: &str,
+    canonical_session: &str,
+    attempt: u8,
+) -> LedgerInstallTrace {
+    let marker = qsv_ledger_marker_for_confirmed_backend(
+        explicitly_enabled,
+        backend_name,
+        canonical_session,
+        u64::from(attempt),
+    );
+    LedgerInstallTrace {
+        installed_epoch: marker.as_ref().map(|_| u64::from(attempt)),
+        installed_marker: marker,
+        start_called: true,
+    }
+}
+
 /// The ledger remains default-off unless the sender process explicitly enables it.
 #[cfg(target_os = "windows")]
 fn qsv_ledger_opt_in_enabled() -> bool {
@@ -2234,6 +2262,7 @@ fn build_production_sender_bundle(
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
+    use sm_infra::diagnostics::TransportLedgerProbe;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{
@@ -2319,6 +2348,17 @@ fn build_production_sender_bundle(
         .create_local_offer()
         .map_err(|e| BundleError::Other(e.to_string()))?;
     let offer = add_qsv_ledger_marker_to_offer(offer, &backend_name, attempt);
+    if offer
+        .0
+        .lines()
+        .any(|line| line.starts_with("a=x-sm-qsv-ledger:"))
+    {
+        let _ = sender.install_qsv_ledger_for_offer(
+            &offer,
+            u64::from(attempt),
+            Arc::new(TransportLedgerProbe::collecting()),
+        );
+    }
 
     sender
         .start(enc_to_sender_rx, tr_ev_tx)
@@ -2801,6 +2841,31 @@ impl ChannelLike for TauriSenderChannel {
 #[cfg(test)]
 mod tests {
     use sm_domain::EncoderConfig;
+
+    #[test]
+    fn qsv_opt_in_installs_the_canonical_marker_and_epoch_before_start() {
+        let trace =
+            super::install_qsv_ledger_before_start_for_test(true, "hw_intel_qsv", "1000 2", 7);
+
+        assert_eq!(
+            trace.installed_marker.as_deref(),
+            Some("a=x-sm-qsv-ledger:1:1000%202:7")
+        );
+        assert_eq!(trace.installed_epoch, Some(7));
+        assert!(trace.start_called);
+    }
+
+    #[test]
+    fn default_off_and_nvenc_do_not_install_qsv_ledger_before_start() {
+        for (enabled, backend) in [(false, "hw_intel_qsv"), (true, "hw_nvidia_nvenc")] {
+            let trace =
+                super::install_qsv_ledger_before_start_for_test(enabled, backend, "1000 2", 7);
+
+            assert_eq!(trace.installed_marker, None);
+            assert_eq!(trace.installed_epoch, None);
+            assert!(trace.start_called);
+        }
+    }
 
     // ─── SC-S1-001: eager sender supervisor — Bye at t≈0 reaches supervisor ─────
     //

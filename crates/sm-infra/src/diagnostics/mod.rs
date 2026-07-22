@@ -7,3 +7,5 @@ pub mod qsv_ledger;
     reason = "Ledger APIs remain unintegrated until sender wiring"
 )]
 pub(crate) mod qsv_ledger;
+
+pub use qsv_ledger::TransportLedgerProbe;

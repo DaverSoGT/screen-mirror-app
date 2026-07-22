@@ -47,10 +47,13 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoSender,
 };
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::diagnostics::qsv_ledger::TransportLedgerProbe;
 #[cfg(test)]
-use crate::diagnostics::qsv_ledger::{LedgerActivation, LedgerMarker};
+use crate::diagnostics::qsv_ledger::LedgerActivation;
+use crate::diagnostics::qsv_ledger::{
+    DatagramSend, LedgerMarker, PendingWriterFifo, RtpBinding, RtpHeader, RtpHeaderAggregator,
+    SendFinalizeContext, SourceAuKey, TransportLedgerProbe, WriterWitness,
+    primary_h264_rtp_binding, send_and_finalize,
+};
 use crate::transport::annex_b::duration_to_90khz;
 
 // ─── Internal control message ────────────────────────────────────────────────
@@ -99,7 +102,17 @@ struct SenderShared {
     dropped: AtomicU64,
 }
 
-/// Private proof that this adapter minted a binding for its own canonical offer.
+struct DatagramTarget<'a> {
+    socket: &'a UdpSocket,
+    destination: SocketAddr,
+}
+
+impl DatagramSend for DatagramTarget<'_> {
+    fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize> {
+        self.socket.send_to(datagram, self.destination)
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct OfferEpochBinding {
@@ -107,6 +120,7 @@ struct OfferEpochBinding {
     epoch: u64,
 }
 
+/// Private proof that this adapter minted a binding for its own canonical offer.
 /// The negotiated prerequisites needed before a transport observation can exist.
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +146,6 @@ fn media_readiness_from_state(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn canonical_offer_session_id(offer: &str) -> Option<String> {
     let origin = offer.lines().find_map(|line| line.strip_prefix("o="))?;
     let mut fields = origin.split_whitespace();
@@ -140,19 +153,11 @@ fn canonical_offer_session_id(offer: &str) -> Option<String> {
     Some(format!("{} {}", fields.next()?, fields.next()?))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
-)]
 struct SenderLedgerSeed {
     session_id: String,
     epoch: u64,
     probe: Arc<TransportLedgerProbe>,
 }
-
-#[cfg(feature = "test-support")]
-const TEST_SUPPORT_LEDGER_EPOCH: u64 = 1;
 
 impl SenderShared {
     fn new() -> Arc<Self> {
@@ -198,13 +203,7 @@ pub struct Str0mVideoSender {
     /// Effective local socket address after `start()`. `None` before start.
     /// Used by integration tests to discover the bound port for candidate exchange.
     local_addr: Option<std::net::SocketAddr>,
-    #[cfg(any(test, feature = "test-support"))]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
-    )]
     transport_ledger_probe: Mutex<Option<Arc<TransportLedgerProbe>>>,
-    #[cfg(any(test, feature = "test-support"))]
     sender_ledger_seed: Mutex<Option<SenderLedgerSeed>>,
 }
 
@@ -280,9 +279,7 @@ impl VideoSender for Str0mVideoSender {
             control_tx: None,
             handle: None,
             local_addr: None,
-            #[cfg(any(test, feature = "test-support"))]
             transport_ledger_probe: Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
             sender_ledger_seed: Mutex::new(None),
         })
     }
@@ -320,6 +317,12 @@ impl VideoSender for Str0mVideoSender {
         let local_addr = udp
             .local_addr()
             .map_err(|e| TransportError::Io(e.to_string()))?;
+
+        let sender_ledger_seed = self
+            .sender_ledger_seed
+            .lock()
+            .ok()
+            .and_then(|mut seed| seed.take());
 
         // Take the Rtc out of pre_neg and move it into the thread.
         let pre_neg = {
@@ -381,6 +384,7 @@ impl VideoSender for Str0mVideoSender {
                         ctrl_rx,
                         state,
                         encoder,
+                        sender_ledger_seed,
                     );
                 })
                 .map_err(|e| TransportError::Internal(format!("thread spawn failed: {e}")))?;
@@ -506,8 +510,56 @@ impl Str0mVideoSender {
         }
     }
 
+    pub fn install_qsv_ledger_for_offer(
+        &self,
+        offer: &SdpOffer,
+        epoch: u64,
+        probe: Arc<TransportLedgerProbe>,
+    ) -> bool {
+        let session_id = match self.pre_neg.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .and_then(|pre_neg| canonical_offer_session_id(&pre_neg.offer_str)),
+            Err(_) => None,
+        };
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        let mut markers = offer
+            .0
+            .lines()
+            .filter(|line| line.starts_with("a=x-sm-qsv-ledger:"));
+        let Some(marker) = markers.next() else {
+            return false;
+        };
+        if markers.next().is_some() {
+            return false;
+        }
+        let Ok(marker) = LedgerMarker::parse(marker) else {
+            return false;
+        };
+        if marker != LedgerMarker::new(&session_id, epoch) {
+            return false;
+        }
+        if let Ok(mut attached) = self.transport_ledger_probe.lock() {
+            *attached = Some(Arc::clone(&probe));
+        } else {
+            return false;
+        }
+        match self.sender_ledger_seed.lock() {
+            Ok(mut seed) => {
+                *seed = Some(SenderLedgerSeed {
+                    session_id,
+                    epoch,
+                    probe,
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Attaches an inert probe for external test-support contract compilation.
-    #[cfg(feature = "test-support")]
     pub fn install_transport_ledger_probe_for_test(&self, probe: Arc<TransportLedgerProbe>) {
         let Ok(guard) = self.pre_neg.lock() else {
             return;
@@ -522,7 +574,7 @@ impl Str0mVideoSender {
         if let Ok(mut seed) = self.sender_ledger_seed.lock() {
             *seed = Some(SenderLedgerSeed {
                 session_id,
-                epoch: TEST_SUPPORT_LEDGER_EPOCH,
+                epoch: 1,
                 probe,
             });
         }
@@ -623,6 +675,7 @@ fn run_sender_loop(
     ctrl_rx: std::sync::mpsc::Receiver<SenderControl>,
     state: Arc<SenderShared>,
     encoder: Option<Arc<dyn VideoEncoder + Send + Sync>>,
+    ledger_seed: Option<SenderLedgerSeed>,
 ) {
     let mut buf = vec![0u8; 2048];
     let rtc = &mut pre_neg.rtc;
@@ -639,6 +692,9 @@ fn run_sender_loop(
     // Window boundary owned by the loop (design D-PPT3-4).
     let mut pace_stats = PaceStats::new();
     let mut pace_window_start = Instant::now();
+    let ledger_clock_start = Instant::now();
+    let mut pending_writers = PendingWriterFifo::new(128);
+    let mut rtp_aggregator = RtpHeaderAggregator::new();
 
     loop {
         // ── 1. Stop flag ──────────────────────────────────────────────────
@@ -754,10 +810,23 @@ fn run_sender_loop(
                         if let Some(writer) = rtc.writer(mid) {
                             // Pass the entire Annex-B frame. str0m's H264Packetizer
                             // handles start-code stripping, FU-A fragmentation, SRTP.
-                            if let Err(_e) =
-                                writer.write(pt, wallclock, rtp_time, pkt.data.as_ref())
+                            if writer
+                                .write(pt, wallclock, rtp_time, pkt.data.as_ref())
+                                .is_err()
                             {
                                 state.dropped.fetch_add(1, Ordering::Relaxed);
+                            } else if let Some(seed) = &ledger_seed {
+                                let observed_at_us =
+                                    ledger_clock_start.elapsed().as_micros() as u64;
+                                let source = SourceAuKey::new(
+                                    seed.session_id.clone(),
+                                    seed.epoch,
+                                    pkt.sequence,
+                                    rtp_ts,
+                                );
+                                seed.probe.record_writer(WriterWitness::new(source.clone()));
+                                let _ = pending_writers
+                                    .push(WriterWitness::new(source), observed_at_us);
                             }
                         }
                     } else {
@@ -793,7 +862,44 @@ fn run_sender_loop(
                             t.destination
                         );
                     }
-                    let _ = udp.send_to(&t.contents, t.destination);
+                    if let (Some(seed), Some(primary_payload_type)) = (&ledger_seed, pre_neg.pt) {
+                        let observed_at_us = ledger_clock_start.elapsed().as_micros() as u64;
+                        let primary_payload_type = *primary_payload_type;
+                        if let Some(binding) =
+                            primary_h264_rtp_binding(&t.contents, primary_payload_type)
+                        {
+                            let observation = rtp_aggregator.observe(RtpHeader::new(
+                                binding.ssrc(),
+                                binding.rtp_timestamp(),
+                                u16::from_be_bytes([t.contents[2], t.contents[3]]),
+                                observed_at_us,
+                            ));
+                            let mut sender = DatagramTarget {
+                                socket: &udp,
+                                destination: t.destination,
+                            };
+                            let _ = send_and_finalize(
+                                &mut sender,
+                                &t.contents,
+                                SendFinalizeContext {
+                                    pending: &mut pending_writers,
+                                    session: &seed.session_id,
+                                    epoch: seed.epoch,
+                                    binding: RtpBinding::new(
+                                        binding.ssrc(),
+                                        binding.rtp_timestamp(),
+                                        observation.occurrence,
+                                    ),
+                                    now_us: observed_at_us,
+                                    probe: &seed.probe,
+                                },
+                            );
+                        } else {
+                            let _ = udp.send_to(&t.contents, t.destination);
+                        }
+                    } else {
+                        let _ = udp.send_to(&t.contents, t.destination);
+                    }
                     // [sm-sender-pace] burst accounting: count every UDP send (design D-PPT3-4).
                     pace_stats.on_transmit();
                 }

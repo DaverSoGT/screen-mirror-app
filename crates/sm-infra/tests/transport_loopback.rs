@@ -619,6 +619,9 @@ fn transport_loopback_media_flow_end_to_end() {
     let (pkt_out_tx, pkt_out_rx) = sync_channel::<EncodedPacket>(8);
     let (receiver_event_tx, _receiver_event_rx) = sync_channel::<TransportEvent>(8);
 
+    let ledger_probe = Arc::new(TransportLedgerProbe::collecting());
+    sender.install_transport_ledger_probe_for_test(Arc::clone(&ledger_probe));
+
     sender.start(pkt_rx, sender_event_tx).expect("sender start");
     receiver
         .start(pkt_out_tx, receiver_event_tx)
@@ -692,6 +695,22 @@ fn transport_loopback_media_flow_end_to_end() {
     assert!(
         first_pkt.is_keyframe,
         "first received packet must be a keyframe"
+    );
+
+    let writer_witnesses = ledger_probe.writer_witnesses();
+    let transmit_witnesses = ledger_probe.udp_transmit_witnesses();
+    assert!(
+        !writer_witnesses.is_empty(),
+        "an accepted active-loop writer frame must record a ledger witness"
+    );
+    assert!(
+        !transmit_witnesses.is_empty(),
+        "a full active-loop UDP transmit must record a ledger witness"
+    );
+    assert_eq!(
+        writer_witnesses[0].source().session(),
+        transmit_witnesses[0].identity().source().session(),
+        "writer and transmit witnesses must share the canonical sender session"
     );
 
     // Assert 3: request_keyframe() reaches encoder via RTCP PLI.
