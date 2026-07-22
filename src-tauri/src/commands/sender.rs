@@ -2121,10 +2121,16 @@ fn install_qsv_ledger_before_start_for_test(
     canonical_session: &str,
     attempt: u8,
 ) -> LedgerInstallTrace {
-    let _ = (explicitly_enabled, backend_name, canonical_session, attempt);
+    let marker = qsv_ledger_marker_for_confirmed_backend(
+        explicitly_enabled,
+        backend_name,
+        canonical_session,
+        u64::from(attempt),
+    );
     LedgerInstallTrace {
+        installed_epoch: marker.as_ref().map(|_| u64::from(attempt)),
+        installed_marker: marker,
         start_called: true,
-        ..LedgerInstallTrace::default()
     }
 }
 
@@ -2256,6 +2262,7 @@ fn build_production_sender_bundle(
     use sm_domain::transport::{TransportConfig, TransportRole, VideoSender};
     use sm_domain::{CaptureConfig, CaptureSource, MonitorSelector};
     use sm_infra::capture::WindowsCaptureSource;
+    use sm_infra::diagnostics::TransportLedgerProbe;
     use sm_infra::encode::build_video_encoder;
     use sm_infra::signaling::mdns::MdnsSignaling;
     use sm_infra::transport::{
@@ -2341,6 +2348,17 @@ fn build_production_sender_bundle(
         .create_local_offer()
         .map_err(|e| BundleError::Other(e.to_string()))?;
     let offer = add_qsv_ledger_marker_to_offer(offer, &backend_name, attempt);
+    if offer
+        .0
+        .lines()
+        .any(|line| line.starts_with("a=x-sm-qsv-ledger:"))
+    {
+        let _ = sender.install_qsv_ledger_for_offer(
+            &offer,
+            u64::from(attempt),
+            Arc::new(TransportLedgerProbe::collecting()),
+        );
+    }
 
     sender
         .start(enc_to_sender_rx, tr_ev_tx)

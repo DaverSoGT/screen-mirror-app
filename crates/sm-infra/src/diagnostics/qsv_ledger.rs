@@ -779,25 +779,33 @@ impl PendingSendTransaction<'_> {
     pub(crate) fn cancel(self) {}
 }
 
-trait DatagramSend {
+pub(crate) trait DatagramSend {
     fn send_datagram(&mut self, datagram: &[u8]) -> io::Result<usize>;
 }
 
-struct SendFinalizeContext<'a> {
-    pending: &'a mut PendingWriterFifo,
-    session: &'a str,
-    epoch: u64,
-    binding: RtpBinding,
-    now_us: u64,
-    probe: &'a TransportLedgerProbe,
+pub(crate) struct SendFinalizeContext<'a> {
+    pub(crate) pending: &'a mut PendingWriterFifo,
+    pub(crate) session: &'a str,
+    pub(crate) epoch: u64,
+    pub(crate) binding: RtpBinding,
+    pub(crate) now_us: u64,
+    pub(crate) probe: &'a TransportLedgerProbe,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
-)]
-fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option<RtpBinding> {
-    if datagram.len() < 12 || datagram[0] >> 6 != 2 || datagram[1] & 0x7f != primary_payload_type {
+pub(crate) fn primary_h264_rtp_binding(
+    datagram: &[u8],
+    primary_payload_type: u8,
+) -> Option<RtpBinding> {
+    if datagram.len() < 12 || datagram[0] >> 6 != 2 {
+        return None;
+    }
+
+    let csrc_count = usize::from(datagram[0] & 0x0f);
+    let header_len = 12usize.checked_add(csrc_count.checked_mul(4)?)?;
+    if datagram.len() < header_len || (192..=223).contains(&datagram[1]) {
+        return None;
+    }
+    if datagram[1] & 0x7f != primary_payload_type {
         return None;
     }
 
@@ -808,11 +816,7 @@ fn primary_h264_rtp_binding(datagram: &[u8], primary_payload_type: u8) -> Option
     ))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Slice 4A staged for mandatory 4B integration")
-)]
-fn send_and_finalize(
+pub(crate) fn send_and_finalize(
     sender: &mut impl DatagramSend,
     datagram: &[u8],
     context: SendFinalizeContext<'_>,
