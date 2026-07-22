@@ -1391,6 +1391,30 @@ mod tests {
     }
 
     #[test]
+    fn primary_h264_classifier_rejects_rtcp_with_a_colliding_payload_type() {
+        let primary = 72;
+        let rtcp_sender_report = [0x80, 200, 0, 6, 0, 0, 0, 9, 0, 0, 0, 99];
+
+        assert_eq!(
+            primary_h264_rtp_binding(&rtcp_sender_report, primary),
+            None,
+            "RTCP packet types must not be interpreted as RTP payload types"
+        );
+    }
+
+    #[test]
+    fn primary_h264_classifier_rejects_rtp_truncated_after_a_declared_csrc() {
+        let primary = 96;
+        let truncated_rtp = [0x81, primary, 0, 1, 0, 0, 0, 9, 0, 0, 0, 99];
+
+        assert_eq!(
+            primary_h264_rtp_binding(&truncated_rtp, primary),
+            None,
+            "an RTP header that declares a missing CSRC must not produce a binding"
+        );
+    }
+
+    #[test]
     fn collecting_probe_retains_at_most_the_configured_witness_bound() {
         let probe = TransportLedgerProbe::collecting_with_witness_limit(2);
         for sequence in 0..3 {

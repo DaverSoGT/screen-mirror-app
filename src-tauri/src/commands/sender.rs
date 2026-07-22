@@ -2106,6 +2106,28 @@ fn qsv_ledger_marker_for_confirmed_backend(
     })
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct LedgerInstallTrace {
+    installed_marker: Option<String>,
+    installed_epoch: Option<u64>,
+    start_called: bool,
+}
+
+#[cfg(test)]
+fn install_qsv_ledger_before_start_for_test(
+    explicitly_enabled: bool,
+    backend_name: &str,
+    canonical_session: &str,
+    attempt: u8,
+) -> LedgerInstallTrace {
+    let _ = (explicitly_enabled, backend_name, canonical_session, attempt);
+    LedgerInstallTrace {
+        start_called: true,
+        ..LedgerInstallTrace::default()
+    }
+}
+
 /// The ledger remains default-off unless the sender process explicitly enables it.
 #[cfg(target_os = "windows")]
 fn qsv_ledger_opt_in_enabled() -> bool {
@@ -2801,6 +2823,31 @@ impl ChannelLike for TauriSenderChannel {
 #[cfg(test)]
 mod tests {
     use sm_domain::EncoderConfig;
+
+    #[test]
+    fn qsv_opt_in_installs_the_canonical_marker_and_epoch_before_start() {
+        let trace =
+            super::install_qsv_ledger_before_start_for_test(true, "hw_intel_qsv", "1000 2", 7);
+
+        assert_eq!(
+            trace.installed_marker.as_deref(),
+            Some("a=x-sm-qsv-ledger:1:1000%202:7")
+        );
+        assert_eq!(trace.installed_epoch, Some(7));
+        assert!(trace.start_called);
+    }
+
+    #[test]
+    fn default_off_and_nvenc_do_not_install_qsv_ledger_before_start() {
+        for (enabled, backend) in [(false, "hw_intel_qsv"), (true, "hw_nvidia_nvenc")] {
+            let trace =
+                super::install_qsv_ledger_before_start_for_test(enabled, backend, "1000 2", 7);
+
+            assert_eq!(trace.installed_marker, None);
+            assert_eq!(trace.installed_epoch, None);
+            assert!(trace.start_called);
+        }
+    }
 
     // ─── SC-S1-001: eager sender supervisor — Bye at t≈0 reaches supervisor ─────
     //
