@@ -47,13 +47,13 @@ use sm_domain::transport::{
     TRANSPORT_CHANNEL_CAPACITY, TransportConfig, TransportError, TransportEvent, VideoSender,
 };
 
-use crate::diagnostics::qsv_ledger::{
-    DatagramSend, LedgerMarker, PendingWriterFifo, RtpBinding, RtpHeader,
-    RtpHeaderAggregator, SendFinalizeContext, SourceAuKey, TransportLedgerProbe, WriterWitness,
-    primary_h264_rtp_binding, send_and_finalize,
-};
 #[cfg(test)]
 use crate::diagnostics::qsv_ledger::LedgerActivation;
+use crate::diagnostics::qsv_ledger::{
+    DatagramSend, LedgerMarker, PendingWriterFifo, RtpBinding, RtpHeader, RtpHeaderAggregator,
+    SendFinalizeContext, SourceAuKey, TransportLedgerProbe, WriterWitness,
+    primary_h264_rtp_binding, send_and_finalize,
+};
 use crate::transport::annex_b::duration_to_90khz;
 
 // ─── Internal control message ────────────────────────────────────────────────
@@ -158,7 +158,6 @@ struct SenderLedgerSeed {
     epoch: u64,
     probe: Arc<TransportLedgerProbe>,
 }
-
 
 impl SenderShared {
     fn new() -> Arc<Self> {
